@@ -1,0 +1,16 @@
+{
+  "name": "MeshChat",
+  "short_name": "MeshChat",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#000000",
+  "theme_color": "#000000",
+  "orientation": "portrait",
+  "icons": [
+    {
+      "src": "/icon.png",
+      "sizes": "189x189",
+      "type": "image/png"
+    }
+  ]
+}

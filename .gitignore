@@ -1,0 +1,13 @@
+start.bat
+start.sh
+*.env
+__pycache__/
+*.pyc
+*.pyo
+*.log
+ 
+# local dev folders
+project/
+static/doc/
+static/FA6E31B89/
+minimizer.py
