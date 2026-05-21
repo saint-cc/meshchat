@@ -1,0 +1,216 @@
+SETUP / INSTALLATION
+====================
+
+
+OVERVIEW
+--------
+
+The project consists of a single `server.py` script which provides:
+
+- HTTP server
+- WebSocket server
+
+The HTTP side serves a flat/static HTML + JavaScript frontend.
+
+Because the frontend is fully static, it can also be hosted separately using:
+
+- NGINX
+- Apache
+- Caddy
+- GitHub Pages
+- Any static web hosting solution
+
+The Python server is primarily responsible for backend WebSocket communication.
+
+
+IMPORTANT WEBSOCKET NOTE
+------------------------
+
+The frontend expects the websocket endpoint to exist at:
+
+    wss://mydomain.org/ws/
+
+For internal/local usage this may also be:
+
+    ws://192.168.x.x:8888
+
+or:
+
+    ws://localhost:8888
+
+Your reverse proxy (NGINX or similar) must forward:
+
+    /ws/
+
+to the Python websocket server.
+
+Example:
+
+    Browser
+        ↓
+    https://mydomain.org/ws/
+        ↓
+    nginx reverse proxy
+        ↓
+    ws://localhost:8888
+
+
+REVERSE PROXY / SSL
+-------------------
+
+For external internet access it is recommended to place the server behind
+NGINX or another reverse proxy.
+
+Typical setup:
+
+    Internet
+       ↓
+    NGINX (SSL + domain)
+       ↓
+    server.py
+
+The reverse proxy handles:
+
+- HTTPS / WSS
+- SSL certificates
+- domain binding
+- forwarding traffic to the local Python server
+
+
+STARTING THE SERVER
+-------------------
+
+Depending on your environment run either:
+
+    start.bat
+
+or:
+
+    start.sh
+
+These scripts simply configure environment variables before launching
+`server.py`.
+
+Typical configuration values:
+
+- email login credentials
+- SMTP settings
+- ports
+- runtime configuration
+
+Using environment variables keeps deployment simple and also makes the
+project easy to deploy using Docker.
+
+
+EMAIL RELAY / OFFLINE DELIVERY
+------------------------------
+
+If you want offline message delivery between relay servers, you must configure
+a dedicated email account for the relay server.
+
+The relay uses email as a store-and-forward transport when remote users or
+servers are temporarily offline.
+
+Typical setup:
+
+    meshchat@domain.org
+
+The configured account should support:
+
+- SMTP (outbound mail)
+- IMAP (inbound mail)
+
+A dedicated mailbox is strongly recommended instead of using a personal email
+account.
+
+
+TYPICAL start.bat
+-----------------
+
+:: Relay identity (what this server tells clients it is)
+set RELAY_WSS_URL=wss://meshchat.domain.org/ws/
+set RELAY_EMAIL=meshchat@domain.org
+
+:: Email relay — outbound + inbound
+set EMAIL_HOST=mail.domain.org
+set EMAIL_PORT_OUT=587
+set EMAIL_PORT_IN=993
+set EMAIL_USER=meshchat@domain.org
+set EMAIL_PASS=****
+set EMAIL_FROM=meshchat@domain.org
+set EMAIL_TLS=starttls
+
+:: Local server ports
+set HTTP_PORT=8000
+set WS_PORT=8888
+
+python server.py
+
+
+LOCAL NETWORK USAGE
+-------------------
+
+Inside your local network you can directly connect to:
+
+    http://<server-ip>:8000
+
+Example:
+
+    http://192.168.1.50:8000
+
+
+CHROME SECURE ORIGIN REQUIREMENT
+--------------------------------
+
+Some browser APIs and crypto libraries normally require HTTPS contexts.
+
+For local development you can enable the Chrome flag:
+
+    chrome://flags
+
+and enable the option that treats insecure origins as secure.
+
+This allows local HTTP development to use APIs normally restricted to HTTPS.
+
+On desktop systems this also usually works directly via:
+
+    http://localhost:8000
+
+
+SELF-SIGNED SSL CERTIFICATES
+----------------------------
+
+When connecting through your external HTTPS endpoint you may see a browser
+warning if using:
+
+- self-signed certificates
+- invalid certificates
+- local/private CA certificates
+
+Accepting/passing the warning should still allow the application and
+websocket connection to function normally.
+
+
+LOCALSTORAGE WARNING
+--------------------
+
+Browsers separate localStorage by origin.
+
+The following are considered completely different storage locations:
+
+    http://localhost:8000
+    http://192.168.1.50:8000
+    https://mydomain.org
+
+Depending on your testing setup:
+
+- identities may appear missing
+- restores may not work across origins
+- data may not automatically transfer
+
+If needed use the built-in:
+
+- Export
+- Import
+
+features to transfer data between environments.
