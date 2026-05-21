@@ -1,5 +1,4 @@
 start.bat
-start.sh
 *.env
 __pycache__/
 *.pyc
