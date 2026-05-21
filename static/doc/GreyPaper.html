@@ -1,0 +1,471 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>MeshChat Greypaper</title>
+
+<style>
+body{
+  margin:0;
+  background:#111315;
+  color:#d2d5d9;
+  font-family:monospace;
+  line-height:1.65;
+}
+
+.container{
+  max-width:950px;
+  margin:40px auto;
+  padding:20px;
+}
+
+h1,h2,h3{
+  color:#f0f0f0;
+  letter-spacing:0.05em;
+}
+
+h1{
+  border-bottom:1px solid #4a4f55;
+  padding-bottom:12px;
+}
+
+h2{
+  margin-top:38px;
+  border-left:3px solid #6c737c;
+  padding-left:10px;
+}
+
+h3{
+  margin-top:24px;
+}
+
+p{
+  color:#c2c6cc;
+}
+
+ul{
+  margin-top:10px;
+}
+
+li{
+  margin:8px 0;
+  color:#c8ccd2;
+}
+
+code{
+  background:rgba(255,255,255,0.06);
+  padding:2px 5px;
+  border-radius:4px;
+  color:#f3f4f5;
+}
+
+.section{
+  margin-bottom:28px;
+}
+
+.note{
+  color:#aeb4bb;
+}
+
+.small{
+  opacity:0.7;
+  font-size:13px;
+}
+
+hr{
+  border:none;
+  border-top:1px solid #4a4f55;
+  margin:40px 0;
+}
+
+.block{
+  background:rgba(255,255,255,0.035);
+  border:1px solid rgba(255,255,255,0.09);
+  padding:14px;
+  border-radius:8px;
+  margin:18px 0;
+  overflow-x:auto;
+  color:#d8dbe0;
+}
+</style>
+</head>
+
+<body>
+
+<div class="container">
+
+<h1>MeshChat: A Resilient Identity Messaging Protocol</h1>
+
+<div class="section">
+<h2>Abstract</h2>
+
+<p>
+MeshChat is an experimental decentralized communication protocol focused on portable cryptographic identity,
+direct peer connectivity and resilient message delivery under unstable network conditions.
+</p>
+
+<p>
+The system avoids centralized identity providers and minimizes infrastructure trust requirements.
+Identities are locally derived from user-held secrets and can migrate freely between devices, domains and relay nodes.
+</p>
+
+<p>
+Communication prefers direct WebSocket connectivity between peers while preserving asynchronous delivery through relay-assisted fallback transport.
+</p>
+</div>
+
+<div class="section">
+<h2>1. Introduction</h2>
+
+<p>
+Modern messaging systems typically bind identity, message storage and routing to centralized service providers.
+MeshChat explores an alternative model where identity is user-owned, reproducible and transport-independent.
+</p>
+
+<p>
+The protocol operates entirely at the application layer and intentionally relies on existing Internet infrastructure
+rather than introducing custom network-layer routing systems.
+</p>
+
+<div class="block">
+MeshChat does not attempt to replace TCP/IP, DNS, BGP or existing Internet routing.
+Instead it defines a portable identity and message delivery layer operating above them.
+</div>
+
+<p>
+The project prioritizes:
+</p>
+
+<ul>
+  <li>Portable cryptographic identity</li>
+  <li>Direct peer communication where possible</li>
+  <li>Graceful degradation under partial failure</li>
+  <li>Minimal infrastructure trust assumptions</li>
+  <li>Eventually consistent synchronization</li>
+</ul>
+</div>
+
+<div class="section">
+<h2>2. Identity Model</h2>
+
+<p>
+Each identity is deterministically derived from a username and passphrase.
+No centralized registration authority exists.
+</p>
+
+<p>
+Key material is locally generated using PBKDF2 and HKDF expansion:
+</p>
+
+<ul>
+  <li>Encryption key (AES-GCM)</li>
+  <li>Signing key seed (Ed25519)</li>
+  <li>Backup/recovery key</li>
+</ul>
+
+<p>
+A stable public identifier (<code>publicID</code>) is derived from cryptographic material rather than infrastructure ownership.
+</p>
+
+<div class="block">
+Identity in MeshChat is cryptographic rather than account-based.
+A relay node does not create or own identities.
+</div>
+</div>
+
+<div class="section">
+<h2>2.1 Identity Portability & Reconstruction</h2>
+
+<p>
+MeshChat identities are not tied to devices, sessions or domains.
+A user can reconstruct the same identity on any compatible client using only their credentials.
+</p>
+
+<p>
+When a user appears on a new device:
+</p>
+
+<ul>
+  <li>The same cryptographic identity is recreated deterministically</li>
+  <li>The identity reconnects to known contacts as the same participant</li>
+  <li>Peer synchronization restores contact and message state progressively</li>
+  <li>Conversation history may be reconstructed through sync and encrypted backup exchange</li>
+</ul>
+
+<p class="note">
+Identity continuity exists independently from device continuity.
+</p>
+</div>
+
+<div class="section">
+<h2>3. Communication Model</h2>
+
+<p>
+MeshChat uses a hybrid communication model combining direct peer transport and asynchronous fallback delivery.
+</p>
+
+<h3>3.1 Direct Peer Connectivity</h3>
+
+<p>
+Clients maintain a persistent WebSocket connection to a chosen home relay.
+However, messages are normally sent directly from one client to another client’s advertised WebSocket endpoint.
+</p>
+
+<div class="block">
+Alice → Bob.currentWSS
+</div>
+
+<p>
+This allows low-latency communication without requiring relay-to-relay federation.
+</p>
+
+<h3>3.2 Home Relay Model</h3>
+
+<p>
+Each identity maintains a preferred relay association.
+The relay acts as:
+</p>
+
+<ul>
+  <li>Connection anchor</li>
+  <li>Fallback message transport</li>
+  <li>Temporary synchronization point</li>
+  <li>Reachability advertisement source</li>
+</ul>
+
+<p>
+The relay is not a trust authority and cannot decrypt or validate encrypted payload contents.
+</p>
+
+<h3>3.3 Packet Structure</h3>
+
+<p>
+Messages are transmitted as opaque encrypted blobs:
+</p>
+
+<ul>
+  <li>Encrypted payload</li>
+  <li>Ed25519 signature</li>
+  <li>Sender publicID</li>
+  <li>Recipient publicID</li>
+</ul>
+
+<p>
+Relays transport packets without access to message content.
+</p>
+</div>
+
+<div class="section">
+<h2>4. Reachability & Migration</h2>
+
+<p>
+MeshChat identities may migrate between domains, devices or relay nodes without changing identity.
+</p>
+
+<p>
+A contact advertisement may contain:
+</p>
+
+<div class="block">
+{
+  mail: "meshchat@domain.org",
+  wss: "wss://domain.org/ws/"
+}
+</div>
+
+<p>
+These fields serve different purposes:
+</p>
+
+<ul>
+  <li><code>wss</code> → current preferred live endpoint</li>
+  <li><code>mail</code> → durable fallback relay transport address</li>
+</ul>
+
+<p>
+The current WebSocket endpoint may change frequently while the relay email may remain stable for extended periods.
+</p>
+
+<p>
+Migration therefore becomes a gradual convergence process rather than a hard transition event.
+</p>
+
+<p class="note">
+Temporary divergence between known endpoints is tolerated by design.
+</p>
+</div>
+
+<div class="section">
+<h2>5. Synchronization Model</h2>
+
+<p>
+MeshChat uses opportunistic peer synchronization rather than strict global consistency.
+</p>
+
+<p>
+Peers may:
+</p>
+
+<ul>
+  <li>Exchange recent message windows</li>
+  <li>Compare synchronization state</li>
+  <li>Merge missing encrypted packets</li>
+  <li>Repair temporary divergence over time</li>
+</ul>
+
+<p>
+The protocol prioritizes eventual consistency and graceful recovery over immediate consensus.
+</p>
+
+<div class="block">
+Temporary forks in local conversation state are expected and self-repair through synchronization.
+</div>
+</div>
+
+<div class="section">
+<h2>6. Offline & Delay-Tolerant Delivery</h2>
+
+<p>
+If direct peer connectivity fails, messages may fall back to asynchronous relay-assisted delivery.
+</p>
+
+<p>
+Relays may:
+</p>
+
+<ul>
+  <li>Temporarily queue encrypted packets</li>
+  <li>Forward packets through email transport</li>
+  <li>Retry delayed delivery</li>
+  <li>Expire stale packets using TTL policies</li>
+</ul>
+
+<p>
+The client itself is transport-agnostic and does not directly interact with email systems.
+Fallback logic exists entirely within relay behavior.
+</p>
+
+<div class="block">
+Client → Home Relay → Email fallback → Recipient Relay → Recipient Client
+</div>
+</div>
+
+<div class="section">
+<h2>7. Trust Model</h2>
+
+<p>
+MeshChat assumes infrastructure may be observable, unreliable or partially hostile.
+</p>
+
+<p>
+Security assumptions:
+</p>
+
+<ul>
+  <li>Payloads remain end-to-end encrypted</li>
+  <li>Message authenticity is verified cryptographically</li>
+  <li>Relays may observe timing and routing metadata</li>
+  <li>Relays are not trusted for identity verification</li>
+</ul>
+
+<p>
+Initial trust establishment is expected to occur out-of-band where possible:
+</p>
+
+<ul>
+  <li>QR exchange</li>
+  <li>In-person verification</li>
+  <li>Existing secure channels</li>
+  <li>TOFU-style onboarding</li>
+</ul>
+</div>
+
+<div class="section">
+<h2>8. Relay Philosophy</h2>
+
+<p>
+Relays are intentionally minimal and non-authoritative.
+</p>
+
+<p>
+Unlike federated systems, relays do not maintain global consensus or relay-to-relay routing protocols.
+Cross-domain communication occurs through ordinary Internet infrastructure and optional asynchronous transport methods.
+</p>
+
+<p>
+A relay protects:
+</p>
+
+<ul>
+  <li>Its own availability</li>
+  <li>Its own resources</li>
+  <li>Its own transport integrity</li>
+</ul>
+
+<p>
+A relay does not own:
+</p>
+
+<ul>
+  <li>User identity</li>
+  <li>Message authenticity</li>
+  <li>Conversation state truth</li>
+</ul>
+</div>
+
+<div class="section">
+<h2>9. Design Philosophy</h2>
+
+<p>
+MeshChat explores communication as a resilient distributed state problem rather than a centralized service problem.
+</p>
+
+<p>
+The system intentionally favors:
+</p>
+
+<ul>
+  <li>Identity portability</li>
+  <li>Graceful degradation</li>
+  <li>Transport flexibility</li>
+  <li>Local-first state ownership</li>
+  <li>Partial connectivity tolerance</li>
+  <li>Incremental self-repair</li>
+</ul>
+
+<p>
+Failure is treated as a temporary synchronization condition rather than a terminal communication event.
+</p>
+</div>
+
+<div class="section">
+<h2>10. Conclusion</h2>
+
+<p>
+MeshChat investigates a communication model where cryptographic identity remains stable while connectivity and infrastructure remain fluid.
+</p>
+
+<p>
+The protocol separates identity from transport and allows communication to continue across changing domains, devices and partial network failures.
+</p>
+
+<p>
+The project remains experimental and intentionally iterative.
+Future revisions may refine synchronization, migration handling and transport negotiation while preserving the core identity model.
+</p>
+</div>
+
+<hr>
+
+<p class="note">
+MeshChat Greypaper — Experimental Protocol Design
+</p>
+
+<p class="small">
+Version 0.x — evolving specification
+</p>
+
+</div>
+
+</body>
+</html>

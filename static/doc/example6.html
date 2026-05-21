@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Meshchat Entropy & Brute Meter</title>
+
+<style>
+body {
+  font-family: monospace;
+  background: #111;
+  color: #ddd;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 40px;
+}
+
+input {
+  width: 340px;
+  padding: 10px;
+  margin: 8px;
+  background: #222;
+  border: 1px solid #444;
+  color: #eee;
+}
+
+.bar-container {
+  width: 340px;
+  height: 28px;
+  background: #333;
+  margin-top: 20px;
+  border: 1px solid #444;
+}
+
+.bar {
+  height: 100%;
+  width: 0%;
+  transition: width 0.2s ease, background 0.2s ease;
+}
+
+.label {
+  margin-top: 12px;
+  font-size: 14px;
+  text-align: center;
+  white-space: pre-line;
+}
+</style>
+</head>
+
+<body>
+
+<h2>Entropy + Brute Force Estimator</h2>
+
+<input id="user" placeholder="username" />
+<input id="pass" type="password" placeholder="passphrase" />
+
+<div class="bar-container">
+  <div id="bar" class="bar"></div>
+</div>
+
+<div class="label" id="label">entropy: 0 bits</div>
+
+<script>
+/* -----------------------------
+   ENTROPY MODEL
+----------------------------- */
+
+function calcEntropy(pass) {
+  let charset = 0;
+
+  if (/[a-z]/.test(pass)) charset += 26;
+  if (/[A-Z]/.test(pass)) charset += 26;
+  if (/[0-9]/.test(pass)) charset += 10;
+  if (/[^a-zA-Z0-9]/.test(pass)) charset += 32;
+
+  if (charset === 0) return 0;
+
+  return pass.length * Math.log2(charset);
+}
+
+function usernameEntropy(user) {
+  if (!user) return 0;
+
+  const common = [
+    "admin","test","user","root","guest",
+    "bob","alice","administrator"
+  ];
+
+  if (common.includes(user.toLowerCase())) {
+    return 4; // extremely weak effective entropy
+  }
+
+  return Math.log2(5000); // rough generic namespace estimate
+}
+
+/* -----------------------------
+   BRUTE FORCE MODEL
+----------------------------- */
+
+function estimateCrackTimeBits(bits, rate = 1e11) {
+  const totalGuesses = Math.pow(2, bits);
+  const seconds = totalGuesses / rate;
+
+  const minute = 60;
+  const hour = 3600;
+  const day = 86400;
+  const year = 31557600;
+
+  let value, unit;
+
+  if (seconds < minute) {
+    value = seconds;
+    unit = "seconds";
+  } else if (seconds < hour) {
+    value = seconds / minute;
+    unit = "minutes";
+  } else if (seconds < day) {
+    value = seconds / hour;
+    unit = "hours";
+  } else if (seconds < year) {
+    value = seconds / day;
+    unit = "days";
+  } else {
+    value = seconds / year;
+    unit = "years";
+  }
+
+  return { value, unit, seconds };
+}
+
+/* -----------------------------
+   UI UPDATE
+----------------------------- */
+
+function update() {
+  const user = document.getElementById('user').value;
+  const pass = document.getElementById('pass').value;
+
+  let entropyPass = calcEntropy(pass);
+  let entropyUser = usernameEntropy(user);
+
+  let entropy = entropyPass + entropyUser;
+  entropy -= linguisticPenalty(pass);
+  entropy = Math.max(entropy, 0);
+
+  // penalty if username appears inside password
+  if (user && pass.toLowerCase().includes(user.toLowerCase())) {
+    entropy *= 0.7;
+  }
+
+  const crack = estimateCrackTimeBits(entropy);
+
+  let bar = document.getElementById('bar');
+  let label = document.getElementById('label');
+
+  let percent = Math.min(entropy / 120 * 100, 100);
+
+  let color = "black";
+  if (entropy < 20) color = "black";
+  else if (entropy < 40) color = "red";
+  else if (entropy < 60) color = "orange";
+  else if (entropy < 80) color = "yellow";
+  else color = "green";
+
+  bar.style.width = percent + "%";
+  bar.style.background = color;
+
+  let crackText;
+
+  if (crack.seconds > 1e17) {
+    crackText = ">> heat death of universe";
+  } else {
+    crackText = `${crack.value.toExponential(2)} ${crack.unit}`;
+  }
+
+  label.textContent =
+`entropy: ${entropy.toFixed(1)} bits
+brute force: ${crackText}`;
+}
+
+function linguisticPenalty(str) {
+  if (!str) return 0;
+
+  const s = str.toLowerCase();
+
+  // common word / phrase indicators
+  const commonPhrases = [
+    "this is",
+    "very",
+    "password",
+    "admin",
+    "test",
+    "hello",
+    "qwerty",
+    "let me",
+    "please",
+    "i am"
+  ];
+
+  let penalty = 0;
+
+  for (const p of commonPhrases) {
+    if (s.includes(p)) penalty += 8;
+  }
+
+  // repeated structure penalty
+  const words = s.split(/\s+/);
+  const unique = new Set(words);
+
+  if (words.length > 0) {
+    const repetitionRatio = 1 - (unique.size / words.length);
+    penalty += repetitionRatio * 20;
+  }
+
+  return penalty;
+}
+
+document.getElementById('user').addEventListener('input', update);
+document.getElementById('pass').addEventListener('input', update);
+
+</script>
+
+</body>
+</html>

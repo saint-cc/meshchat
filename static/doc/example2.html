@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8" />
+<title>Meshchat Sync Demo</title>
+<style>
+body { font-family: Arial, sans-serif; display:flex; height:100vh; margin:0; }
+.panel { flex:1; padding:10px; border-right:1px solid #333; display:flex; flex-direction:column; }
+.panel:last-child { border-right:none; }
+.header { font-weight:bold; margin-bottom:10px; }
+.log { flex:1; border:1px solid #444; padding:5px; overflow:auto; font-size:12px; background:#111; color:#0f0; }
+.row { display:flex; gap:5px; margin-top:5px; }
+input { flex:1; }
+button { padding:5px; }
+.status { margin-bottom:5px; font-size:12px; }
+</style>
+</head>
+<body>
+
+<div class="panel" id="bobPanel">
+  <div class="header">Bob</div>
+  <div class="status" id="bobStatus">offline</div>
+  <button onclick="toggle('bob')">Toggle Online</button>
+  <div class="log" id="bobLog"></div>
+  <div class="row">
+    <input id="bobInput" placeholder="message..." />
+    <button onclick="send('bob')">Send</button>
+  </div>
+  <button onclick="resync('bob')">Resync</button>
+</div>
+
+<div class="panel" id="alicePanel">
+  <div class="header">Alice</div>
+  <div class="status" id="aliceStatus">offline</div>
+  <button onclick="toggle('alice')">Toggle Online</button>
+  <div class="log" id="aliceLog"></div>
+  <div class="row">
+    <input id="aliceInput" placeholder="message..." />
+    <button onclick="send('alice')">Send</button>
+  </div>
+  <button onclick="resync('alice')">Resync</button>
+</div>
+
+<script>
+const server = {
+  messages: [],
+  online: { bob:false, alice:false },
+  lastSync: { bob: 0, alice: 0 }
+};
+
+function uid() {
+  return crypto.randomUUID();
+}
+
+function now() {
+  return Date.now();
+}
+
+function log(user, msg) {
+  const el = document.getElementById(user + 'Log');
+  el.innerHTML += msg + "<br>";
+  el.scrollTop = el.scrollHeight;
+}
+
+function setStatus(user) {
+  document.getElementById(user + 'Status').innerText = server.online[user] ? 'online' : 'offline';
+}
+
+function toggle(user) {
+  server.online[user] = !server.online[user];
+  setStatus(user);
+}
+
+function deliver(msg) {
+  const to = msg.to;
+  if (server.online[to]) {
+    log(to, `[live] ${msg.from}: ${msg.text}`);
+  }
+}
+
+function send(user) {
+  const input = document.getElementById(user + 'Input');
+  const text = input.value;
+  if (!text) return;
+
+  const msg = {
+    id: uid(),
+    from: user,
+    to: user === 'bob' ? 'alice' : 'bob',
+    text,
+    time: now()
+  };
+
+  server.messages.push(msg);
+
+  log(user, `you: ${text}`);
+  deliver(msg);
+
+  input.value = '';
+}
+
+function resync(user) {
+  const peer = user === 'bob' ? 'alice' : 'bob';
+
+  if (!server.online[peer]) {
+    log(user, `[sync] peer offline, cannot resync`);
+    return;
+  }
+
+  const last = server.lastSync[user] || 0;
+
+  const msgs = server.messages
+    .filter(m =>
+      ((m.from === user && m.to === peer) || (m.from === peer && m.to === user))
+      && m.time > last
+    )
+    .sort((a,b) => a.time - b.time);
+
+  for (let m of msgs) {
+    log(user, `[sync] ${m.from}: ${m.text}`);
+  }
+
+  server.lastSync[user] = now();
+}
+
+setStatus('bob');
+setStatus('alice');
+</script>
+
+</body>
+</html>

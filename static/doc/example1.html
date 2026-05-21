@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>Meshchat Minimal Working Demo</title>
+
+<style>
+body { font-family: monospace; display: flex; gap: 20px; }
+.panel { width: 50%; border: 1px solid #ccc; padding: 10px; }
+pre { background: #eee; padding: 6px; height: 320px; overflow:auto; }
+input { width: 90%; margin: 4px 0; }
+button { margin: 3px 0; }
+</style>
+
+<script type="module">
+import { ed25519 } from 'https://esm.sh/@noble/curves@1.4.0/ed25519';
+window.ed25519 = ed25519;
+</script>
+
+</head>
+
+<body>
+
+<div class="panel">
+<h3>Left</h3>
+
+<input id="l_user" placeholder="user">
+<input id="l_pass" type="password" placeholder="pass">
+
+<button onclick="login('left')">Login</button>
+<button onclick="exchange('left','right')">Exchange</button>
+<button onclick="send('left','right')">Send</button>
+
+<pre id="l_log"></pre>
+</div>
+
+<div class="panel">
+<h3>Right</h3>
+
+<input id="r_user" placeholder="user">
+<input id="r_pass" type="password" placeholder="pass">
+
+<button onclick="login('right')">Login</button>
+<button onclick="exchange('right','left')">Exchange</button>
+<button onclick="send('right','left')">Send</button>
+
+<pre id="r_log"></pre>
+</div>
+
+<script>
+const state = { left:{}, right:{} };
+
+const enc = new TextEncoder();
+const dec = new TextDecoder();
+
+// ---------------- logging ----------------
+function log(side,msg){
+  document.getElementById(side[0]+"_log").textContent += msg + "\n";
+}
+
+// ---------------- base utils ----------------
+function b2h(b){ return [...b].map(x=>x.toString(16).padStart(2,'0')).join(''); }
+function h2b(h){ return Uint8Array.from(h.match(/../g).map(x=>parseInt(x,16))); }
+
+// ---------------- KDF ----------------
+async function master(name, pass){
+  const salt = await crypto.subtle.digest(
+    "SHA-256",
+    enc.encode("meshchat:" + name)
+  );
+
+  const base = await crypto.subtle.importKey(
+    "raw",
+    enc.encode(pass),
+    "PBKDF2",
+    false,
+    ["deriveBits"]
+  );
+
+  return new Uint8Array(await crypto.subtle.deriveBits({
+    name:"PBKDF2",
+    salt,
+    iterations:100000,
+    hash:"SHA-256"
+  }, base, 256));
+}
+
+async function hkdf(masterKey, label){
+  const key = await crypto.subtle.importKey(
+    "raw",
+    masterKey,
+    "HKDF",
+    false,
+    ["deriveBits"]
+  );
+
+  return new Uint8Array(await crypto.subtle.deriveBits({
+    name:"HKDF",
+    hash:"SHA-256",
+    salt:new Uint8Array(32),
+    info: enc.encode("meshchat:"+label)
+  }, key, 256));
+}
+
+// ---------------- crypto helpers ----------------
+async function aesKey(raw){
+  return crypto.subtle.importKey(
+    "raw",
+    raw,
+    "AES-GCM",
+    false,
+    ["encrypt","decrypt"]
+  );
+}
+
+// ---------------- login ----------------
+async function login(side){
+  const user = document.getElementById(side[0]+"_user").value;
+  const pass = document.getElementById(side[0]+"_pass").value;
+
+  const m = await master(user, pass);
+
+  const encKeyRaw = await hkdf(m,"encryption");
+  const signSeed  = await hkdf(m,"signing");
+
+  const encKey = await aesKey(encKeyRaw);
+  const pub = ed25519.getPublicKey(signSeed);
+
+  state[side] = {
+    user,
+    encKey,
+    signSeed,
+    pub,
+    contacts:{}
+  };
+
+  log(side,"[login] OK " + user);
+}
+
+// ---------------- exchange ----------------
+function exchange(from,to){
+  const a = state[from];
+
+  state[to].contacts[a.user] = {
+    pub: a.pub,
+    encKey: a.encKey   // IMPORTANT: recipient stores sender enc key
+  };
+
+  log(from,"[exchange] sent");
+  log(to,"[exchange] received from "+a.user);
+}
+
+// ---------------- send ----------------
+async function send(from,to){
+
+  const sender = state[from];
+  const recv   = state[to];
+
+  const c = sender.contacts[recv.user];
+
+  const msg = enc.encode("hello world");
+
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+
+  const ct = await crypto.subtle.encrypt(
+    {name:"AES-GCM", iv},
+    c.encKey,
+    msg
+  );
+
+  const ctBytes = new Uint8Array(ct);
+
+  const sig = ed25519.sign(ctBytes, sender.signSeed);
+
+  const packet = {
+    from: sender.user,
+    iv: b2h(iv),
+    ct: b2h(ctBytes),
+    sig: b2h(sig)
+  };
+
+  log(from,"[send] encrypted + signed");
+
+  receive(packet,to);
+}
+
+// ---------------- receive ----------------
+async function receive(p,side){
+
+  const me = state[side];
+  const c  = me.contacts[p.from];
+
+  const ct = h2b(p.ct);
+  const sig = h2b(p.sig);
+  const iv = h2b(p.iv);
+
+  const ok = ed25519.verify(sig, ct, c.pub);
+
+  log(side,"[verify] " + ok);
+
+  if(!ok) return;
+
+  const plain = await crypto.subtle.decrypt(
+    {name:"AES-GCM", iv},
+    me.encKey,
+    ct
+  );
+
+  log(side,"[decrypt] " + dec.decode(plain));
+}
+
+</script>
+
+</body>
+</html>

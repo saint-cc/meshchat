@@ -8,6 +8,5 @@ __pycache__/
  
 # local dev folders
 project/
-static/doc/
 static/FA6E31B89/
 minimizer.py

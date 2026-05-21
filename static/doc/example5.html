@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<title>MeshChat Network Sim</title>
+<style>
+body {
+  margin: 0;
+  background: #0b0f0c;
+  color: #aaffaa;
+  font-family: monospace;
+  overflow: hidden;
+}
+
+#ui {
+  position: fixed;
+  top: 10px;
+  left: 10px;
+  z-index: 10;
+  background: rgba(0,0,0,0.6);
+  padding: 10px;
+  border: 1px solid #1f3;
+}
+
+canvas {
+  display: block;
+}
+
+#log {
+  position: fixed;
+  right: 0;
+  top: 0;
+  width: 25%;
+  height: 100%;
+  overflow-y: auto;
+  background: rgba(0,0,0,0.6);
+  border-left: 1px solid #1f3;
+  font-size: 11px;
+  padding: 10px;
+}
+</style>
+</head>
+<body>
+
+<div id="ui">
+  <div>Mesh Sim</div>
+  <br>
+
+</div>
+
+<div id="log"></div>
+<canvas id="c"></canvas>
+
+<script>
+const canvas = document.getElementById("c");
+const ctx = canvas.getContext("2d");
+canvas.width = window.innerWidth;
+canvas.height = window.innerHeight;
+
+const N = 40;
+const nodes = [];
+const links = [];
+const messages = [];
+
+const center = {x: canvas.width/2, y: canvas.height/2};
+
+function rand(a,b){ return a + Math.random()*(b-a); }
+
+const LOG_MAX = 100;
+
+function log(msg){
+  const el = document.getElementById("log");
+
+  const line = document.createElement("div");
+  line.textContent = msg;
+
+  el.prepend(line);
+
+  // trim
+  while (el.children.length > LOG_MAX) {
+    el.removeChild(el.lastChild);
+  }
+}
+
+function createNodes(){
+  for(let i=0;i<N;i++){
+    const angle = Math.random()*Math.PI*2;
+    const radius = rand(100, Math.min(canvas.width,canvas.height)/2 - 50);
+    nodes.push({
+      id: i,
+      x: center.x + Math.cos(angle)*radius,
+      y: center.y + Math.sin(angle)*radius,
+      color: "#2f6",
+      peers: []
+    });
+  }
+
+  // random connections
+  nodes.forEach(n=>{
+    const count = Math.floor(rand(6,10));
+    for(let i=0;i<count;i++){
+      const target = nodes[Math.floor(Math.random()*N)];
+      if(target !== n && !n.peers.includes(target.id)){
+        n.peers.push(target.id);
+        links.push([n.id, target.id]);
+      }
+    }
+  });
+}
+
+function draw(){
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+
+  // links
+  ctx.strokeStyle = "rgba(0,255,0,0.08)";
+  links.forEach(l=>{
+    const a = nodes[l[0]];
+    const b = nodes[l[1]];
+    ctx.beginPath();
+    ctx.moveTo(a.x,a.y);
+    ctx.lineTo(b.x,b.y);
+    ctx.stroke();
+  });
+
+  // nodes
+  nodes.forEach(n=>{
+    ctx.fillStyle = n.color;
+    ctx.beginPath();
+    ctx.arc(n.x,n.y,4,0,Math.PI*2);
+    ctx.fill();
+  });
+
+  // messages
+  messages.forEach(m=>{
+    const a = nodes[m.from];
+    const b = nodes[m.to];
+
+    const t = m.t / m.duration;
+    const x = a.x + (b.x - a.x)*t;
+    const y = a.y + (b.y - a.y)*t;
+
+    ctx.fillStyle = "#ff0";
+    ctx.beginPath();
+    ctx.arc(x,y,3,0,Math.PI*2);
+    ctx.fill();
+
+    m.t += tick;
+  });
+
+  for(let i=messages.length-1;i>=0;i--){
+    if(messages[i].t > messages[i].duration){
+      messages.splice(i,1);
+    }
+  }
+
+  requestAnimationFrame(draw);
+}
+
+function sendBurst(){
+  for(let i=0;i<10;i++){
+    const a = nodes[Math.floor(Math.random()*N)];
+    const b = nodes[Math.floor(Math.random()*N)];
+    if(a.id === b.id) continue;
+
+    messages.push({
+      from: a.id,
+      to: b.id,
+      t: 0,
+      duration: rand(300,1200)
+    });
+
+    log(`msg ${a.id} → ${b.id}`);
+  }
+}
+
+let tick = 10;
+let interv = 150;
+
+createNodes();
+draw();
+
+setInterval(()=>{
+  // background random chatter
+  if(Math.random() < 0.3){
+    sendBurst();
+  }
+}, interv);
+
+</script>
+</body>
+</html>

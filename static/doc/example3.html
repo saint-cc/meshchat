@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>QR POC</title>
+<style>
+body {
+    font-family: Arial;
+    text-align: center;
+    background: #111;
+    color: #eee;
+}
+#qrcode {
+    margin: 20px auto;
+    padding: 10px;
+    background: white;
+    display: inline-block;
+}
+#reader {
+    width: 300px;
+    margin: 20px auto;
+}
+input, button {
+    padding: 10px;
+    margin: 5px;
+    font-size: 16px;
+}
+</style>
+</head>
+<body>
+
+<h2>QR Generator</h2>
+<input id="qrText" placeholder="Enter text..." />
+<button onclick="generateQR()">Generate</button>
+<div id="qrcode"></div>
+
+<hr>
+
+<h2>QR Scanner</h2>
+<button onclick="startScanner()">Start Camera</button>
+<button onclick="stopScanner()">Stop</button>
+<div id="reader"></div>
+<div id="result"></div>
+
+<!-- QR Generator -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+
+<!-- QR Scanner -->
+<script src="https://unpkg.com/html5-qrcode"></script>
+
+<script>
+let qr;
+let scanner;
+
+function generateQR() {
+    const text = document.getElementById("qrText").value;
+    document.getElementById("qrcode").innerHTML = "";
+
+    qr = new QRCode(document.getElementById("qrcode"), {
+        text: text,
+        width: 200,
+        height: 200
+    });
+}
+
+// Scanner
+function startScanner() {
+    scanner = new Html5Qrcode("reader");
+
+    scanner.start(
+        { facingMode: "environment" },
+        {
+            fps: 10,
+            qrbox: 250
+        },
+        (decodedText) => {
+            document.getElementById("result").innerText =
+                "Scanned: " + decodedText;
+        },
+        (errorMessage) => {
+            // ignore scan errors
+        }
+    ).catch(err => {
+        console.error("Camera start failed:", err);
+    });
+}
+
+function stopScanner() {
+    if (scanner) {
+        scanner.stop().then(() => {
+            document.getElementById("reader").innerHTML = "";
+        });
+    }
+}
+</script>
+
+</body>
+</html>

@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+<title>MeshChat</title>
+
+<style>
+body{
+    margin:0;
+    padding:40px 20px;
+    background:#111315;
+    color:#d7dbe0;
+    font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+}
+
+.wrapper{
+    max-width:720px;
+    margin:60px auto;
+}
+
+.container{
+    background:#181b1f;
+    border:1px solid #2a3038;
+    border-radius:12px;
+    padding:40px;
+}
+
+h1{
+    margin-top:0;
+    margin-bottom:30px;
+    font-size:32px;
+    font-weight:600;
+    color:#f1f3f5;
+    letter-spacing:-0.02em;
+}
+
+p{
+    font-size:16px;
+    line-height:1.75;
+    color:#c7ccd2;
+    margin:18px 0;
+}
+
+.dim{
+    color:#9aa3ad;
+}
+
+strong{
+    color:#f1f3f5;
+    font-weight:600;
+}
+
+.note{
+    margin-top:35px;
+    padding-top:20px;
+    border-top:1px solid #2a3038;
+    color:#8e98a3;
+    font-size:14px;
+}
+
+code{
+    background:rgba(255,255,255,0.05);
+    padding:2px 6px;
+    border-radius:5px;
+    font-family:monospace;
+    color:#f0f0f0;
+}
+</style>
+</head>
+
+<body>
+
+<div class="wrapper">
+
+<div class="container">
+
+<h1>MeshChat</h1>
+
+<p>
+MeshChat is an experimental messaging system focused on portable identity,
+direct communication and minimal infrastructure trust.
+</p>
+
+<p class="dim">
+Messages are end-to-end encrypted and signed.
+Relays transport encrypted packets but cannot read message contents.
+</p>
+
+<p>
+There are no centralized accounts or phone-number based identities.
+A user identity is derived locally from a username and passphrase.
+</p>
+
+<p class="dim">
+The same credentials recreate the same cryptographic identity on any compatible client.
+</p>
+
+<p>
+Contacts are added by exchanging identity information directly between users,
+for example through QR codes or existing trusted communication channels.
+</p>
+
+<p>
+The system prefers direct peer connectivity when available,
+while fallback transport mechanisms help communication continue during outages or migration.
+</p>
+
+<div class="note">
+Experimental protocol and research project.<br>
+Current focus areas: identity portability, resilient synchronization and decentralized transport behavior.
+</div>
+
+</div>
+
+</div>
+
+</body>
+</html>

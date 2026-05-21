@@ -1,0 +1,124 @@
+
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>Name Activity List</title>
+<style>
+    body {
+        font-family: Arial, sans-serif;
+        background: #0b0b0b;
+        color: #ddd;
+        padding: 20px;
+    }
+
+    .row {
+        display: flex;
+        align-items: center;
+        padding: 8px;
+        cursor: pointer;
+        border-bottom: 1px solid #222;
+    }
+
+    .row:hover {
+        background: #111;
+    }
+
+    .name {
+        flex: 1;
+    }
+
+    .dot {
+        width: 12px;
+        height: 12px;
+        border-radius: 50%;
+        background: #444;
+        transition: background 0.1s linear;
+    }
+</style>
+</head>
+<body>
+
+<div id="list"></div>
+
+<script>
+const names = [
+    "Alice", "Bob", "Charlie", "Diana", "Eve",
+    "Frank", "Grace", "Hank", "Ivy", "Jack"
+];
+
+// store state
+const items = [];
+
+// create UI
+const list = document.getElementById("list");
+
+names.forEach(name => {
+    const row = document.createElement("div");
+    row.className = "row";
+
+    const label = document.createElement("div");
+    label.className = "name";
+    label.textContent = name;
+
+    const dot = document.createElement("div");
+    dot.className = "dot";
+
+    row.appendChild(label);
+    row.appendChild(dot);
+    list.appendChild(row);
+
+    const item = {
+        name,
+        dot,
+        timestamp: null
+    };
+
+    items.push(item);
+
+    row.onclick = () => {
+        item.timestamp = Date.now();
+    };
+});
+
+// helper: interpolate between two colors
+function lerp(a, b, t) {
+    return a + (b - a) * t;
+}
+
+// green -> dark
+const startColor = [17, 255, 17];   // #11ff11
+const endColor   = [17, 17, 17];    // #111111
+
+const MAX_AGE = 60000; // 2 minutes in ms
+
+function update() {
+    const now = Date.now();
+
+    for (const item of items) {
+        if (!item.timestamp) continue;
+
+        const age = now - item.timestamp;
+        let t = age / MAX_AGE;
+
+        if (t > 1) t = 1;
+
+        const r = Math.round(lerp(startColor[0], endColor[0], t));
+        const g = Math.round(lerp(startColor[1], endColor[1], t));
+        const b = Math.round(lerp(startColor[2], endColor[2], t));
+
+        item.dot.style.background = `rgb(${r},${g},${b})`;
+    }
+
+    requestAnimationFrame(update);
+}
+
+// start loop
+update();
+</script>
+
+</body>
+</html>
+
+
+

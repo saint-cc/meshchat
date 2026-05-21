@@ -1,0 +1,312 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+
+<title>MeshChat Docs</title>
+
+<style>
+:root{
+  --bg:#0b0f14;
+  --panel:#121923;
+  --panel2:#0f151d;
+  --text:#d7e1ec;
+  --muted:#7f8b99;
+  --accent:#4ea1ff;
+  --border:#1f2a38;
+}
+
+*{
+  box-sizing:border-box;
+}
+
+body{
+  margin:0;
+  font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+  background:var(--bg);
+  color:var(--text);
+  overflow:hidden;
+}
+
+.layout{
+  display:flex;
+  height:100vh;
+}
+
+/* LEFT PANEL */
+
+.sidebar{
+  width:320px;
+  border-right:1px solid var(--border);
+  background:var(--panel);
+  display:flex;
+  flex-direction:column;
+}
+
+.sidebar-inner{
+  padding:24px;
+  overflow-y:auto;
+}
+
+h1{
+  font-size:20px;
+  font-weight:600;
+  margin-top:0;
+  margin-bottom:8px;
+}
+
+.intro{
+  color:var(--muted);
+  margin-top:0;
+  margin-bottom:24px;
+  font-size:14px;
+  line-height:1.5;
+}
+
+.card{
+  background:var(--panel2);
+  border:1px solid var(--border);
+  border-radius:12px;
+  padding:14px;
+}
+
+.group-title{
+  font-size:12px;
+  text-transform:uppercase;
+  letter-spacing:0.08em;
+  color:var(--muted);
+  margin-bottom:10px;
+  margin-top:18px;
+}
+
+.group-title:first-child{
+  margin-top:0;
+}
+
+ul{
+  list-style:none;
+  padding:0;
+  margin:0;
+}
+
+li{
+  margin:6px 0;
+}
+
+a{
+  display:block;
+  padding:10px 12px;
+  border-radius:8px;
+  color:var(--text);
+  text-decoration:none;
+  border:1px solid transparent;
+  transition:0.15s ease;
+  cursor:pointer;
+}
+
+a:hover{
+  background:rgba(78,161,255,0.08);
+  border-color:var(--accent);
+  color:var(--accent);
+}
+
+.desc{
+  display:block;
+  font-size:12px;
+  opacity:0.65;
+  margin-top:4px;
+}
+
+.hint{
+  font-size:12px;
+  color:var(--muted);
+  margin-top:18px;
+  line-height:1.5;
+}
+
+/* RIGHT PANEL */
+
+.viewer{
+  flex:1;
+  display:flex;
+  flex-direction:column;
+}
+
+.topbar{
+  height:52px;
+  border-bottom:1px solid var(--border);
+  background:var(--panel);
+  display:flex;
+  align-items:center;
+  padding:0 18px;
+  font-size:14px;
+  color:var(--muted);
+}
+
+.content{
+  flex:1;
+  background:#fff;
+}
+
+iframe{
+  width:100%;
+  height:100%;
+  border:none;
+  background:#fff;
+}
+
+.welcome{
+  height:100%;
+  overflow:auto;
+  background:var(--bg);
+  color:var(--text);
+  padding:50px;
+}
+
+.welcome h2{
+  margin-top:0;
+  font-size:28px;
+}
+
+.welcome p{
+  color:var(--muted);
+  line-height:1.7;
+  max-width:850px;
+}
+
+.welcome ul{
+  margin-top:24px;
+}
+
+.welcome li{
+  color:var(--text);
+  margin:10px 0;
+}
+
+.code{
+  display:inline-block;
+  padding:2px 6px;
+  border-radius:6px;
+  background:#111923;
+  border:1px solid var(--border);
+  font-family:monospace;
+  color:#9bc7ff;
+}
+</style>
+</head>
+
+<body>
+
+<div class="layout">
+
+  <!-- LEFT -->
+  <div class="sidebar">
+
+    <div class="sidebar-inner">
+
+      <h1>MeshChat Docs</h1>
+
+      <p class="intro">
+        Experimental decentralized messaging protocol documentation and isolated examples.
+      </p>
+
+      <div class="card">
+
+        <div class="group-title">Documentation</div>
+
+        <ul>
+          <li>
+            <a onclick="openDoc('introduction.html','Introduction')">
+              Introduction
+              <span class="desc">Starting point and architecture overview</span>
+            </a>
+          </li>
+
+          <li>
+		    <a onclick="openDoc('greypaper.html','Greypaper')">Greypaper
+			 <span class="desc">Not a Whitepaper!</span>
+			</a>
+          </li>
+        </ul>
+
+        <div class="group-title">Examples</div>
+
+        <ul>
+          <li><a onclick="openDoc('example1.html','Example 1')">Example 1<span class="desc">Soft login</span></a></li>
+          <li><a onclick="openDoc('example2.html','Example 2')">Example 2<span class="desc">Syncing</span></a></li>
+          <li><a onclick="openDoc('example3.html','Example 3')">Example 3<span class="desc">Qr-codes</span></a></li>
+          <li><a onclick="openDoc('example4.html','Example 4')">Example 4<span class="desc">Online fade</span></a></li>
+          <li><a onclick="openDoc('example5.html','Example 5')">Example 5<span class="desc">Mesh visualisation</span></a></li>
+          <li><a onclick="openDoc('example6.html','Example 6')">Example 6<span class="desc">Entropy + Brute Force Estimator</span></a></li>
+        </ul>
+
+      </div>
+
+      <div class="hint">
+        Example files are intentionally small isolated demos focused on one code aspect at a time.
+      </div>
+
+    </div>
+
+  </div>
+
+  <!-- RIGHT -->
+  <div class="viewer">
+
+    <div class="topbar" id="titlebar">
+      Welcome
+    </div>
+
+    <div class="content" id="content">
+
+      <div class="welcome">
+
+        <h2>MeshChat Documentation Hub</h2>
+
+        <p>
+          This environment contains protocol notes, experimental concepts and small isolated
+          HTML examples used during development of the MeshChat communication system.
+        </p>
+
+        <p>
+          The examples intentionally focus on one subsystem at a time:
+        </p>
+
+        <ul>
+          <li>Deterministic identity generation</li>
+          <li>Cryptographic signing and verification</li>
+          <li>Encrypted message exchange</li>
+          <li>Relay synchronization behavior</li>
+          <li>Migration between domains</li>
+          <li>Entropy and identity analysis</li>
+        </ul>
+
+        <p>
+          Start with
+          <span class="code">Introduction</span>
+          for architecture overview or open the
+          <span class="code">Greypaper</span>
+          for the broader protocol concepts.
+        </p>
+
+      </div>
+
+    </div>
+
+  </div>
+
+</div>
+
+<script>
+function openDoc(file,title){
+
+  document.getElementById("titlebar").textContent = title;
+
+  document.getElementById("content").innerHTML =
+    '<iframe src="' + file + '"></iframe>';
+}
+</script>
+
+</body>
+</html>
