@@ -12,7 +12,7 @@ Meshchat is a communication system where identities are derived locally from a u
 
 Messages are signed and encrypted end-to-end, while delivery can happen over multiple transport methods such as direct WebSocket connections or email-based store-and-forward relays.
 
-The server is intentionally mostly stateless. Clients synchronize directly whenever possible and fall back to relays only when necessary.
+The server is intentionally (mostly) stateless. 
 
 ---
 
@@ -102,7 +102,7 @@ Meshchat prefers direct encrypted WebSocket communication between clients.
 
 When direct delivery fails:
 
-- messages may be buffered through relays
+- messages are send to local relay
 - relays may optionally use email as asynchronous fallback transport
 
 Email is used as a transport mechanism only.  
@@ -161,8 +161,10 @@ The project intentionally allows heterogeneous implementations as long as protoc
 ---
 
 ## special thanks to
-Cyberchaos
-BitBubblex
+Cyberchaos. 
+
+BitBubblex. 
+
 Claude (Anthropic) as AI pair programmer.
 
 ---
