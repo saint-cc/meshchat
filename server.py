@@ -28,9 +28,9 @@ STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 WS_HOST = "0.0.0.0"
 WS_PORT = int(os.environ.get("WS_PORT", 8888))
 
-# Relay identity — sent to every connecting client so they can discover each other's relays
-RELAY_WSS_URL = os.environ.get("RELAY_WSS_URL", "ws://localhost:8888/")
-RELAY_EMAIL   = os.environ.get("RELAY_EMAIL",   "meshchat@localhost")
+# Relay identity — sent to clients on request
+RELAY_WSS_URL = os.environ.get("RELAY_WSS_URL", "")   # e.g. wss://yourrelay.example.com/ws/
+RELAY_EMAIL   = os.environ.get("RELAY_EMAIL",   "")   # e.g. meshchat@yourrelay.example.com
 
 # Rate limiter
 RATE_LIMIT_RATE  = 10   # tokens refilled per second
@@ -40,10 +40,10 @@ RATE_LIMIT_BURST = 20   # max burst size
 ONLINE_EXPIRY_SECONDS = 300   # prune peers not seen within this window
 
 # Email relay (offline message delivery)
-EMAIL_HOST     = os.environ.get("EMAIL_HOST",     "mail.cyberchaos.nl")
+EMAIL_HOST     = os.environ.get("EMAIL_HOST",     "mail.somemail.cc")
 EMAIL_PORT_OUT = int(os.environ.get("EMAIL_PORT_OUT", 587))
 EMAIL_PORT_IN  = int(os.environ.get("EMAIL_PORT_IN",  993))
-EMAIL_USER     = os.environ.get("EMAIL_USER",     "meshchat@cyberchaos.nl")
+EMAIL_USER     = os.environ.get("EMAIL_USER",     "meshchat@somemail.cc")
 EMAIL_PASS     = os.environ.get("EMAIL_PASS",     "")
 EMAIL_FROM     = os.environ.get("EMAIL_FROM",     EMAIL_USER)
 EMAIL_TLS      = os.environ.get("EMAIL_TLS",      "starttls")  # "starttls" or "ssl"
@@ -338,11 +338,17 @@ async def handler(ws):
                 log.info("REGISTERED id=%s  peer=%s  sessions=%d  total=%d",
                          short(client_id), addr,
                          len(connected[client_id]), session_count())
-                await send_to(ws, {
-                    "type":  "relay_info",
-                    "wss":   RELAY_WSS_URL,
-                    "email": RELAY_EMAIL,
-                })
+
+            elif kind == "get_relay_info":
+                if RELAY_WSS_URL or RELAY_EMAIL:
+                    await send_to(ws, {
+                        "type":  "relay_info",
+                        "wss":   RELAY_WSS_URL,
+                        "email": RELAY_EMAIL,
+                    })
+                    log.info("RELAY_INFO sent to %s", short(client_id))
+                else:
+                    log.debug("RELAY_INFO requested but not configured, skipped")
 
             elif kind == "who_online":
                 ids = msg.get("ids", [])

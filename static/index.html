@@ -5,6 +5,185 @@
 if ("serviceWorker" in navigator) {
   navigator.serviceWorker.register("/sw.js");
 }
-</script></head> <body> <div id="loginScreen"> <form id="loginForm"> <div id="loginBox"> <h2>MESHCHAT</h2> <div class="subtitle">decentralised · encrypted · yours</div> <input id="inputName" name="mesh_user" placeholder="user" autocomplete="user" spellcheck="false"> <input id="inputPassphrase" name="password" type="password" placeholder="passphrase" autocomplete="current-password"> <button id="loginButton" type="submit">ENTER</button> <div id="loginStatus"></div> <div id="loginNotice"> <strong>note —</strong> your name and passphrase are your identity.<br> choose something unique. no recovery without them. </div> </div> </form> </div> <div id="appContainer"> <div id="sidebar"> <div id="sidebarHeader"> <div> <div id="sidebarTitle">MESHCHAT</div> <div id="sidebarMeta">not connected</div> </div> <button id="meshLogToggle" onclick="mlog.toggle()">LOG</button> <button id="addContactBtn" title="Add contact">+</button> </div> <ul id="contactList"></ul> <div id="showBlockedToggle" style="display:none"></div> <button id="showBlockedBtn"></button> <div id="syncStatus"></div> <div id="connectionStatus"> <div id="connDot"></div> <span id="connLabel">disconnected</span> </div> </div> <div id="chatContainer"> <div id="chatHeader" style="position:relative"> <button id="backBtn" onclick="document.getElementById('appContainer').classList.remove('chatOpen')" style="display:none;background:none;border:none;color:var(--accent);font-family:inherit;font-size:12px;letter-spacing:0.1em;cursor:pointer;margin-bottom:6px"> ← BACK </button> <div id="chatHeaderRow"> <div id="chatHeaderInfo"> <div id="emptyChat">select a contact to start chatting</div> <div id="chatHeaderName" style="display:none"></div> <div id="chatHeaderId" style="display:none"></div> </div> <button id="contactMenuBtn" title="Contact options">⋯</button> </div> <div class="contact-dropdown" id="contactDropdown"> <button id="syncBtn" class="chat-action-btn">SYNC</button> <button onclick="contactAction('edit')">EDIT</button> <button id="blockToggleBtn" onclick="contactAction('block')">BLOCK</button> <button class="danger" onclick="contactAction('delete')">DELETE</button> <button id="exportBtn" class="chat-action-btn">BACKUP</button> </div> </div> <div id="chatMessages"></div> <div id="chatInputContainer"> <textarea id="chatInput" placeholder="type a message..." autocomplete="off"></textarea> <button id="sendButton">SEND</button> <div id="mediaButtons"> <button id="audioBtn" title="Hold to record">🎤</button> <button id="imageBtn" title="Send image">📷</button> </div> <input type="file" id="imageInput" accept="image/*" style="display:none"> </div> </div> </div> <div id="meshLog"> <div id="meshLogHeader"> <span>MESHCHAT LOG</span> <button onclick="mlog.clear()">CLR</button> <button onclick="mlog.hide()">✕</button> </div> <div id="meshLogBody"></div> </div> <div id="contactActionOverlay" class="overlay"> <div class="modal-box"> <h3 id="contactActionTitle">EDIT CONTACT</h3> <div id="contactActionBody" style="display:flex;flex-direction:column;gap:12px"></div> <div class="modal-btns" id="contactActionBtns"></div> </div> </div> <div id="modalOverlay" class="overlay"> <div class="modal-box"> <h3>ADD CONTACT</h3> <div class="qr-tabs"> <button class="qr-tab active" id="tabShow" onclick="switchTab('show')">MY QR</button> <button class="qr-tab" id="tabScan" onclick="switchTab('scan')">SCAN</button> <button class="qr-tab" id="tabPaste" onclick="switchTab('paste')">PASTE</button> </div> <div class="qr-panel active" id="panelShow"> <div id="myKeyBox" title="click to copy"> <span>your key — click to copy</span> <strong id="myKeyDisplay">—</strong> </div> <div id="myQrCode"></div> <div class="hint" style="text-align:center">let your contact scan this · or copy key above</div> </div> <div class="qr-panel" id="panelScan"> <div id="qrReader" style="width:100%"></div> <div id="scanResult"></div> <button class="scan-btn" id="scanToggleBtn" onclick="toggleScanner()">START CAMERA</button> <div class="hint" style="text-align:center">point camera at contact's QR code</div> </div> <div class="qr-panel" id="panelPaste"> <div class="hint">paste their key below</div> </div> <input id="modalContactName" placeholder="contact name" autocomplete="off"> <input id="modalContactKey" placeholder="their key" autocomplete="off" spellcheck="false"> <div class="hint">name is local only — only you see it.</div> <div class="modal-btns"> <button class="btn-cancel" id="modalCancel">CANCEL</button> <button class="btn-confirm" id="modalConfirm">ADD</button> </div> </div> </div> <div id="exportOverlay" class="overlay"> <div class="modal-box"> <h3>BACKUP / RESTORE</h3> <div class="hint">export an encrypted backup of your contacts and messages.<br>your passphrase is required to restore.</div> <input id="exportPassphrase" type="password" placeholder="confirm passphrase"> <div id="exportStatus"></div> <div class="modal-btns"> <button class="btn-cancel" id="exportCancel">CANCEL</button> <button class="btn-alt" id="importConfirm">IMPORT FILE</button> <button class="btn-confirm" id="exportConfirm">EXPORT</button> </div> </div> </div> <script type="text/javascript" src="script.js"></script> <script>
+</script><style>
+
+.bar-container {
+  width: 260px;
+  height: 28px;
+  background: #333;
+  margin-top: 20px;
+  border: 1px solid #444;
+}
+
+.barEntr {
+  height: 100%;
+  width: 0%;
+  transition: width 0.2s ease, background 0.2s ease;
+}
+
+.labelEntr {
+  margin-top: 12px;
+  font-size: 14px;
+  text-align: center;
+  white-space: pre-line;
+}
+</style></head> <body> <div id="loginScreen"> <form id="loginForm"> <div id="loginBox"> <h2>MESHCHAT</h2> <div class="subtitle">decentralised · encrypted · yours</div> <input id="inputName" name="mesh_user" placeholder="user" autocomplete="user" spellcheck="false"> <input id="inputPassphrase" name="password" type="password" placeholder="passphrase" autocomplete="current-password"> <button id="loginButton" type="submit">ENTER</button> <div id="loginStatus"></div> <div class="bar-container"> <div id="barEntr" class="barEntr"></div> </div> <div class="labelEntr" id="labelEntr">entropy: 0 bits</div> <div id="loginNotice"> <strong>note —</strong> your name and passphrase are your identity.<br> choose something unique. no recovery without them. </div> </div> </form> </div> <div id="appContainer"> <div id="sidebar"> <div id="sidebarHeader"> <div> <div id="sidebarTitle">MESHCHAT</div> <div id="sidebarMeta">not connected</div> </div> <button id="meshLogToggle" onclick="mlog.toggle()">LOG</button> <button id="addContactBtn" title="Add contact">+</button> </div> <ul id="contactList"></ul> <div id="showBlockedToggle" style="display:none"></div> <button id="showBlockedBtn"></button> <div id="syncStatus"></div> <div id="connectionStatus"> <div id="connDot"></div> <span id="connLabel">disconnected</span> </div> </div> <div id="chatContainer"> <div id="chatHeader" style="position:relative"> <button id="backBtn" onclick="document.getElementById('appContainer').classList.remove('chatOpen')" style="display:none;background:none;border:none;color:var(--accent);font-family:inherit;font-size:12px;letter-spacing:0.1em;cursor:pointer;margin-bottom:6px"> ← BACK </button> <div id="chatHeaderRow"> <div id="chatHeaderInfo"> <div id="emptyChat">select a contact to start chatting</div> <div id="chatHeaderName" style="display:none"></div> <div id="chatHeaderId" style="display:none"></div> <div id="chatHeaderRelay" style="display:none;font-size:10px;color:var(--muted);margin-top:2px;letter-spacing:0.05em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis"></div> </div> <button id="contactMenuBtn" title="Contact options">⋯</button> </div> <div class="contact-dropdown" id="contactDropdown"> <button id="syncBtn" class="chat-action-btn">SYNC</button> <button onclick="contactAction('edit')">EDIT</button> <button id="blockToggleBtn" onclick="contactAction('block')">BLOCK</button> <button class="danger" onclick="contactAction('delete')">DELETE</button> <button id="exportBtn" class="chat-action-btn">BACKUP</button> </div> </div> <div id="chatMessages"></div> <div id="chatInputContainer"> <textarea id="chatInput" placeholder="type a message..." autocomplete="off"></textarea> <button id="sendButton">SEND</button> <div id="mediaButtons"> <button id="audioBtn" title="Hold to record">🎤</button> <button id="imageBtn" title="Send image">📷</button> </div> <input type="file" id="imageInput" accept="image/*" style="display:none"> </div> </div> </div> <div id="meshLog"> <div id="meshLogHeader"> <span>MESHCHAT LOG</span> <button onclick="mlog.clear()">CLR</button> <button onclick="mlog.hide()">✕</button> </div> <div id="meshLogBody"></div> </div> <div id="contactActionOverlay" class="overlay"> <div class="modal-box"> <h3 id="contactActionTitle">EDIT CONTACT</h3> <div id="contactActionBody" style="display:flex;flex-direction:column;gap:12px"></div> <div class="modal-btns" id="contactActionBtns"></div> </div> </div> <div id="modalOverlay" class="overlay"> <div class="modal-box"> <h3>ADD CONTACT</h3> <div class="qr-tabs"> <button class="qr-tab active" id="tabShow" onclick="switchTab('show')">MY QR</button> <button class="qr-tab" id="tabScan" onclick="switchTab('scan')">SCAN</button> <button class="qr-tab" id="tabPaste" onclick="switchTab('paste')">PASTE</button> </div> <div class="qr-panel active" id="panelShow"> <div id="myKeyBox" title="click to copy"> <span>your key — click to copy</span> <strong id="myKeyDisplay">—</strong> </div> <div id="myQrCode"></div> <div class="hint" style="text-align:center">let your contact scan this · or copy key above</div> </div> <div class="qr-panel" id="panelScan"> <div id="qrReader" style="width:100%"></div> <div id="scanResult"></div> <button class="scan-btn" id="scanToggleBtn" onclick="toggleScanner()">START CAMERA</button> <div class="hint" style="text-align:center">point camera at contact's QR code</div> </div> <div class="qr-panel" id="panelPaste"> <div class="hint">paste their key below</div> </div> <input id="modalContactName" placeholder="contact name" autocomplete="off"> <input id="modalContactKey" placeholder="their key" autocomplete="off" spellcheck="false"> <div class="hint">name is local only — only you see it.</div> <div class="modal-btns"> <button class="btn-cancel" id="modalCancel">CANCEL</button> <button class="btn-confirm" id="modalConfirm">ADD</button> </div> </div> </div> <div id="exportOverlay" class="overlay"> <div class="modal-box"> <h3>BACKUP / RESTORE</h3> <div class="hint">export an encrypted backup of your contacts and messages.<br>your passphrase is required to restore.</div> <input id="exportPassphrase" type="password" placeholder="confirm passphrase"> <div id="exportStatus"></div> <div class="modal-btns"> <button class="btn-cancel" id="exportCancel">CANCEL</button> <button class="btn-alt" id="importConfirm">IMPORT FILE</button> <button class="btn-confirm" id="exportConfirm">EXPORT</button> </div> </div> </div> <script type="text/javascript" src="script.js"></script> <script>
+/* -----------------------------
+   ENTROPY MODEL
+----------------------------- */
+
+function calcEntropy(pass) {
+  let charset = 0;
+
+  if (/[a-z]/.test(pass)) charset += 26;
+  if (/[A-Z]/.test(pass)) charset += 26;
+  if (/[0-9]/.test(pass)) charset += 10;
+  if (/[^a-zA-Z0-9]/.test(pass)) charset += 32;
+
+  if (charset === 0) return 0;
+
+  return pass.length * Math.log2(charset);
+}
+
+function usernameEntropy(user) {
+  if (!user) return 0;
+
+  const common = [
+    "admin","test","user","root","guest",
+    "bob","alice","administrator"
+  ];
+
+  if (common.includes(user.toLowerCase())) {
+    return 4; // extremely weak effective entropy
+  }
+
+  return Math.log2(5000); // rough generic namespace estimate
+}
+
+/* -----------------------------
+   BRUTE FORCE MODEL
+----------------------------- */
+
+function estimateCrackTimeBits(bits, rate = 1e11) {
+  const totalGuesses = Math.pow(2, bits);
+  const seconds = totalGuesses / rate;
+
+  const minute = 60;
+  const hour = 3600;
+  const day = 86400;
+  const year = 31557600;
+
+  let value, unit;
+
+  if (seconds < minute) {
+    value = seconds;
+    unit = "seconds";
+  } else if (seconds < hour) {
+    value = seconds / minute;
+    unit = "minutes";
+  } else if (seconds < day) {
+    value = seconds / hour;
+    unit = "hours";
+  } else if (seconds < year) {
+    value = seconds / day;
+    unit = "days";
+  } else {
+    value = seconds / year;
+    unit = "years";
+  }
+
+  return { value, unit, seconds };
+}
+
+/* -----------------------------
+   UI UPDATE
+----------------------------- */
+
+function updateEntr() {
+  const user = document.getElementById('inputName').value;
+  const pass = document.getElementById('inputPassphrase').value;
+
+  let entropyPass = calcEntropy(pass);
+  let entropyUser = usernameEntropy(user);
+
+  let entropy = entropyPass + entropyUser;
+  entropy -= linguisticPenalty(pass);
+  entropy = Math.max(entropy, 0);
+
+  // penalty if username appears inside password
+  if (user && pass.toLowerCase().includes(user.toLowerCase())) {
+    entropy *= 0.7;
+  }
+
+  const crack = estimateCrackTimeBits(entropy);
+
+  let bar = document.getElementById('barEntr');
+  let label = document.getElementById('labelEntr');
+
+  let percent = Math.min(entropy / 120 * 100, 100);
+
+  let color = "black";
+  if (entropy < 20) color = "black";
+  else if (entropy < 40) color = "red";
+  else if (entropy < 60) color = "orange";
+  else if (entropy < 80) color = "yellow";
+  else color = "green";
+
+  bar.style.width = percent + "%";
+  bar.style.background = color;
+
+  let crackText;
+
+  if (crack.seconds > 1e17) {
+    crackText = ">> heat death of universe";
+  } else {
+    crackText = `${crack.value.toExponential(2)} ${crack.unit}`;
+  }
+
+  label.textContent =
+`entropy: ${entropy.toFixed(1)} bits
+brute force: ${crackText}`;
+}
+
+function linguisticPenalty(str) {
+  if (!str) return 0;
+
+  const s = str.toLowerCase();
+
+  // common word / phrase indicators
+  const commonPhrases = [
+    "this is",
+    "very",
+    "password",
+    "admin",
+    "test",
+    "hello",
+    "qwerty",
+    "let me",
+    "please",
+    "i am"
+  ];
+
+  let penalty = 0;
+
+  for (const p of commonPhrases) {
+    if (s.includes(p)) penalty += 8;
+  }
+
+  // repeated structure penalty
+  const words = s.split(/\s+/);
+  const unique = new Set(words);
+
+  if (words.length > 0) {
+    const repetitionRatio = 1 - (unique.size / words.length);
+    penalty += repetitionRatio * 20;
+  }
+
+  return penalty;
+}
+
+document.getElementById('inputName').addEventListener('input', updateEntr);
+document.getElementById('inputPassphrase').addEventListener('input', updateEntr);
+
 
 </script> </body> </html>
