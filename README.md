@@ -5,8 +5,6 @@ A decentralized messaging protocol with portable cryptographic identities, multi
 Meshchat is an experimental communication protocol designed for resilient, infrastructure-light messaging using deterministic identities, end-to-end encryption, and opportunistic delivery over WebSockets and email fallback.
 
 ---
-# special thanks
-Developed with Claude (Anthropic) as AI pair programmer.
 
 ## What is Meshchat?
 
@@ -159,6 +157,13 @@ Current implementations should be considered unstable and exploratory.
 Alternative clients, relay implementations, protocol analysis, transport experiments, and security reviews are welcome.
 
 The project intentionally allows heterogeneous implementations as long as protocol compatibility is preserved.
+
+---
+
+## special thanks to
+Cyberchaos
+BitBubblex
+Claude (Anthropic) as AI pair programmer.
 
 ---
 
