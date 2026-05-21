@@ -148,14 +148,16 @@ async def flush_email_queue():
     """Send one email per queued recipient, body = JSON array of packets."""
     if not email_queue:
         return
-    for comm_id, msgs in list(email_queue.items()):
+    for comm_id, entry in list(email_queue.items()):
+        msgs   = entry["msgs"]
+        target = entry.get("target") or EMAIL_USER
         if not msgs:
             continue
         try:
             body = json.dumps(msgs)
             mail = MIMEMultipart()
             mail["From"]    = EMAIL_FROM
-            mail["To"]      = EMAIL_USER
+            mail["To"]      = target
             mail["Subject"] = f"MC:{comm_id}"
             mail["Date"]    = formatdate(localtime=True)
             mail.attach(MIMEText(body, "plain"))
@@ -167,14 +169,14 @@ async def flush_email_queue():
                 username=EMAIL_USER,
                 password=EMAIL_PASS,
                 sender=EMAIL_FROM,
-                recipients=[EMAIL_USER],
+                recipients=[target],
                 **({ "use_tls": True } if EMAIL_TLS == "ssl" else { "start_tls": True }),
             )
             stats["email_out"] += 1
-            log.info("EMAIL OUT  to=%s  packets=%d", short(comm_id), len(msgs))
+            log.info("EMAIL OUT  to=%s  target=%s  packets=%d", short(comm_id), target, len(msgs))
             del email_queue[comm_id]
         except Exception as e:
-            log.warning("EMAIL OUT fail  to=%s  error=%s", short(comm_id), e)
+            log.warning("EMAIL OUT fail  to=%s  target=%s  error=%s", short(comm_id), target, e)
 
 # ══════════════════════════════════════════
 #   EMAIL INBOUND
@@ -371,10 +373,12 @@ async def handler(ws):
                 if reached:
                     log.info("MESSAGE    from=%s  to=%s  reached=%d", short(frm), short(to), reached)
                 else:
+                    target = msg.get("relay_email") or EMAIL_USER
                     if to not in email_queue:
-                        email_queue[to] = []
-                    email_queue[to].append(msg)
-                    log.info("EMAIL Q    from=%s  to=%s  queued (offline)", short(frm), short(to))
+                        email_queue[to] = {"target": target, "msgs": []}
+                    email_queue[to]["msgs"].append(msg)
+                    log.info("EMAIL Q    from=%s  to=%s  target=%s  queued (offline)",
+                             short(frm), short(to), target)
 
             elif kind in ("msg_exchange", "backup_offer", "backup_accept",
                           "backup_push", "push_restore_request",
