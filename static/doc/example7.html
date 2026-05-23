@@ -1,0 +1,134 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>RGB Identicon 11x7</title>
+  <style>
+    body {
+      font-family: system-ui, sans-serif;
+      background: #111;
+      color: #eee;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 40px;
+      gap: 20px;
+    }
+
+    input {
+      width: 520px;
+      padding: 10px;
+      font-size: 14px;
+    }
+
+    .icon {
+      width: 220px;
+      height: 140px;
+    }
+  </style>
+</head>
+<body>
+
+<h2>RGB Layer Identicon (11×7)</h2>
+
+<input id="key" placeholder="pubID.signKey.email" />
+<div id="output"></div>
+
+<script>
+const W = 11;
+const H = 7;
+
+// fixed palette (B channel selects)
+const palette = [
+  "#ff4d4d",
+  "#4dff88",
+  "#4da6ff",
+  "#ffd24d",
+  "#c44dff",
+  "#4dfff6"
+];
+
+async function hashKey(key) {
+  const enc = new TextEncoder();
+  const buf = await crypto.subtle.digest("SHA-256", enc.encode(key));
+  return new Uint8Array(buf);
+}
+
+function getByte(hash, i) {
+  return hash[i % hash.length];
+}
+
+function buildGrid(hash) {
+  const grid = [];
+  let i = 0;
+
+  const half = Math.ceil(W / 2);
+
+  const baseColor = palette[getByte(hash, 2) % palette.length];
+
+  for (let y = 0; y < H; y++) {
+    const row = [];
+
+    for (let x = 0; x < half; x++) {
+
+      const r = getByte(hash, i++);
+      const g = getByte(hash, i + 7); // offset layer (important)
+
+      // STRUCTURE (R)
+      let on = (r & 1) === 1;
+
+      // MODULATION (G)
+      if ((g & 3) === 0) on = !on;     // occasional inversion
+      if ((g & 7) === 0) on = false;   // sparsify some pixels
+
+      row[x] = on ? baseColor : null;
+    }
+
+    // mirror
+    for (let x = half; x < W; x++) {
+      row[x] = row[W - 1 - x];
+    }
+
+    grid.push(row);
+  }
+
+  return grid;
+}
+
+function render(grid) {
+  const cell = 16;
+  const w = W * cell;
+  const h = H * cell;
+
+  let svg = `<svg class="icon" viewBox="0 0 ${w} ${h}">`;
+  svg += `<rect width="100%" height="100%" fill="#111"/>`;
+
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const c = grid[y][x];
+      if (c) {
+        svg += `<rect x="${x*cell}" y="${y*cell}" width="${cell}" height="${cell}" fill="${c}"/>`;
+      }
+    }
+  }
+
+  svg += `</svg>`;
+  return svg;
+}
+
+async function generate(key) {
+  const hash = await hashKey(key);
+  const grid = buildGrid(hash);
+
+  document.getElementById("output").innerHTML = render(grid);
+}
+
+document.getElementById("key").addEventListener("input", (e) => {
+  if (e.target.value.length > 0) {
+    generate(e.target.value);
+  }
+});
+</script>
+
+</body>
+</html>
