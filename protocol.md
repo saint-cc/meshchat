@@ -61,7 +61,7 @@ A relay server exposes two interfaces:
 A relay optionally advertises its coordinates via `get_relay_info`:
 
 ```json
-{ "type": "relay_info", "wss": "wss://relay.example.com/ws/", "email": "meshchat@relay.example.com" }
+{ "type": "relay_info", "wss": "wss://relay.example.com/ws/", "email": "relay@example.com" }
 ```
 
 Both fields are optional. A relay with no email configured simply cannot
@@ -86,7 +86,7 @@ The envelope is plaintext. The relay can read it for routing purposes only.
   "type":        "message",
   "from":        "<publicId>",
   "to":          "<publicId>",
-  "relay_email": "alice@relay.example.com",
+  "relay": 		 "relay@example.com",
   "blob":        { "iv": [...], "data": [...] },
   "sig":         [...]
 }
