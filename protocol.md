@@ -33,12 +33,16 @@ publicId = base64url( SHA-256(encKey)[0:12] )
 
 **Shareable address** — everything needed to reach someone, encoded as a single string:
 ```
-<encKey_b64>.<signPublicKey_b64>.<relayEmail>
+<encKey_b64>.<signPublicKey_b64>.<relayEmail_b64>
 ```
 
-The third field (`relayEmail`) is optional for existing contacts but included
-when sharing via QR code or copy-paste. It bootstraps the email fallback path
-before any WebSocket contact has been made.
+All three segments are base64url encoded. The third field (`relayEmail_b64`) is
+`btoa(email)` — standard base64 of the relay email address. It is optional for
+existing contacts but included when sharing via QR code or copy-paste, bootstrapping
+the email fallback path before any WebSocket contact has been made.
+
+Implementations must decode the third segment with `atob()` before use.
+Segments beyond the third must be ignored for forward compatibility.
 
 This string is shared as a QR code or pasted manually. It contains no private
 key material and is safe to share publicly.
@@ -220,6 +224,45 @@ Relay coordinates spread passively through the network:
 A client stores `lastRelay`, `lastRelayEmail`, `lastRelaySeen` per contact.
 The WSS address is treated as a *last known location*, not a permanent home.
 The email address is treated as a stable anchor and not overwritten automatically.
+
+---
+
+## Client-to-Client Direct Relay Delivery
+
+When sending a message to a contact whose `lastRelay` is known, the client
+attempts direct delivery to the contact's relay WSS before falling back to
+its own signal server. This is a client-side optimisation — the relay server
+is unaware of it.
+
+**Priority order:**
+1. Contact is online on our own signal server → send directly, done
+2. Contact has a known relay WSS → open or reuse a connection to it, send there
+3. Relay connection fails or no relay known → send via our own signal server
+
+**Connection management:**
+- Relay connections are keyed by hostname — one connection serves all contacts on the same relay
+- On open, the client sends `{ "type": "connect", "id": "<publicId>" }` before any message
+- A 30-second idle timer closes the connection after the last outbound message
+- Any message resets the timer; protocol traffic (backup, sync) does not
+- Pre-open messages are queued and flushed when the connection becomes ready
+
+**Protocol traffic (non-message types):**
+Protocol packets such as backup, sync, and restore are piggybacked on an
+already-open relay connection if one exists, but never open a new connection.
+This gives cross-relay contacts sporadic backup coverage without interfering
+with the idle timer or connection lifecycle.
+
+**Incoming traffic:**
+Any packet arriving on a relay connection is routed through the standard
+`handleSignal` handler unchanged. Clients are not expected to send anything
+back on a relay connection they opened, but if they do it is processed normally.
+This allows passive relay info updates to propagate through incidental traffic.
+
+**Failure handling:**
+If the relay connection fails before or after open, the client falls back
+to its own signal server for that message. The server will then attempt
+email delivery to `relay_email` in the packet envelope if the recipient
+is offline, preserving the cross-relay delivery path via email bridge.
 
 ---
 
