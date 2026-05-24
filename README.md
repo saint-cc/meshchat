@@ -18,15 +18,15 @@ The server is intentionally (mostly) stateless.
 
 ## Design Principles
 
-### C — Cryptographic Identity Portability
+### Cryptographic Identity Portability
 
 Identities are deterministic and portable. A user can reconstruct their identity anywhere using the same credentials.
 
-### M — Multi-path Opportunistic Transport
+### Multi-path Opportunistic Transport
 
 Messages may travel over direct WebSocket connections, relays, or email fallback depending on network availability.
 
-### S — Social Trust Without Central Authority
+### Social Trust Without Central Authority
 
 Trust decisions are local to the client. No server can globally define who should be trusted or blocked.
 
