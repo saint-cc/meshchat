@@ -80,16 +80,36 @@ The reverse proxy handles:
 STARTING THE SERVER
 -------------------
 
+Create and activate a Python virtual environment:
+
+Linux / macOS:
+
+    python3 -m venv venv
+    source venv/bin/activate
+    pip install -r requirements.txt
+
+Windows:
+
+    python -m venv venv
+    venv\Scripts\activate
+    pip install -r requirements.txt
+
+
+# Running the relay
+
 Depending on your environment run either:
-
-    start.bat
-
-or:
 
     start.sh
 
-These scripts simply configure environment variables before launching
-`server.py`.
+or:
+
+    start.bat
+
+
+These scripts configure the relay using environment variables
+(Docker-friendly) and then start:
+
+    python server.py
 
 Typical configuration values:
 
