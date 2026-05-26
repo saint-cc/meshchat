@@ -116,7 +116,7 @@ Clients on different relay servers communicate directly:
 
 - Choose a unique username — common names are easier to correlate
 - Use a strong passphrase — it is your only protection
-- Share your QR code only with people you trust — it reveals your relay server
+- Share your QR code only with people you trust — it reveals your relay server and your public ID
 - There is no way to prove a new key belongs to the same person — verify out-of-band when re-adding contacts
 
 ---
