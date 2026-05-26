@@ -7,9 +7,8 @@ No accounts. No central authority. No plaintext on the wire.
 
 ## Overview
 
-MeshChat is a store-and-forward messaging protocol built on three transport layers:
-WebSocket for real-time delivery, email for async relay-to-relay delivery, and
-a distributed backup system for message persistence across devices.
+MeshChat is a store-and-forward messaging protocol built on WebSocket transport
+for real-time delivery and a distributed backup system for persistence across devices.
 
 A relay server is a dumb router. It cannot read messages, does not store history,
 and has no concept of users or accounts. Anyone can run one.
@@ -23,336 +22,213 @@ username and passphrase using PBKDF2 + HKDF.
 
 | Key | Algorithm | Purpose |
 |-----|-----------|---------|
-| `encKey` | AES-GCM 256-bit | Encrypt messages sent to this user |
-| `signKey` | Ed25519 | Sign outgoing messages |
+| encKey | AES-GCM 256-bit | Encrypt messages sent to this user |
+| signKey | Ed25519 | Sign outgoing messages |
 
-**PublicId** — a stable identifier derived from the encryption key:
-```
+### PublicId
+
 publicId = base64url( SHA-256(encKey)[0:12] )
-```
 
-**Shareable address** — everything needed to reach someone, encoded as a single string:
-```
-<encKey_b64>.<signPublicKey_b64>.<relayEmail_b64>
-```
+---
 
-All three segments are base64url encoded. The third field (`relayEmail_b64`) is
-`btoa(email)` — standard base64 of the relay email address. It is optional for
-existing contacts but included when sharing via QR code or copy-paste, bootstrapping
-the email fallback path before any WebSocket contact has been made.
+### Shareable Address
 
-Implementations must decode the third segment with `atob()` before use.
-Segments beyond the third must be ignored for forward compatibility.
+<encKey_b64>.<signPublicKey_b64>.<relayWss_b64>
 
-This string is shared as a QR code or pasted manually. It contains no private
-key material and is safe to share publicly.
+All fields are base64url encoded. The relay field is optional and used only
+for bootstrap discovery.
 
 ---
 
 ## Relay Server
 
-A relay server exposes two interfaces:
+A relay exposes a WebSocket interface:
 
-- **WebSocket** — real-time packet routing (`ws://` or `wss://`)
-- **Email** — async offline delivery via SMTP out / IMAP in
-
-### Identity
-
-A relay optionally advertises its coordinates via `get_relay_info`:
-
-```json
-{ "type": "relay_info", "wss": "wss://relay.example.com/ws/", "email": "relay@example.com" }
-```
-
-Both fields are optional. A relay with no email configured simply cannot
-deliver to offline users on foreign relays.
+- WebSocket: ws:// or wss://
 
 ### Routing
 
-The relay routes packets by the `to` field. If the recipient is connected,
-the packet is delivered immediately. If not, the relay reads `relay_email`
-from the packet envelope and forwards via email to the recipient's relay.
-If no `relay_email` is present, the packet is queued to the relay's own
-email inbox for local delivery when the recipient reconnects.
+- Deliver immediately if recipient is connected
+- Otherwise optionally queue temporarily for offline delivery
+
+Queueing is implementation-defined.
 
 ---
 
 ## Packet Envelope
 
-The envelope is plaintext. The relay can read it for routing purposes only.
-
-```json
 {
-  "type":        "message",
-  "from":        "<publicId>",
-  "to":          "<publicId>",
-  "relay": 		 "relay@example.com",
-  "blob":        { "iv": [...], "data": [...] },
-  "sig":         [...]
+  "type": "message",
+  "from": "<publicId>",
+  "to": "<publicId>",
+  "blob": { "iv": [], "data": [] },
+  "sig": []
 }
-```
 
-| Field | Description |
-|-------|-------------|
-| `type` | Packet type (see below) |
-| `from` | Sender's publicId |
-| `to` | Recipient's publicId |
-| `relay_email` | Recipient's relay email — used by relay for offline forwarding |
-| `blob` | AES-GCM encrypted payload (see below) |
-| `sig` | Ed25519 signature over the encrypted blob |
-
-The relay never sees message content. `relay_email` is the only routing hint
-it receives, and it reveals nothing about the message itself.
+Relay only reads routing metadata.
 
 ---
 
 ## Encrypted Payload
 
-The blob is encrypted with the **recipient's** `encKey` (AES-GCM, random IV per message).
-Only the intended recipient can decrypt it.
+Encrypted with recipient encKey (AES-GCM).
 
-```json
 {
-  "id":    "<uuid>",
-  "type":  "text",
-  "text":  "Hello!",
-  "ts":    1700000000000,
+  "id": "<uuid>",
+  "type": "text",
+  "text": "Hello!",
+  "ts": 1700000000000,
   "relay": {
-    "wss":   "wss://sender-relay.example.com/ws/",
-    "email": "meshchat@sender-relay.example.com"
+    "wss": "wss://sender-relay.example.com/ws/"
   }
 }
-```
-
-| Field | Description |
-|-------|-------------|
-| `id` | UUID, used for deduplication and merging |
-| `type` | `text` \| `audio` \| `image` \| `reaction` |
-| `text` | Message body (type=text only) |
-| `ts` | Unix timestamp in milliseconds |
-| `relay` | Sender's current relay coordinates — recipient uses this to update routing |
-
-The `relay` field inside the payload is how relay discovery propagates.
-Every message passively teaches the recipient where to reach the sender.
-It is updated only if the message timestamp is newer than the stored value,
-preventing stale synced messages from overwriting fresh data.
 
 ---
 
 ## Message Types
 
 ### text
-```json
-{ "id": "...", "type": "text", "text": "Hello!", "ts": 0, "relay": {} }
-```
+{
+  "id": "...",
+  "type": "text",
+  "text": "Hello!",
+  "ts": 0,
+  "relay": {}
+}
 
 ### audio
-```json
-{ "id": "...", "type": "audio", "data": "<base64>", "mimeType": "audio/webm", "ts": 0, "relay": {} }
-```
+{
+  "id": "...",
+  "type": "audio",
+  "data": "<base64>",
+  "mimeType": "audio/webm",
+  "ts": 0,
+  "relay": {}
+}
 
 ### image
-```json
-{ "id": "...", "type": "image", "data": "<base64>", "mimeType": "image/jpeg", "ts": 0, "relay": {} }
-```
+{
+  "id": "...",
+  "type": "image",
+  "data": "<base64>",
+  "mimeType": "image/jpeg",
+  "ts": 0,
+  "relay": {}
+}
 
 ### reaction
-Reactions use a **stable derived ID** so merging is idempotent:
-```
-reactionId = base64url( SHA-256("reaction:" + senderPublicId + ":" + targetMsgId)[0:12] )
-```
-```json
-{ "id": "<reactionId>", "type": "reaction", "targetId": "<msgId>", "emoji": ":)", "ts": 0, "relay": {} }
-```
-`emoji` is `:)`, `:(`, or `null` (cleared).
+
+reactionId = base64url(
+  SHA-256("reaction:" + senderPublicId + ":" + targetMsgId)[0:12]
+)
+
+{
+  "id": "<reactionId>",
+  "type": "reaction",
+  "targetId": "<msgId>",
+  "emoji": ":)",
+  "ts": 0,
+  "relay": {}
+}
 
 ---
 
 ## Signature Verification
 
-The sender signs the encrypted blob (not the plaintext) using Ed25519:
-```
-sig = Ed25519.sign( JSON.stringify(blob), signingKeySeed )
-```
-The recipient verifies using the sender's signing public key (from the shareable address).
-Messages that fail verification are displayed with a warning but not dropped —
-they may be legitimately unsigned (older clients or relay-forwarded).
+sig = Ed25519.sign(JSON.stringify(blob), signingKeySeed)
+
+Verified using sender public key from shareable address.
 
 ---
 
-## WebSocket Packet Types
+## WebSocket Types
 
-### Client → Server
+Client → Server:
+- connect
+- get_relay_info
+- who_online
+- message
+- msg_exchange
+- backup_offer
+- backup_accept
+- backup_push
+- push_restore_request
+- push_restore_ack
+- restore_push
+- ping
 
-| Type | Description |
-|------|-------------|
-| `connect` | Register publicId with relay |
-| `get_relay_info` | Request relay's WSS and email identity |
-| `who_online` | Poll presence for a list of publicIds |
-| `message` | Send a message packet to another user |
-| `msg_exchange` | Bilateral message sync (last N messages) |
-| `backup_offer` | Offer a backup blob to a peer |
-| `backup_accept` | Accept a pending backup offer |
-| `backup_push` | Push a backup blob to a peer |
-| `push_restore_request` | Request a restore from a peer |
-| `push_restore_ack` | Acknowledge a restore request |
-| `restore_push` | Push a full restore blob to a peer |
-| `ping` | Keepalive |
-
-### Server → Client
-
-| Type | Description |
-|------|-------------|
-| `relay_info` | Relay's WSS URL and email address |
-| `seen` | A queried publicId is online |
-| `online_list` | List of online publicIds from a who_online query |
-| `gone` | A connected peer has disconnected |
-| `message` | Delivered message packet |
-| `pong` | Keepalive response |
-| `error` | Error (e.g. rate_limited) |
+Server → Client:
+- relay_info
+- seen
+- online_list
+- gone
+- message
+- pong
+- error
 
 ---
 
 ## Relay Discovery
 
-Relay coordinates spread passively through the network:
-
-1. **QR code / shareable address** — contains `relayEmail` for bootstrap
-2. **`relay_info` response** — relay tells client its own coordinates on connect
-3. **Message payload** — every message carries sender's `relay` field inside the encrypted blob
-
-A client stores `lastRelay`, `lastRelayEmail`, `lastRelaySeen` per contact.
-The WSS address is treated as a *last known location*, not a permanent home.
-The email address is treated as a stable anchor and not overwritten automatically.
+- QR/share address bootstrap
+- relay_info exchange
+- relay field inside messages
 
 ---
 
-## Client-to-Client Direct Relay Delivery
+## Client Relay Selection
 
-When sending a message to a contact whose `lastRelay` is known, the client
-attempts direct delivery to the contact's relay WSS before falling back to
-its own signal server. This is a client-side optimisation — the relay server
-is unaware of it.
+1. Contact online locally → direct send
+2. Known relay → connect and send
+3. fallback → local relay
 
-**Priority order:**
-1. Contact is online on our own signal server → send directly, done
-2. Contact has a known relay WSS → open or reuse a connection to it, send there
-3. Relay connection fails or no relay known → send via our own signal server
-
-**Connection management:**
-- Relay connections are keyed by hostname — one connection serves all contacts on the same relay
-- On open, the client sends `{ "type": "connect", "id": "<publicId>" }` before any message
-- A 30-second idle timer closes the connection after the last outbound message
-- Any message resets the timer; protocol traffic (backup, sync) does not
-- Pre-open messages are queued and flushed when the connection becomes ready
-
-**Protocol traffic (non-message types):**
-Protocol packets such as backup, sync, and restore are piggybacked on an
-already-open relay connection if one exists, but never open a new connection.
-This gives cross-relay contacts sporadic backup coverage without interfering
-with the idle timer or connection lifecycle.
-
-**Incoming traffic:**
-Any packet arriving on a relay connection is routed through the standard
-`handleSignal` handler unchanged. Clients are not expected to send anything
-back on a relay connection they opened, but if they do it is processed normally.
-This allows passive relay info updates to propagate through incidental traffic.
-
-**Failure handling:**
-If the relay connection fails before or after open, the client falls back
-to its own signal server for that message. The server will then attempt
-email delivery to `relay_email` in the packet envelope if the recipient
-is offline, preserving the cross-relay delivery path via email bridge.
+Connection rules:
+- one connection per hostname
+- idle timeout 30s
+- queued pre-open messages flushed on connect
 
 ---
 
-## Distributed Backup
+## Backup System
 
-Contacts and message history are encrypted and backed up peer-to-peer.
-No relay stores backup data.
+Peer-to-peer encrypted backups.
 
-**Protocol:**
-1. `backup_offer` — sender announces blob size to peer
-2. `backup_accept` — peer accepts (constrained peers may never accept)
-3. `backup_push` — sender transmits encrypted blob
+Steps:
+1. backup_offer
+2. backup_accept
+3. backup_push
 
-Backup blobs are encrypted with the sender's own `backupKey` (derived from
-passphrase via HKDF). A peer storing a backup cannot read it.
-
-Self-sync (same user, multiple devices) skips the offer step.
+Backup encrypted with backupKey.
 
 ---
 
 ## Message Merging
 
-All message stores use ID-based merging:
-```
-merged = deduplicate_by_id( local + remote ).sort_by_timestamp()
-```
-
-This makes the protocol eventually consistent. Duplicate delivery (from
-multiple relays or email) is handled by deduplication. Late-arriving messages
-sort into the correct chronological position.
-
-Reaction messages use their stable derived ID, so a changed reaction
-naturally replaces the previous one during merging.
+merged = deduplicate_by_id(local + remote).sort_by_timestamp()
 
 ---
 
 ## Rate Limiting
 
-The relay applies a token bucket rate limiter per WebSocket connection:
-- Refill rate: 10 tokens/second
-- Burst: 20 tokens
-
-Connections exceeding this receive an `error` packet with `reason: rate_limited`.
-
----
-
-## Email Relay Format
-
-Offline messages are batched and sent as a single email per recipient:
-
-```
-From:    meshchat@sender-relay.example.com
-To:      meshchat@recipient-relay.example.com
-Subject: MC:<recipientPublicId>
-Body:    [ <packet>, <packet>, ... ]   (JSON array)
-```
-
-The receiving relay polls IMAP for unseen messages with `MC:` subjects,
-delivers packets to connected clients, and marks emails as seen.
-If the recipient is still offline, the email is left unseen for retry
-on the next poll cycle.
+10 tokens/sec, burst 20.
 
 ---
 
 ## Key Derivation
 
-```
-master  = PBKDF2( passphrase, SHA-256("meshchat-v1:" + username), 100000, SHA-256 )
+master = PBKDF2(passphrase, SHA-256("meshchat-v1:" + username), 100000)
 
-encryptionKey   = HKDF( master, info="meshchat-v1:encryption" )   → AES-GCM key
-backupKey       = HKDF( master, info="meshchat-v1:backup"     )   → AES-GCM key
-signingKeySeed  = HKDF( master, info="meshchat-v1:signing"    )   → Ed25519 seed
-```
-
-The same username+passphrase always produces the same keys.
-There is no account recovery mechanism — the passphrase is the identity.
+encryptionKey  = HKDF(master, "encryption")
+backupKey      = HKDF(master, "backup")
+signingKeySeed = HKDF(master, "signing")
 
 ---
 
 ## Design Principles
 
-- **No central authority** — any node can be a relay, no registration required
-- **Operator-blind** — relay operators cannot read messages or identify users beyond publicIds
-- **Eventually consistent** — message stores converge over time across devices and relays
-- **Graceful degradation** — WebSocket → email → manual export/import
-- **Passive discovery** — relay locations propagate through normal message flow
-- **No metadata inflation** — the envelope reveals sender, recipient, and relay hint only
-
----
-
-*MeshChat Protocol v0 — subject to change*  
-*Developed by saint-cc with Claude (Anthropic) as AI pair programmer*  
-*Licensed under AGPL v3*
+- No central authority
+- Any node can be a relay
+- Operator-blind relays
+- Eventually consistent
+- Minimal metadata
+- Graceful degradation
