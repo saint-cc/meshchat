@@ -1,16 +1,12 @@
 import asyncio
+import glob
 import json
 import logging
 import multiprocessing
 import os
 import time
-from email import message_from_bytes
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
-from email.utils import formatdate
+import uuid
 
-import aiosmtplib
-import aioimaplib
 import websockets
 from flask import Flask, send_from_directory
 
@@ -30,7 +26,6 @@ WS_PORT = int(os.environ.get("WS_PORT", 8888))
 
 # Relay identity — sent to clients on request
 RELAY_WSS_URL = os.environ.get("RELAY_WSS_URL", "")   # e.g. wss://yourrelay.example.com/ws/
-RELAY_EMAIL   = os.environ.get("RELAY_EMAIL",   "")   # e.g. meshchat@yourrelay.example.com
 
 # Rate limiter
 RATE_LIMIT_RATE  = 10   # tokens refilled per second
@@ -39,16 +34,12 @@ RATE_LIMIT_BURST = 20   # max burst size
 # Online presence
 ONLINE_EXPIRY_SECONDS = 300   # prune peers not seen within this window
 
-# Email relay (offline message delivery)
-EMAIL_HOST     = os.environ.get("EMAIL_HOST",     "mail.somemail.cc")
-EMAIL_PORT_OUT = int(os.environ.get("EMAIL_PORT_OUT", 587))
-EMAIL_PORT_IN  = int(os.environ.get("EMAIL_PORT_IN",  993))
-EMAIL_USER     = os.environ.get("EMAIL_USER",     "meshchat@somemail.cc")
-EMAIL_PASS     = os.environ.get("EMAIL_PASS",     "")
-EMAIL_FROM     = os.environ.get("EMAIL_FROM",     EMAIL_USER)
-EMAIL_TLS      = os.environ.get("EMAIL_TLS",      "starttls")  # "starttls" or "ssl"
-EMAIL_TICK     = int(os.environ.get("EMAIL_TICK", 60))         # seconds between email cycles
-EMAIL_STARTUP_DELAY = int(os.environ.get("EMAIL_STARTUP_DELAY", 10))
+# Offline buffer — file-based queue for messages to offline clients
+BUF_DIR      = os.environ.get("BUF_DIR",      os.path.join(os.getcwd(), "relay_buf"))
+BUF_MAX_MSGS = int(os.environ.get("BUF_MAX_MSGS", 100))     # max packets per recipient
+BUF_MAX_AGE  = int(os.environ.get("BUF_MAX_AGE",  86400))   # seconds before expiry (24h)
+BUF_MAX_MB   = float(os.environ.get("BUF_MAX_MB",  10))     # max MB per recipient
+BUF_EXPIRE_INTERVAL = 300                                    # seconds between expiry sweeps
 
 # Logging
 LOG_FORMAT   = "%(asctime)s  %(levelname)-8s  %(message)s"
@@ -69,13 +60,12 @@ log = logging.getLogger("signal")
 #   SIGNAL SERVER STATE
 # ══════════════════════════════════════════
 
-connected:   dict[str, set]  = {}   # commID → set of websockets
-email_queue: dict[str, list] = {}   # commID → [raw msg dict, ...]
+connected: dict[str, set] = {}   # publicId → set of websockets
 
 stats = {
-    "bytes_in":  0, "bytes_out":  0,
-    "msgs_in":   0, "msgs_out":   0,
-    "email_in":  0, "email_out":  0,
+    "bytes_in":  0, "bytes_out": 0,
+    "msgs_in":   0, "msgs_out":  0,
+    "buf_in":    0, "buf_out":   0,
 }
 
 # ══════════════════════════════════════════
@@ -141,145 +131,103 @@ async def deliver(to_id, obj, exclude=None):
     return reached
 
 # ══════════════════════════════════════════
-#   EMAIL OUTBOUND
+#   OFFLINE BUFFER
+#   Layout: BUF_DIR/<publicId>/<ts>_<uuid>.json
+#   Limits: BUF_MAX_MSGS, BUF_MAX_AGE, BUF_MAX_MB per recipient.
+#   On connect: flush all buffered packets oldest-first, delete on success.
+#   Expiry sweep: background task removes files older than BUF_MAX_AGE.
 # ══════════════════════════════════════════
 
-async def flush_email_queue():
-    """Send one email per queued recipient, body = JSON array of packets."""
-    if not email_queue:
-        return
-    for comm_id, entry in list(email_queue.items()):
-        msgs   = entry["msgs"]
-        target = entry.get("target") or EMAIL_USER
-        if not msgs:
-            continue
-        try:
-            body = json.dumps(msgs)
-            mail = MIMEMultipart()
-            mail["From"]    = EMAIL_FROM
-            mail["To"]      = target
-            mail["Subject"] = f"MC:{comm_id}"
-            mail["Date"]    = formatdate(localtime=True)
-            mail.attach(MIMEText(body, "plain"))
+def buf_dir(to_id):
+    return os.path.join(BUF_DIR, to_id)
 
-            await aiosmtplib.send(
-                mail,
-                hostname=EMAIL_HOST,
-                port=EMAIL_PORT_OUT,
-                username=EMAIL_USER,
-                password=EMAIL_PASS,
-                sender=EMAIL_FROM,
-                recipients=[target],
-                **({ "use_tls": True } if EMAIL_TLS == "ssl" else { "start_tls": True }),
-            )
-            stats["email_out"] += 1
-            log.info("EMAIL OUT  to=%s  target=%s  packets=%d", short(comm_id), target, len(msgs))
-            del email_queue[comm_id]
-        except Exception as e:
-            log.warning("EMAIL OUT fail  to=%s  target=%s  error=%s", short(comm_id), target, e)
+def buf_files(to_id):
+    """Return list of buffer files for recipient, oldest first."""
+    d = buf_dir(to_id)
+    if not os.path.isdir(d): return []
+    pattern = os.path.join(d, "*.json")
+    return sorted(glob.glob(pattern, recursive=False))
 
-# ══════════════════════════════════════════
-#   EMAIL INBOUND
-# ══════════════════════════════════════════
-
-async def poll_email_inbox():
-    """Poll IMAP, deliver any MC:<commID> emails to online peers."""
+def buf_write(to_id, msg):
+    """Write a packet to the offline buffer. Enforces per-recipient limits."""
+    d = buf_dir(to_id)
     try:
-        imap = aioimaplib.IMAP4_SSL(host=EMAIL_HOST, port=EMAIL_PORT_IN)
-        await imap.wait_hello_from_server()
-        await imap.login(EMAIL_USER, EMAIL_PASS)
-        await imap.select("INBOX")
-
-        _, data_uid = await imap.uid_search("UNSEEN")
-        log.info("EMAIL IN   UID UNSEEN raw: %r", data_uid)
-
-        uids = data_uid[0].split() if data_uid and data_uid[0] else []
-        uids = [u for u in uids if u and u != b'']
-
-        _, data_all = await imap.uid_search("ALL")
-        log.info("EMAIL IN   UID ALL raw: %r", data_all)
-
-        if not uids:
-            log.info("EMAIL IN   no unseen messages")
-            await imap.logout()
-            return
-
-        log.info("EMAIL IN   found %d unseen uid(s): %r", len(uids), uids)
-
-        for uid in uids:
-            try:
-                uid_str = uid.decode() if isinstance(uid, bytes) else uid
-                status, msg_data = await imap.uid("fetch", uid_str, "(RFC822)")
-
-                raw_email = bytes(msg_data[1]) if isinstance(msg_data[1], (bytes, bytearray)) else None
-                if not raw_email:
-                    log.warning("EMAIL IN   unexpected fetch structure: %r",
-                                [type(p).__name__ for p in msg_data])
-                    continue
-
-                parsed  = message_from_bytes(raw_email)
-                subject = parsed.get("Subject", "")
-
-                if not subject.startswith("MC:"):
-                    log.info("EMAIL IN   uid=%s  not a meshchat email, skipping", uid_str)
-                    continue
-
-                comm_id = subject[3:].strip()
-                if not comm_id:
-                    continue
-
-                body = ""
-                if parsed.is_multipart():
-                    for part in parsed.walk():
-                        if part.get_content_type() == "text/plain":
-                            body = part.get_payload(decode=True).decode("utf-8", errors="replace")
-                            break
-                else:
-                    body = parsed.get_payload(decode=True).decode("utf-8", errors="replace")
-
-                packets = json.loads(body)
-                if not isinstance(packets, list):
-                    packets = [packets]
-
-                log.info("EMAIL IN   uid=%s  to=%s  packets=%d",
-                         uid_str, short(comm_id), len(packets))
-
-                delivered = 0
-                for pkt in packets:
-                    reached = await deliver(comm_id, pkt)
-                    delivered += reached
-
-                stats["email_in"] += 1
-
-                if delivered > 0:
-                    await imap.uid("store", uid_str, "+FLAGS", "\\Seen")
-                    log.info("EMAIL IN   to=%s  delivered=%d  marked seen",
-                             short(comm_id), delivered)
-                else:
-                    await imap.uid("store", uid_str, "-FLAGS", "\\Seen")
-                    log.info("EMAIL IN   to=%s  offline — kept unseen for retry",
-                             short(comm_id))
-
-            except Exception as e:
-                log.warning("EMAIL IN   parse/deliver fail uid=%s  error=%s", uid, e)
-
-        await imap.logout()
-
+        os.makedirs(d, exist_ok=True)
     except Exception as e:
-        log.warning("EMAIL IN   imap error: %s", e, exc_info=True)
+        log.warning("BUF        mkdir failed  to=%s  err=%s", short(to_id), e)
+        return
 
-# ══════════════════════════════════════════
-#   EMAIL TICK
-# ══════════════════════════════════════════
+    files = buf_files(to_id)
 
-async def email_tick():
-    """Combined inbound + outbound cycle, runs every EMAIL_TICK seconds."""
-    await asyncio.sleep(EMAIL_STARTUP_DELAY)
+    # enforce message count limit — drop oldest
+    while len(files) >= BUF_MAX_MSGS:
+        try:
+            os.remove(files.pop(0))
+            log.info("BUF        drop oldest (count limit)  to=%s", short(to_id))
+        except Exception:
+            pass
+
+    # enforce size limit
+    total = sum(os.path.getsize(f) for f in files if os.path.exists(f))
+    raw   = json.dumps(msg).encode()
+    if total + len(raw) > BUF_MAX_MB * 1024 * 1024:
+        log.warning("BUF        size limit reached  to=%s  dropping", short(to_id))
+        return
+
+    fname = os.path.join(d, f"{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}.json")
+    try:
+        with open(fname, "w") as f:
+            json.dump(msg, f)
+        stats["buf_in"] += 1
+        log.info("BUF        write  to=%s  file=%s", short(to_id), os.path.basename(fname))
+    except Exception as e:
+        log.warning("BUF        write failed  to=%s  err=%s", short(to_id), e)
+
+async def buf_deliver(to_id, ws):
+    """Flush all buffered packets for a reconnecting client. Delete on success."""
+    files = buf_files(to_id)
+    if not files:
+        return
+    log.info("BUF        flush  to=%s  count=%d", short(to_id), len(files))
+    for fpath in files:
+        try:
+            with open(fpath) as f:
+                msg = json.load(f)
+            if await send_to(ws, msg):
+                os.remove(fpath)
+                stats["buf_out"] += 1
+        except Exception as e:
+            log.warning("BUF        flush error  to=%s  file=%s  err=%s",
+                        short(to_id), os.path.basename(fpath), e)
+
+async def buf_expire():
+    """Background task — remove buffer files older than BUF_MAX_AGE."""
     while True:
-        log.info("EMAIL TICK outbound flush + inbound poll")
-        await flush_email_queue()
-        await poll_email_inbox()
-        await asyncio.sleep(EMAIL_TICK)
+        await asyncio.sleep(BUF_EXPIRE_INTERVAL)
+        now     = time.time()
+        dropped = 0
+        try:
+            if not os.path.isdir(BUF_DIR): continue
+            for rec_dir in os.scandir(BUF_DIR):
+                if not rec_dir.is_dir():
+                    continue
+                for entry in os.scandir(rec_dir.path):
+                    if not entry.name.endswith(".json"):
+                        continue
+                    if now - entry.stat().st_mtime > BUF_MAX_AGE:
+                        try:
+                            os.remove(entry.path)
+                            dropped += 1
+                        except Exception:
+                            pass
+                # clean up empty recipient dirs
+                if not os.listdir(rec_dir.path):
+                    try: os.rmdir(rec_dir.path)
+                    except Exception: pass
+        except Exception as e:
+            log.warning("BUF        expire sweep error: %s", e)
+        if dropped:
+            log.info("BUF        expired %d file(s)", dropped)
 
 # ══════════════════════════════════════════
 #   STATS
@@ -289,11 +237,11 @@ async def log_stats():
     while True:
         await asyncio.sleep(STATS_INTERVAL)
         log.info("STATS      sessions=%d  in=%s(%d msgs)  out=%s(%d msgs)  "
-                 "email_in=%d  email_out=%d",
+                 "buf_in=%d  buf_out=%d",
                  session_count(),
                  fmt_bytes(stats["bytes_in"]),  stats["msgs_in"],
                  fmt_bytes(stats["bytes_out"]), stats["msgs_out"],
-                 stats["email_in"], stats["email_out"])
+                 stats["buf_in"], stats["buf_out"])
 
 # ══════════════════════════════════════════
 #   WEBSOCKET HANDLER
@@ -340,13 +288,14 @@ async def handler(ws):
                 log.info("REGISTERED id=%s  peer=%s  sessions=%d  total=%d",
                          short(client_id), addr,
                          len(connected[client_id]), session_count())
+                # flush any buffered packets immediately
+                await buf_deliver(client_id, ws)
 
             elif kind == "get_relay_info":
-                if RELAY_WSS_URL or RELAY_EMAIL:
+                if RELAY_WSS_URL:
                     await send_to(ws, {
-                        "type":  "relay_info",
-                        "wss":   RELAY_WSS_URL,
-                        "email": RELAY_EMAIL,
+                        "type": "relay_info",
+                        "wss":  RELAY_WSS_URL,
                     })
                     log.info("RELAY_INFO sent to %s", short(client_id))
                 else:
@@ -358,7 +307,7 @@ async def handler(ws):
                     log.warning("  who_online bad payload, dropped")
                     continue
                 ids     = ids[:10]
-                matched = [id for id in ids if id in connected]
+                matched = [i for i in ids if i in connected]
                 if client_id:
                     for matched_id in matched:
                         await deliver(matched_id, {"type": "seen", "id": client_id}, exclude=ws)
@@ -373,12 +322,8 @@ async def handler(ws):
                 if reached:
                     log.info("MESSAGE    from=%s  to=%s  reached=%d", short(frm), short(to), reached)
                 else:
-                    target = msg.get("relay_email") or EMAIL_USER
-                    if to not in email_queue:
-                        email_queue[to] = {"target": target, "msgs": []}
-                    email_queue[to]["msgs"].append(msg)
-                    log.info("EMAIL Q    from=%s  to=%s  target=%s  queued (offline)",
-                             short(frm), short(to), target)
+                    buf_write(to, msg)
+                    log.info("BUF Q      from=%s  to=%s  (offline)", short(frm), short(to))
 
             elif kind in ("msg_exchange", "backup_offer", "backup_accept",
                           "backup_push", "push_restore_request",
@@ -421,14 +366,16 @@ async def handler(ws):
 # ══════════════════════════════════════════
 
 async def run_signal_server():
+    #os.makedirs(BUF_DIR, exist_ok=True)
     log.info("=" * 50)
     log.info("MeshChat signal server")
     log.info("Listening on %s:%d", WS_HOST, WS_PORT)
-    log.info("Email host: %s  tick: %ds  tls: %s", EMAIL_HOST, EMAIL_TICK, EMAIL_TLS)
+    log.info("Buffer dir: %s  max_msgs=%d  max_age=%ds  max_mb=%.1f",
+             BUF_DIR, BUF_MAX_MSGS, BUF_MAX_AGE, BUF_MAX_MB)
     log.info("=" * 50)
     async with websockets.serve(handler, WS_HOST, WS_PORT):
         asyncio.create_task(log_stats())
-        asyncio.create_task(email_tick())
+        asyncio.create_task(buf_expire())
         await asyncio.Future()
 
 # ══════════════════════════════════════════
@@ -468,10 +415,10 @@ if __name__ == "__main__":
         asyncio.run(run_signal_server())
     except KeyboardInterrupt:
         log.info("Shutting down")
-        log.info("FINAL      in=%s(%d msgs)  out=%s(%d msgs)  email_in=%d  email_out=%d",
+        log.info("FINAL      in=%s(%d msgs)  out=%s(%d msgs)  buf_in=%d  buf_out=%d",
                  fmt_bytes(stats["bytes_in"]),  stats["msgs_in"],
                  fmt_bytes(stats["bytes_out"]), stats["msgs_out"],
-                 stats["email_in"], stats["email_out"])
+                 stats["buf_in"], stats["buf_out"])
     finally:
         http_proc.terminate()
         http_proc.join()
