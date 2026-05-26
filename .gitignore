@@ -6,6 +6,7 @@ __pycache__/
 *.log
  
 # local dev folders
+relay_buf/
 project/
 static/FA6E31B89/
 minimizer.py
