@@ -2,7 +2,7 @@
 
 A decentralized messaging protocol with portable cryptographic identities, multi-path transport, and stateless relays.
 
-Meshchat is an experimental communication protocol designed for resilient, infrastructure-light messaging using deterministic identities, end-to-end encryption, and opportunistic delivery over WebSockets and email fallback.
+Meshchat is an experimental communication protocol designed for resilient, infrastructure-light messaging using deterministic identities, end-to-end encryption, and opportunistic delivery over WebSockets.
 
 ---
 
@@ -10,7 +10,7 @@ Meshchat is an experimental communication protocol designed for resilient, infra
 
 Meshchat is a communication system where identities are derived locally from a username and passphrase instead of being created by a central server.
 
-Messages are signed and encrypted end-to-end, while delivery can happen over multiple transport methods such as direct WebSocket connections or email-based store-and-forward relays.
+Messages are signed and encrypted end-to-end, while delivery can happen over multiple transport methods such as direct WebSocket connections.
 
 The server is intentionally (mostly) stateless. 
 
@@ -24,7 +24,7 @@ Identities are deterministic and portable. A user can reconstruct their identity
 
 ### Multi-path Opportunistic Transport
 
-Messages may travel over direct WebSocket connections, relays, or email fallback depending on network availability.
+Messages may travel over direct WebSocket connections or relays.
 
 ### Social Trust Without Central Authority
 
@@ -103,7 +103,6 @@ Meshchat prefers direct encrypted WebSocket communication between clients.
 When direct delivery fails:
 
 - messages are send to local relay
-- relays may optionally use email as asynchronous fallback transport
 
 Email is used as a transport mechanism only.  
 Relays cannot decrypt payload contents.

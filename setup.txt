@@ -113,8 +113,6 @@ These scripts configure the relay using environment variables
 
 Typical configuration values:
 
-- email login credentials
-- SMTP settings
 - ports
 - runtime configuration
 
@@ -122,45 +120,21 @@ Using environment variables keeps deployment simple and also makes the
 project easy to deploy using Docker.
 
 
-EMAIL RELAY / OFFLINE DELIVERY
-------------------------------
-
-If you want offline message delivery between relay servers, you must configure
-a dedicated email account for the relay server.
-
-The relay uses email as a store-and-forward transport when remote users or
-servers are temporarily offline.
-
-Typical setup:
-
-    meshchat@domain.org
-
-The configured account should support:
-
-- SMTP (outbound mail)
-- IMAP (inbound mail)
-
-A dedicated mailbox is strongly recommended instead of using a personal email
-account.
 
 
 TYPICAL start.bat
 -----------------
 
 :: Relay identity (what this server tells clients it is)
-set RELAY_WSS_URL=wss://meshchat.domain.org/ws/
-set RELAY_EMAIL=meshchat@domain.org
+set RELAY_WSS_URL=wss://example.domain.org/ws/
 
-:: Email relay — outbound + inbound
-set EMAIL_HOST=mail.domain.org
-set EMAIL_PORT_OUT=587
-set EMAIL_PORT_IN=993
-set EMAIL_USER=meshchat@domain.org
-set EMAIL_PASS=****
-set EMAIL_FROM=meshchat@domain.org
-set EMAIL_TLS=starttls
+:: local file buffer
+set BUF_DIR=./relay_buf
+set BUF_MAX_MSGS=100
+set BUF_MAX_AGE=86400
+set BUF_MAX_MB=10
 
-:: Local server ports
+:: Ports (defaults match nginx/local setup)
 set HTTP_PORT=8000
 set WS_PORT=8888
 

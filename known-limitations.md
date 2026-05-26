@@ -12,15 +12,6 @@ Messages are fire-and-forget. There is no acknowledgement from the recipient tha
 **Ordering not guaranteed**
 Messages may arrive out of chronological order, especially across transport paths or after an offline period. The client sorts by timestamp, so the conversation will eventually look correct — but arrival order may differ from send order.
 
-**Duplicate delivery possible**
-A message may arrive more than once if it travels via multiple paths (relay WSS and email, for example). Deduplication by message ID handles this transparently, but it does happen.
-
-**Cross-relay offline delivery is slow and best-effort**
-When a contact is offline on their relay and the WSS path fails, messages fall back to email bridge. This depends on third-party mail server reliability and polling intervals. Delivery may be delayed by minutes or fail silently if the mail server is unavailable.
-
-**No guaranteed eventual delivery**
-If both the relay WSS and email fallback fail, messages are lost. There is no persistent retry mechanism beyond the email polling cycle.
-
 ---
 
 ## Identity
@@ -57,9 +48,6 @@ Audio and image data lives in memory only and is never written to localStorage o
 **Relay operator sees metadata**
 The relay operator can observe sender publicId, recipient publicId, message timing, and approximate message size. Message content is encrypted and unreadable, but the communication graph is visible.
 
-**Recipient relay revealed to sender relay**
-The `relay_email` field in the packet envelope tells the sender's relay where to forward offline messages. This reveals which relay the recipient uses.
-
 **No forward secrecy**
 Messages are encrypted with static keys derived from the passphrase. If a passphrase is compromised in the future and an attacker has stored ciphertext, past messages can be decrypted. There is no per-session key ratchet.
 
@@ -69,12 +57,6 @@ The publicId is deterministic and permanent for a given identity. Anyone who obs
 ---
 
 ## Infrastructure
-
-**No local offline queue**
-When a contact is offline on the local relay, messages are currently buffered via email. A purpose-built local file queue is planned but not yet implemented. Email buffer introduces latency and external dependency for what should be a local operation.
-
-**Email fallback requires third-party mail service**
-The email bridge depends on an external SMTP/IMAP provider. Free mail services may rate-limit, delay, or drop messages. The relay has no visibility into whether an email was actually delivered.
 
 **Single relay is a single point of failure**
 If a user's relay goes offline, they become unreachable until it returns or they migrate to a new relay. There is no automatic failover or relay redundancy.

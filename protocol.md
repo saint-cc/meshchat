@@ -227,7 +227,6 @@ signingKeySeed = HKDF(master, "signing")
 ## Design Principles
 
 - No central authority
-- Any node can be a relay
 - Operator-blind relays
 - Eventually consistent
 - Minimal metadata
