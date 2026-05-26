@@ -1,175 +1,130 @@
-# meshchat
+# MeshChat
 
-A decentralized messaging protocol with portable cryptographic identities, multi-path transport, and stateless relays.
+Decentralised, end-to-end encrypted messaging. No accounts. No central server. No plaintext.
 
-Meshchat is an experimental communication protocol designed for resilient, infrastructure-light messaging using deterministic identities, end-to-end encryption, and opportunistic delivery over WebSockets.
-
----
-
-## What is Meshchat?
-
-Meshchat is a communication system where identities are derived locally from a username and passphrase instead of being created by a central server.
-
-Messages are signed and encrypted end-to-end, while delivery can happen over multiple transport methods such as direct WebSocket connections.
-
-The server is intentionally (mostly) stateless. 
+Messages are encrypted in the browser before they leave your device. Relay servers route ciphertext — they never see your messages, your contacts, or your identity.
 
 ---
 
-## Design Principles
+## How it works
 
-### Cryptographic Identity Portability
+Your identity is derived from your username and passphrase using PBKDF2 + HKDF. The same credentials always produce the same keypair. There is no registration, no server account, and no password reset — your passphrase **is** the key.
 
-Identities are deterministic and portable. A user can reconstruct their identity anywhere using the same credentials.
+Contacts are added by exchanging a shareable address (QR code or copy-paste). This address contains your encryption public key, signing public key, and relay server URL. No other information is needed.
 
-### Multi-path Opportunistic Transport
-
-Messages may travel over direct WebSocket connections or relays.
-
-### Social Trust Without Central Authority
-
-Trust decisions are local to the client. No server can globally define who should be trusted or blocked.
+Messages are encrypted with AES-256-GCM for the recipient and signed with Ed25519. Relay servers see only routing metadata (sender ID, recipient ID, size) and store nothing permanently.
 
 ---
 
-## Non-Goals
+## Features
 
-Meshchat is NOT:
-
-- a blockchain
-- a cryptocurrency
-- a fully anonymous network
-- a military-grade secure communication platform
-- a globally consistent messaging system
-- a centralized chat service
-
-The project prioritizes resilience, portability, and decentralization over perfect metadata privacy or formal security guarantees.
+- End-to-end encrypted text, image, and audio messages
+- Message signing and verification
+- Cross-relay messaging — clients on different servers communicate directly
+- Offline delivery — messages are buffered on the recipient's relay until they reconnect
+- Peer backup — contacts automatically back up each other's encrypted data
+- Multi-device sync — same identity on multiple devices converges over time
+- Reactions
+- QR code contact exchange
+- Encrypted backup export / import
+- Progressive Web App — installable, works offline for reading
+- No dependencies on accounts, email, or phone numbers
 
 ---
 
-## Protocol Overview
+## Running a relay server
 
-Basic packet structure:
+### Requirements
 
-```json
-{
-  "sender": "...",
-  "receiver": "...",
-  "type": "...",
-  "relay": "...",
-  "blob": "..."
+- Python 3.11+
+- `websockets` and `flask` packages
+
+```bash
+pip install websockets flask
+```
+
+### Configuration
+
+Copy and edit `start.sh` (Linux/Mac) or create a `start.bat` (Windows):
+
+```bash
+export RELAY_WSS_URL="wss://yourrelay.example.com/ws/"
+export HTTP_PORT=8000
+export WS_PORT=8888
+export BUF_DIR="./relay_buf"
+export BUF_MAX_MSGS=100
+export BUF_MAX_AGE=86400
+export BUF_MAX_MB=10
+
+python3 server.py
+```
+
+`RELAY_WSS_URL` is the only required setting for cross-relay messaging. It tells clients where to find this relay so they can include it in their shareable address.
+
+### Nginx reverse proxy (recommended)
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name yourrelay.example.com;
+
+    location / {
+        proxy_pass http://127.0.0.1:8000;
+    }
+
+    location /ws/ {
+        proxy_pass http://127.0.0.1:8888;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_read_timeout 3600;
+    }
 }
 ```
 
-### Packet Notes
+### Static files
 
-- all packets are signed
-- payloads are encrypted end-to-end
-- relays cannot modify packets without invalidating signatures
-- delivery ordering is not guaranteed
-- eventual synchronization between peers is expected
-- clients may connect through multiple transports simultaneously
+Put the client files (`index.html`, `style.css`, `script.js`, `manifest.json`, `sw.js`) in a `static/` directory next to `server.py`. Flask serves them automatically.
 
 ---
 
-## Identity Model
+## Security model
 
-User identities are deterministically derived from:
+- **Relay operators** can see: sender publicId, recipient publicId, message timing, approximate size. They cannot see message content.
+- **Contacts** can see: your publicId, your relay URL, when you send messages.
+- **Passphrase security** is everything. A weak passphrase means a weak identity. The login screen shows an entropy estimate to help.
+- **No forward secrecy** — keys are static. A compromised passphrase exposes all past messages if an attacker has stored ciphertext.
+- **No anonymity** — IP addresses are visible to relay operators. MeshChat is not a replacement for Tor.
 
-- username (case-insensitive)
-- passphrase
-
-Derived key material is used for:
-
-- signing
-- encryption
-- backup recovery
-
-No account registration is required.
-
-Losing the passphrase means losing the identity.
-
-Changing the passphrase creates a new identity.
-
-Existing trusted contacts must manually trust the new identity.  
-The protocol intentionally does not allow identities to automatically delegate trust to replacement identities.
+See [known-limitations.md](known-limitations.md) for a full list of trade-offs.
 
 ---
 
-## Transport Model
+## Cross-relay messaging
 
-Meshchat prefers direct encrypted WebSocket communication between clients.
+Clients on different relay servers communicate directly:
 
-When direct delivery fails:
-
-- messages are send to local relay
-
-Email is used as a transport mechanism only.  
-Relays cannot decrypt payload contents.
-
-Contacts may exchange updated relay and WebSocket endpoint information over existing trusted channels, allowing identities to migrate between domains or infrastructure providers.
+1. Alice shares her address (QR code) which includes her relay WSS URL
+2. Bob scans it — his client now knows Alice's relay
+3. When Bob sends a message, his client opens a temporary WebSocket to Alice's relay and delivers it directly
+4. If Alice is offline, her relay buffers the message to disk and delivers it when she reconnects
+5. Alice's relay URL updates automatically as she moves between relays, propagated via message payloads
 
 ---
 
-## Group Model
+## Privacy tips
 
-Groups are currently implemented as independent identities acting as routing entities.
-
-A group may:
-
-- receive encrypted messages
-- redistribute messages to participants
-- abstract participant identities from each other
-
-Trust in a group derives entirely from trust in the group owner/operator.
-
-More advanced group trust models may be explored later.
+- Choose a unique username — common names are easier to correlate
+- Use a strong passphrase — it is your only protection
+- Share your QR code only with people you trust — it reveals your relay server
+- There is no way to prove a new key belongs to the same person — verify out-of-band when re-adding contacts
 
 ---
 
-## Security Notes
+## Protocol
 
-Meshchat uses modern cryptographic primitives but does not claim perfect secrecy or anonymity.
-
-Compromised identities remain compromised until manually abandoned or blocked by contacts.
-
-Historical encrypted data may become decryptable if weak passphrases are used or future attacks succeed.
-
-Users are strongly encouraged to use long, high-entropy passphrases.
-
-The protocol prioritizes practical resilience and decentralized communication over formal guarantees against all future adversaries.
+See [protocol.md](protocol.md) for the full protocol specification including packet formats, key derivation, routing rules, and backup protocol.
 
 ---
 
-## Project Status
-
-Experimental / proof-of-concept.
-
-The protocol, transport behavior, and packet formats are still evolving and may change incompatibly.
-
-Current implementations should be considered unstable and exploratory.
-
----
-
-## Contributing
-
-Alternative clients, relay implementations, protocol analysis, transport experiments, and security reviews are welcome.
-
-The project intentionally allows heterogeneous implementations as long as protocol compatibility is preserved.
-
----
-
-## special thanks to
-Cyberchaos. 
-
-BitBubblex. 
-
-Claude (Anthropic) as AI pair programmer.
-
----
-
-## License
-
-This project is licensed under the GNU Affero General Public License v3.0 (AGPL-3.0).
-
-See the LICENSE file for details.
+*MeshChat v0 — experimental*
