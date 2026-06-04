@@ -120,6 +120,11 @@ async def send_to(ws, obj):
         return True
     except Exception as e:
         log.warning("  send failed: %s", e)
+        # actively prune dead socket from all registered IDs
+        for id_, sockets in list(connected.items()):
+            sockets.discard(ws)
+            if not sockets:
+                del connected[id_]
         return False
 
 async def deliver(to_id, obj, exclude=None):
