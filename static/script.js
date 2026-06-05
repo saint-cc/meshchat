@@ -39,7 +39,7 @@ function esc(str){return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').
 function setSyncStatus(msg){document.getElementById("syncStatus").textContent=msg;}
 function linkify(text){return text.replace(/(https?:\/\/[^\s]+)/g,(url)=>{try{new URL(url);const short_url=url.length>50?url.slice(0,47)+"...":url;return`<a href="${url}" target="_blank" rel="noopener noreferrer">${short_url}</a>`;}catch{return url;}});}
 function pollBatchSize(){return Math.min(10,Math.max(3,Math.round(Object.keys(state.contacts).length*0.1)));}
-function pollContacts(){const others=Object.keys(state.contacts).filter(id=>id!==state.publicId).sort(()=>Math.random()-0.5).slice(0,pollBatchSize()-1);sendSignal({type:"who_online",ids:[state.publicId,...others]});mlog.debug(`POLL       queried ${1 + others.length} id(s)`);}
+function pollContacts(){const others=Object.keys(state.contacts).filter(id=>id!==state.publicId&&!state.contacts[id].legacy128).sort(()=>Math.random()-0.5).slice(0,pollBatchSize()-1);sendSignal({type:"who_online",ids:[state.publicId,...others]});mlog.debug(`POLL       queried ${1 + others.length} id(s)`);}
 function schedulePoll(){const jitter=(Math.random()-0.5)*10000;setTimeout(()=>{pollContacts();schedulePoll();},30000+jitter);}
 function serialiseContacts(){const out={};for(const[id,c]of Object.entries(state.contacts))
 out[id]={name:c.name,publicId:c.publicId,shareableKey:c.shareableKey,messages:c.messages.slice(-15).map(m=>m.type==="audio"?{...m,data:null,expired:true}:m),blocked:c.blocked||false,lastStateChange:c.lastStateChange||0,lastRelay:c.lastRelay||null,lastRelaySeen:c.lastRelaySeen||0,legacy128:c.legacy128||false,signKeyBytes128:c.signKeyBytes128||null};return out;}
