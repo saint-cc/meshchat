@@ -64,7 +64,7 @@ async function handleBackupPush(msg){if(!msg.from||!msg.blob)return;if(state.con
 await saveContacts();renderContactList();if(state.currentChat)renderMessages();mlog.info(`← BACKUP_PUSH  from self — merged other-me`);}catch(e){mlog.warn(`← BACKUP_PUSH  from self — decrypt failed`);}
 return;}
 state.peerBackups[msg.from]=msg.blob;savePeerBackups();mlog.info(`← BACKUP_PUSH  from ${pid(msg.from)} — stored`);}
-const pendingRestoreRequest=new Set();async function sendRestoreRequest(id){if(!contact||contact.blocked||contact.legacy128)return;const contact=state.contacts[id];if(!contact||contact.blocked)return;if(pendingRestoreRequest.has(id)){mlog.debug(`RESTORE_REQ already pending  to ${pid(id)}`);return;}
+const pendingRestoreRequest=new Set();async function sendRestoreRequest(id){const contact=state.contacts[id];if(!contact||contact.blocked||contact.legacy128)return;if(pendingRestoreRequest.has(id)){mlog.debug(`RESTORE_REQ already pending  to ${pid(id)}`);return;}
 if(!canRestore(id)){mlog.debug(`RESTORE_REQ skipped cooldown  to ${pid(id)}`);return;}
 pendingRestoreRequest.add(id);const blob=await encryptObject(contact.encKey,{publicId_A:state.publicId,publicId_B:id});sendSignal({type:"push_restore_request",from:state.publicId,to:id,blob});mlog.info(`→ RESTORE_REQ  to   ${pid(id)}`);}
 async function handleRestoreRequest(msg){if(!msg.from||!msg.blob)return;try{const plain=await decryptObject(state.encKey,msg.blob);if(plain.publicId_A!==msg.from){mlog.warn(`← RESTORE_REQ  from ${pid(msg.from)} — ID_A mismatch, dropped`);return;}
