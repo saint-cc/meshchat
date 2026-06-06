@@ -1,4 +1,3 @@
-start.bat
 *.env
 __pycache__/
 *.pyc
@@ -9,4 +8,6 @@ __pycache__/
 relay_buf/
 project/
 static/FA6E31B89/
+start.bat
+start.sh
 minimizer.py
