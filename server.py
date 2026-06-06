@@ -332,7 +332,8 @@ async def handler(ws):
 
             elif kind in ("msg_exchange", "backup_offer", "backup_accept",
                           "backup_push", "push_restore_request",
-                          "push_restore_ack", "restore_push"):
+                          "push_restore_ack", "restore_push",
+                          "token_request","token_response" ):
                 frm = msg.get("from", "?")
                 to  = msg.get("to")
                 if not to:
