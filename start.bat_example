@@ -1,0 +1,21 @@
+@echo off
+
+:: ══════════════════════════════════════════
+::   MESHCHAT LOCAL DEV — environment vars
+::   Keep this file out of git (.gitignore)
+:: ══════════════════════════════════════════
+
+:: Relay identity (what this server tells clients it is)
+set RELAY_WSS_URL=wss://yourdomain.com/ws/
+
+:: local file buffer
+set BUF_DIR=/Path/to/relay_buf
+set BUF_MAX_MSGS=100
+set BUF_MAX_AGE=86400
+set BUF_MAX_MB=10
+
+:: Ports (defaults match nginx/local setup)
+set HTTP_PORT=8000
+set WS_PORT=8888
+
+python server.py
