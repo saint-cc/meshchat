@@ -3,11 +3,11 @@ __pycache__/
 *.pyc
 *.pyo
 *.log
+start.bat
+start.sh
+minimizer.py
  
 # local dev folders
 relay_buf/
 project/
 static/FA6E31B89/
-start.bat
-start.sh
-minimizer.py
