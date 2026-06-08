@@ -915,7 +915,7 @@ function handleSignal(msg) {
         }
       } else if (state.contacts[msg.id]) {
         markOnline(msg.id);
-        sendRestoreRequest(msg.id);
+        if (canRestore(msg.id)) sendRestoreRequest(msg.id);
         if (sessionFresh) {
           sendSignal({ type: "push_restore_ack", from: state.publicId, to: msg.id });
           mlog.info(`→ RESTORE_ACK  to   ${pid(msg.id)} — fresh, asking for peer backup`);
