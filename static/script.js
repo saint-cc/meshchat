@@ -13,6 +13,20 @@
 const LOG_MAX_LINES      = 20;
 const LOG_CLEAR_INTERVAL = 5 * 60 * 1000;
 
+const POLL_INTERVAL_MS        = 30_000;   // base interval between presence polls
+const POLL_JITTER_MS          = 10_000;   // ± random jitter added to poll interval
+const PRUNE_INTERVAL_MS       = 30_000;   // how often to sweep expired online entries
+const BACKUP_INTERVAL_MS      = 10 * 60 * 1000;  // periodic backup + restore-request sweep
+const WS_RECONNECT_MS         = 3_000;   // delay before reconnecting signal websocket
+const RELAY_CONNECT_TIMEOUT_MS = 5_000;  // max wait for relay websocket to open
+const RELAY_RECONNECT_MS      = 5_000;   // delay before reconnecting a persistent relay
+const MODAL_CLOSE_DELAY_MS    = 1_200;   // brief pause before closing export/import modal
+
+const MAX_DOT_AGE   = 300_000;
+const BACKUP_THRESHOLD  = 2;
+const BACKUP_OFFER_TTL   = 60_000;
+const RELAY_IDLE_MS  = 30_000;
+
 function pid(id) { return id ? String(id).slice(0, 8) : "?"; }
 
 const mlog = (() => {
@@ -113,7 +127,7 @@ function pruneOnline() {
   }
   renderContactList();
 }
-setInterval(pruneOnline, 30_000);
+setInterval(pruneOnline, PRUNE_INTERVAL_MS);
 
 /* ══════════════════════════════════════════
    LOGIN NOTICES
@@ -144,7 +158,6 @@ function setRandomLoginNotice() {
 const dotTimestamps = {};
 const DOT_ON_COLOR  = [17, 255, 17];
 const DOT_OFF_COLOR = [17,  17, 17];
-const MAX_DOT_AGE   = 300_000;
 
 function lerp(a, b, t) { return a + (b - a) * t; }
 
@@ -375,8 +388,8 @@ function pollContacts() {
 }
 
 function schedulePoll() {
-  const jitter = (Math.random() - 0.5) * 10000;
-  setTimeout(() => { pollContacts(); schedulePoll(); }, 30000 + jitter);
+  const jitter = (Math.random() - 0.5) * POLL_JITTER_MS;
+  setTimeout(() => { pollContacts(); schedulePoll(); }, POLL_INTERVAL_MS + jitter);
 }
 
 /* ══════════════════════════════════════════
@@ -433,7 +446,6 @@ async function saveContacts() {
 }
 
 let messagesSinceBackup = 0;
-const BACKUP_THRESHOLD  = 2;
 
 async function saveContactsBackup(force = false) {
   if (!state.cryptoKey) return;
@@ -449,7 +461,7 @@ setInterval(() => {
   for (const id of Object.keys(state.contacts)) {
     if (id !== state.publicId) sendRestoreRequest(id);
   }
-}, 10 * 60 * 1000);
+}, BACKUP_INTERVAL_MS);
 
 async function loadContacts() {
   try {
@@ -508,7 +520,6 @@ function savePeerTokens() {
 
 // tracks which peers we have a pending offer waiting for accept
 const pendingBackupOffer = {};   // id → { blob, ts }
-const BACKUP_OFFER_TTL   = 60_000;
 
 async function pushBackupToContacts(blob) {
   for (const id of Object.keys(state.contacts)) {
@@ -859,7 +870,7 @@ function connectSignal() {
   ws.onclose = () => {
     setConnected(false);
     mlog.warn("WS         disconnected — retrying in 3s");
-    setTimeout(connectSignal, 3000);
+    setTimeout(connectSignal, WS_RECONNECT_MS);
   };
   ws.onerror = () => ws.close();
   ws.onmessage = (evt) => { try { handleSignal(JSON.parse(evt.data)); } catch(e) {} };
@@ -953,7 +964,6 @@ function sendSignal(obj) {
    Timer: 30s inactivity → graceful close.
    Incoming: piped through handleSignal as-is.
 ══════════════════════════════════════════ */
-const RELAY_IDLE_MS  = 30_000;
 const relayConns     = {};   // hostname → { ws, timer, queue:[], ready:false, outbound:true }
 
 function relayHostname(url) {
@@ -1004,7 +1014,7 @@ function getOrOpenRelayConn(url, messageOnly) {
       mlog.warn(`RELAY      connect timeout  host=${hostname}`);
       entry.ws?.close();
     }
-  }, 5000);
+  }, RELAY_CONNECT_TIMEOUT_MS);
 
   try {
     const ws = new WebSocket(url);
@@ -1072,7 +1082,7 @@ function openPersistentRelay(wss) {
       origWs.addEventListener("close", () => {
         if (relayConns[hostname]?.persistent) return;   // already replaced
         mlog.info(`RELAY[128] reconnecting  host=${hostname}`);
-        setTimeout(() => openPersistentRelay(wss), 5000);
+        setTimeout(() => openPersistentRelay(wss), RELAY_RECONNECT_MS);
       }, { once: true });
     }
   }
@@ -2100,7 +2110,7 @@ document.getElementById("exportConfirm").onclick = async () => {
   const pass   = document.getElementById("exportPassphrase").value;
   const status = document.getElementById("exportStatus");
   if (!pass) { status.textContent = "passphrase required"; return; }
-  try { status.textContent = "encrypting…"; await exportBackup(pass); status.textContent = "exported!"; setTimeout(closeExportModal, 1200); }
+  try { status.textContent = "encrypting…"; await exportBackup(pass); status.textContent = "exported!"; setTimeout(closeExportModal, MODAL_CLOSE_DELAY_MS); }
   catch(e) { status.textContent = "export failed: " + e.message; }
 };
 
@@ -2112,7 +2122,7 @@ document.getElementById("importConfirm").onclick = () => {
     const status = document.getElementById("exportStatus");
     if (!file) return;
     if (!pass) { status.textContent = "enter passphrase first"; return; }
-    try { status.textContent = "decrypting…"; await importBackup(file, pass); status.textContent = "restored!"; setTimeout(closeExportModal, 1200); }
+    try { status.textContent = "decrypting…"; await importBackup(file, pass); status.textContent = "restored!"; setTimeout(closeExportModal, MODAL_CLOSE_DELAY_MS); }
     catch(e) { status.textContent = "restore failed — wrong passphrase or file?"; }
   };
   input.click();
