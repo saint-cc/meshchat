@@ -92,7 +92,6 @@ const EXCHANGE_COUNT  = 10;
    RESTORE HANDSHAKE — rate limiting
 ══════════════════════════════════════════ */
 const lastRestoreTime  = {};
-const RESTORE_COOLDOWN = 5 * 60 * 1000;
 
 function canRestore(id) {
   const last = lastRestoreTime[id];
