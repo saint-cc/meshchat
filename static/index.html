@@ -46,11 +46,11 @@ if ("serviceWorker" in navigator) {
 
 <!-- LOGIN -->
 <div id="loginScreen">
-  <form id="loginForm" >
+  <form id="loginForm" method="post">
     <div id="loginBox">
       <h2>MESHCHAT</h2>
       <div class="subtitle">decentralised · encrypted · yours</div>
-      <input id="inputName" name="mesh_user" placeholder="user" autocomplete="user" spellcheck="false">
+      <input id="inputName" name="mesh_user" placeholder="user" autocomplete="username" spellcheck="false">
       <input id="inputPassphrase" name="password" type="password" placeholder="passphrase" autocomplete="current-password">
 	  <label>
 		<input type="checkbox" onchange="togglePw(this)">
