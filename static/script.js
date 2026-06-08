@@ -13,19 +13,20 @@
 const LOG_MAX_LINES      = 20;
 const LOG_CLEAR_INTERVAL = 5 * 60 * 1000;
 
-const POLL_INTERVAL_MS        = 30_000;   // base interval between presence polls
-const POLL_JITTER_MS          = 10_000;   // ± random jitter added to poll interval
-const PRUNE_INTERVAL_MS       = 30_000;   // how often to sweep expired online entries
-const BACKUP_INTERVAL_MS      = 10 * 60 * 1000;  // periodic backup + restore-request sweep
-const WS_RECONNECT_MS         = 3_000;   // delay before reconnecting signal websocket
-const RELAY_CONNECT_TIMEOUT_MS = 5_000;  // max wait for relay websocket to open
-const RELAY_RECONNECT_MS      = 5_000;   // delay before reconnecting a persistent relay
-const MODAL_CLOSE_DELAY_MS    = 1_200;   // brief pause before closing export/import modal
+const POLL_INTERVAL_MS        	= 30_000;   // base interval between presence polls
+const POLL_JITTER_MS          	= 10_000;   // ± random jitter added to poll interval
+const PRUNE_INTERVAL_MS       	= 30_000;   // how often to sweep expired online entries
+const BACKUP_INTERVAL_MS      	= 10 * 60 * 1000;  // periodic backup + restore-request sweep
+const WS_RECONNECT_MS         	= 3_000;   // delay before reconnecting signal websocket
+const RELAY_CONNECT_TIMEOUT_MS 	= 5_000;   // max wait for relay websocket to open
+const RELAY_RECONNECT_MS      	= 5_000;   // delay before reconnecting a persistent relay
+const MODAL_CLOSE_DELAY_MS    	= 1_200;   // brief pause before closing export/import modal
+const RESTORE_COOLDOWN 			= 5 * 60 * 1000;
 
-const MAX_DOT_AGE   = 300_000;
-const BACKUP_THRESHOLD  = 2;
-const BACKUP_OFFER_TTL   = 60_000;
-const RELAY_IDLE_MS  = 30_000;
+const MAX_DOT_AGE   			= 300_000; // = PRUNE_INTERVAL_MS
+const BACKUP_THRESHOLD  		= 2;
+const BACKUP_OFFER_TTL   		= 60_000;
+const RELAY_IDLE_MS  			= 30_000;
 
 function pid(id) { return id ? String(id).slice(0, 8) : "?"; }
 
@@ -91,7 +92,6 @@ const EXCHANGE_COUNT  = 10;
    RESTORE HANDSHAKE — rate limiting
 ══════════════════════════════════════════ */
 const lastRestoreTime  = {};
-const RESTORE_COOLDOWN = 5 * 60 * 1000;
 
 function canRestore(id) {
   const last = lastRestoreTime[id];
