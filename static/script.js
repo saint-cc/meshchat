@@ -370,7 +370,7 @@ function pollContacts() {
     .filter(id => id !== state.publicId && !state.contacts[id].legacy128)
     .sort(() => Math.random() - 0.5)
     .slice(0, pollBatchSize() - 1);
-  sendSignal({ type: "who_online", ids: [state.publicId, ...others] });
+  sendSignal({ type: "announce", ids: [state.publicId, ...others] });
   mlog.debug(`POLL       queried ${1 + others.length} id(s)`);
 }
 
