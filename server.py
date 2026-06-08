@@ -306,10 +306,10 @@ async def handler(ws):
                 else:
                     log.debug("RELAY_INFO requested but not configured, skipped")
 
-            elif kind == "who_online":
+            elif kind == "announce":
                 ids = msg.get("ids", [])
                 if not isinstance(ids, list):
-                    log.warning("  who_online bad payload, dropped")
+                    log.warning("  announce bad payload, dropped")
                     continue
                 ids     = ids[:10]
                 matched = [i for i in ids if i in connected]

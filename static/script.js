@@ -594,6 +594,11 @@ async function handleBackupPush(msg) {
     return;
   }
 
+  if (!state.contacts[msg.from]) {
+    mlog.warn(`← BACKUP_PUSH  from ${pid(msg.from)} — unknown contact, dropped`);
+    return;
+  }
+
   state.peerBackups[msg.from] = msg.blob;
   savePeerBackups();
   mlog.info(`← BACKUP_PUSH  from ${pid(msg.from)} — stored`);
@@ -771,7 +776,11 @@ async function handleRestorePush(msg) {
     const restored = await deserialiseContacts(plain);
     let added = 0, msgsMerged = 0;
     for (const [id, contact] of Object.entries(restored)) {
-      if (!state.contacts[id]) { state.contacts[id] = contact; added++; }
+      if (!state.contacts[id]) {
+        state.contacts[id] = contact;
+        state.contacts[id].lastRelaySeen = 0;
+        added++;
+      }
       else {
         mergeContactMeta(state.contacts[id], contact);
         const before = state.contacts[id].messages.length;
@@ -845,11 +854,7 @@ function connectSignal() {
     for (const c of Object.values(state.contacts)) {
       if (c.legacy128 && c.lastRelay) openPersistentRelay(c.lastRelay);
     }
-    // Fire restore_req for all contacts immediately — don't wait for seen.
-    // The server will deliver it if they're online; drop it if not.
-    for (const id of Object.keys(state.contacts)) {
-      if (id !== state.publicId) sendRestoreRequest(id);
-    }
+
   };
   ws.onclose = () => {
     setConnected(false);
@@ -890,7 +895,7 @@ function handleSignal(msg) {
       break;
 
     case "seen":
-      mlog.info(`SIG seen       ${pid(msg.id)}`);
+      mlog.debug(`SIG seen       ${pid(msg.id)}`);
       if (msg.id === state.publicId) {
         markOnline(msg.id);
         if (sessionFresh) {
