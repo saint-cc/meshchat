@@ -1,11 +1,24 @@
-<!DOCTYPE html><html id="htmlRoot"> <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>MeshChat</title><link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' fill='%23000'/%3E%3Cpath d='M3 8h10' stroke='%2300ffcc' stroke-width='2'/%3E%3Ccircle cx='8' cy='8' r='2' fill='%2300ffcc'/%3E%3C/svg%3E"><script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script><script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script><script type="module">
+<!DOCTYPE html>
+<html id="htmlRoot">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0"> 
+<title>MeshChat</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' fill='%23000'/%3E%3Cpath d='M3 8h10' stroke='%2300ffcc' stroke-width='2'/%3E%3Ccircle cx='8' cy='8' r='2' fill='%2300ffcc'/%3E%3C/svg%3E">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+<script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+<script type="module">
   import { ed25519 } from 'https://esm.sh/@noble/curves@1.4.0/ed25519';
   window.ed25519 = ed25519;
-</script><link rel="stylesheet" href="./style.css"><link rel="manifest" href="./manifest.json"><script>
+</script>
+<link rel="stylesheet" href="./style.css">
+<link rel="manifest" href="./manifest.json">
+<script>
 if ("serviceWorker" in navigator) {
   navigator.serviceWorker.register("./sw.js");
 }
-</script><style>
+</script>
+<style>
 
 .bar-container {
   width: 260px;
@@ -27,19 +40,202 @@ if ("serviceWorker" in navigator) {
   text-align: center;
   white-space: pre-line;
 }
-</style></head> <body> <div id="loginScreen"> <form id="loginForm"> <div id="loginBox"> <h2>MESHCHAT</h2> <div class="subtitle">decentralised · encrypted · yours</div> <input id="inputName" name="mesh_user" placeholder="user" autocomplete="user" spellcheck="false"> <input id="inputPassphrase" name="password" type="password" placeholder="passphrase" autocomplete="current-password"> <label> <input type="checkbox" onchange="togglePw(this)"> Show password </label> <script>
+</style>
+</head>
+<body>
+
+<!-- LOGIN -->
+<div id="loginScreen">
+  <form id="loginForm" >
+    <div id="loginBox">
+      <h2>MESHCHAT</h2>
+      <div class="subtitle">decentralised · encrypted · yours</div>
+      <input id="inputName" name="mesh_user" placeholder="user" autocomplete="user" spellcheck="false">
+      <input id="inputPassphrase" name="password" type="password" placeholder="passphrase" autocomplete="current-password">
+	  <label>
+		<input type="checkbox" onchange="togglePw(this)">
+		Show password
+	  </label>
+
+		<script>
 		function togglePw(el) {
 			document.getElementById("inputPassphrase").type =
 				el.checked ? "text" : "password";
 		}
-		</script> <button id="loginButton" type="submit">ENTER</button> <div id="loginStatus"></div> <div class="bar-container"> <div id="barEntr" class="barEntr"></div> </div> <div class="labelEntr" id="labelEntr">entropy: 0 bits</div> <div id="loginNotice"> <strong>note —</strong> your name and passphrase are your identity.<br> choose something unique. no recovery without them. </div> </div> </form> </div> <div id="appContainer"> <div id="sidebar"> <div id="sidebarHeader"> <div> <div id="sidebarTitle">MESHCHAT</div> <div id="sidebarMeta">not connected</div> </div> <button id="exportBtn" class="chat-action-btn">💾</button> <button id="meshLogToggle" onclick="mlog.toggle()">>_</button> <button id="addContactBtn" title="Add contact">+</button> </div> <ul id="contactList"></ul> <div id="showBlockedToggle" style="display:none"></div> <button id="showBlockedBtn"></button> <div id="syncStatus"></div> <div id="connectionStatus"> <div id="connDot"></div> <span id="connLabel">disconnected</span> </div> </div> <div id="chatContainer"> <div id="chatHeader" style="position:relative"> <button id="backBtn" onclick="document.getElementById('appContainer').classList.remove('chatOpen')" style="display:none;background:none;border:none;color:var(--accent);font-family:inherit;font-size:12px;letter-spacing:0.1em;cursor:pointer;margin-bottom:6px"> ← BACK </button> <div id="chatHeaderRow"> <div id="chatHeaderInfo"> <div id="emptyChat">select a contact to start chatting</div> <div id="chatHeaderName" style="display:none"></div> <div id="chatHeaderId" style="display:none"></div> <div id="chatHeaderRelay" style="display:none;font-size:10px;color:var(--muted);margin-top:2px;letter-spacing:0.05em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis"></div> </div> <button id="contactMenuBtn" title="Contact options">⋯</button> </div> <div class="contact-dropdown" id="contactDropdown"> <button id="syncBtn" class="chat-action-btn">SYNC</button> <button onclick="contactAction('edit')">EDIT</button> <button id="blockToggleBtn" onclick="contactAction('block')">BLOCK</button> <button class="danger" onclick="contactAction('delete')">DELETE</button> </div> </div> <div id="chatMessages"></div> <div id="chatInputContainer"> <textarea id="chatInput" placeholder="type a message..." autocomplete="off"></textarea> <button id="sendButton">SEND</button> <div id="mediaButtons"> <button id="audioBtn" title="Hold to record">🎤</button> <button id="imageBtn" title="Send image">📷</button> </div> <input type="file" id="imageInput" accept="image/*" style="display:none"> </div> </div> </div> <div id="meshLog"> <div id="meshLogHeader"> <span>MESHCHAT LOG</span> <button onclick="mlog.clear()">CLR</button> <button onclick="mlog.hide()">✕</button> </div> <div id="meshLogBody"></div> </div> <div id="contactActionOverlay" class="overlay"> <div class="modal-box"> <h3 id="contactActionTitle">EDIT CONTACT</h3> <div id="contactActionBody" style="display:flex;flex-direction:column;gap:12px"></div> <div class="modal-btns" id="contactActionBtns"></div> </div> </div> <div id="modalOverlay" class="overlay"> <div class="modal-box"> <h3>ADD CONTACT</h3> <div class="qr-tabs"> <button class="qr-tab active" id="tabShow" onclick="switchTab('show')">MY QR</button> <button class="qr-tab" id="tabScan" onclick="switchTab('scan')">SCAN</button> <button class="qr-tab" id="tabPaste" onclick="switchTab('paste')">PASTE</button> <button class="qr-tab" id="tabLegacy" onclick="switchTab('legacy')">[128]</button> </div> <div class="qr-panel active" id="panelShow"> <div id="myKeyBox" title="click to copy"> <span>your key — click to copy</span> <strong id="myKeyDisplay">—</strong> </div> <div id="myQrCode"></div> <div class="hint" style="text-align:center">let your contact scan this · or copy key above</div> </div> <div class="qr-panel" id="panelScan"> <div id="qrReader" style="width:100%"></div> <div id="scanResult"></div> <button class="scan-btn" id="scanToggleBtn" onclick="toggleScanner()">START CAMERA</button> <div class="hint" style="text-align:center">point camera at contact's QR code</div> </div> <div class="qr-panel" id="panelPaste"> <div class="hint">paste their key below</div> </div> <div class="qr-panel" id="panelLegacy"> <div class="hint">128-bit legacy contact (e.g. C64).<br>paste their <strong>encKey128.signKey128</strong> key below.<br>this contact can send and receive messages only.</div> <div id="myKey128Box" title="click to copy" style="background:var(--bg);border:1px solid var(--border);padding:10px 12px;font-size:11px;display:flex;flex-direction:column;gap:4px;color:var(--muted);cursor:pointer;transition:border-color 0.2s" onclick="navigator.clipboard.writeText(state.shareableKey128||'')"> <span>your 128-bit key — click to copy</span> <strong id="myKey128Display" style="color:var(--text);word-break:break-all;font-size:10px;letter-spacing:0.03em;line-height:1.5">—</strong> </div> </div> <input id="modalContactName" placeholder="contact name" autocomplete="off"> <input id="modalContactKey" placeholder="their key" autocomplete="off" spellcheck="false"> <div class="hint">name is local only — only you see it.</div> <div class="modal-btns"> <button class="btn-cancel" id="modalCancel">CANCEL</button> <button class="btn-confirm" id="modalConfirm">ADD</button> </div> </div> </div> <div id="exportOverlay" class="overlay"> <div class="modal-box"> <h3>BACKUP / RESTORE</h3> <div class="hint">export an encrypted backup of your contacts and messages.<br>your passphrase is required to restore.</div> <input id="exportPassphrase" type="password" placeholder="confirm passphrase"> <div id="exportStatus"></div> <div class="modal-btns"> <button class="btn-cancel" id="exportCancel">CANCEL</button> <button class="btn-alt" id="importConfirm">IMPORT FILE</button> <button class="btn-confirm" id="exportConfirm">EXPORT</button> </div> </div> </div> <a href="https://github.com/saint-cc/meshchat" target="_blank" title="GitHub" class="github-link"> <svg viewbox="0 0 16 16" width="16" height="16" aria-hidden="true"> <path fill="currentColor" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38
+		</script>
+		
+      <button id="loginButton" type="submit">ENTER</button>
+      <div id="loginStatus"></div>
+	  <div class="bar-container">
+        <div id="barEntr" class="barEntr"></div>
+      </div>
+	  <div class="labelEntr" id="labelEntr">entropy: 0 bits</div>
+      <div id="loginNotice">
+        <strong>note —</strong> your name and passphrase are your identity.<br>
+        choose something unique. no recovery without them.
+      </div>
+    </div>
+  </form>
+</div>
+
+<!-- MAIN APP -->
+<div id="appContainer">
+  <div id="sidebar">
+    <div id="sidebarHeader">
+      <div>
+        <div id="sidebarTitle">MESHCHAT</div>
+        <div id="sidebarMeta">not connected</div>
+      </div>
+	  <button id="exportBtn" class="chat-action-btn">💾</button>
+	  <button id="meshLogToggle" onclick="mlog.toggle()">>_</button>
+      <button id="addContactBtn" title="Add contact">+</button>
+    </div>
+    <ul id="contactList"></ul>
+	<div id="showBlockedToggle" style="display:none"></div>
+    <button id="showBlockedBtn"></button>
+    <div id="syncStatus"></div>
+    <div id="connectionStatus">
+      <div id="connDot"></div>
+      <span id="connLabel">disconnected</span>
+    </div>
+  </div>
+
+  <div id="chatContainer">
+    <div id="chatHeader" style="position:relative">
+      <button id="backBtn"
+        onclick="document.getElementById('appContainer').classList.remove('chatOpen')"
+        style="display:none;background:none;border:none;color:var(--accent);font-family:inherit;font-size:12px;letter-spacing:0.1em;cursor:pointer;margin-bottom:6px">
+        ← BACK
+      </button>
+      <div id="chatHeaderRow">
+        <div id="chatHeaderInfo">
+          <div id="emptyChat">select a contact to start chatting</div>
+          <div id="chatHeaderName" style="display:none"></div>
+          <div id="chatHeaderId"   style="display:none"></div>
+          <div id="chatHeaderRelay" style="display:none;font-size:10px;color:var(--muted);margin-top:2px;letter-spacing:0.05em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis"></div>
+        </div>						
+		<button id="contactMenuBtn" title="Contact options">⋯</button>
+      </div>
+      <div class="contact-dropdown" id="contactDropdown">
+	    <button id="syncBtn"   class="chat-action-btn">SYNC</button>
+        <button onclick="contactAction('edit')">EDIT</button>
+        <button id="blockToggleBtn" onclick="contactAction('block')">BLOCK</button>
+        <button class="danger" onclick="contactAction('delete')">DELETE</button>
+		
+      </div>
+    </div>
+    <div id="chatMessages"></div>
+    <div id="chatInputContainer">
+		<textarea id="chatInput" placeholder="type a message..." autocomplete="off"></textarea>
+		<button id="sendButton">SEND</button>
+		<div id="mediaButtons">
+		  <button id="audioBtn" title="Hold to record">🎤</button>
+		  <button id="imageBtn" title="Send image">📷</button>
+		</div>
+		<input type="file" id="imageInput" accept="image/*" style="display:none">
+    </div>
+  </div>
+</div>
+
+<!-- IN-PAGE LOG -->
+<div id="meshLog">
+  <div id="meshLogHeader">
+    <span>MESHCHAT LOG</span>
+    <button onclick="mlog.clear()">CLR</button>
+    <button onclick="mlog.hide()">✕</button>
+  </div>
+  <div id="meshLogBody"></div>
+</div>
+
+
+<!-- CONTACT ACTION MODAL -->
+<div id="contactActionOverlay" class="overlay">
+  <div class="modal-box">
+    <h3 id="contactActionTitle">EDIT CONTACT</h3>
+    <div id="contactActionBody" style="display:flex;flex-direction:column;gap:12px"></div>
+    <div class="modal-btns" id="contactActionBtns"></div>
+  </div>
+</div>
+
+<!-- ADD CONTACT MODAL -->
+<div id="modalOverlay" class="overlay">
+  <div class="modal-box">
+    <h3>ADD CONTACT</h3>
+    <div class="qr-tabs">
+      <button class="qr-tab active" id="tabShow"  onclick="switchTab('show')">MY QR</button>
+      <button class="qr-tab"        id="tabScan"  onclick="switchTab('scan')">SCAN</button>
+      <button class="qr-tab"        id="tabPaste" onclick="switchTab('paste')">PASTE</button>
+      <button class="qr-tab"        id="tabLegacy" onclick="switchTab('legacy')">[128]</button>
+    </div>
+    <div class="qr-panel active" id="panelShow">
+      <div id="myKeyBox" title="click to copy">
+        <span>your key — click to copy</span>
+        <strong id="myKeyDisplay">—</strong>
+      </div>
+      <div id="myQrCode"></div>
+      <div class="hint" style="text-align:center">let your contact scan this · or copy key above</div>
+    </div>
+    <div class="qr-panel" id="panelScan">
+      <div id="qrReader" style="width:100%"></div>
+      <div id="scanResult"></div>
+      <button class="scan-btn" id="scanToggleBtn" onclick="toggleScanner()">START CAMERA</button>
+      <div class="hint" style="text-align:center">point camera at contact's QR code</div>
+    </div>
+    <div class="qr-panel" id="panelPaste">
+      <div class="hint">paste their key below</div>
+    </div>
+    <div class="qr-panel" id="panelLegacy">
+      <div class="hint">128-bit legacy contact (e.g. C64).<br>paste their <strong>encKey128.signKey128</strong> key below.<br>this contact can send and receive messages only.</div>
+      <div id="myKey128Box" title="click to copy" style="background:var(--bg);border:1px solid var(--border);padding:10px 12px;font-size:11px;display:flex;flex-direction:column;gap:4px;color:var(--muted);cursor:pointer;transition:border-color 0.2s" onclick="navigator.clipboard.writeText(state.shareableKey128||'')">
+        <span>your 128-bit key — click to copy</span>
+        <strong id="myKey128Display" style="color:var(--text);word-break:break-all;font-size:10px;letter-spacing:0.03em;line-height:1.5">—</strong>
+      </div>
+    </div>
+    <input id="modalContactName" placeholder="contact name" autocomplete="off">
+    <input id="modalContactKey"  placeholder="their key" autocomplete="off" spellcheck="false">
+    <div class="hint">name is local only — only you see it.</div>
+    <div class="modal-btns">
+      <button class="btn-cancel"  id="modalCancel">CANCEL</button>
+      <button class="btn-confirm" id="modalConfirm">ADD</button>
+    </div>
+  </div>
+</div>
+
+<!-- BACKUP / RESTORE MODAL -->
+<div id="exportOverlay" class="overlay">
+  <div class="modal-box">
+    <h3>BACKUP / RESTORE</h3>
+    <div class="hint">export an encrypted backup of your contacts and messages.<br>your passphrase is required to restore.</div>
+    <input id="exportPassphrase" type="password" placeholder="confirm passphrase">
+    <div id="exportStatus"></div>
+    <div class="modal-btns">
+      <button class="btn-cancel"  id="exportCancel">CANCEL</button>
+      <button class="btn-alt"     id="importConfirm">IMPORT FILE</button>
+      <button class="btn-confirm" id="exportConfirm">EXPORT</button>
+    </div>
+  </div>
+</div>
+
+<a
+    href="https://github.com/saint-cc/meshchat"
+    target="_blank"
+    title="GitHub"
+    class="github-link"
+>
+    <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true">
+        <path fill="currentColor"
+              d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38
               0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13
               -.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66
               .07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15
               -.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.65 7.65 0 0 1 2-.27c.68 0
               1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82
               1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01
-              1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/> </svg> </a> <style>
+              1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/>
+    </svg>
+</a>
+
+<style>
 .github-link {
     position: fixed;
     top: 6px;
@@ -53,7 +249,12 @@ if ("serviceWorker" in navigator) {
 .github-link:hover {
     opacity: 0.9;
 }
-</style> <script type="text/javascript" src="script.js"></script> <script type="text/javascript" src="statemachine.js"></script> <script>
+</style>
+
+<script type="text/javascript" src="script.js"></script>
+<script type="text/javascript" src="statemachine.js"></script>
+
+<script>
 /* -----------------------------
    ENTROPY MODEL
 ----------------------------- */
@@ -214,4 +415,6 @@ document.getElementById('inputName').addEventListener('input', updateEntr);
 document.getElementById('inputPassphrase').addEventListener('input', updateEntr);
 
 
-</script> </body> </html>
+</script>
+</body>
+</html>
