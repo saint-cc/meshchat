@@ -1094,9 +1094,6 @@ function getOrOpenRelayConn(url, messageOnly) {
       clearTimeout(connectTimeout);
       entry.ready = true;
       mlog.info(`RELAY      open  host=${hostname}`);
-      // on a foreign relay only announce our 128-bit identity —
-      // registering publicId here bleeds us into the foreign mesh
-      if (state.publicId128) ws.send(JSON.stringify({ type: "connect", id: state.publicId128 }));
       entry.queue.forEach(raw => ws.send(raw));
       entry.queue = [];
     };
