@@ -939,8 +939,11 @@ function handleAuthOk(msg) {
 }
 
 function handleAuthFail(msg) {
+  if (authState.step === "done") {
+    mlog.debug(`RELAY      remote rejected unauthenticated traffic  reason=${msg.reason}`);
+    return;
+  }
   mlog.err(`AUTH FAIL  reason=${msg.reason}  step=${authState.step}`);
-  // nothing to do — ws.onclose will handle reconnect
 }
 
 let sessionFresh = true;
