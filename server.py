@@ -394,18 +394,6 @@ async def handler(ws):
                     buf_write(to, msg)
                     log.info("BUF Q      from=%s  to=%s  (offline)", short(frm), short(to))
 
-            # ── everything below requires at least one authed identity ──
-            elif not is_authed():
-                log.warning("UNAUTHED   type=%r  peer=%s  dropped", kind, addr)
-                await send_to(ws, {"type": "auth_fail", "reason": "not_authenticated"})
-
-            elif kind == "get_relay_info":
-                if RELAY_WSS_URL:
-                    await send_to(ws, {"type": "relay_info", "wss": RELAY_WSS_URL})
-                    log.info("RELAY_INFO sent to %s", short(last_id()))
-                else:
-                    log.debug("RELAY_INFO requested but not configured, skipped")
-
             elif kind == "announce":
                 ids = msg.get("ids", [])
                 if not isinstance(ids, list):
@@ -428,6 +416,18 @@ async def handler(ws):
                 reached = await deliver(to, msg, exclude=ws)
                 log.info("%-12s from=%s  to=%s  reached=%d",
                          kind.upper()[:12], short(frm), short(to), reached)
+
+            # ── everything below requires at least one authed identity ──
+            elif not is_authed():
+                log.warning("UNAUTHED   type=%r  peer=%s  dropped", kind, addr)
+                await send_to(ws, {"type": "auth_fail", "reason": "not_authenticated"})
+
+            elif kind == "get_relay_info":
+                if RELAY_WSS_URL:
+                    await send_to(ws, {"type": "relay_info", "wss": RELAY_WSS_URL})
+                    log.info("RELAY_INFO sent to %s", short(last_id()))
+                else:
+                    log.debug("RELAY_INFO requested but not configured, skipped")
 
             elif kind == "ping":
                 await send_to(ws, {"type": "pong"})
