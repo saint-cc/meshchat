@@ -1,12 +1,16 @@
 import asyncio
+import base64
 import glob
+import hashlib
 import json
 import logging
 import multiprocessing
 import os
+import secrets
 import time
 import uuid
 
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 import websockets
 from flask import Flask, send_from_directory
 
@@ -46,6 +50,9 @@ LOG_FORMAT   = "%(asctime)s  %(levelname)-8s  %(message)s"
 LOG_DATE_FMT = "%H:%M:%S"
 LOG_LEVEL    = logging.INFO
 
+# Auth
+AUTH_TIMEOUT = 15   # seconds to complete challenge-response before disconnect
+
 # Stats interval
 STATS_INTERVAL = 60   # seconds between periodic stat dumps
 
@@ -61,6 +68,7 @@ log = logging.getLogger("signal")
 # ══════════════════════════════════════════
 
 connected: dict[str, set] = {}   # publicId → set of websockets
+pending_auth: dict = {}          # ws → { enc_key, nonce, ts, bits }
 
 stats = {
     "bytes_in":  0, "bytes_out": 0,
@@ -134,6 +142,63 @@ async def deliver(to_id, obj, exclude=None):
         if ws is exclude: continue
         if await send_to(ws, obj): reached += 1
     return reached
+
+# ══════════════════════════════════════════
+#   AUTH HELPERS
+#   derive_public_id  — mirrors client JS logic exactly
+#   auth_challenge    — encrypt nonce to client's enc key, store pending
+#   auth_verify       — check proof, register, flush buffer
+# ══════════════════════════════════════════
+
+def derive_public_id(enc_key_bytes: bytes) -> str:
+    """SHA-256(enc_key)[0..12] encoded as base64url — mirrors client derivePublicId()."""
+    digest = hashlib.sha256(enc_key_bytes).digest()[:12]
+    return base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
+
+async def auth_challenge(ws, enc_key_bytes: bytes, bits: int):
+    """Generate a random nonce, encrypt it to the client's enc key, send challenge."""
+    nonce_plain = secrets.token_bytes(32)
+    iv          = secrets.token_bytes(12)
+    aesgcm      = AESGCM(enc_key_bytes)
+    ciphertext  = aesgcm.encrypt(iv, nonce_plain, None)
+    pending_auth[id(ws)] = {
+        "enc_key": enc_key_bytes,
+        "nonce":   nonce_plain,
+        "ts":      time.monotonic(),
+        "bits":    bits,
+    }
+    await send_to(ws, {
+        "type": "auth_challenge",
+        "bits": bits,
+        "iv":   list(iv),
+        "data": list(ciphertext),
+    })
+    log.info("AUTH       challenge sent  bits=%d  peer=%s", bits, ws.remote_address)
+
+async def auth_verify(ws, nonce_back: list, addr: str) -> str | None:
+    """Verify proof, register identity, flush buffer. Returns public_id or None on failure."""
+    entry = pending_auth.pop(id(ws), None)
+    if not entry:
+        log.warning("AUTH       proof with no pending challenge  peer=%s", addr)
+        return None
+    if time.monotonic() - entry["ts"] > AUTH_TIMEOUT:
+        log.warning("AUTH       challenge expired  peer=%s", addr)
+        await send_to(ws, {"type": "auth_fail", "reason": "timeout"})
+        return None
+    if bytes(nonce_back) != entry["nonce"]:
+        log.warning("AUTH       proof mismatch  peer=%s", addr)
+        await send_to(ws, {"type": "auth_fail", "reason": "proof_invalid"})
+        return None
+
+    public_id = derive_public_id(entry["enc_key"])
+    if public_id not in connected:
+        connected[public_id] = set()
+    connected[public_id].add(ws)
+    log.info("AUTH OK    id=%s  bits=%d  peer=%s  total=%d",
+             short(public_id), entry["bits"], addr, session_count())
+    await send_to(ws, {"type": "auth_ok", "public_id": public_id})
+    await buf_deliver(public_id, ws)
+    return public_id
 
 # ══════════════════════════════════════════
 #   OFFLINE BUFFER
@@ -253,16 +318,22 @@ async def log_stats():
 # ══════════════════════════════════════════
 
 async def handler(ws):
-    client_id = None
-    limiter   = RateLimiter()
-    addr      = peer_info(ws)
+    client_ids = []   # public_ids authed this socket, sequential (128-bit first if any)
+    limiter    = RateLimiter()
+    addr       = peer_info(ws)
     log.info("CONNECT    peer=%s", addr)
+
+    def is_authed():
+        return len(client_ids) > 0
+
+    def last_id():
+        return client_ids[-1] if client_ids else None
 
     try:
         async for raw in ws:
 
             if not limiter.allow():
-                log.warning("RATELIMIT  peer=%s  id=%s", addr, short(client_id))
+                log.warning("RATELIMIT  peer=%s  ids=%s", addr, client_ids)
                 await send_to(ws, {"type": "error", "reason": "rate_limited"})
                 continue
 
@@ -282,41 +353,34 @@ async def handler(ws):
                      fmt_bytes(stats["bytes_in"]),
                      fmt_bytes(stats["bytes_out"]))
 
-            if kind == "connect":
-                client_id = msg.get("id")
-                if not client_id:
-                    log.warning("  connect with no id, ignored")
+            # ── auth_init: client presents enc key, server sends challenge ──
+            if kind == "auth_init":
+                enc_key_list = msg.get("enc_key")
+                bits         = msg.get("bits", 256)
+                if not enc_key_list or bits not in (128, 256):
+                    log.warning("AUTH       bad auth_init  peer=%s", addr)
+                    await send_to(ws, {"type": "auth_fail", "reason": "bad_init"})
                     continue
-                if client_id not in connected:
-                    connected[client_id] = set()
-                connected[client_id].add(ws)
-                log.info("REGISTERED id=%s  peer=%s  sessions=%d  total=%d",
-                         short(client_id), addr,
-                         len(connected[client_id]), session_count())
-                # flush any buffered packets immediately
-                await buf_deliver(client_id, ws)
-
-            elif kind == "get_relay_info":
-                if RELAY_WSS_URL:
-                    await send_to(ws, {
-                        "type": "relay_info",
-                        "wss":  RELAY_WSS_URL,
-                    })
-                    log.info("RELAY_INFO sent to %s", short(client_id))
-                else:
-                    log.debug("RELAY_INFO requested but not configured, skipped")
-
-            elif kind == "announce":
-                ids = msg.get("ids", [])
-                if not isinstance(ids, list):
-                    log.warning("  announce bad payload, dropped")
+                enc_key_bytes = bytes(enc_key_list)
+                expected_len  = 16 if bits == 128 else 32
+                if len(enc_key_bytes) != expected_len:
+                    log.warning("AUTH       wrong key length  bits=%d  got=%d  peer=%s",
+                                bits, len(enc_key_bytes), addr)
+                    await send_to(ws, {"type": "auth_fail", "reason": "bad_key_length"})
                     continue
-                ids     = ids[:10]
-                matched = [i for i in ids if i in connected]
-                if client_id:
-                    for matched_id in matched:
-                        await deliver(matched_id, {"type": "seen", "id": client_id}, exclude=ws)
+                await auth_challenge(ws, enc_key_bytes, bits)
 
+            # ── auth_proof: client returns decrypted nonce ──
+            elif kind == "auth_proof":
+                nonce_back = msg.get("nonce")
+                if not nonce_back:
+                    log.warning("AUTH       empty proof  peer=%s", addr)
+                    continue
+                public_id = await auth_verify(ws, nonce_back, addr)
+                if public_id:
+                    client_ids.append(public_id)
+
+            # ── message: fire and forget — no sender auth required ──
             elif kind == "message":
                 frm = msg.get("from", "?")
                 to  = msg.get("to")
@@ -330,10 +394,32 @@ async def handler(ws):
                     buf_write(to, msg)
                     log.info("BUF Q      from=%s  to=%s  (offline)", short(frm), short(to))
 
+            # ── everything below requires at least one authed identity ──
+            elif not is_authed():
+                log.warning("UNAUTHED   type=%r  peer=%s  dropped", kind, addr)
+                await send_to(ws, {"type": "auth_fail", "reason": "not_authenticated"})
+
+            elif kind == "get_relay_info":
+                if RELAY_WSS_URL:
+                    await send_to(ws, {"type": "relay_info", "wss": RELAY_WSS_URL})
+                    log.info("RELAY_INFO sent to %s", short(last_id()))
+                else:
+                    log.debug("RELAY_INFO requested but not configured, skipped")
+
+            elif kind == "announce":
+                ids = msg.get("ids", [])
+                if not isinstance(ids, list):
+                    log.warning("  announce bad payload, dropped")
+                    continue
+                ids     = ids[:10]
+                matched = [i for i in ids if i in connected]
+                for matched_id in matched:
+                    await deliver(matched_id, {"type": "seen", "id": last_id()}, exclude=ws)
+
             elif kind in ("msg_exchange", "backup_offer", "backup_accept",
                           "backup_push", "push_restore_request",
                           "push_restore_ack", "restore_push",
-                          "token_request","token_response" ):
+                          "token_request", "token_response"):
                 frm = msg.get("from", "?")
                 to  = msg.get("to")
                 if not to:
@@ -350,22 +436,26 @@ async def handler(ws):
                 log.warning("UNKNOWN    type=%r  peer=%s  dropped", kind, addr)
 
     except websockets.exceptions.ConnectionClosedOK:
-        log.info("CLOSE OK   peer=%s  id=%s", addr, short(client_id))
+        log.info("CLOSE OK   peer=%s  ids=%s", addr, client_ids)
     except websockets.exceptions.ConnectionClosedError as e:
-        log.warning("CLOSE ERR  peer=%s  id=%s  reason=%s", addr, short(client_id), e)
+        log.warning("CLOSE ERR  peer=%s  ids=%s  reason=%s", addr, client_ids, e)
     except Exception as e:
-        log.error("HANDLER EX peer=%s  id=%s  error=%s", addr, short(client_id), e)
+        log.error("HANDLER EX peer=%s  ids=%s  error=%s", addr, client_ids, e)
     finally:
-        if client_id and client_id in connected:
-            connected[client_id].discard(ws)
-            remaining = len(connected[client_id])
-            if remaining == 0:
-                del connected[client_id]
-                log.info("REMOVED    id=%s  peer=%s  total=%d",
-                         short(client_id), addr, session_count())
-            else:
-                log.info("SESSION-   id=%s  peer=%s  sessions_left=%d",
-                         short(client_id), addr, remaining)
+        # clean up any pending challenge if socket dropped mid-auth
+        pending_auth.pop(id(ws), None)
+        # unregister all authed identities on this socket
+        for cid in client_ids:
+            if cid in connected:
+                connected[cid].discard(ws)
+                remaining = len(connected[cid])
+                if remaining == 0:
+                    del connected[cid]
+                    log.info("REMOVED    id=%s  peer=%s  total=%d",
+                             short(cid), addr, session_count())
+                else:
+                    log.info("SESSION-   id=%s  peer=%s  sessions_left=%d",
+                             short(cid), addr, remaining)
 
 # ══════════════════════════════════════════
 #   SIGNAL SERVER ENTRYPOINT (async)

@@ -851,24 +851,25 @@ async function handleMsgExchange(msg) {
 /* ══════════════════════════════════════════
    WEBSOCKET
 ══════════════════════════════════════════ */
+/* ══════════════════════════════════════════
+   AUTH STATE
+   Sequential: 128-bit first (if we have one), then 256-bit.
+   authStep: "idle" | "await_challenge_128" | "await_challenge_256" | "done"
+   After "done" the usual post-connect flow runs.
+══════════════════════════════════════════ */
+const authState = { step: "idle" };
+
 function connectSignal() {
   const ws = new WebSocket(SIGNAL_URL);
   state.ws = ws;
   ws.onopen = () => {
-    if (state.publicId128) ws.send(JSON.stringify({ type: "connect", id: state.publicId128 }));
-    ws.send(JSON.stringify({ type: "connect", id: state.publicId }));
-    ws.send(JSON.stringify({ type: "get_relay_info" }));
-    setConnected(true);
     mlog.info(`WS         connected  ${SIGNAL_URL}`);
-    pollContacts();
-    // Re-open persistent relay connections for 128-bit contacts
-    for (const c of Object.values(state.contacts)) {
-      if (c.legacy128 && c.lastRelay && !c.blocked) openPersistentRelay(c.lastRelay);
-    }
-
+    authState.step = "idle";
+    startAuth();
   };
   ws.onclose = () => {
     setConnected(false);
+    authState.step = "idle";
     mlog.warn("WS         disconnected — retrying in 3s");
     setTimeout(connectSignal, WS_RECONNECT_MS);
   };
@@ -876,10 +877,79 @@ function connectSignal() {
   ws.onmessage = (evt) => { try { handleSignal(JSON.parse(evt.data)); } catch(e) {} };
 }
 
+function startAuth() {
+  // 128-bit first if we have that identity
+  if (state.encKey128 && state.publicId128) {
+    authState.step = "await_challenge_128";
+    state.ws.send(JSON.stringify({
+      type:    "auth_init",
+      bits:    128,
+      enc_key: Array.from(base64ToRaw(state.shareableKey128.split(".")[0])),
+    }));
+    mlog.info("AUTH       init 128-bit");
+  } else {
+    startAuth256();
+  }
+}
+
+function startAuth256() {
+  authState.step = "await_challenge_256";
+  state.ws.send(JSON.stringify({
+    type:    "auth_init",
+    bits:    256,
+    enc_key: Array.from(base64ToRaw(state.shareableKey.split(".")[0])),
+  }));
+  mlog.info("AUTH       init 256-bit");
+}
+
+async function handleAuthChallenge(msg) {
+  const bits = msg.bits;
+  try {
+    const iv         = new Uint8Array(msg.iv);
+    const data       = new Uint8Array(msg.data);
+    const encKey     = bits === 128 ? state.encKey128 : state.encKey;
+    const plainBytes = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, encKey, data);
+    const nonce      = Array.from(new Uint8Array(plainBytes));
+    state.ws.send(JSON.stringify({ type: "auth_proof", nonce }));
+    mlog.info(`AUTH       proof sent  bits=${bits}`);
+  } catch(e) {
+    mlog.err(`AUTH       decrypt failed bits=${bits}: ${e.message}`);
+  }
+}
+
+function handleAuthOk(msg) {
+  mlog.info(`AUTH OK    id=${pid(msg.public_id)}  bits=${authState.step === "await_challenge_128" ? 128 : 256}`);
+
+  if (authState.step === "await_challenge_128") {
+    // 128-bit done — now do 256-bit
+    startAuth256();
+    return;
+  }
+
+  // 256-bit done — fully authenticated, run post-connect flow
+  authState.step = "done";
+  setConnected(true);
+  state.ws.send(JSON.stringify({ type: "get_relay_info" }));
+  pollContacts();
+  schedulePoll();
+  // Re-open persistent relay connections for 128-bit contacts
+  for (const c of Object.values(state.contacts)) {
+    if (c.legacy128 && c.lastRelay && !c.blocked) openPersistentRelay(c.lastRelay);
+  }
+}
+
+function handleAuthFail(msg) {
+  mlog.err(`AUTH FAIL  reason=${msg.reason}  step=${authState.step}`);
+  // nothing to do — ws.onclose will handle reconnect
+}
+
 let sessionFresh = true;
 
 function handleSignal(msg) {
   switch(msg.type) {
+    case "auth_challenge": handleAuthChallenge(msg); break;
+    case "auth_ok":        handleAuthOk(msg);        break;
+    case "auth_fail":      handleAuthFail(msg);      break;
     case "relay_info":
       if (state.contacts[state.publicId]) {
         const me = state.contacts[state.publicId];
@@ -2073,7 +2143,6 @@ document.getElementById("loginButton").onclick = async (e) => {
     mlog.info(`LOGIN      ${name}  ${pid(state.publicId)}`);
     renderContactList();
     connectSignal();
-    schedulePoll();
   } catch(e) { status.textContent = e.message || "error during login"; btn.disabled = false; }
 };
 
