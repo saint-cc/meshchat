@@ -33,6 +33,10 @@ WS_PORT = int(os.environ.get("WS_PORT", 8888))
 # Relay identity — sent to clients on request
 RELAY_WSS_URL = os.environ.get("RELAY_WSS_URL", "")   # e.g. wss://yourrelay.example.com/ws/
 
+# Connection limits
+MAX_CONNECTIONS        = int(os.environ.get("MAX_CONNECTIONS",        50))   # total WS sessions
+MAX_CONNECTIONS_PER_IP = int(os.environ.get("MAX_CONNECTIONS_PER_IP", 15))   # per source IP
+
 # Rate limiter
 RATE_LIMIT_RATE  = 10   # tokens refilled per second
 RATE_LIMIT_BURST = 20   # max burst size
@@ -43,6 +47,9 @@ WS_MAX_SIZE = int(os.environ.get("WS_MAX_SIZE", 2 * 1024 * 1024))   # 2 MB per f
 # ID validation — base64url chars only, 8–64 chars
 _ID_RE = re.compile(r'^[A-Za-z0-9\-_]{8,64}$')
 def valid_id(s): return isinstance(s, str) and bool(_ID_RE.match(s))
+
+# Online presence
+ONLINE_EXPIRY_SECONDS = 300   # prune peers not seen within this window
 
 # Offline buffer — file-based queue for messages to offline clients
 BUF_DIR      = os.environ.get("BUF_DIR",      os.path.join(os.getcwd(), "relay_buf"))
@@ -75,6 +82,7 @@ log = logging.getLogger("signal")
 
 connected: dict[str, set] = {}   # publicId → set of websockets
 pending_auth: dict = {}          # ws → { enc_key, nonce, ts, bits }
+ip_conns: dict[str, int] = {}    # ip → active connection count
 
 stats = {
     "bytes_in":  0, "bytes_out": 0,
@@ -106,7 +114,12 @@ def peer_info(ws):
         try:    return str(ws.remote_address)
         except: return "unknown"
 
+def unique_keys():
+    """Number of distinct registered public IDs."""
+    return len(connected)
+
 def session_count():
+    """Total number of active WebSocket connections (one client may have 2)."""
     return sum(len(s) for s in connected.values())
 
 # ══════════════════════════════════════════
@@ -207,8 +220,8 @@ async def auth_verify(ws, nonce_back: list, addr: str) -> str | None:
     if public_id not in connected:
         connected[public_id] = set()
     connected[public_id].add(ws)
-    log.info("AUTH OK    id=%s  bits=%d  peer=%s  total=%d",
-             short(public_id), entry["bits"], addr, session_count())
+    log.info("AUTH OK    id=%s  bits=%d  peer=%s  keys=%d  sessions=%d",
+             short(public_id), entry["bits"], addr, unique_keys(), session_count())
     await send_to(ws, {"type": "auth_ok", "public_id": public_id})
     await buf_deliver(public_id, ws)
     return public_id
@@ -326,9 +339,9 @@ async def buf_expire():
 async def log_stats():
     while True:
         await asyncio.sleep(STATS_INTERVAL)
-        log.info("STATS      sessions=%d  in=%s(%d msgs)  out=%s(%d msgs)  "
+        log.info("STATS      keys=%d  sessions=%d  in=%s(%d msgs)  out=%s(%d msgs)  "
                  "buf_in=%d  buf_out=%d",
-                 session_count(),
+                 unique_keys(), session_count(),
                  fmt_bytes(stats["bytes_in"]),  stats["msgs_in"],
                  fmt_bytes(stats["bytes_out"]), stats["msgs_out"],
                  stats["buf_in"], stats["buf_out"])
@@ -341,7 +354,23 @@ async def handler(ws):
     client_ids = []   # public_ids authed this socket, sequential (128-bit first if any)
     limiter    = RateLimiter()
     addr       = peer_info(ws)
-    log.info("CONNECT    peer=%s", addr)
+
+    # ── connection limits ──
+    if session_count() >= MAX_CONNECTIONS:
+        log.warning("LIMIT      max_connections=%d reached  peer=%s", MAX_CONNECTIONS, addr)
+        await ws.close(1013, "server full")
+        return
+
+    ip_conns[addr] = ip_conns.get(addr, 0) + 1
+    if ip_conns[addr] > MAX_CONNECTIONS_PER_IP:
+        log.warning("LIMIT      per_ip=%d reached  peer=%s", MAX_CONNECTIONS_PER_IP, addr)
+        ip_conns[addr] -= 1
+        await ws.close(1013, "too many connections from your address")
+        return
+
+    log.info("CONNECT    peer=%s  sessions=%d/%d  from_ip=%d/%d",
+             addr, session_count(), MAX_CONNECTIONS,
+             ip_conns[addr], MAX_CONNECTIONS_PER_IP)
 
     def is_authed():
         return len(client_ids) > 0
@@ -466,6 +495,11 @@ async def handler(ws):
     except Exception as e:
         log.error("HANDLER EX peer=%s  ids=%s  error=%s", addr, client_ids, e)
     finally:
+        # release per-IP slot
+        if addr in ip_conns:
+            ip_conns[addr] -= 1
+            if ip_conns[addr] <= 0:
+                del ip_conns[addr]
         # clean up any pending challenge if socket dropped mid-auth
         pending_auth.pop(id(ws), None)
         # unregister all authed identities on this socket

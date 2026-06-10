@@ -1,34 +1,41 @@
+````markdown
 # MeshChat
 
-Decentralised, end-to-end encrypted messaging. No accounts. No central server. No plaintext.
+Decentralised, end-to-end encrypted messaging built around cryptographic identities rather than accounts.
 
-Messages are encrypted in the browser before they leave your device. Relay servers route ciphertext — they never see your messages, your contacts, or your identity.
+No registration. No central identity provider. No plaintext.
+
+Messages are encrypted in the browser before they leave your device. Relay servers transport and temporarily buffer ciphertext, but never possess your private keys or message contents.
 
 ---
 
 ## How it works
 
-Your identity is derived from your username and passphrase using PBKDF2 + HKDF. The same credentials always produce the same keypair. There is no registration, no server account, and no password reset — your passphrase **is** the key.
+Your identity is derived locally from your username and passphrase using PBKDF2 + HKDF. The same credentials always produce the same cryptographic identity.
 
-Contacts are added by exchanging a shareable address (QR code or copy-paste). This address contains your encryption public key, signing public key, and relay server URL. No other information is needed.
+There are no accounts to create and no passwords stored on any server. Your passphrase **is** your identity.
 
-Messages are encrypted with AES-256-GCM for the recipient and signed with Ed25519. Relay servers see only routing metadata (sender ID, recipient ID, size) and store nothing permanently.
+Contacts are added by exchanging a shareable address (QR code or copy-paste). This contains your encryption public key, signing public key and current relay address. No registration or central directory is required.
+
+Messages are encrypted with AES-256-GCM for the recipient and signed with Ed25519 before leaving your device.
 
 ---
 
 ## Features
 
-- End-to-end encrypted text, image, and audio messages
+- End-to-end encrypted text, image and audio messages
 - Message signing and verification
-- Cross-relay messaging — clients on different servers communicate directly
-- Offline delivery — messages are buffered on the recipient's relay until they reconnect
-- Peer backup — contacts automatically back up each other's encrypted data
-- Multi-device sync — same identity on multiple devices converges over time
-- Reactions
+- No accounts, email addresses or phone numbers
+- Roaming identities — move freely between relay servers
+- No central directory or identity provider
+- Direct client-to-relay delivery across different relays
+- Offline delivery through temporary encrypted relay buffers
+- Multi-device synchronization
+- Peer backup of encrypted data
 - QR code contact exchange
 - Encrypted backup export / import
-- Progressive Web App — installable, works offline for reading
-- No dependencies on accounts, email, or phone numbers
+- Progressive Web App (PWA)
+- Installable and offline-capable for reading conversations
 
 ---
 
@@ -37,15 +44,16 @@ Messages are encrypted with AES-256-GCM for the recipient and signed with Ed2551
 ### Requirements
 
 - Python 3.11+
-- `websockets` and `flask` packages
+- `websockets`
+- `flask`
 
 ```bash
-pip install websockets flask
-```
+pip install websockets flask cryptography
+````
 
 ### Configuration
 
-Copy and edit `start.sh` (Linux/Mac) or create a `start.bat` (Windows):
+Example:
 
 ```bash
 export RELAY_WSS_URL="wss://yourrelay.example.com/ws/"
@@ -59,9 +67,9 @@ export BUF_MAX_MB=10
 python3 server.py
 ```
 
-`RELAY_WSS_URL` is the only required setting for cross-relay messaging. It tells clients where to find this relay so they can include it in their shareable address.
+`RELAY_WSS_URL` is the relay address clients distribute when sharing their identity.
 
-### Nginx reverse proxy (recommended)
+### Nginx reverse proxy
 
 ```nginx
 server {
@@ -84,47 +92,98 @@ server {
 
 ### Static files
 
-Put the client files (`index.html`, `style.css`, `script.js`, `manifest.json`, `sw.js`) in a `static/` directory next to `server.py`. Flask serves them automatically.
+The client files (`index.html`, `style.css`, `script.js`, `manifest.json`, `sw.js`) are inside a `static/` directory next to `server.py`.
+
+---
+
+## Relay authentication
+
+When a client connects, the relay authenticates the session by verifying ownership of the presented public key through a challenge-response exchange.
+
+This allows the relay to associate active connections and offline message buffers with authenticated identities without ever learning private keys or passphrases.
+
+Relay authentication protects against identity spoofing while preserving end-to-end encryption.
+
+---
+
+## Design philosophy
+
+MeshChat separates **transport** from **trust**.
+
+Relay servers are intentionally simple transport nodes. They forward ciphertext, temporarily buffer encrypted messages for offline users, and authenticate ownership of public identities during connection.
+
+Trust resides entirely in cryptographic identities generated locally by each client.
+
+There is no global directory, no relay-to-relay communication and no central authority coordinating the network. Contacts learn each other's current relay location directly, allowing identities to migrate between relays while remaining reachable.
 
 ---
 
 ## Security model
 
-- **Relay operators** can see: sender publicId, recipient publicId, message timing, approximate size. They cannot see message content.
-- **Contacts** can see: your publicId, your relay URL, when you send messages.
-- **Passphrase security** is everything. A weak passphrase means a weak identity. The login screen shows an entropy estimate to help.
-- **No forward secrecy** — keys are static. A compromised passphrase exposes all past messages if an attacker has stored ciphertext.
-- **No anonymity** — IP addresses are visible to relay operators. MeshChat is not a replacement for Tor.
+### Relay operators can see
 
-See [known-limitations.md](known-limitations.md) for a full list of trade-offs.
+* sender public ID
+* recipient public ID
+* message timing
+* approximate message size
+* relay currently used by connected clients
+
+### Relay operators cannot see
+
+* plaintext messages
+* attachments
+* private keys
+* passphrases
+* contact names
+* encrypted backups
+
+### Important limitations
+
+* Passphrase security is everything.
+* Static identities mean there is currently **no forward secrecy**.
+* Relay operators can observe IP addresses.
+* MeshChat is **not** an anonymity network and is not a replacement for Tor.
+
+See `known-limitations.md` for a complete discussion.
 
 ---
 
-## Cross-relay messaging
+## Routing
 
-Clients on different relay servers communicate directly:
+Messages are delivered directly to the recipient's current relay.
 
-1. Alice shares her address (QR code) which includes her relay WSS URL
-2. Bob scans it — his client now knows Alice's relay
-3. When Bob sends a message, his client opens a temporary WebSocket to Alice's relay and delivers it directly
-4. If Alice is offline, her relay buffers the message to disk and delivers it when she reconnects
-5. Alice's relay URL updates automatically as she moves between relays, propagated via message payloads
+1. Alice shares her MeshChat address.
+2. Bob stores Alice's current relay information.
+3. Bob's client opens a temporary connection directly to Alice's relay.
+4. Alice's relay immediately delivers the message if she is connected.
+5. Otherwise the encrypted message is buffered until Alice reconnects.
+6. When Alice migrates to another relay, her contacts automatically learn her new location through normal protocol traffic.
+
+Relay servers never communicate with one another.
 
 ---
 
 ## Privacy tips
 
-- Choose a unique username — common names are easier to correlate
-- Use a strong passphrase — it is your only protection
-- Share your QR code only with people you trust — it reveals your relay server and your public ID
-- There is no way to prove a new key belongs to the same person — verify out-of-band when re-adding contacts
+* Choose a unique username.
+* Use a strong passphrase.
+* Verify contacts out-of-band when first exchanging identities.
+* Treat your passphrase as your private key.
+* Share your MeshChat address only with people you trust.
 
 ---
 
 ## Protocol
 
-See [protocol.md](protocol.md) for the full protocol specification including packet formats, key derivation, routing rules, and backup protocol.
+See `protocol.md` for the complete protocol specification, packet formats, routing rules, synchronization protocol and backup protocol.
 
 ---
 
-*MeshChat v0 — experimental*
+## Status
+
+MeshChat is an experimental research project exploring decentralised, roaming, end-to-end encrypted messaging.
+
+The protocol is still evolving and should not yet be considered stable.
+
+```
+```

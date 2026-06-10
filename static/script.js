@@ -1,4 +1,4 @@
-/* ══════════════════════════════════════════
+/* ═════════════════════════════════════════════════════════════
    LOGGING
    mlog.info()  → console + in-page
    mlog.debug() → console only
@@ -9,21 +9,21 @@
    pid(id) — trims a publicId to 8 chars for display.
    NOTE: deliberately NOT named short() to avoid
          collision with the url-truncation var in linkify().
-══════════════════════════════════════════ */
+═══════════════════════════════════════════════════════════════ */
 const LOG_MAX_LINES      = 20;
 const LOG_CLEAR_INTERVAL = 5 * 60 * 1000;
 
-const POLL_INTERVAL_MS        	= 30_000;   // base interval between presence polls
-const POLL_JITTER_MS          	= 10_000;   // ± random jitter added to poll interval
-const PRUNE_INTERVAL_MS       	= 30_000;   // how often to sweep expired online entries
-const BACKUP_INTERVAL_MS      	= 10 * 60 * 1000;  // periodic backup + restore-request sweep
-const WS_RECONNECT_MS         	= 3_000;   // delay before reconnecting signal websocket
-const RELAY_CONNECT_TIMEOUT_MS 	= 5_000;   // max wait for relay websocket to open
-const RELAY_RECONNECT_MS      	= 5_000;   // delay before reconnecting a persistent relay
-const MODAL_CLOSE_DELAY_MS    	= 1_200;   // brief pause before closing export/import modal
+const POLL_INTERVAL_MS        	= 30_000;			// base interval between presence polls
+const POLL_JITTER_MS          	= 10_000;			// ± random jitter added to poll interval
+const PRUNE_INTERVAL_MS       	= 30_000;			// how often to sweep expired online entries
+const BACKUP_INTERVAL_MS      	= 10 * 60 * 1000;	// periodic backup + restore-request sweep
+const WS_RECONNECT_MS         	= 3_000;			// delay before reconnecting signal websocket
+const RELAY_CONNECT_TIMEOUT_MS 	= 5_000;			// max wait for relay websocket to open
+const RELAY_RECONNECT_MS      	= 5_000;			// delay before reconnecting a persistent relay
+const MODAL_CLOSE_DELAY_MS    	= 1_200;			// brief pause before closing export/import modal
 const RESTORE_COOLDOWN 			= 5 * 60 * 1000;
 
-const MAX_DOT_AGE   			= 300_000; // = PRUNE_INTERVAL_MS
+const MAX_DOT_AGE   			= 300_000; 			// = PRUNE_INTERVAL_MS
 const BACKUP_THRESHOLD  		= 2;
 const BACKUP_OFFER_TTL   		= 60_000;
 const RELAY_IDLE_MS  			= 30_000;
@@ -1818,12 +1818,12 @@ function openChat(id) {
   idEl.textContent   = c.publicId.slice(0,16) + "…";
   updateChatRelayInfo(id);
   const menuBtn = document.getElementById("contactMenuBtn");
-  if (c.publicId === state.publicId) {
-    menuBtn.classList.remove("visible");
-  } else {
-    menuBtn.classList.add("visible");
-    document.getElementById("blockToggleBtn").textContent = c.blocked ? "UNBLOCK" : "BLOCK";
-  }
+  const isMe    = c.publicId === state.publicId;
+  menuBtn.classList.add("visible");
+  document.getElementById("syncBtn").style.display          = isMe ? "none" : "";
+  document.getElementById("blockToggleBtn").style.display   = isMe ? "none" : "";
+  document.querySelector("#contactDropdown .danger").style.display = isMe ? "none" : "";
+  if (!isMe) document.getElementById("blockToggleBtn").textContent = c.blocked ? "UNBLOCK" : "BLOCK";
   document.getElementById("contactDropdown").classList.remove("open");
   renderContactList();
   renderMessages();
