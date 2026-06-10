@@ -76,8 +76,51 @@ server {
     listen 443 ssl;
     server_name yourrelay.example.com;
 
+    ssl_certificate     /etc/letsencrypt/live/yourrelay.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/yourrelay.example.com/privkey.pem;
+
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers HIGH:!aNULL:!MD5;
+
+
+    ## General protection
+
+    client_max_body_size 5m;
+
+    client_header_timeout 10s;
+    client_body_timeout   10s;
+    send_timeout          30s;
+
+    keepalive_timeout     30s;
+
+    limit_conn conn_limit 20;
+
+    ## Security headers
+
+    add_header X-Frame-Options SAMEORIGIN always;
+    add_header X-Content-Type-Options nosniff always;
+    add_header Referrer-Policy no-referrer always;
+
+    ## Logging
+
+    access_log /var/log/nginx/meshchat_access.log;
+    error_log  /var/log/nginx/meshchat_error.log;
+
+
     location / {
-        proxy_pass http://127.0.0.1:8000;
+
+        limit_req zone=req_limit burst=20 nodelay;
+
+        proxy_pass http://172.16.3.35:8000;
+
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
     }
 
     location /ws/ {
