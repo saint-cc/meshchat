@@ -672,7 +672,8 @@ async function sendRestoreRequest(id) {
   const reqObj = { type: "push_restore_request", from: state.publicId, to: id, blob, ...(token ? { token } : {}) };
   const viaRelay = sendToRelay(id, reqObj, true);
   if (!viaRelay) sendSignal(reqObj);
-  mlog.info(`→ RESTORE_REQ  to   ${pid(id)}${token ? "  +token" : ""}  via=${viaRelay ? "relay" : "signal(fallback)"}`);  mlog.info(`→ RESTORE_REQ  to   ${pid(id)}${token ? "  +token" : ""}`);
+  mlog.info(`→ RESTORE_REQ  to   ${pid(id)}${token ? "  +token" : ""}  via=${viaRelay ? "relay" : "signal(fallback)"}`);  
+ 
 }
 
 async function handleRestoreRequest(msg) {

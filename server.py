@@ -6,6 +6,7 @@ import json
 import logging
 import multiprocessing
 import os
+import re
 import secrets
 import time
 import uuid
@@ -34,6 +35,13 @@ RELAY_WSS_URL = os.environ.get("RELAY_WSS_URL", "")   # e.g. wss://yourrelay.exa
 # Rate limiter
 RATE_LIMIT_RATE  = 10   # tokens refilled per second
 RATE_LIMIT_BURST = 20   # max burst size
+
+# WebSocket
+WS_MAX_SIZE = int(os.environ.get("WS_MAX_SIZE", 2 * 1024 * 1024))   # 2 MB per frame
+
+# ID validation — base64url chars only, 8–64 chars
+_ID_RE = re.compile(r'^[A-Za-z0-9\-_]{8,64}$')
+def valid_id(s): return isinstance(s, str) and bool(_ID_RE.match(s))
 
 # Online presence
 ONLINE_EXPIRY_SECONDS = 300   # prune peers not seen within this window
@@ -209,7 +217,10 @@ async def auth_verify(ws, nonce_back: list, addr: str) -> str | None:
 # ══════════════════════════════════════════
 
 def buf_dir(to_id):
-    return os.path.join(BUF_DIR, to_id)
+    path = os.path.realpath(os.path.join(BUF_DIR, to_id))
+    if not path.startswith(os.path.realpath(BUF_DIR) + os.sep):
+        raise ValueError(f"path traversal attempt: {to_id!r}")
+    return path
 
 def buf_files(to_id):
     """Return list of buffer files for recipient, oldest first."""
@@ -220,7 +231,11 @@ def buf_files(to_id):
 
 def buf_write(to_id, msg):
     """Write a packet to the offline buffer. Enforces per-recipient limits."""
-    d = buf_dir(to_id)
+    try:
+        d = buf_dir(to_id)
+    except ValueError as e:
+        log.warning("BUF        rejected  to=%s  reason=%s", short(to_id), e)
+        return
     try:
         os.makedirs(d, exist_ok=True)
     except Exception as e:
@@ -343,6 +358,10 @@ async def handler(ws):
                 log.warning("BAD JSON   peer=%s  raw=%r", addr, raw[:120])
                 continue
 
+            if len(raw) > WS_MAX_SIZE:
+                log.warning("OVERSIZE   peer=%s  size=%d  dropped", addr, len(raw))
+                continue
+
             stats["bytes_in"] += len(raw)
             stats["msgs_in"]  += 1
 
@@ -384,8 +403,8 @@ async def handler(ws):
             elif kind == "message":
                 frm = msg.get("from", "?")
                 to  = msg.get("to")
-                if not to:
-                    log.warning("  message with no 'to', dropped")
+                if not valid_id(to):
+                    log.warning("  message with invalid 'to', dropped")
                     continue
                 reached = await deliver(to, msg, exclude=ws)
                 if reached:
@@ -399,7 +418,7 @@ async def handler(ws):
                 if not isinstance(ids, list):
                     log.warning("  announce bad payload, dropped")
                     continue
-                ids     = ids[:10]
+                ids     = [i for i in ids[:10] if valid_id(i)]
                 matched = [i for i in ids if i in connected]
                 for matched_id in matched:
                     await deliver(matched_id, {"type": "seen", "id": last_id()}, exclude=ws)
@@ -410,8 +429,8 @@ async def handler(ws):
                           "token_request", "token_response"):
                 frm = msg.get("from", "?")
                 to  = msg.get("to")
-                if not to:
-                    log.warning("  %s with no 'to', dropped", kind)
+                if not valid_id(to):
+                    log.warning("  %s with invalid 'to', dropped", kind)
                     continue
                 reached = await deliver(to, msg, exclude=ws)
                 log.info("%-12s from=%s  to=%s  reached=%d",
