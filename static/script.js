@@ -1001,18 +1001,11 @@ function handleSignal(msg) {
       renderContactList();
       break;
 
-    case "gone":
-      state.online.delete(msg.id);
-      dotTimestamps[msg.id] = null;
-      mlog.info(`○ GONE         ${pid(msg.id)}`);
-      renderContactList();
-      break;
-
     case "push_restore_request": markOnline(msg.from);		handleRestoreRequest(msg); break;
     case "push_restore_ack":     markOnline(msg.from);		handleRestoreAck(msg);     break;
     case "restore_push":         markOnline(msg.from);		handleRestorePush(msg);    break;
-    case "token_request":  markOnline(msg.from); handleTokenRequest(msg);  break;
-    case "token_response": markOnline(msg.from); handleTokenResponse(msg); break;
+    case "token_request":  		 markOnline(msg.from); 		handleTokenRequest(msg);  break;
+    case "token_response": 		 markOnline(msg.from); 		handleTokenResponse(msg); break;
     case "message":              receiveMessage(msg);       break;
     case "msg_exchange":         markOnline(msg.from);		handleMsgExchange(msg);    break;
     case "backup_offer":         markOnline(msg.from);		handleBackupOffer(msg);    break;
