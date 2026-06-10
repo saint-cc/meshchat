@@ -14,6 +14,7 @@ import uuid
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 import websockets
 from flask import Flask, send_from_directory
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 # ══════════════════════════════════════════
 #   CONFIGURATION
@@ -42,9 +43,6 @@ WS_MAX_SIZE = int(os.environ.get("WS_MAX_SIZE", 2 * 1024 * 1024))   # 2 MB per f
 # ID validation — base64url chars only, 8–64 chars
 _ID_RE = re.compile(r'^[A-Za-z0-9\-_]{8,64}$')
 def valid_id(s): return isinstance(s, str) and bool(_ID_RE.match(s))
-
-# Online presence
-ONLINE_EXPIRY_SECONDS = 300   # prune peers not seen within this window
 
 # Offline buffer — file-based queue for messages to offline clients
 BUF_DIR      = os.environ.get("BUF_DIR",      os.path.join(os.getcwd(), "relay_buf"))
@@ -98,8 +96,15 @@ def short(id_str):
     return id_str[:8] + "…"
 
 def peer_info(ws):
-    try:    return str(ws.remote_address)
-    except: return "unknown"
+    try:
+        headers = ws.request.headers
+        ip = (headers.get("X-Real-IP")
+              or headers.get("X-Forwarded-For", "").split(",")[0].strip()
+              or ws.remote_address[0])
+        return ip
+    except Exception:
+        try:    return str(ws.remote_address)
+        except: return "unknown"
 
 def session_count():
     return sum(len(s) for s in connected.values())
@@ -181,7 +186,7 @@ async def auth_challenge(ws, enc_key_bytes: bytes, bits: int):
         "iv":   list(iv),
         "data": list(ciphertext),
     })
-    log.info("AUTH       challenge sent  bits=%d  peer=%s", bits, ws.remote_address)
+    log.info("AUTH       challenge sent  bits=%d  peer=%s", bits, peer_info(ws))
 
 async def auth_verify(ws, nonce_back: list, addr: str) -> str | None:
     """Verify proof, register identity, flush buffer. Returns public_id or None on failure."""
@@ -503,6 +508,7 @@ def run_http_server():
     http_log.info("HTTP server starting on %s:%d  static=%s", HTTP_HOST, HTTP_PORT, STATIC_DIR)
 
     app = Flask(__name__, static_folder=STATIC_DIR, static_url_path="")
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 
     @app.route("/")
     def index():
