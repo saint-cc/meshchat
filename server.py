@@ -74,6 +74,14 @@ STATS_INTERVAL = 60   # seconds between periodic stat dumps
 # ══════════════════════════════════════════
 
 logging.basicConfig(level=LOG_LEVEL, format=LOG_FORMAT, datefmt=LOG_DATE_FMT)
+
+class _HandshakeFilter(logging.Filter):
+    def filter(self, record):
+        return "opening handshake failed" not in record.getMessage()
+
+logging.getLogger("websockets.server").addFilter(_HandshakeFilter())
+logging.getLogger("websockets.asyncio.server").addFilter(_HandshakeFilter())
+
 log = logging.getLogger("signal")
 
 # ══════════════════════════════════════════
@@ -194,7 +202,7 @@ async def auth_challenge(ws, enc_key_bytes: bytes, bits: int):
         "bits":    bits,
     }
     await send_to(ws, {
-        "type": "auth_challenge",
+        "type": "sig:auth_challenge",
         "bits": bits,
         "iv":   list(iv),
         "data": list(ciphertext),
@@ -209,11 +217,11 @@ async def auth_verify(ws, nonce_back: list, addr: str) -> str | None:
         return None
     if time.monotonic() - entry["ts"] > AUTH_TIMEOUT:
         log.warning("AUTH       challenge expired  peer=%s", addr)
-        await send_to(ws, {"type": "auth_fail", "reason": "timeout"})
+        await send_to(ws, {"type": "sig:auth_fail", "reason": "timeout"})
         return None
     if bytes(nonce_back) != entry["nonce"]:
         log.warning("AUTH       proof mismatch  peer=%s", addr)
-        await send_to(ws, {"type": "auth_fail", "reason": "proof_invalid"})
+        await send_to(ws, {"type": "sig:auth_fail", "reason": "proof_invalid"})
         return None
 
     public_id = derive_public_id(entry["enc_key"])
@@ -222,7 +230,7 @@ async def auth_verify(ws, nonce_back: list, addr: str) -> str | None:
     connected[public_id].add(ws)
     log.info("AUTH OK    id=%s  bits=%d  peer=%s  keys=%d  sessions=%d",
              short(public_id), entry["bits"], addr, unique_keys(), session_count())
-    await send_to(ws, {"type": "auth_ok", "public_id": public_id})
+    await send_to(ws, {"type": "sig:auth_ok", "public_id": public_id})
     await buf_deliver(public_id, ws)
     return public_id
 
@@ -407,24 +415,24 @@ async def handler(ws):
                      fmt_bytes(stats["bytes_out"]))
 
             # ── auth_init: client presents enc key, server sends challenge ──
-            if kind == "auth_init":
+            if kind == "sig:auth_init":
                 enc_key_list = msg.get("enc_key")
                 bits         = msg.get("bits", 256)
                 if not enc_key_list or bits not in (128, 256):
                     log.warning("AUTH       bad auth_init  peer=%s", addr)
-                    await send_to(ws, {"type": "auth_fail", "reason": "bad_init"})
+                    await send_to(ws, {"type": "sig:auth_fail", "reason": "bad_init"})
                     continue
                 enc_key_bytes = bytes(enc_key_list)
                 expected_len  = 16 if bits == 128 else 32
                 if len(enc_key_bytes) != expected_len:
                     log.warning("AUTH       wrong key length  bits=%d  got=%d  peer=%s",
                                 bits, len(enc_key_bytes), addr)
-                    await send_to(ws, {"type": "auth_fail", "reason": "bad_key_length"})
+                    await send_to(ws, {"type": "sig:auth_fail", "reason": "bad_key_length"})
                     continue
                 await auth_challenge(ws, enc_key_bytes, bits)
 
             # ── auth_proof: client returns decrypted nonce ──
-            elif kind == "auth_proof":
+            elif kind == "sig:auth_proof":
                 nonce_back = msg.get("nonce")
                 if not nonce_back:
                     log.warning("AUTH       empty proof  peer=%s", addr)
@@ -434,7 +442,7 @@ async def handler(ws):
                     client_ids.append(public_id)
 
             # ── message: fire and forget — no sender auth required ──
-            elif kind == "message":
+            elif kind == "app:message":
                 frm = msg.get("from", "?")
                 to  = msg.get("to")
                 if not valid_id(to):
@@ -447,7 +455,7 @@ async def handler(ws):
                     buf_write(to, msg)
                     log.info("BUF Q      from=%s  to=%s  (offline)", short(frm), short(to))
 
-            elif kind == "announce":
+            elif kind == "sig:announce":
                 ids = msg.get("ids", [])
                 if not isinstance(ids, list):
                     log.warning("  announce bad payload, dropped")
@@ -455,12 +463,12 @@ async def handler(ws):
                 ids     = [i for i in ids[:10] if valid_id(i)]
                 matched = [i for i in ids if i in connected]
                 for matched_id in matched:
-                    await deliver(matched_id, {"type": "seen", "id": last_id()}, exclude=ws)
+                    await deliver(matched_id, {"type": "sig:seen", "id": last_id()}, exclude=ws)
 
-            elif kind in ("msg_exchange", "backup_offer", "backup_accept",
-                          "backup_push", "push_restore_request",
-                          "push_restore_ack", "restore_push",
-                          "token_request", "token_response"):
+            elif kind in ("app:sync", "sync:backup_offer", "sync:backup_accept",
+                          "sync:backup_push", "sync:restore_req",
+                          "sync:restore_ack", "sync:restore_push",
+                          "sync:token_req", "sync:token_resp"):
                 frm = msg.get("from", "?")
                 to  = msg.get("to")
                 if not valid_id(to):
@@ -473,17 +481,17 @@ async def handler(ws):
             # ── everything below requires at least one authed identity ──
             elif not is_authed():
                 log.warning("UNAUTHED   type=%r  peer=%s  dropped", kind, addr)
-                await send_to(ws, {"type": "auth_fail", "reason": "not_authenticated"})
+                await send_to(ws, {"type": "sig:auth_fail", "reason": "not_authenticated"})
 
-            elif kind == "get_relay_info":
+            elif kind == "sig:relay_req":
                 if RELAY_WSS_URL:
-                    await send_to(ws, {"type": "relay_info", "wss": RELAY_WSS_URL})
+                    await send_to(ws, {"type": "sig:relay_info", "wss": RELAY_WSS_URL})
                     log.info("RELAY_INFO sent to %s", short(last_id()))
                 else:
                     log.debug("RELAY_INFO requested but not configured, skipped")
 
-            elif kind == "ping":
-                await send_to(ws, {"type": "pong"})
+            elif kind == "sig:ping":
+                await send_to(ws, {"type": "sig:pong"})
 
             else:
                 log.warning("UNKNOWN    type=%r  peer=%s  dropped", kind, addr)

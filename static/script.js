@@ -133,21 +133,23 @@ setInterval(pruneOnline, PRUNE_INTERVAL_MS);
    LOGIN NOTICES
 ══════════════════════════════════════════ */
 function setRandomLoginNotice() {
-  const notices = [
-    "<strong>note —</strong> your name and passphrase are your identity.<br>choose something unique. no recovery without them.",
-    "<strong>hint —</strong> messages may arrive later if a device was offline.",
-    "<strong>hint —</strong> you can use multiple devices, but they sync when they meet.<br>no central account storage.",
-    "<strong>hint —</strong> this chat works without a central server.<br>you are part of the network.",
-    "<strong>hint —</strong> some messages may appear in the past.<br>they arrived late, not wrong.",
-    "<strong>hint —</strong> if something seems missing, it may still be syncing.<br>give it a moment.",
-    "<strong>hint —</strong> your contacts live on your device and your network.",
-    "<strong>hint —</strong> there are no accounts to recover.<br>your passphrase is the key.",
-    "<strong>hint —</strong> different devices may briefly show different views.<br>they will converge over time.",
-    "<strong>hint —</strong> this system favors resilience over perfection.<br>it keeps going even when parts are offline.",
-    "<strong>hint —</strong> delays, duplicates or reordering can happen.<br>the system will sort it out.",
-    "<strong>hint —</strong> no central history exists.<br>your devices build their own view over time.",
-    "<strong>hint —</strong> be careful with trust.<br>humans are part of the protocol."
-  ];
+const notices = [
+  "<strong>note —</strong> your name and passphrase are your identity.<br>there are no accounts to recover.",
+  "<strong>hint —</strong> your passphrase is the only way to your identity.<br>choose it carefully.",
+  "<strong>hint —</strong> contacts are stored on your device.<br>your network grows one friend at a time.",
+  "<strong>hint —</strong> relay servers forward encrypted messages.<br>they cannot read what they carry.",
+  "<strong>hint —</strong> your current relay is shared automatically with contacts.<br>moving later is supported.",
+  "<strong>hint —</strong> conversations may update over time.<br>late messages are placed where they belong.",
+  "<strong>hint —</strong> different devices may briefly disagree.<br>they converge as information spreads.",
+  "<strong>hint —</strong> the last activity shown is the last one observed.<br>absence is not proof of absence.",
+  "<strong>hint —</strong> relay servers are temporary meeting places.<br>your identity is independent of any relay.",
+  "<strong>hint —</strong> encrypted peer backups help devices catch up.<br>no central history exists.",
+  "<strong>hint —</strong> resilience comes before immediacy.<br>the network prefers eventual delivery over failure.",
+  "<strong>hint —</strong> your contacts maintain their own view of the network.<br>there is no global directory.",
+  "<strong>hint —</strong> trust people, not servers.<br>servers transport data, they do not define identity.",
+  "<strong>hint —</strong> every message can carry updated relay information.<br>the network repairs itself through conversation.",
+  "<strong>hint —</strong> if something seems missing, don't panic.<br>distributed systems occasionally take the scenic route."
+];
   const el = document.getElementById("loginNotice");
   if (el) el.innerHTML = notices[Math.floor(Math.random() * notices.length)];
 }
@@ -383,7 +385,7 @@ function pollContacts() {
     .filter(id => id !== state.publicId && !state.contacts[id].legacy128)
     .sort(() => Math.random() - 0.5)
     .slice(0, pollBatchSize() - 1);
-  sendSignal({ type: "announce", ids: [state.publicId, ...others] });
+  sendSignal({ type: "sig:announce", ids: [state.publicId, ...others] });
   mlog.debug(`POLL       queried ${1 + others.length} id(s)`);
 }
 
@@ -535,7 +537,7 @@ async function pushBackupToContacts(blob) {
       // self-sync: no negotiation needed, push directly
       try {
         const freshBlob = await encryptObject(state.cryptoKey, serialiseContacts());
-        sendSignal({ type: "backup_push", from: state.publicId, to: id, blob: freshBlob });
+        sendSignal({ type: "sync:backup_push", from: state.publicId, to: id, blob: freshBlob });
         mlog.info(`→ BACKUP_PUSH  to self — sent fresh data`);
       } catch(e) {
         mlog.warn(`→ BACKUP_PUSH  to self — encrypt failed`);
@@ -546,7 +548,7 @@ async function pushBackupToContacts(blob) {
     // estimate wire size before sending
     const size = JSON.stringify(blob).length;
     pendingBackupOffer[id] = { blob, ts: Date.now() };
-    sendSignal({ type: "backup_offer", from: state.publicId, to: id, size });
+    sendSignal({ type: "sync:backup_offer", from: state.publicId, to: id, size });
     mlog.info(`→ BACKUP_OFFER to   ${pid(id)}  size=${size}`);
   }
 }
@@ -557,7 +559,7 @@ function handleBackupOffer(msg) {
   markOnline(msg.from);
   // accept unconditionally — a constrained peer would simply not implement this handler
   mlog.info(`← BACKUP_OFFER from ${pid(msg.from)}  size=${msg.size} — accepting`);
-  sendSignal({ type: "backup_accept", from: state.publicId, to: msg.from });
+  sendSignal({ type: "sync:backup_accept", from: state.publicId, to: msg.from });
 }
 
 function handleBackupAccept(msg) {
@@ -574,7 +576,7 @@ function handleBackupAccept(msg) {
     return;
   }
   delete pendingBackupOffer[msg.from];
-  sendSignal({ type: "backup_push", from: state.publicId, to: msg.from, blob: pending.blob });
+  sendSignal({ type: "sync:backup_push", from: state.publicId, to: msg.from, blob: pending.blob });
   mlog.info(`→ BACKUP_PUSH  to   ${pid(msg.from)} — accepted`);
 }
 
@@ -616,7 +618,7 @@ async function handleBackupPush(msg) {
 
   // token exchange — one time only
   if (!state.peerTokens[msg.from]) {
-    sendSignal({ type: "token_request", from: state.publicId, to: msg.from });
+    sendSignal({ type: "sync:token_req", from: state.publicId, to: msg.from });
     mlog.info(`→ TOKEN_REQ    to   ${pid(msg.from)} — no token yet`);
   }
 }
@@ -632,7 +634,7 @@ async function handleTokenRequest(msg) {
     shareableKey: contact.shareableKey,
     date:        Date.now(),
   });
-  const tokenRespObj = { type: "token_response", from: state.publicId, to: msg.from, token };
+  const tokenRespObj = { type: "sync:token_resp", from: state.publicId, to: msg.from, token };
   const viaRelayResp = sendToRelay(msg.from, tokenRespObj, false);
   if (!viaRelayResp) sendSignal(tokenRespObj);
   mlog.info(`→ TOKEN_RESP   to   ${pid(msg.from)}  via=${viaRelayResp ? "relay" : "signal(fallback)"}`);
@@ -669,7 +671,7 @@ async function sendRestoreRequest(id) {
     signPublicKey: rawToBase64(state.contacts[state.publicId]?.signPublicKey),
   });
   const token = state.peerTokens[id] || null;
-  const reqObj = { type: "push_restore_request", from: state.publicId, to: id, blob, ...(token ? { token } : {}) };
+  const reqObj = { type: "sync:restore_req", from: state.publicId, to: id, blob, ...(token ? { token } : {}) };
   const viaRelay = sendToRelay(id, reqObj, true);
   if (!viaRelay) sendSignal(reqObj);
   mlog.info(`→ RESTORE_REQ  to   ${pid(id)}${token ? "  +token" : ""}  via=${viaRelay ? "relay" : "signal(fallback)"}`);  
@@ -735,7 +737,7 @@ async function handleRestoreRequest(msg) {
   }
 
   // send ack — cross domain if we have their wss
-  const ackObj = { type: "push_restore_ack", from: state.publicId, to: msg.from };
+  const ackObj = { type: "sync:restore_ack", from: state.publicId, to: msg.from };
   const senderWss = plain.wss || state.contacts[msg.from]?.lastRelay || null;
   let ackSent = false;
   if (senderWss) {
@@ -759,7 +761,7 @@ async function handleRestoreAck(msg) {
 
   if (msg.from === state.publicId) {
     const freshBlob = await encryptObject(state.cryptoKey, serialiseContacts());
-    sendSignal({ type: "restore_push", from: state.publicId, to: msg.from, blob: freshBlob });
+    sendSignal({ type: "sync:restore_push", from: state.publicId, to: msg.from, blob: freshBlob });
     mlog.info(`← RESTORE_ACK  from self — sending fresh data`);
     return;
   }
@@ -770,7 +772,7 @@ async function handleRestoreAck(msg) {
     return;
   }
   mlog.info(`← RESTORE_ACK  from ${pid(msg.from)} — sending restore_push`);
-  sendSignal({ type: "restore_push", from: state.publicId, to: msg.from, blob: backup });
+  sendSignal({ type: "sync:restore_push", from: state.publicId, to: msg.from, blob: backup });
 }
 
 async function handleRestorePush(msg) {
@@ -823,7 +825,7 @@ function initiateExchange(contactId) {
     return;
   }
   if (state.contacts[contactId]?.blocked) return;
-  sendSignal({ type: "msg_exchange", from: state.publicId, to: contactId, msgs: getLast(contactId), reply: false });
+  sendSignal({ type: "app:sync", from: state.publicId, to: contactId, msgs: getLast(contactId), reply: false });
   mlog.info(`→ SYNC         to   ${pid(contactId)}`);
   setSyncStatus("syncing…");
 }
@@ -835,7 +837,7 @@ async function handleMsgExchange(msg) {
   if (!msg.reply) {
     mlog.info(`← SYNC_REQ     from ${pid(msg.from)} — replying`);
     const pending = msg.msgs || [];
-    sendSignal({ type: "msg_exchange", from: state.publicId, to: msg.from, msgs: getLast(msg.from), reply: true });
+    sendSignal({ type: "app:sync", from: state.publicId, to: msg.from, msgs: getLast(msg.from), reply: true });
     const before = contact.messages.length;
     contact.messages = mergeMessages(contact.messages, pending);
     mlog.debug(`SYNC merge +${contact.messages.length - before} msgs from ${pid(msg.from)}`);
@@ -883,7 +885,7 @@ function startAuth() {
   if (state.encKey128 && state.publicId128) {
     authState.step = "await_challenge_128";
     state.ws.send(JSON.stringify({
-      type:    "auth_init",
+      type:    "sig:auth_init",
       bits:    128,
       enc_key: Array.from(base64ToRaw(state.shareableKey128.split(".")[0])),
     }));
@@ -896,7 +898,7 @@ function startAuth() {
 function startAuth256() {
   authState.step = "await_challenge_256";
   state.ws.send(JSON.stringify({
-    type:    "auth_init",
+    type:    "sig:auth_init",
     bits:    256,
     enc_key: Array.from(base64ToRaw(state.shareableKey.split(".")[0])),
   }));
@@ -911,7 +913,7 @@ async function handleAuthChallenge(msg) {
     const encKey     = bits === 128 ? state.encKey128 : state.encKey;
     const plainBytes = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, encKey, data);
     const nonce      = Array.from(new Uint8Array(plainBytes));
-    state.ws.send(JSON.stringify({ type: "auth_proof", nonce }));
+    state.ws.send(JSON.stringify({ type: "sig:auth_proof", nonce }));
     mlog.info(`AUTH       proof sent  bits=${bits}`);
   } catch(e) {
     mlog.err(`AUTH       decrypt failed bits=${bits}: ${e.message}`);
@@ -930,7 +932,7 @@ function handleAuthOk(msg) {
   // 256-bit done — fully authenticated, run post-connect flow
   authState.step = "done";
   setConnected(true);
-  state.ws.send(JSON.stringify({ type: "get_relay_info" }));
+  state.ws.send(JSON.stringify({ type: "sig:relay_req" }));
   pollContacts();
   schedulePoll();
   // Re-open persistent relay connections for 128-bit contacts
@@ -951,10 +953,10 @@ let sessionFresh = true;
 
 function handleSignal(msg) {
   switch(msg.type) {
-    case "auth_challenge": handleAuthChallenge(msg); break;
-    case "auth_ok":        handleAuthOk(msg);        break;
-    case "auth_fail":      handleAuthFail(msg);      break;
-    case "relay_info":
+    case "sig:auth_challenge": handleAuthChallenge(msg); break;
+    case "sig:auth_ok":        handleAuthOk(msg);        break;
+    case "sig:auth_fail":      handleAuthFail(msg);      break;
+    case "sig:relay_info":
       if (state.contacts[state.publicId]) {
         const me = state.contacts[state.publicId];
         if (msg.wss)   me.lastRelay      = msg.wss;
@@ -979,38 +981,38 @@ function handleSignal(msg) {
       }
       break;
 
-    case "seen":
+    case "sig:seen":
       mlog.debug(`SIG seen       ${pid(msg.id)}`);
       if (msg.id === state.publicId) {
         markOnline(msg.id);
         if (sessionFresh) {
-          sendSignal({ type: "push_restore_ack", from: state.publicId, to: state.publicId });
+          sendSignal({ type: "sync:restore_ack", from: state.publicId, to: state.publicId });
           mlog.info(`→ RESTORE_ACK  to self — fresh start, skipping handshake`);
         }
       } else if (state.contacts[msg.id]) {
         markOnline(msg.id);
         if (canRestore(msg.id)) sendRestoreRequest(msg.id);
         if (sessionFresh) {
-          sendSignal({ type: "push_restore_ack", from: state.publicId, to: msg.id });
+          sendSignal({ type: "sync:restore_ack", from: state.publicId, to: msg.id });
           mlog.info(`→ RESTORE_ACK  to   ${pid(msg.id)} — fresh, asking for peer backup`);
         }
       } else if (sessionFresh) {
-        sendSignal({ type: "push_restore_ack", from: state.publicId, to: msg.id });
+        sendSignal({ type: "sync:restore_ack", from: state.publicId, to: msg.id });
         mlog.info(`→ RESTORE_ACK  to   ${pid(msg.id)} — fresh, asking for peer backup`);
       }
       renderContactList();
       break;
 
-    case "push_restore_request": markOnline(msg.from);		handleRestoreRequest(msg); break;
-    case "push_restore_ack":     markOnline(msg.from);		handleRestoreAck(msg);     break;
-    case "restore_push":         markOnline(msg.from);		handleRestorePush(msg);    break;
-    case "token_request":  		 markOnline(msg.from); 		handleTokenRequest(msg);  break;
-    case "token_response": 		 markOnline(msg.from); 		handleTokenResponse(msg); break;
-    case "message":              receiveMessage(msg);       break;
-    case "msg_exchange":         markOnline(msg.from);		handleMsgExchange(msg);    break;
-    case "backup_offer":         markOnline(msg.from);		handleBackupOffer(msg);    break;
-    case "backup_accept":        markOnline(msg.from);		handleBackupAccept(msg);   break;
-    case "backup_push":          markOnline(msg.from);		handleBackupPush(msg);     break;
+    case "sync:restore_req": markOnline(msg.from);		handleRestoreRequest(msg); break;
+    case "sync:restore_ack":     markOnline(msg.from);		handleRestoreAck(msg);     break;
+    case "sync:restore_push":         markOnline(msg.from);		handleRestorePush(msg);    break;
+    case "sync:token_req":  		 markOnline(msg.from); 		handleTokenRequest(msg);  break;
+    case "sync:token_resp": 		 markOnline(msg.from); 		handleTokenResponse(msg); break;
+    case "app:message":              receiveMessage(msg);       break;
+    case "app:sync":         markOnline(msg.from);		handleMsgExchange(msg);    break;
+    case "sync:backup_offer":         markOnline(msg.from);		handleBackupOffer(msg);    break;
+    case "sync:backup_accept":        markOnline(msg.from);		handleBackupAccept(msg);   break;
+    case "sync:backup_push":          markOnline(msg.from);		handleBackupPush(msg);     break;
 
     default: mlog.debug(`SIG unknown type=${msg.type}`);
   }
@@ -1019,7 +1021,7 @@ function handleSignal(msg) {
 function sendSignal(obj) {
   if (state.ws?.readyState === WebSocket.OPEN) state.ws.send(JSON.stringify(obj));
   // piggyback protocol traffic on open relay connections — never opens one, never resets timer
-  if (obj.to && obj.type !== "message") sendToRelay(obj.to, obj, false);
+  if (obj.to && obj.type !== "app:message") sendToRelay(obj.to, obj, false);
 }
 
 /* ══════════════════════════════════════════
@@ -1266,7 +1268,7 @@ async function sendImageMessage(file) {
       const encBlob = await encryptObject(state.encKey, { data: base64, mimeType });
       imageCache[id] = { encBlob, mimeType };
 
-      const imgMsgObj  = { type: "message", from: state.publicId,
+      const imgMsgObj  = { type: "app:message", from: state.publicId,
                    to: state.currentChat, blob: encrypted, sig };
       const viaRelayImg = sendToRelay(state.currentChat, imgMsgObj, true);
       if (!viaRelayImg) sendSignal(imgMsgObj);
@@ -1304,7 +1306,7 @@ async function sendAudioMessage(blob) {
     const encBlob = await encryptObject(state.encKey, { data: base64, mimeType });
     audioCache[id] = { encBlob, mimeType };
 
-    const audioMsgObj = { type: "message", from: state.publicId,
+    const audioMsgObj = { type: "app:message", from: state.publicId,
                  to: state.currentChat, blob: encrypted, sig };
     const viaRelayAud  = sendToRelay(state.currentChat, audioMsgObj, true);
     if (!viaRelayAud) sendSignal(audioMsgObj);
@@ -1423,7 +1425,7 @@ async function sendMessage() {
     sig  = await signBlob(blob);
   }
 
-  const msgObj = { type: "message", from: fromId, to: contact.publicId, blob, ...(sig ? { sig } : {}) };
+  const msgObj = { type: "app:message", from: fromId, to: contact.publicId, blob, ...(sig ? { sig } : {}) };
   const viaRelay = sendToRelay(state.currentChat, msgObj, true);
   if (!viaRelay) sendSignal(msgObj);
   contact.messages.push({ id, from: fromId, text, ts, valid: true });
@@ -1453,7 +1455,7 @@ async function sendReaction(targetMsgId, emoji) {
   const blob     = await encryptMessage(contact.encKey, payload);
   const sig      = await signBlob(blob);
 
-  const reactMsgObj = { type: "message", from: state.publicId, to: state.currentChat, blob, sig };
+  const reactMsgObj = { type: "app:message", from: state.publicId, to: state.currentChat, blob, sig };
   const viaRelayReact = sendToRelay(state.currentChat, reactMsgObj, true);
   if (!viaRelayReact) sendSignal(reactMsgObj);
   const msgObj = { id, from: state.publicId, type: "reaction", targetId: targetMsgId, emoji, ts, valid: true };
