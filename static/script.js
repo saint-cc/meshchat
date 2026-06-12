@@ -377,6 +377,24 @@ function linkify(text) {
   });
 }
 
+function pollBatchSize() {
+  return Math.min(10, Math.max(3, Math.round(Object.keys(state.contacts).length * 0.1)));
+}
+
+function pollContacts() {
+  const others = Object.keys(state.contacts)
+    .filter(id => id !== state.publicId && !state.contacts[id].legacy128)
+    .sort(() => Math.random() - 0.5)
+    .slice(0, pollBatchSize() - 1);
+  sendSignal({ type: "sig:announce", ids: [state.publicId, ...others] });
+  mlog.debug(`POLL       queried ${1 + others.length} id(s)`);
+}
+
+function schedulePoll() {
+  const jitter = (Math.random() - 0.5) * POLL_JITTER_MS;
+  setTimeout(() => { pollContacts(); schedulePoll(); }, POLL_INTERVAL_MS + jitter);
+}
+
 /* ══════════════════════════════════════════
    STORAGE
    Audio messages are stripped of their data
