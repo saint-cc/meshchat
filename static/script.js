@@ -10,6 +10,7 @@
    NOTE: deliberately NOT named short() to avoid
          collision with the url-truncation var in linkify().
 ═══════════════════════════════════════════════════════════════ */
+const VERSION            = "0.3.0";
 const LOG_MAX_LINES      = 20;
 const LOG_CLEAR_INTERVAL = 5 * 60 * 1000;
 
@@ -374,24 +375,6 @@ function linkify(text) {
       return `<a href="${url}" target="_blank" rel="noopener noreferrer">${short_url}</a>`;
     } catch { return url; }
   });
-}
-
-function pollBatchSize() {
-  return Math.min(10, Math.max(3, Math.round(Object.keys(state.contacts).length * 0.1)));
-}
-
-function pollContacts() {
-  const others = Object.keys(state.contacts)
-    .filter(id => id !== state.publicId && !state.contacts[id].legacy128)
-    .sort(() => Math.random() - 0.5)
-    .slice(0, pollBatchSize() - 1);
-  sendSignal({ type: "sig:announce", ids: [state.publicId, ...others] });
-  mlog.debug(`POLL       queried ${1 + others.length} id(s)`);
-}
-
-function schedulePoll() {
-  const jitter = (Math.random() - 0.5) * POLL_JITTER_MS;
-  setTimeout(() => { pollContacts(); schedulePoll(); }, POLL_INTERVAL_MS + jitter);
 }
 
 /* ══════════════════════════════════════════
@@ -932,7 +915,7 @@ function handleAuthOk(msg) {
   // 256-bit done — fully authenticated, run post-connect flow
   authState.step = "done";
   setConnected(true);
-  state.ws.send(JSON.stringify({ type: "sig:relay_req" }));
+  state.ws.send(JSON.stringify({ type: "sig:relay_req", version: VERSION }));
   pollContacts();
   schedulePoll();
   // Re-open persistent relay connections for 128-bit contacts
@@ -957,6 +940,7 @@ function handleSignal(msg) {
     case "sig:auth_ok":        handleAuthOk(msg);        break;
     case "sig:auth_fail":      handleAuthFail(msg);      break;
     case "sig:relay_info":
+      if (msg.version) mlog.info(`RELAY_INFO server=${msg.version}  client=${VERSION}${msg.version !== VERSION ? "  ⚠ version mismatch" : ""}`);
       if (state.contacts[state.publicId]) {
         const me = state.contacts[state.publicId];
         if (msg.wss)   me.lastRelay      = msg.wss;

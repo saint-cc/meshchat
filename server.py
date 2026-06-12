@@ -20,6 +20,9 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 #   CONFIGURATION
 # ══════════════════════════════════════════
 
+# Version
+VERSION = "0.3.0"
+
 # HTTP server
 HTTP_HOST  = "0.0.0.0"
 HTTP_PORT  = int(os.environ.get("HTTP_PORT", 8000))
@@ -74,14 +77,6 @@ STATS_INTERVAL = 60   # seconds between periodic stat dumps
 # ══════════════════════════════════════════
 
 logging.basicConfig(level=LOG_LEVEL, format=LOG_FORMAT, datefmt=LOG_DATE_FMT)
-
-class _HandshakeFilter(logging.Filter):
-    def filter(self, record):
-        return "opening handshake failed" not in record.getMessage()
-
-logging.getLogger("websockets.server").addFilter(_HandshakeFilter())
-logging.getLogger("websockets.asyncio.server").addFilter(_HandshakeFilter())
-
 log = logging.getLogger("signal")
 
 # ══════════════════════════════════════════
@@ -484,11 +479,12 @@ async def handler(ws):
                 await send_to(ws, {"type": "sig:auth_fail", "reason": "not_authenticated"})
 
             elif kind == "sig:relay_req":
+                client_version = msg.get("version", "0.2.9")
                 if RELAY_WSS_URL:
-                    await send_to(ws, {"type": "sig:relay_info", "wss": RELAY_WSS_URL})
-                    log.info("RELAY_INFO sent to %s", short(last_id()))
+                    await send_to(ws, {"type": "sig:relay_info", "wss": RELAY_WSS_URL, "version": VERSION})
+                    log.info("RELAY_INFO sent to %s  client=%s  server=%s", short(last_id()), client_version, VERSION)
                 else:
-                    log.debug("RELAY_INFO requested but not configured, skipped")
+                    log.info("RELAY_INFO client=%s  server=%s  (no relay configured)", client_version, VERSION)
 
             elif kind == "sig:ping":
                 await send_to(ws, {"type": "sig:pong"})
