@@ -12,8 +12,8 @@ A decentralised, encrypted messaging protocol built on WebSocket relay servers. 
 
 **Relays** are WebSocket servers that route packets between clients. A relay has no knowledge of message contents. Clients choose which relay to use. Relays are interoperable — clients on different relays communicate directly.
 
-**Authentication** gates receiving, not sending. A client must prove possession of their encryption key before the relay registers them for routing or delivers buffered messages. Sending is fire-and-forget and requires no auth.
-
+**Authentication** gates both sending and receiving. A client must prove possession of their encryption key before the relay accepts any messages from them or registers them for inbound routing. The from field of any app:message must match an identity already proven on that socket.
+When connecting to a foreign relay to send, the client runs the same challenge-response handshake before any messages are transmitted. The queue is held until auth completes, then flushed.
 ---
 
 ## Identity and Key Derivation
@@ -229,38 +229,45 @@ On reconnect and successful auth, the relay flushes all buffered packets oldest-
 ## Signal Server Protocol
 
 ### Client → Server
-
 | Type | Fields | Auth required | Description |
 |---|---|---|---|
-| `auth_init`            | `enc_key`, `bits`           | no  | Begin challenge-response |
-| `auth_proof`           | `nonce`                     | no  | Return decrypted nonce |
-| `message`              | `from`, `to`, `blob`, `sig` | no  | Fire-and-forget delivery |
-| `get_relay_info`       | —                           | yes | Request relay's own WSS URL |
-| `announce`             | `ids[]`                     | yes | Check local presence of up to 10 IDs |
-| `msg_exchange`         | `from`, `to`, `msgs[]`, `reply` | yes | Manual sync exchange |
-| `backup_offer`         | `from`, `to`, `size`        | yes | Offer backup blob to peer |
-| `backup_accept`        | `from`, `to`                | yes | Accept a backup offer |
-| `backup_push`          | `from`, `to`, `blob`        | yes | Push backup blob to peer |
-| `push_restore_request` | `from`, `to`, `blob`        | yes | Request peer send their stored backup |
-| `push_restore_ack`     | `from`, `to`                | yes | Acknowledge restore request |
-| `restore_push`         | `from`, `to`, `blob`        | yes | Push stored backup to requester |
-| `token_request`        | `from`, `to`                | yes | Request a contact token |
-| `token_response`       | `from`, `to`, `token`       | yes | Deliver a contact token |
-| `ping`                 | —                           | yes | Keepalive |
+| `sig:auth_init`        | `enc_key`, `bits`               | no  | Begin challenge-response |
+| `sig:auth_proof`       | `nonce`                         | no  | Return decrypted nonce |
+| `sig:announce`         | `ids[]`                         | no  | Check local presence of up to 10 IDs |
+| `app:message`          | `from`, `to`, `blob`, `sig`     | yes | Deliver message — `from` must match authed identity on this socket |
+| `app:sync`             | `from`, `to`, `msgs[]`, `reply` | no  | Manual sync exchange |
+| `sync:backup_offer`    | `from`, `to`, `size`            | no  | Offer backup blob to peer |
+| `sync:backup_accept`   | `from`, `to`                    | no  | Accept a backup offer |
+| `sync:backup_push`     | `from`, `to`, `blob`            | no  | Push backup blob to peer |
+| `sync:restore_req`     | `from`, `to`, `blob`            | no  | Request peer send their stored backup |
+| `sync:restore_ack`     | `from`, `to`                    | no  | Acknowledge restore request |
+| `sync:restore_push`    | `from`, `to`, `blob`            | no  | Push stored backup to requester |
+| `sync:token_req`       | `from`, `to`                    | no  | Request a contact token |
+| `sync:token_resp`      | `from`, `to`, `token`           | no  | Deliver a contact token |
+| `sig:relay_req`        | —                               | yes | Request relay's own WSS URL |
+| `sig:ping`             | —                               | yes | Keepalive |
 
 ### Server → Client
-
 | Type | Fields | Description |
 |---|---|---|
-| `auth_challenge` | `bits`, `iv`, `data`  | Encrypted nonce for client to decrypt |
-| `auth_ok`        | `public_id`           | Auth succeeded, routing active |
-| `auth_fail`      | `reason`              | Auth failed |
-| `relay_info`     | `wss`                 | Relay's own WSS URL |
-| `seen`           | `id`                  | A queried ID is locally connected |
-| `pong`           | —                     | Keepalive response |
-| `error`          | `reason`              | Protocol error (e.g. rate limited) |
+| `sig:auth_challenge` | `bits`, `iv`, `data` | Encrypted nonce for client to decrypt |
+| `sig:auth_ok`        | `public_id`          | Auth succeeded, routing active |
+| `sig:auth_fail`      | `reason`             | Auth failed or unauthed packet dropped |
+| `sig:relay_info`     | `wss`                | Relay's own WSS URL |
+| `sig:seen`           | `id`                 | A queried ID is locally connected |
+| `sig:pong`           | —                    | Keepalive response |
+| `error`              | `reason`             | Protocol error (e.g. rate limited, not_authenticated) |
 
-All other packet types are routed by `to` field and delivered to all authenticated sessions for that publicId.
+### Notes
+- `app:message` is the only type that requires auth AND validates `from` ∈ `client_ids` on the socket.
+  All other types that require auth (`sig:relay_req`, `sig:ping`) only require the socket to be authed,
+  not a matching `from`.
+- Sync and backup types are intentionally unauthenticated — they are e2e encrypted and
+  routed by the server without inspection.
+- When connecting to a foreign relay to send, the client runs the same challenge-response
+  handshake before transmitting. The outbound queue is held until auth completes.
+- `sig:announce` is unauthenticated to allow presence probing before auth completes.
+
 
 ---
 
