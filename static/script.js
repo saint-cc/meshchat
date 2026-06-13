@@ -1433,7 +1433,7 @@ async function receiveMessage(msg) {
     if (msgObj.type === "reaction") {
       contact.messages = mergeMessages(contact.messages, [msgObj]);
     } else {
-      contact.messages.push(msgObj);
+      contact.messages = mergeMessages(contact.messages, [msgObj]);
       if (state.currentChat !== msg.from) {
         state.unread[msg.from] = (state.unread[msg.from] || 0) + 1;
       }
@@ -1446,6 +1446,15 @@ async function receiveMessage(msg) {
     console.warn("message decrypt failed", e);
     mlog.err(`← MSG          from ${pid(msg.from)} — decrypt failed`);
   }
+}
+
+async function pushMiniBackup(contactId) {
+  const contact = state.contacts[contactId];
+  if (!contact) return;
+  const slim = { [contactId]: { ...serialiseContacts()[contactId] } };
+  const blob = await encryptObject(state.cryptoKey, slim);
+  sendSignal({ type: "sync:backup_push", from: state.publicId, to: state.publicId, blob });
+  mlog.info(`→ MINI_BACKUP  to self  contact=${pid(contactId)}`);
 }
 
 async function sendMessage() {
@@ -1478,6 +1487,7 @@ async function sendMessage() {
   await saveContacts();
   input.value = "";
   renderMessages();
+  pushMiniBackup(contact.publicId);
 }
 
 /* ══════════════════════════════════════════
@@ -2015,7 +2025,22 @@ function contactAction(action) {
     relayInput.value        = c.lastRelay || "";
     relayInput.autocomplete = "off";
     relayInput.spellcheck   = false;
+    relayInput.setAttribute("list", "relayDatalist");
     body.appendChild(relayInput);
+
+    // datalist — unique WSS values collected from all contacts
+    const datalist = document.createElement("datalist");
+    datalist.id = "relayDatalist";
+    const knownRelays = new Set();
+    for (const contact of Object.values(state.contacts)) {
+      if (contact.lastRelay && !knownRelays.has(contact.lastRelay)) {
+        knownRelays.add(contact.lastRelay);
+        const opt = document.createElement("option");
+        opt.value = contact.lastRelay;
+        datalist.appendChild(opt);
+      }
+    }
+    body.appendChild(datalist);
 
     btns.innerHTML = '<button class="btn-cancel" onclick="closeContactAction()">CANCEL</button>' +
                      '<button class="btn-confirm" id="contactActionConfirm">SAVE</button>';
