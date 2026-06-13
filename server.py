@@ -20,9 +20,6 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 #   CONFIGURATION
 # ══════════════════════════════════════════
 
-# Version
-VERSION = "0.3.0"
-
 # HTTP server
 HTTP_HOST  = "0.0.0.0"
 HTTP_PORT  = int(os.environ.get("HTTP_PORT", 8000))
@@ -77,6 +74,14 @@ STATS_INTERVAL = 60   # seconds between periodic stat dumps
 # ══════════════════════════════════════════
 
 logging.basicConfig(level=LOG_LEVEL, format=LOG_FORMAT, datefmt=LOG_DATE_FMT)
+
+class _HandshakeFilter(logging.Filter):
+    def filter(self, record):
+        return "opening handshake failed" not in record.getMessage()
+
+logging.getLogger("websockets.server").addFilter(_HandshakeFilter())
+logging.getLogger("websockets.asyncio.server").addFilter(_HandshakeFilter())
+
 log = logging.getLogger("signal")
 
 # ══════════════════════════════════════════
@@ -436,12 +441,21 @@ async def handler(ws):
                 if public_id:
                     client_ids.append(public_id)
 
-            # ── message: fire and forget — no sender auth required ──
+            # ── everything below requires at least one authed identity ──
+            elif not is_authed():
+                log.warning("UNAUTHED   type=%r  peer=%s  dropped", kind, addr)
+                await send_to(ws, {"type": "sig:auth_fail", "reason": "not_authenticated"})
+
+            # ── message: from must match an authed identity on this socket ──
             elif kind == "app:message":
                 frm = msg.get("from", "?")
                 to  = msg.get("to")
                 if not valid_id(to):
                     log.warning("  message with invalid 'to', dropped")
+                    continue
+                if frm not in client_ids:
+                    log.warning("MESSAGE    from=%s  not authed  peer=%s  dropped", short(frm), addr)
+                    await send_to(ws, {"type": "error", "reason": "not_authenticated"})
                     continue
                 reached = await deliver(to, msg, exclude=ws)
                 if reached:
@@ -479,12 +493,11 @@ async def handler(ws):
                 await send_to(ws, {"type": "sig:auth_fail", "reason": "not_authenticated"})
 
             elif kind == "sig:relay_req":
-                client_version = msg.get("version", "0.2.9")
                 if RELAY_WSS_URL:
-                    await send_to(ws, {"type": "sig:relay_info", "wss": RELAY_WSS_URL, "version": VERSION})
-                    log.info("RELAY_INFO sent to %s  client=%s  server=%s", short(last_id()), client_version, VERSION)
+                    await send_to(ws, {"type": "sig:relay_info", "wss": RELAY_WSS_URL})
+                    log.info("RELAY_INFO sent to %s", short(last_id()))
                 else:
-                    log.info("RELAY_INFO client=%s  server=%s  (no relay configured)", client_version, VERSION)
+                    log.debug("RELAY_INFO requested but not configured, skipped")
 
             elif kind == "sig:ping":
                 await send_to(ws, {"type": "sig:pong"})

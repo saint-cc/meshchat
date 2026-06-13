@@ -5,17 +5,20 @@ Decentralised, end-to-end encrypted messaging built around cryptographic identit
 
 No registration. No central identity provider. No plaintext.
 
-Messages are encrypted in the browser before they leave your device. Relay servers transport and temporarily buffer ciphertext, but never possess your private keys or message contents.
+Messages are encrypted in the browser before they leave your device. Relay servers transport and temporarily buffer ciphertext, 
+but never possess your private keys or message contents.
 
 ---
 
 ## How it works
 
-Your identity is derived locally from your username and passphrase using PBKDF2 + HKDF. The same credentials always produce the same cryptographic identity.
+Your identity is derived locally from your username and passphrase using PBKDF2 + HKDF. The same credentials always produce 
+the same cryptographic identity.
 
 There are no accounts to create and no passwords stored on any server. Your passphrase **is** your identity.
 
-Contacts are added by exchanging a shareable address (QR code or copy-paste). This contains your encryption public key, signing public key and current relay address. No registration or central directory is required.
+Contacts are added by exchanging a shareable address (QR code or copy-paste). This contains your encryption public key, 
+signing public key and current relay address. No registration or central directory is required.
 
 Messages are encrypted with AES-256-GCM for the recipient and signed with Ed25519 before leaving your device.
 
@@ -148,9 +151,11 @@ The client files (`index.html`, `style.css`, `script.js`, `manifest.json`, `sw.j
 
 ## Relay authentication
 
-When a client connects, the relay authenticates the session by verifying ownership of the presented public key through a challenge-response exchange.
+When a client connects, the relay authenticates the session by verifying ownership of the presented public key through 
+a challenge-response exchange.
 
-This allows the relay to associate active connections and offline message buffers with authenticated identities without ever learning private keys or passphrases.
+This allows the relay to associate active connections and offline message buffers with authenticated identities without ever 
+learning private keys or passphrases.
 
 Relay authentication protects against identity spoofing while preserving end-to-end encryption.
 
@@ -160,11 +165,13 @@ Relay authentication protects against identity spoofing while preserving end-to-
 
 MeshChat separates **transport** from **trust**.
 
-Relay servers are intentionally simple transport nodes. They forward ciphertext, temporarily buffer encrypted messages for offline users, and authenticate ownership of public identities during connection.
+Relay servers are intentionally simple transport nodes. They forward ciphertext, temporarily buffer encrypted messages for 
+offline users, and authenticate ownership of public identities during connection.
 
 Trust resides entirely in cryptographic identities generated locally by each client.
 
-There is no global directory, no relay-to-relay communication and no central authority coordinating the network. Contacts learn each other's current relay location directly, allowing identities to migrate between relays while remaining reachable.
+There is no global directory, no relay-to-relay communication and no central authority coordinating the network. Contacts 
+learn each other's current relay location directly, allowing identities to migrate between relays while remaining reachable.
 
 ---
 

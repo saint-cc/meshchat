@@ -10,7 +10,6 @@
    NOTE: deliberately NOT named short() to avoid
          collision with the url-truncation var in linkify().
 ═══════════════════════════════════════════════════════════════ */
-const VERSION            = "0.3.0";
 const LOG_MAX_LINES      = 20;
 const LOG_CLEAR_INTERVAL = 5 * 60 * 1000;
 
@@ -933,7 +932,7 @@ function handleAuthOk(msg) {
   // 256-bit done — fully authenticated, run post-connect flow
   authState.step = "done";
   setConnected(true);
-  state.ws.send(JSON.stringify({ type: "sig:relay_req", version: VERSION }));
+  state.ws.send(JSON.stringify({ type: "sig:relay_req" }));
   pollContacts();
   schedulePoll();
   // Re-open persistent relay connections for 128-bit contacts
@@ -958,7 +957,6 @@ function handleSignal(msg) {
     case "sig:auth_ok":        handleAuthOk(msg);        break;
     case "sig:auth_fail":      handleAuthFail(msg);      break;
     case "sig:relay_info":
-      if (msg.version) mlog.info(`RELAY_INFO server=${msg.version}  client=${VERSION}${msg.version !== VERSION ? "  ⚠ version mismatch" : ""}`);
       if (state.contacts[state.publicId]) {
         const me = state.contacts[state.publicId];
         if (msg.wss)   me.lastRelay      = msg.wss;
@@ -1062,11 +1060,11 @@ function getOrOpenRelayConn(url, messageOnly) {
 
   if (!hostname) return null;
 
-  if (url ===  state.contacts[state.publicId].lastRelay) {
+  if (url === state.contacts[state.publicId].lastRelay) {
     mlog.info(`RELAY      local relay, using signal directly`);
     return null;
   }
-  
+
   // only reuse connections WE opened — never piggyback on inbound
   if (relayConns[hostname]?.outbound) return relayConns[hostname];
   if (relayConns[hostname] && !relayConns[hostname].outbound) {
@@ -1076,7 +1074,7 @@ function getOrOpenRelayConn(url, messageOnly) {
 
   if (!messageOnly) return null;   // don't open for protocol traffic
 
-  const entry = { ws: null, timer: null, queue: [], ready: false, outbound: true };
+  const entry = { ws: null, timer: null, queue: [], ready: false, outbound: true, authStep: "idle", authBits: 256 };
   relayConns[hostname] = entry;
 
   // connection timeout — if not open within 5s, give up and fall back
@@ -1093,14 +1091,58 @@ function getOrOpenRelayConn(url, messageOnly) {
 
     ws.onopen = () => {
       clearTimeout(connectTimeout);
-      entry.ready = true;
-      mlog.info(`RELAY      open  host=${hostname}`);
-      entry.queue.forEach(raw => ws.send(raw));
-      entry.queue = [];
+      // 128-bit persistent connections auth with the 128-bit identity,
+      // all other relay connections auth with the 256-bit identity
+      const bits   = entry.persistent ? 128 : 256;
+      const encKey = bits === 128
+        ? Array.from(base64ToRaw(state.shareableKey128.split(".")[0]))
+        : Array.from(base64ToRaw(state.shareableKey.split(".")[0]));
+      entry.authStep = "await_challenge";
+      entry.authBits = bits;
+      ws.send(JSON.stringify({ type: "sig:auth_init", bits, enc_key: encKey }));
+      mlog.info(`RELAY      open, authing ${bits}-bit  host=${hostname}`);
     };
 
-    ws.onmessage = (evt) => {
-      try { handleSignal(JSON.parse(evt.data)); } catch(e) {}
+    ws.onmessage = async (evt) => {
+      try {
+        const msg = JSON.parse(evt.data);
+
+        // ── auth challenge ──
+        if (entry.authStep === "await_challenge" && msg.type === "sig:auth_challenge") {
+          const iv         = new Uint8Array(msg.iv);
+          const data       = new Uint8Array(msg.data);
+          const decryptKey = entry.authBits === 128 ? state.encKey128 : state.encKey;
+          const plainBytes = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, decryptKey, data);
+          const nonce      = Array.from(new Uint8Array(plainBytes));
+          ws.send(JSON.stringify({ type: "sig:auth_proof", nonce }));
+          entry.authStep = "await_ok";
+          mlog.info(`RELAY      auth proof sent ${entry.authBits}-bit  host=${hostname}`);
+          return;
+        }
+
+        // ── auth ok — now ready to send ──
+        if (entry.authStep === "await_ok" && msg.type === "sig:auth_ok") {
+          entry.authStep = "done";
+          entry.ready    = true;
+          mlog.info(`RELAY      authed ${entry.authBits}-bit, flushing ${entry.queue.length} msg(s)  host=${hostname}`);
+          entry.queue.forEach(raw => ws.send(raw));
+          entry.queue = [];
+          return;
+        }
+
+        // ── auth fail ──
+        if (msg.type === "sig:auth_fail") {
+          mlog.warn(`RELAY      auth failed  host=${hostname}  reason=${msg.reason}`);
+          ws.close();
+          return;
+        }
+
+        // ── anything else passes through normally ──
+        handleSignal(msg);
+
+      } catch(e) {
+        mlog.warn(`RELAY      onmessage error  host=${hostname}  err=${e.message}`);
+      }
     };
 
     ws.onerror = () => {
