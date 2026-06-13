@@ -1894,8 +1894,8 @@ function renderMessages() {
   }
 
   visible.forEach(m => {
-    const mine   = m.from === state.publicId;
-    const wrap   = document.createElement("div");
+    const mine = m.from === state.publicId || m.from === state.publicId128;
+    const wrap = document.createElement("div");
     wrap.style.cssText = "display:flex;flex-direction:column;align-items:" + (mine ? "flex-end" : "flex-start");
     const bubble = document.createElement("div");
     bubble.className = "message " + (mine ? "mine" : "theirs") + (m.valid === false ? " invalid" : "");
