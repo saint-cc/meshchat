@@ -557,6 +557,11 @@ def run_http_server():
     app = Flask(__name__, static_folder=STATIC_DIR, static_url_path="")
     app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 
+    @app.after_request
+    def no_cache(r):
+        r.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+        return r
+        
     @app.route("/")
     def index():
         return send_from_directory(app.static_folder, "index.html")
