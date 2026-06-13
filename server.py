@@ -443,7 +443,8 @@ async def handler(ws):
 
             # ── everything below requires at least one authed identity ──
             elif not is_authed():
-                log.warning("UNAUTHED   type=%r  peer=%s  dropped", kind, addr)
+                frm = msg.get("from", "?")
+                log.warning("UNAUTHED   type=%r  from=%s  peer=%s  dropped", kind, short(frm), addr)
                 await send_to(ws, {"type": "sig:auth_fail", "reason": "not_authenticated"})
 
             # ── message: from must match an authed identity on this socket ──
@@ -486,11 +487,6 @@ async def handler(ws):
                 reached = await deliver(to, msg, exclude=ws)
                 log.info("%-12s from=%s  to=%s  reached=%d",
                          kind.upper()[:12], short(frm), short(to), reached)
-
-            # ── everything below requires at least one authed identity ──
-            elif not is_authed():
-                log.warning("UNAUTHED   type=%r  peer=%s  dropped", kind, addr)
-                await send_to(ws, {"type": "sig:auth_fail", "reason": "not_authenticated"})
 
             elif kind == "sig:relay_req":
                 if RELAY_WSS_URL:
