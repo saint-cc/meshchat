@@ -1,191 +1,1090 @@
 <!DOCTYPE html>
 <html>
 <head>
-<meta charset="utf-8"/>
-<title>MeshChat Network Sim</title>
+<meta charset="UTF-8">
+<title>MeshChat Protocol Simulator</title>
 <style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+:root {
+  --bg:       #0a0a0a;
+  --surface:  #111;
+  --border:   #222;
+  --muted:    #444;
+  --dim:      #666;
+  --text:     #ccc;
+  --accent:   #4fc3f7;
+  --online:   #4caf50;
+  --offline:  #1a1a1a;
+  --relay:    #b39ddb;
+  --packet:   #fff176;
+  --migrate:  #ff8a65;
+  --danger:   #e57373;
+}
 body {
-  margin: 0;
-  background: #0b0f0c;
-  color: #aaffaa;
-  font-family: monospace;
+  font-family: 'Courier New', monospace;
+  background: var(--bg);
+  color: var(--text);
+  height: 100vh;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+#header {
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  flex-shrink: 0;
+}
+#header h1 { font-size: 13px; letter-spacing: 0.3em; color: var(--accent); }
+#header span { font-size: 10px; color: var(--muted); letter-spacing: 0.1em; }
+#main {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+}
+#canvas-wrap {
+  flex: 1;
+  position: relative;
+  min-width: 0;
+}
+canvas { display: block; width: 100%; height: 100%; background: black;}
+
+/* relay column */
+#relay-col {
+  width: 160px;
+  flex-shrink: 0;
+  border-left: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  overflow-y: auto;
+  padding: 8px 0;
+}
+#relay-col::-webkit-scrollbar { width: 3px; }
+#relay-col::-webkit-scrollbar-thumb { background: var(--border); }
+.relay-item {
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border);
+  cursor: pointer;
+  transition: background 0.1s;
+  font-size: 10px;
+  letter-spacing: 0.05em;
+}
+.relay-item:hover { background: var(--surface); }
+.relay-item.selected { background: var(--surface); border-left: 2px solid var(--relay); }
+.relay-name { color: var(--relay); margin-bottom: 2px; }
+.relay-stat { color: var(--muted); font-size: 9px; }
+.relay-bar {
+  height: 2px;
+  background: var(--border);
+  margin-top: 4px;
+  border-radius: 1px;
   overflow: hidden;
 }
-
-#ui {
-  position: fixed;
-  top: 10px;
-  left: 10px;
-  z-index: 10;
-  background: rgba(0,0,0,0.6);
-  padding: 10px;
-  border: 1px solid #1f3;
-}
-
-canvas {
-  display: block;
-}
-
-#log {
-  position: fixed;
-  right: 0;
-  top: 0;
-  width: 25%;
+.relay-bar-fill {
   height: 100%;
-  overflow-y: auto;
-  background: rgba(0,0,0,0.6);
-  border-left: 1px solid #1f3;
-  font-size: 11px;
-  padding: 10px;
+  background: var(--relay);
+  transition: width 0.3s;
 }
+
+/* sliders column */
+#slider-col {
+  width: 160px;
+  flex-shrink: 0;
+  border-left: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  padding: 12px;
+  gap: 10px;
+  overflow-y: auto;
+}
+#slider-col::-webkit-scrollbar { width: 3px; }
+#slider-col::-webkit-scrollbar-thumb { background: var(--border); }
+#slider-col .section-label {
+  font-size: 9px;
+  color: var(--muted);
+  letter-spacing: 0.15em;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 4px;
+  margin-bottom: 2px;
+}
+
+/* log column */
+#log-col {
+  width: 220px;
+  flex-shrink: 0;
+  border-left: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+.log-section {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  border-bottom: 1px solid var(--border);
+}
+.log-section:last-child { border-bottom: none; }
+.log-header {
+  padding: 5px 10px;
+  font-size: 9px;
+  letter-spacing: 0.15em;
+  color: var(--muted);
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.log-header span { color: var(--dim); }
+.log-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 6px 8px;
+  font-size: 9px;
+  line-height: 1.7;
+  letter-spacing: 0.03em;
+  color: var(--dim);
+}
+.log-body::-webkit-scrollbar { width: 3px; }
+.log-body::-webkit-scrollbar-thumb { background: var(--border); }
+.log-line { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.log-line.god  { color: #888; }
+.log-line.info { color: var(--text); }
+.log-line.warn { color: #f80; }
+.log-line.migrate { color: var(--migrate); }
+.log-line.msg    { color: var(--packet); opacity: 0.8; }
+.log-line.online { color: var(--online); }
+.log-ts { color: var(--muted); margin-right: 4px; }
+
+/* info panel */
+#info-panel {
+  width: 180px;
+  flex-shrink: 0;
+  border-left: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+}
+#info-top {
+  flex: 1;
+  padding: 12px;
+  overflow-y: auto;
+  font-size: 10px;
+  line-height: 1.8;
+  color: var(--dim);
+  letter-spacing: 0.05em;
+  border-bottom: 1px solid var(--border);
+}
+#info-top strong { color: var(--text); display: block; margin-bottom: 6px; font-size: 11px; letter-spacing: 0.15em; }
+#info-top .kv { display: flex; justify-content: space-between; gap: 4px; }
+#info-top .kv span:last-child { color: var(--text); text-align: right; }
+
+#controls {
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  overflow-y: auto;
+  flex-shrink: 0;
+}
+.ctrl-group label {
+  display: block;
+  font-size: 9px;
+  color: var(--muted);
+  letter-spacing: 0.1em;
+  margin-bottom: 4px;
+}
+.ctrl-group input[type=range] {
+  width: 100%;
+  accent-color: var(--accent);
+}
+.ctrl-group .val {
+  font-size: 9px;
+  color: var(--accent);
+  float: right;
+}
+.ctrl-btn {
+  width: 100%;
+  background: none;
+  border: 1px solid var(--border);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  padding: 6px;
+  cursor: pointer;
+  transition: border-color 0.15s, color 0.15s;
+  text-align: left;
+}
+.ctrl-btn:hover { border-color: var(--accent); color: var(--accent); }
+.ctrl-btn.migrate { border-color: var(--migrate); color: var(--migrate); }
+.ctrl-btn.migrate:hover { background: #1a0f0a; }
+
+#legend {
+  padding: 10px 12px;
+  border-top: 1px solid var(--border);
+  font-size: 9px;
+  color: var(--muted);
+  letter-spacing: 0.08em;
+  flex-shrink: 0;
+}
+.legend-row { display: flex; align-items: center; gap: 6px; margin-bottom: 3px; }
+.legend-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+.legend-sq  { width: 8px; height: 8px; flex-shrink: 0; }
 </style>
 </head>
 <body>
 
-<div id="ui">
-  <div>Mesh Sim</div>
-  <br>
-
+<div id="header">
+  <h1>MESHCHAT SIM</h1>
+  <span id="hdr-stats">clients: 0  relays: 0  packets: 0</span>
 </div>
 
-<div id="log"></div>
-<canvas id="c"></canvas>
+<div id="main">
+  <div id="canvas-wrap">
+    <canvas id="c"></canvas>
+  </div>
+
+  <div id="relay-col" id="relay-list"></div>
+
+  <div id="slider-col">
+    <div class="section-label">TOPOLOGY</div>
+    <div class="ctrl-group">
+      <label>RELAYS <span class="val" id="val-relays">12</span></label>
+      <input type="range" id="sl-relays" min="2" max="40" step="1" value="12">
+    </div>
+    <div class="ctrl-group">
+      <label>CLIENTS <span class="val" id="val-clients">80</span></label>
+      <input type="range" id="sl-clients" min="2" max="4000" step="1" value="80">
+    </div>
+    <div class="section-label">SIMULATION</div>
+    <div class="ctrl-group">
+      <label>SIM SPEED <span class="val" id="val-speed">1x</span></label>
+      <input type="range" id="sl-speed" min="0.1" max="5" step="0.1" value="1">
+    </div>
+    <div class="ctrl-group">
+      <label>MSG RATE <span class="val" id="val-msg">3/s</span></label>
+      <input type="range" id="sl-msg" min="0" max="30" step="1" value="3">
+    </div>
+    <div class="ctrl-group">
+      <label>CHURN <span class="val" id="val-churn">5%</span></label>
+      <input type="range" id="sl-churn" min="0" max="50" step="1" value="5">
+    </div>
+    <div class="ctrl-group">
+      <label>PULSE SPEED <span class="val" id="val-pulse">1x</span></label>
+      <input type="range" id="sl-pulse" min="0.2" max="4" step="0.1" value="1">
+    </div>
+  </div>
+
+  <div id="info-panel">
+    <div id="info-top">
+      <strong>SELECT A NODE</strong>
+      <div style="color:var(--muted);font-size:9px">click any client or relay to inspect</div>
+    </div>
+
+    <div id="controls">
+      <button class="ctrl-btn" onclick="sim.randomMessage()">▶ SEND RANDOM MSG</button>
+      <button class="ctrl-btn" onclick="sim.sendFromSelected()">▶ SEND FROM SEL</button>
+      <button class="ctrl-btn migrate" onclick="sim.randomMigrate()">⇄ MIGRATE RANDOM</button>
+      <button class="ctrl-btn migrate" onclick="sim.migrateSelected()">⇄ MIGRATE SELECTED</button>
+      <button class="ctrl-btn" onclick="sim.toggleChurn()">⏸ PAUSE CHURN</button>
+      <button class="ctrl-btn" onclick="sim.reset()">↺ RESET SIM</button>
+    </div>
+
+    <div id="legend">
+      <div class="legend-row"><div class="legend-dot" style="background:var(--online)"></div> client online</div>
+      <div class="legend-row"><div class="legend-dot" style="background:var(--muted)"></div> client offline</div>
+      <div class="legend-row"><div class="legend-sq"  style="background:var(--relay)"></div> relay server</div>
+      <div class="legend-row"><div class="legend-dot" style="background:var(--packet)"></div> message packet</div>
+      <div class="legend-row"><div class="legend-dot" style="background:var(--migrate)"></div> migrate packet</div>
+    </div>
+  </div>
+
+  <div id="log-col">
+    <div class="log-section">
+      <div class="log-header">GOD LOG <span>global events</span></div>
+      <div class="log-body" id="god-log"></div>
+    </div>
+    <div class="log-section">
+      <div class="log-header">NODE LOG <span id="node-log-label">none selected</span></div>
+      <div class="log-body" id="node-log"></div>
+    </div>
+  </div>
+</div>
 
 <script>
-const canvas = document.getElementById("c");
-const ctx = canvas.getContext("2d");
-canvas.width = window.innerWidth;
-canvas.height = window.innerHeight;
+// ═══════════════════════════════════════
+//   CONFIG
+// ═══════════════════════════════════════
+const CFG = {
+  CLIENT_COUNT : 80,
+  RELAY_COUNT  : 12,
+  CONTACT_MIN  : 2,
+  CONTACT_MAX  : 6,
+  CLIENT_RADIUS: 4,
+  RELAY_SIZE   : 10,
+};
 
-const N = 40;
-const nodes = [];
-const links = [];
-const messages = [];
+// ═══════════════════════════════════════
+//   LOGGING
+// ═══════════════════════════════════════
+const LOG_MAX = 120;
 
-const center = {x: canvas.width/2, y: canvas.height/2};
+const godLines  = [];
+const nodeLines = {};
 
-function rand(a,b){ return a + Math.random()*(b-a); }
-
-const LOG_MAX = 100;
-
-function log(msg){
-  const el = document.getElementById("log");
-
-  const line = document.createElement("div");
-  line.textContent = msg;
-
-  el.prepend(line);
-
-  // trim
-  while (el.children.length > LOG_MAX) {
-    el.removeChild(el.lastChild);
-  }
+function godLog(text, cls = "god") {
+  godLines.push({ text, cls });
+  if (godLines.length > LOG_MAX) godLines.shift();
+  renderGodLog();
 }
 
-function createNodes(){
-  for(let i=0;i<N;i++){
-    const angle = Math.random()*Math.PI*2;
-    const radius = rand(100, Math.min(canvas.width,canvas.height)/2 - 50);
-    nodes.push({
-      id: i,
-      x: center.x + Math.cos(angle)*radius,
-      y: center.y + Math.sin(angle)*radius,
-      color: "#2f6",
-      peers: []
-    });
+function nodeLog(id, text, cls = "info") {
+  if (!nodeLines[id]) nodeLines[id] = [];
+  nodeLines[id].push({ text, cls });
+  if (nodeLines[id].length > LOG_MAX) nodeLines[id].shift();
+  if (sim.selected === id) renderNodeLog(id);
+}
+
+function renderGodLog() {
+  const el = document.getElementById("god-log");
+  if (!el) return;
+  el.innerHTML = godLines.map(l =>
+    `<div class="log-line ${l.cls}">${l.text}</div>`
+  ).join("");
+  el.scrollTop = el.scrollHeight;
+}
+
+function renderNodeLog(id) {
+  const el    = document.getElementById("node-log");
+  const label = document.getElementById("node-log-label");
+  if (!el) return;
+  if (!id) { el.innerHTML = ""; if (label) label.textContent = "none selected"; return; }
+  const lines = nodeLines[id] || [];
+  if (label) label.textContent = id.slice(0, 12) + "…";
+  el.innerHTML = lines.map(l =>
+    `<div class="log-line ${l.cls}">${l.text}</div>`
+  ).join("");
+  el.scrollTop = el.scrollHeight;
+}
+
+// ═══════════════════════════════════════
+//   STATE
+// ═══════════════════════════════════════
+const sim = (() => {
+  let clients = [];
+  let relays  = [];
+  let pulses  = [];
+  let selected = null;
+  let churnPaused = false;
+
+  const ts = () => new Date().toLocaleTimeString([], { hour:"2-digit", minute:"2-digit", second:"2-digit", hour12: false });
+
+  let simSpeed   = 1;
+  let msgRate    = 3;
+  let churnRate  = 5;
+  let pulseSpeed = 1;
+
+  let msgAccum   = 0;
+  let churnAccum = 0;
+  let totalMsgs  = 0;
+  let totalMigrates = 0;
+
+  const canvas = document.getElementById("c");
+  const ctx    = canvas.getContext("2d");
+  let W = 0, H = 0;
+
+  function keyToPos(id) {
+    let h = 0;
+    for (let i = 0; i < id.length; i++) h = Math.imul(31, h) + id.charCodeAt(i) | 0;
+    const x = ((h >>> 0) & 0xFFFF) / 0xFFFF;
+    const y = ((h >>> 16) & 0xFFFF) / 0xFFFF;
+    return { x, y };
   }
 
-  // random connections
-  nodes.forEach(n=>{
-    const count = Math.floor(rand(6,10));
-    for(let i=0;i<count;i++){
-      const target = nodes[Math.floor(Math.random()*N)];
-      if(target !== n && !n.peers.includes(target.id)){
-        n.peers.push(target.id);
-        links.push([n.id, target.id]);
+  function randId(prefix) {
+    return prefix + Math.random().toString(36).slice(2, 10);
+  }
+
+  function relayColor(i, total) {
+    const hue = Math.round((i / total) * 360);
+    return { stroke: `hsl(${hue},70%,60%)`, fill: `hsl(${hue},50%,18%)` };
+  }
+
+  function build() {
+    clients = [];
+    relays  = [];
+    pulses  = [];
+    totalMsgs = 0;
+    totalMigrates = 0;
+    selected = null;
+
+    for (let i = 0; i < CFG.RELAY_COUNT; i++) {
+      relays.push({
+        id:      `relay${String(i+1).padStart(2,"0")}.mesh`,
+        clients: 0,
+        load:    0,
+        bufSize: 0,
+        buffer:  {},
+        color:   relayColor(i, CFG.RELAY_COUNT),
+      });
+    }
+
+    for (let i = 0; i < CFG.CLIENT_COUNT; i++) {
+      const id  = randId("c");
+      const pos = keyToPos(id);
+      const relay = relays[Math.floor(Math.random() * relays.length)];
+      relay.clients++;
+      clients.push({
+        id,
+        x: pos.x,
+        y: pos.y,
+        relay,
+        prevRelay: null,
+        contacts: [],
+        online: Math.random() > 0.2,
+        msgCount: 0,
+      });
+    }
+
+    for (const c of clients) {
+      const n = CFG.CONTACT_MIN + Math.floor(Math.random() * (CFG.CONTACT_MAX - CFG.CONTACT_MIN + 1));
+      const pool = clients.filter(o => o !== c && !c.contacts.includes(o));
+      shuffle(pool);
+      for (let i = 0; i < Math.min(n, pool.length); i++) {
+        const other = pool[i];
+        if (!c.contacts.includes(other))  c.contacts.push(other);
+        if (!other.contacts.includes(c))  other.contacts.push(c);
       }
     }
-  });
-}
 
-function draw(){
-  ctx.clearRect(0,0,canvas.width,canvas.height);
+    renderRelayList();
+    updateInfo();
+  }
 
-  // links
-  ctx.strokeStyle = "rgba(0,255,0,0.08)";
-  links.forEach(l=>{
-    const a = nodes[l[0]];
-    const b = nodes[l[1]];
-    ctx.beginPath();
-    ctx.moveTo(a.x,a.y);
-    ctx.lineTo(b.x,b.y);
-    ctx.stroke();
-  });
-
-  // nodes
-  nodes.forEach(n=>{
-    ctx.fillStyle = n.color;
-    ctx.beginPath();
-    ctx.arc(n.x,n.y,4,0,Math.PI*2);
-    ctx.fill();
-  });
-
-  // messages
-  messages.forEach(m=>{
-    const a = nodes[m.from];
-    const b = nodes[m.to];
-
-    const t = m.t / m.duration;
-    const x = a.x + (b.x - a.x)*t;
-    const y = a.y + (b.y - a.y)*t;
-
-    ctx.fillStyle = "#ff0";
-    ctx.beginPath();
-    ctx.arc(x,y,3,0,Math.PI*2);
-    ctx.fill();
-
-    m.t += tick;
-  });
-
-  for(let i=messages.length-1;i>=0;i--){
-    if(messages[i].t > messages[i].duration){
-      messages.splice(i,1);
+  function shuffle(arr) {
+    for (let i = arr.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [arr[i], arr[j]] = [arr[j], arr[i]];
     }
   }
 
-  requestAnimationFrame(draw);
-}
+  function sq() {
+    const margin = 40;
+    const size   = Math.min(W, H) - margin * 2;
+    return { ox: margin, oy: (H - size) / 2, size };
+  }
 
-function sendBurst(){
-  for(let i=0;i<10;i++){
-    const a = nodes[Math.floor(Math.random()*N)];
-    const b = nodes[Math.floor(Math.random()*N)];
-    if(a.id === b.id) continue;
+  function clientXY(c) {
+    const { ox, oy, size } = sq();
+    return { x: ox + c.x * size, y: oy + c.y * size };
+  }
 
-    messages.push({
-      from: a.id,
-      to: b.id,
-      t: 0,
-      duration: rand(300,1200)
+  function relayXY(r) {
+    const { oy, size } = sq();
+    const rx = W - 20;
+    const idx = relays.indexOf(r);
+    const step = size / (relays.length - 1 || 1);
+    return { x: rx, y: oy + idx * step };
+  }
+
+  function addPulse(x1, y1, x2, y2, color, width = 1.5, onComplete = null) {
+    pulses.push({ x1, y1, x2, y2, progress: 0, color, width, onComplete });
+  }
+
+  const BUF_MAX = 8;
+
+  function bufferPush(relay, recipient, color) {
+    if (!relay.buffer[recipient.id]) relay.buffer[recipient.id] = [];
+    const buf = relay.buffer[recipient.id];
+    if (buf.length < BUF_MAX) buf.push(color);
+    relay.bufSize = Object.values(relay.buffer).reduce((s, b) => s + b.length, 0);
+    godLog(`${ts()} BUF   ${relay.id.split(".")[0]} ← ${recipient.id.slice(0,6)}`, "warn");
+    nodeLog(relay.id, `${ts()} buffered msg for ${recipient.id.slice(0,6)}`, "warn");
+  }
+
+  function bufferFlush(client) {
+    const relay = client.relay;
+    const buf   = relay.buffer[client.id];
+    if (!buf || !buf.length) return;
+    const rp = relayXY(relay);
+    const ep = clientXY(client);
+    godLog(`${ts()} FLUSH ${relay.id.split(".")[0]} → ${client.id.slice(0,6)}  (${buf.length} msgs)`, "info");
+    nodeLog(client.id, `${ts()} flushed ${buf.length} buffered msg(s) from ${relay.id.split(".")[0]}`, "info");
+    buf.forEach((color, i) => {
+      setTimeout(() => addPulse(rp.x, rp.y, ep.x, ep.y, color, 1.5), i * 80);
+    });
+    delete relay.buffer[client.id];
+    relay.bufSize = Object.values(relay.buffer).reduce((s, b) => s + b.length, 0);
+  }
+
+  function spawnMessage(sender, recipient, color) {
+    if (!sender.online) return;
+    const sp = clientXY(sender);
+    const rp = relayXY(recipient.relay);
+    const ep = clientXY(recipient);
+
+    addPulse(sp.x, sp.y, rp.x, rp.y, color, 1.5, () => {
+      if (recipient.online) {
+        addPulse(rp.x, rp.y, ep.x, ep.y, color);
+        nodeLog(sender.id,    `${ts()} → msg to   ${recipient.id.slice(0,6)}`, "msg");
+        nodeLog(recipient.id, `${ts()} ← msg from ${sender.id.slice(0,6)}`, "msg");
+      } else {
+        bufferPush(recipient.relay, recipient, color);
+      }
     });
 
-    log(`msg ${a.id} → ${b.id}`);
+    sender.msgCount++;
+    recipient.relay.load = Math.min(1, recipient.relay.load + 0.05);
+    totalMsgs++;
   }
-}
 
-let tick = 10;
-let interv = 150;
-
-createNodes();
-draw();
-
-setInterval(()=>{
-  // background random chatter
-  if(Math.random() < 0.3){
-    sendBurst();
+  function randomMessage() {
+    const online = clients.filter(c => c.online && c.contacts.length > 0);
+    if (!online.length) return;
+    const sender = online[Math.floor(Math.random() * online.length)];
+    const recipient = sender.contacts[Math.floor(Math.random() * sender.contacts.length)];
+    spawnMessage(sender, recipient, getComputedColor("--packet"));
   }
-}, interv);
 
+  function randomMigrate() {
+    const online = clients.filter(c => c.online);
+    if (!online.length) return;
+    const client = online[Math.floor(Math.random() * online.length)];
+    const oldRelay = client.relay;
+    const candidates = relays.filter(r => r !== oldRelay);
+    if (!candidates.length) return;
+    const newRelay = candidates[Math.floor(Math.random() * candidates.length)];
+
+    oldRelay.clients = Math.max(0, oldRelay.clients - 1);
+    newRelay.clients++;
+    client.prevRelay = oldRelay;
+    client.relay = newRelay;
+
+    const cp = clientXY(client);
+    const op = relayXY(oldRelay);
+    const np = relayXY(newRelay);
+    const mc = getComputedColor("--migrate");
+
+    godLog(`${ts()} MIGRATE ${client.id.slice(0,6)} → ${newRelay.id.split(".")[0]} (was ${oldRelay.id.split(".")[0]})`, "migrate");
+    nodeLog(client.id, `${ts()} migrated to ${newRelay.id.split(".")[0]}`, "migrate");
+
+    addPulse(cp.x, cp.y, np.x, np.y, mc, 2, () => {
+      for (const contact of client.contacts) {
+        const rp = relayXY(contact.relay);
+        const ep = clientXY(contact);
+        addPulse(cp.x, cp.y, rp.x, rp.y, mc, 1.5, () => {
+          if (contact.online) {
+            addPulse(rp.x, rp.y, ep.x, ep.y, mc, 1);
+          } else {
+            bufferPush(contact.relay, contact, mc);
+          }
+        });
+      }
+      addPulse(cp.x, cp.y, op.x, op.y, mc, 1);
+    });
+
+    totalMigrates++;
+    renderRelayList();
+    if (selected?.obj === client) updateInfo();
+  }
+
+  function toggleChurn() {
+    churnPaused = !churnPaused;
+    document.querySelector(".ctrl-btn:nth-of-type(3)").textContent =
+      churnPaused ? "▶ RESUME CHURN" : "⏸ PAUSE CHURN";
+  }
+
+  function reset() {
+    build();
+  }
+
+  // ── click detection ──
+  canvas.addEventListener("click", (e) => {
+    const rect = canvas.getBoundingClientRect();
+    const mx = (e.clientX - rect.left) * (W / rect.width);
+    const my = (e.clientY - rect.top)  * (H / rect.height);
+
+    let hit = null;
+    for (const c of clients) {
+      const { x, y } = clientXY(c);
+      const dx = mx - x, dy = my - y;
+      if (dx*dx + dy*dy < 100) { hit = { type: "client", obj: c }; break; }
+    }
+    if (!hit) {
+      for (const r of relays) {
+        const { x, y } = relayXY(r);
+        const dx = mx - x, dy = my - y;
+        if (dx*dx + dy*dy < 144) { hit = { type: "relay", obj: r }; break; }
+      }
+    }
+    // click empty space to deselect
+    selected = (selected && hit?.obj === selected.obj) ? null : hit;
+    updateInfo();
+    renderRelayList();
+    renderNodeLog(selected?.obj?.id);
+  });
+
+  // ── info panel ──
+  function updateInfo() {
+    const el = document.getElementById("info-top");
+    if (!selected) {
+      el.innerHTML = `<strong>SELECT A NODE</strong><div style="color:var(--muted);font-size:9px">click any client or relay to inspect</div>`;
+      return;
+    }
+    if (selected.type === "client") {
+      const c = selected.obj;
+      el.innerHTML = `
+        <strong>CLIENT</strong>
+        <div class="kv"><span>id</span><span>${c.id.slice(0,10)}…</span></div>
+        <div class="kv"><span>status</span><span style="color:${c.online?"var(--online)":"var(--muted)"}">${c.online?"online":"offline"}</span></div>
+        <div class="kv"><span>relay</span><span style="color:${c.relay.color.stroke}">${c.relay.id.split(".")[0]}</span></div>
+        <div class="kv"><span>prev relay</span><span style="color:var(--muted)">${c.prevRelay ? c.prevRelay.id.split(".")[0] : "—"}</span></div>
+        <div class="kv"><span>contacts</span><span>${c.contacts.length}</span></div>
+        <div class="kv"><span>msgs sent</span><span>${c.msgCount}</span></div>
+      `;
+    } else {
+      const r = selected.obj;
+      const clientsOnRelay = clients.filter(c => c.relay === r);
+      const onlineCount = clientsOnRelay.filter(c => c.online).length;
+      el.innerHTML = `
+        <strong>RELAY</strong>
+        <div class="kv"><span>host</span><span style="color:${r.color.stroke}">${r.id}</span></div>
+        <div class="kv"><span>clients</span><span>${r.clients}</span></div>
+        <div class="kv"><span>online</span><span style="color:var(--online)">${onlineCount}</span></div>
+        <div class="kv"><span>load</span><span>${Math.round(r.load*100)}%</span></div>
+        <div class="kv"><span>buffered</span><span>${r.bufSize}</span></div>
+      `;
+    }
+  }
+
+  // ── relay list sidebar ──
+  function renderRelayList() {
+    const col = document.getElementById("relay-col");
+    col.innerHTML = relays.map((r, i) => `
+      <div class="relay-item${selected?.obj===r?" selected":""}" onclick="sim.selectRelay(${i})" style="border-left:3px solid ${r.color.stroke}">
+        <div class="relay-name" style="color:${r.color.stroke}">${r.id.split(".")[0]}</div>
+        <div class="relay-stat">${r.clients} clients · ${r.bufSize} buf · ${Math.round(r.load*100)}% load</div>
+        <div class="relay-bar"><div class="relay-bar-fill" style="width:${r.load*100}%;background:${r.color.stroke}"></div></div>
+      </div>
+    `).join("");
+  }
+
+  function selectRelay(i) {
+    selected = selected?.obj === relays[i] ? null : { type: "relay", obj: relays[i] };
+    updateInfo();
+    renderRelayList();
+    renderNodeLog(selected?.obj?.id);
+  }
+
+  function getComputedColor(varName) {
+    return getComputedStyle(document.documentElement).getPropertyValue(varName).trim();
+  }
+
+  // ── visual offline delay ──
+  // When a node goes offline we record the time. The draw loop treats it as
+  // still-online for OFFLINE_VISUAL_DELAY ms so in-flight pulses can finish.
+  const OFFLINE_VISUAL_DELAY = 1800;  // ms
+  const offlineAt = {};   // clientId → timestamp when they went offline
+
+  function visuallyOnline(c) {
+    if (c.online) return true;
+    const t = offlineAt[c.id];
+    return t && (performance.now() - t) < OFFLINE_VISUAL_DELAY;
+  }
+
+  // ═══════════════════════════════════════
+  //   DRAW — selection-aware highlighting
+  // ═══════════════════════════════════════
+  function draw() {
+    ctx.fillStyle = "rgba(0,0,0,0.65)";
+    ctx.fillRect(0, 0, W, H);
+
+    const { ox, oy, size } = sq();
+
+    // key space background
+    ctx.fillStyle = "#030303";
+    ctx.fillRect(ox, oy, size, size);
+    ctx.strokeStyle = "#1a1a1a";
+    ctx.lineWidth = 1;
+    ctx.strokeRect(ox, oy, size, size);
+
+    ctx.fillStyle = "#222";
+    ctx.font = "10px 'Courier New'";
+    ctx.fillText("KEY SPACE", ox + 4, oy + 12);
+    ctx.fillText("RELAYS", W - 58, oy + 12);
+
+    // ── compute highlight sets ──
+    const hasSel = !!selected;
+    let hlClients = new Set();   // clients to highlight
+    let hlRelay   = null;        // relay to highlight
+    let hlPairs   = new Set();   // "idA|idB" contact edges to highlight
+
+    if (selected?.type === "client") {
+      const sel = selected.obj;
+      hlClients.add(sel);
+      hlRelay = sel.relay;
+      for (const ct of sel.contacts) {
+        hlClients.add(ct);
+        const key = sel.id < ct.id ? sel.id + "|" + ct.id : ct.id + "|" + sel.id;
+        hlPairs.add(key);
+      }
+    } else if (selected?.type === "relay") {
+      hlRelay = selected.obj;
+      for (const c of clients) {
+        if (c.relay === selected.obj) hlClients.add(c);
+      }
+    }
+
+    // ── contact edges — dim pass ──
+    for (const c of clients) {
+      const cp = clientXY(c);
+      for (const contact of c.contacts) {
+        if (contact.id < c.id) continue;
+        const key = c.id < contact.id ? c.id + "|" + contact.id : contact.id + "|" + c.id;
+        if (hlPairs.has(key)) continue; // drawn in bright pass below
+        ctx.strokeStyle = hasSel ? "#0e0e0e" : (visuallyOnline(c) && visuallyOnline(contact) ? "#1a241a" : "#131313");
+        ctx.lineWidth = 0.3;
+        ctx.beginPath();
+        ctx.moveTo(cp.x, cp.y);
+        ctx.lineTo(clientXY(contact).x, clientXY(contact).y);
+        ctx.stroke();
+      }
+    }
+
+    // ── contact edges — highlighted pass ──
+    if (selected?.type === "client") {
+      const sel = selected.obj;
+      const sp  = clientXY(sel);
+      for (const ct of sel.contacts) {
+        const tp = clientXY(ct);
+        ctx.strokeStyle = ct.online ? sel.relay.color.stroke + "88" : "#55555566";
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.moveTo(sp.x, sp.y);
+        ctx.lineTo(tp.x, tp.y);
+        ctx.stroke();
+      }
+    }
+
+    // ── tether lines (client → relay) ──
+    for (const c of clients) {
+      if (!visuallyOnline(c)) continue;
+      const cp = clientXY(c);
+      const rp = relayXY(c.relay);
+      const isHL = hasSel && hlClients.has(c);
+      ctx.strokeStyle = isHL
+        ? c.relay.color.stroke + "55"
+        : hasSel ? "#0c0c12" : "#1a1530";
+      ctx.lineWidth = isHL ? 0.8 : 0.4;
+      ctx.beginPath();
+      ctx.moveTo(cp.x, cp.y);
+      ctx.lineTo(rp.x, rp.y);
+      ctx.stroke();
+    }
+
+    // ── relay nodes — dimmed/normal pass ──
+    const hlRelays    = [];  // deferred: highlighted/selected relays drawn last
+    for (const r of relays) {
+      const isSelected = selected?.obj === r;
+      const isHL       = r === hlRelay;
+      if (isSelected || isHL) { hlRelays.push(r); continue; }  // defer
+
+      const { x, y } = relayXY(r);
+      const isDimmed  = hasSel;
+      const s = CFG.RELAY_SIZE;
+
+      ctx.globalAlpha = isDimmed ? 0.25 : 1;
+      ctx.fillStyle   = r.color.fill;
+      ctx.strokeStyle = r.color.stroke;
+      ctx.lineWidth   = 1;
+      ctx.fillRect  (x - s/2, y - s/2, s, s);
+      ctx.strokeRect(x - s/2, y - s/2, s, s);
+      if (r.load > 0) {
+        ctx.fillStyle = r.color.stroke + Math.floor(r.load * 200).toString(16).padStart(2,"0");
+        ctx.fillRect(x - s/2, y + s/2 - r.load * s, s, r.load * s);
+      }
+      ctx.globalAlpha = 1;
+    }
+
+    // ── client nodes — dimmed/normal pass ──
+    const hlClientList = [];  // deferred
+    for (const c of clients) {
+      const isSelected = selected?.obj === c;
+      const isHL       = !isSelected && hlClients.has(c);
+      if (isSelected || isHL) { hlClientList.push(c); continue; }  // defer
+
+      const { x, y } = clientXY(c);
+      const isDimmed  = hasSel;
+      ctx.beginPath();
+      ctx.arc(x, y, CFG.CLIENT_RADIUS, 0, Math.PI * 2);
+      ctx.fillStyle   = isDimmed ? "#0d0d0d" : (visuallyOnline(c) ? c.relay.color.fill   : "#1a1a1a");
+      ctx.strokeStyle = isDimmed ? "#1a1a1a" : (visuallyOnline(c) ? c.relay.color.stroke : "#2a2a2a");
+      ctx.lineWidth   = isDimmed ? 0.5 : 0.8;
+      ctx.fill();
+      ctx.stroke();
+    }
+
+    // ── highlighted clients — drawn on top ──
+    for (const c of hlClientList) {
+      const { x, y }   = clientXY(c);
+      const isSelected  = selected?.obj === c;
+      const radius      = CFG.CLIENT_RADIUS + (isSelected ? 2 : 1);
+
+      ctx.beginPath();
+      ctx.arc(x, y, radius, 0, Math.PI * 2);
+      ctx.fillStyle   = visuallyOnline(c) ? c.relay.color.fill   : "#1a1a1a";
+      ctx.strokeStyle = visuallyOnline(c) ? c.relay.color.stroke : "#555";
+      ctx.lineWidth   = isSelected ? 2 : 1.2;
+      ctx.fill();
+      ctx.stroke();
+
+      // outer ring
+      ctx.beginPath();
+      ctx.arc(x, y, radius + (isSelected ? 4 : 3), 0, Math.PI * 2);
+      ctx.strokeStyle = isSelected
+        ? c.relay.color.stroke
+        : (c.online ? c.relay.color.stroke + "66" : "#44444466");
+      ctx.lineWidth = isSelected ? 1.5 : 0.8;
+      ctx.stroke();
+    }
+
+    // ── highlighted/selected relays — drawn on top ──
+    for (const r of hlRelays) {
+      const { x, y }   = relayXY(r);
+      const isSelected  = selected?.obj === r;
+      const s = CFG.RELAY_SIZE;
+
+      ctx.fillStyle   = isSelected ? r.color.stroke : r.color.fill;
+      ctx.strokeStyle = r.color.stroke;
+      ctx.lineWidth   = isSelected ? 2 : 1.5;
+      ctx.fillRect  (x - s/2, y - s/2, s, s);
+      ctx.strokeRect(x - s/2, y - s/2, s, s);
+
+      if (r.load > 0) {
+        ctx.fillStyle = r.color.stroke + Math.floor(r.load * 200).toString(16).padStart(2,"0");
+        ctx.fillRect(x - s/2, y + s/2 - r.load * s, s, r.load * s);
+      }
+
+      Object.keys(r.buffer).forEach((recId, bi) => {
+        const dc = clients.find(c => c.id === recId);
+        ctx.fillStyle = dc ? dc.relay.color.stroke : "#888";
+        ctx.fillRect(x - s/2 + (bi % s) * 2, y - s/2 - 4 - Math.floor(bi / s) * 4, 3, 3);
+      });
+
+      if (isSelected) {
+        ctx.strokeStyle = r.color.stroke;
+        ctx.lineWidth = 1;
+        ctx.strokeRect(x - s/2 - 4, y - s/2 - 4, s + 8, s + 8);
+      }
+
+      // online/total count label
+      ctx.fillStyle = r.color.stroke;
+      ctx.font = "9px 'Courier New'";
+      ctx.fillText(
+        `${clients.filter(c => c.relay === r && c.online).length}/${r.clients}`,
+        x - s/2 - 28, y + 3
+      );
+    }
+
+    // ── pulses ──
+    for (const p of pulses) {
+      const x = p.x1 + (p.x2 - p.x1) * p.progress;
+      const y = p.y1 + (p.y2 - p.y1) * p.progress;
+      const alpha = 1 - Math.pow(p.progress, 2);
+
+      ctx.beginPath();
+      ctx.moveTo(
+        p.x1 + (p.x2 - p.x1) * Math.max(0, p.progress - 0.15),
+        p.y1 + (p.y2 - p.y1) * Math.max(0, p.progress - 0.15)
+      );
+      ctx.lineTo(x, y);
+      ctx.strokeStyle = p.color + Math.floor(alpha * 80).toString(16).padStart(2,"0");
+      ctx.lineWidth = p.width * 0.5;
+      ctx.stroke();
+
+      ctx.beginPath();
+      ctx.arc(x, y, p.width + 1, 0, Math.PI * 2);
+      ctx.fillStyle = p.color + Math.floor(alpha * 255).toString(16).padStart(2,"0");
+      ctx.shadowColor = p.color;
+      ctx.shadowBlur  = 6;
+      ctx.fill();
+      ctx.shadowBlur = 0;
+    }
+  }
+
+  let var_accent = "#4fc3f7";
+
+  // ── tick ──
+  let lastTime = null;
+  function tick(now) {
+    requestAnimationFrame(tick);
+    if (!lastTime) { lastTime = now; return; }
+    const rawDt = Math.min((now - lastTime) / 1000, 0.1);
+    lastTime = now;
+    const dt = rawDt * simSpeed;
+
+    const speed = pulseSpeed * 0.4;
+    const completed = [];
+    pulses = pulses.filter(p => {
+      p.progress += dt * speed;
+      if (p.progress >= 1) {
+        if (p.onComplete) completed.push(p.onComplete);
+        return false;
+      }
+      return true;
+    });
+    completed.forEach(fn => fn());
+
+    if (msgRate > 0) {
+      msgAccum += dt * msgRate;
+      while (msgAccum >= 1) { msgAccum -= 1; randomMessage(); }
+    }
+
+    if (!churnPaused && churnRate > 0) {
+      churnAccum += dt;
+      if (churnAccum > 1) {
+        churnAccum = 0;
+        const n = Math.max(1, Math.round(clients.length * churnRate / 100));
+        let wentOnline = 0, wentOffline = 0;
+        for (let i = 0; i < n; i++) {
+          const c = clients[Math.floor(Math.random() * clients.length)];
+          const wasOnline = c.online;
+          c.online = !c.online;
+          if (!wasOnline && c.online) {
+            wentOnline++;
+            delete offlineAt[c.id];
+            bufferFlush(c);
+            nodeLog(c.id, "", "info");
+            nodeLog(c.id, `${ts()} registered at ${c.relay.id.split(".")[0]}`, "online");
+          } else if (wasOnline && !c.online) {
+            wentOffline++;
+            offlineAt[c.id] = performance.now();
+            nodeLog(c.id, "", "info");
+          }
+        }
+        if (wentOnline || wentOffline)
+          godLog(`${ts()} CHURN  +${wentOnline} online  -${wentOffline} offline`, "info");
+      }
+    }
+
+    for (const r of relays) r.load = Math.max(0, r.load - dt * 0.1);
+
+    const wrap = document.getElementById("canvas-wrap");
+    const dpr  = window.devicePixelRatio || 1;
+    const cw   = wrap.clientWidth;
+    const ch   = wrap.clientHeight;
+    if (canvas.width !== cw * dpr || canvas.height !== ch * dpr) {
+      canvas.width  = cw * dpr;
+      canvas.height = ch * dpr;
+      ctx.scale(dpr, dpr);
+      W = cw; H = ch;
+    }
+
+    draw();
+
+    if (selected) updateInfo();
+
+    const online  = clients.filter(c => c.online).length;
+    const buffered = relays.reduce((s, r) => s + r.bufSize, 0);
+    document.getElementById("hdr-stats").textContent =
+      `online: ${online}/${clients.length}  relays: ${relays.length}  packets: ${pulses.length}  buffered: ${buffered}  msgs: ${totalMsgs}  migrates: ${totalMigrates}`;
+
+    if (Math.random() < 0.05) renderRelayList();
+  }
+
+  function wireSlider(id, valId, suffix, callback) {
+    const el  = document.getElementById(id);
+    const vel = document.getElementById(valId);
+    el.addEventListener("input", () => {
+      const v = parseFloat(el.value);
+      vel.textContent = v + suffix;
+      callback(v);
+    });
+  }
+
+  function init() {
+    var_accent = getComputedColor("--accent");
+    wireSlider("sl-relays",  "val-relays",  "",   v => { CFG.RELAY_COUNT  = v; build(); });
+    wireSlider("sl-clients", "val-clients", "",   v => { CFG.CLIENT_COUNT = v; build(); });
+    wireSlider("sl-speed",   "val-speed",   "x",  v => simSpeed   = v);
+    wireSlider("sl-msg",     "val-msg",     "/s", v => msgRate     = v);
+    wireSlider("sl-churn",   "val-churn",   "%",  v => churnRate   = v);
+    wireSlider("sl-pulse",   "val-pulse",   "x",  v => pulseSpeed  = v);
+    build();
+    requestAnimationFrame(tick);
+  }
+
+  function migrateSelected() {
+    if (!selected) { godLog(`${ts()} MIGRATE SELECTED — no node selected`, "warn"); return; }
+    // works for a selected client, or picks a random client from a selected relay
+    let client;
+    if (selected.type === "client") {
+      client = selected.obj;
+    } else {
+      const pool = clients.filter(c => c.relay === selected.obj && c.online);
+      if (!pool.length) { godLog(`${ts()} MIGRATE SELECTED — no online clients on relay`, "warn"); return; }
+      client = pool[Math.floor(Math.random() * pool.length)];
+    }
+    if (!client.online) { godLog(`${ts()} MIGRATE SELECTED — client offline`, "warn"); return; }
+    const candidates = relays.filter(r => r !== client.relay);
+    if (!candidates.length) return;
+    const newRelay = candidates[Math.floor(Math.random() * candidates.length)];
+
+    client.relay.clients = Math.max(0, client.relay.clients - 1);
+    const oldRelay = client.relay;
+    newRelay.clients++;
+    client.prevRelay = oldRelay;
+    client.relay = newRelay;
+
+    const cp = clientXY(client);
+    const op = relayXY(oldRelay);
+    const np = relayXY(newRelay);
+    const mc = getComputedColor("--migrate");
+
+    godLog(`${ts()} MIGRATE ${client.id.slice(0,6)} → ${newRelay.id.split(".")[0]} (was ${oldRelay.id.split(".")[0]})`, "migrate");
+    nodeLog(client.id, `${ts()} migrated to ${newRelay.id.split(".")[0]}`, "migrate");
+
+    addPulse(cp.x, cp.y, np.x, np.y, mc, 2, () => {
+      for (const contact of client.contacts) {
+        const rp = relayXY(contact.relay);
+        const ep = clientXY(contact);
+        addPulse(cp.x, cp.y, rp.x, rp.y, mc, 1.5, () => {
+          if (contact.online) addPulse(rp.x, rp.y, ep.x, ep.y, mc, 1);
+          else bufferPush(contact.relay, contact, mc);
+        });
+      }
+      addPulse(cp.x, cp.y, op.x, op.y, mc, 1);
+    });
+
+    totalMigrates++;
+    renderRelayList();
+    updateInfo();
+  }
+
+  function sendFromSelected() {
+    if (!selected) { godLog(`${ts()} SEND FROM SEL — no node selected`, "warn"); return; }
+    let sender;
+    if (selected.type === "client") {
+      sender = selected.obj;
+    } else {
+      const pool = clients.filter(c => c.relay === selected.obj && c.online && c.contacts.length > 0);
+      if (!pool.length) { godLog(`${ts()} SEND FROM SEL — no eligible sender on relay`, "warn"); return; }
+      sender = pool[Math.floor(Math.random() * pool.length)];
+    }
+    if (!sender.online) { godLog(`${ts()} SEND FROM SEL — sender offline`, "warn"); return; }
+    if (!sender.contacts.length) { godLog(`${ts()} SEND FROM SEL — no contacts`, "warn"); return; }
+    const recipient = sender.contacts[Math.floor(Math.random() * sender.contacts.length)];
+    spawnMessage(sender, recipient, getComputedColor("--packet"));
+  }
+
+  return { init, randomMessage, sendFromSelected, randomMigrate, migrateSelected, toggleChurn, reset, selectRelay };
+})();
+
+sim.init();
 </script>
 </body>
 </html>
