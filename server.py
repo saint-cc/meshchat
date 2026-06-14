@@ -155,7 +155,7 @@ class RateLimiter:
 
 async def send_to(ws, obj):
     try:
-        raw = json.dumps(obj)
+        raw = json.dumps(obj, separators=(",", ":"))
         await ws.send(raw)
         stats["bytes_out"] += len(raw)
         stats["msgs_out"]  += 1
