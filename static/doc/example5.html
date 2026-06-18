@@ -1416,7 +1416,26 @@ for (const e of edges) {
     pulses  = [];
     totalMsgs = 0;
     totalMigrates = 0;
-    stats = { packetsTotal: 0, packetsDropped: 0, orphanedMessages: 0, lostConnections: 0, restoredConnections: 0, newConnections: 0 };
+    stats = {
+      packetsTotal:         0,
+      packetsDelivered:     0,
+      packetsDropped:       0,
+      latencySum:           0,
+      latencyCount:         0,
+      misroutes:            0,
+      orphanedMessages:     0,
+      lostConnections:      0,
+      restoredConnections:  0,
+      migrations:           0,
+      churnEvents:          0,
+      newConnections:       0,
+      
+      // Live state (initialize to 0 on reset)
+      activeLinks:          0,
+      avgDegree:            "0.0",
+      relayImbalance:       "0.00",
+      bufferDepth:          0
+    };    
     selected = null;
 
     for (let i = 0; i < CFG.RELAY_COUNT; i++) {
