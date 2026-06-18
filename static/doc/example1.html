@@ -5,11 +5,68 @@
 <title>Meshchat Minimal Working Demo</title>
 
 <style>
-body { font-family: monospace; display: flex; gap: 20px; }
-.panel { width: 50%; border: 1px solid #ccc; padding: 10px; }
-pre { background: #eee; padding: 6px; height: 320px; overflow:auto; }
-input { width: 90%; margin: 4px 0; }
-button { margin: 3px 0; }
+body{
+    font-family: monospace;
+    background:#2b2b2b;
+    color:#ddd;
+    display:flex;
+    gap:20px;
+    margin:20px;
+}
+
+.panel{
+    width:50%;
+    background:#3a3a3a;
+    border:1px solid #555;
+    border-radius:8px;
+    padding:12px;
+}
+
+h3{
+    margin:0 0 12px;
+    padding:8px;
+    background:#4a4a4a;
+    border-bottom:1px solid #666;
+    text-align:center;
+    color:#fff;
+}
+
+input{
+    width:90%;
+    margin:4px 0;
+    padding:6px;
+    background:#555;
+    color:#fff;
+    border:1px solid #777;
+    border-radius:4px;
+}
+
+button{
+    margin:3px 0;
+    padding:6px 10px;
+    background:#5a5a5a;
+    color:#fff;
+    border:1px solid #777;
+    border-radius:4px;
+    cursor:pointer;
+}
+
+button:hover{
+    background:#6a6a6a;
+}
+
+pre{
+    margin-top:12px;
+    background:#202020;
+    color:#d8d8d8;
+    border:1px solid #444;
+    padding:8px;
+    height:320px;
+    overflow:auto;
+}
+button{
+    min-width:90px;
+}
 </style>
 
 <script type="module">
@@ -24,12 +81,12 @@ window.ed25519 = ed25519;
 <div class="panel">
 <h3>Left</h3>
 
-<input id="l_user" placeholder="user">
-<input id="l_pass" type="password" placeholder="pass">
-
+<input id="l_user" placeholder="user1">
+<input id="l_pass" type="password" placeholder="pass1">
+<br>
 <button onclick="login('left')">Login</button>
-<button onclick="exchange('left','right')">Exchange</button>
-<button onclick="send('left','right')">Send</button>
+<button onclick="exchange('left','right')">Exchange QR Code</button>
+<button onclick="send('left','right')">Send "hello world"</button>
 
 <pre id="l_log"></pre>
 </div>
@@ -37,12 +94,12 @@ window.ed25519 = ed25519;
 <div class="panel">
 <h3>Right</h3>
 
-<input id="r_user" placeholder="user">
-<input id="r_pass" type="password" placeholder="pass">
-
+<input id="r_user" placeholder="user2">
+<input id="r_pass" type="password" placeholder="pass2">
+<br>
 <button onclick="login('right')">Login</button>
-<button onclick="exchange('right','left')">Exchange</button>
-<button onclick="send('right','left')">Send</button>
+<button onclick="exchange('right','left')">Exchange QR Code</button>
+<button onclick="send('right','left')">Send "hello world"</button>
 
 <pre id="r_log"></pre>
 </div>
@@ -146,10 +203,16 @@ function exchange(from,to){
     encKey: a.encKey   // IMPORTANT: recipient stores sender enc key
   };
 
-  log(from,"[exchange] sent");
-  log(to,"[exchange] received from "+a.user);
+  log(from,"[exchange] show QR code");
+  log(to,"[exchange] key received for "+a.user);
 }
 
+// -------
+function shortHex(b){
+    const h = b2h(b);
+    //return h.slice(0,16) + "..." + h.slice(-16);
+	return b;
+}
 // ---------------- send ----------------
 async function send(from,to){
 
@@ -161,7 +224,7 @@ async function send(from,to){
   const msg = enc.encode("hello world");
 
   const iv = crypto.getRandomValues(new Uint8Array(12));
-
+  
   const ct = await crypto.subtle.encrypt(
     {name:"AES-GCM", iv},
     c.encKey,
@@ -180,7 +243,13 @@ async function send(from,to){
   };
 
   log(from,"[send] encrypted + signed");
-
+	log(from,"");
+	log(from,"[send]");
+	log(from,"  plaintext : hello world");
+	log(from,"  recipient : " + recv.user);
+	log(from,"  iv        : " + shortHex(b2h(iv)));
+	log(from,"  ciphertext: " + shortHex(b2h(msg)));
+	log(from,"  signature : " + shortHex(b2h(sig)));
   receive(packet,to);
 }
 
@@ -196,6 +265,14 @@ async function receive(p,side){
 
   const ok = ed25519.verify(sig, ct, c.pub);
 
+	log(side,"");
+	log(side,"[send]");
+	log(side,"  plaintext : hello world");
+
+	log(side,"  iv        : " + shortHex(b2h(iv)));
+	log(side,"  ciphertext: " + shortHex(b2h(ct)));
+	log(side,"  signature : " + shortHex(b2h(sig)));
+	
   log(side,"[verify] " + ok);
 
   if(!ok) return;

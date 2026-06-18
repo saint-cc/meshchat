@@ -44,6 +44,46 @@ body {
   flex: 1;
   min-height: 0;
 }
+/* stats column — narrow strip, far left */
+#stats-col {
+  width: 108px;
+  flex-shrink: 0;
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  overflow-y: auto;
+}
+#stats-col::-webkit-scrollbar { width: 3px; }
+#stats-col::-webkit-scrollbar-thumb { background: var(--border); }
+#stats-header {
+  padding: 8px 10px;
+  font-size: 10px;
+  letter-spacing: 0.25em;
+  color: var(--accent);
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+#stats-body {
+  display: flex;
+  flex-direction: column;
+  padding: 12px 10px;
+  gap: 16px;
+}
+.stat-block { display: flex; flex-direction: column; gap: 3px; }
+.stat-label {
+  font-size: 8.5px;
+  color: var(--muted);
+  letter-spacing: 0.04em;
+  line-height: 1.4;
+  text-transform: lowercase;
+}
+.stat-value {
+  font-size: 17px;
+  color: var(--text);
+  letter-spacing: 0.02em;
+}
+.stat-value.flag { color: var(--danger); }
+
 #canvas-wrap {
   flex: 1;
   position: relative;
@@ -201,6 +241,10 @@ canvas { display: block; width: 100%; height: 100%; background: black;}
   width: 100%;
   accent-color: var(--accent);
 }
+.ctrl-group input[type=range]:disabled {
+  opacity: 0.3;
+  cursor: not-allowed;
+}
 .ctrl-group .val {
   font-size: 9px;
   color: var(--accent);
@@ -222,6 +266,8 @@ canvas { display: block; width: 100%; height: 100%; background: black;}
 .ctrl-btn:hover { border-color: var(--accent); color: var(--accent); }
 .ctrl-btn.migrate { border-color: var(--migrate); color: var(--migrate); }
 .ctrl-btn.migrate:hover { background: #1a0f0a; }
+.ctrl-btn.evolve.active { border-color: var(--online); color: var(--online); background: #0c160c; }
+.ctrl-btn.evolve.active:hover { background: #102010; }
 
 #legend {
   padding: 10px 12px;
@@ -244,38 +290,61 @@ canvas { display: block; width: 100%; height: 100%; background: black;}
 </div>
 
 <div id="main">
+  <div id="stats-col">
+    <div id="stats-header">STATS</div>
+    <div id="stats-body"></div>
+  </div>
+
   <div id="canvas-wrap">
     <canvas id="c"></canvas>
   </div>
 
-  <div id="relay-col" id="relay-list"></div>
+  <div id="relay-col"></div>
 
   <div id="slider-col">
     <div class="section-label">TOPOLOGY</div>
     <div class="ctrl-group">
-      <label>RELAYS <span class="val" id="val-relays">12</span></label>
-      <input type="range" id="sl-relays" min="2" max="40" step="1" value="12">
+      <label>RELAYS <span class="val" id="val-relays">3</span></label>
+      <input type="range" id="sl-relays" min="2" max="20" step="1" value="3">
     </div>
     <div class="ctrl-group">
-      <label>CLIENTS <span class="val" id="val-clients">80</span></label>
-      <input type="range" id="sl-clients" min="2" max="4000" step="1" value="80">
+      <label>CLIENTS <span class="val" id="val-clients">10</span></label>
+      <input type="range" id="sl-clients" min="2" max="1000" step="1" value="10">
+    </div>
+    <div class="ctrl-group">
+      <label>AVG CONTACTS <span class="val" id="val-contacts">4</span></label>
+      <input type="range" id="sl-contacts" min="1" max="16" step="1" value="4">
     </div>
     <div class="section-label">SIMULATION</div>
     <div class="ctrl-group">
-      <label>SIM SPEED <span class="val" id="val-speed">1x</span></label>
-      <input type="range" id="sl-speed" min="0.1" max="5" step="0.1" value="1">
+      <label>SIM SPEED <span class="val" id="val-speed">0.3x</span></label>
+      <input type="range" id="sl-speed" min="0.1" max="5" step="0.1" value="0.3">
     </div>
     <div class="ctrl-group">
       <label>MSG RATE <span class="val" id="val-msg">3/s</span></label>
       <input type="range" id="sl-msg" min="0" max="30" step="1" value="3">
     </div>
     <div class="ctrl-group">
-      <label>CHURN <span class="val" id="val-churn">5%</span></label>
-      <input type="range" id="sl-churn" min="0" max="50" step="1" value="5">
+      <label>CHURN <span class="val" id="val-churn">1%</span></label>
+      <input type="range" id="sl-churn" min="0" max="50" step="1" value="1">
     </div>
     <div class="ctrl-group">
-      <label>PULSE SPEED <span class="val" id="val-pulse">1x</span></label>
-      <input type="range" id="sl-pulse" min="0.2" max="4" step="0.1" value="1">
+      <label>PULSE SPEED <span class="val" id="val-pulse">3x</span></label>
+      <input type="range" id="sl-pulse" min="0.2" max="4" step="0.1" value="3">
+    </div>
+    <div class="section-label">EVOLVE</div>
+    <button class="ctrl-btn evolve" id="evolveBtn" onclick="sim.toggleEvolve()">▶ START EVOLVE</button>
+    <div class="ctrl-group">
+      <label>INTRODUCE <span class="val" id="val-introduce">8%</span></label>
+      <input type="range" id="sl-introduce" min="0" max="30" step="1" value="8">
+    </div>
+    <div class="ctrl-group">
+      <label>ARRIVE <span class="val" id="val-arrive">4%</span></label>
+      <input type="range" id="sl-arrive" min="0" max="20" step="1" value="4">
+    </div>
+    <div class="ctrl-group">
+      <label>ANGRY <span class="val" id="val-angry">5%</span></label>
+      <input type="range" id="sl-angry" min="0" max="30" step="1" value="5">
     </div>
   </div>
 
@@ -286,11 +355,12 @@ canvas { display: block; width: 100%; height: 100%; background: black;}
     </div>
 
     <div id="controls">
-      <button class="ctrl-btn" onclick="sim.randomMessage()">▶ SEND RANDOM MSG</button>
+
       <button class="ctrl-btn" onclick="sim.sendFromSelected()">▶ SEND FROM SEL</button>
-      <button class="ctrl-btn migrate" onclick="sim.randomMigrate()">⇄ MIGRATE RANDOM</button>
+
       <button class="ctrl-btn migrate" onclick="sim.migrateSelected()">⇄ MIGRATE SELECTED</button>
-      <button class="ctrl-btn" onclick="sim.toggleChurn()">⏸ PAUSE CHURN</button>
+      <button class="ctrl-btn" id="pauseBtn" onclick="sim.togglePause()">⏸ PAUSE</button>
+      <button class="ctrl-btn" id="churnBtn" onclick="sim.toggleChurn()">⏸ PAUSE CHURN</button>
       <button class="ctrl-btn" onclick="sim.reset()">↺ RESET SIM</button>
     </div>
 
@@ -299,7 +369,12 @@ canvas { display: block; width: 100%; height: 100%; background: black;}
       <div class="legend-row"><div class="legend-dot" style="background:var(--muted)"></div> client offline</div>
       <div class="legend-row"><div class="legend-sq"  style="background:var(--relay)"></div> relay server</div>
       <div class="legend-row"><div class="legend-dot" style="background:var(--packet)"></div> message packet</div>
+      <div class="legend-row"><div class="legend-dot" style="background:var(--danger)"></div> misrouted packet</div>
       <div class="legend-row"><div class="legend-dot" style="background:var(--migrate)"></div> migrate packet</div>
+      <div class="legend-row"><div style="width:18px;height:2px;background:#c05020;flex-shrink:0"></div> relay stale (1 side)</div>
+      <div class="legend-row"><div style="width:18px;height:2px;background:#a02020;flex-shrink:0"></div> relay stale (both)</div>
+      <div class="legend-row"><div class="legend-dot" style="background:var(--online)"></div> new connection (intro)</div>
+      <div class="legend-row"><div class="legend-dot" style="background:var(--accent)"></div> new node arrives</div>
     </div>
   </div>
 
@@ -320,10 +395,9 @@ canvas { display: block; width: 100%; height: 100%; background: black;}
 //   CONFIG
 // ═══════════════════════════════════════
 const CFG = {
-  CLIENT_COUNT : 80,
-  RELAY_COUNT  : 12,
-  CONTACT_MIN  : 2,
-  CONTACT_MAX  : 6,
+  CLIENT_COUNT : 10,
+  RELAY_COUNT  : 3,
+  CONTACT_AVG  : 4,
   CLIENT_RADIUS: 4,
   RELAY_SIZE   : 10,
 };
@@ -346,7 +420,8 @@ function nodeLog(id, text, cls = "info") {
   if (!nodeLines[id]) nodeLines[id] = [];
   nodeLines[id].push({ text, cls });
   if (nodeLines[id].length > LOG_MAX) nodeLines[id].shift();
-  if (sim.selected === id) renderNodeLog(id);
+  if (sim.selected?.obj?.id === id) renderNodeLog(id);
+  
 }
 
 function renderGodLog() {
@@ -380,18 +455,111 @@ const sim = (() => {
   let pulses  = [];
   let selected = null;
   let churnPaused = false;
+  let simPaused   = false;
 
   const ts = () => new Date().toLocaleTimeString([], { hour:"2-digit", minute:"2-digit", second:"2-digit", hour12: false });
 
-  let simSpeed   = 1;
+  let simSpeed   = 0.3;
   let msgRate    = 3;
-  let churnRate  = 5;
-  let pulseSpeed = 1;
+  let churnRate  = 3;
+  let pulseSpeed = 3;
+
+  // EVOLVE — structural growth, separate layer from CHURN's presence chaos.
+  // Three dials, each "n% chance of one such event per sim-second":
+  //   introduceRate — existing nodes getting better connected (FOAF)
+  //   arriveRate    — population growth (new node joins via a friend)
+  //   angryRate     — per-client chance of bailing on an overloaded relay
+  let evolveActive  = false;
+  let introduceRate = 8;
+  let arriveRate    = 4;
+  let angryRate     = 5;
+  let evolveAccum   = 0;
+
+  const ANGRY_LOAD_THRESHOLD = 0.6;   // relay.load above this is "overloaded" enough to provoke ANGRY
+  const SELF_HOST_CHANCE     = 0.12;  // ANGRY: rare chance of claiming a fresh relay instead of a known one
+  const PIONEER_CHANCE       = 0.08;  // ARRIVE: rare chance of a fresh pair landing on a fresh relay together
 
   let msgAccum   = 0;
   let churnAccum = 0;
   let totalMsgs  = 0;
   let totalMigrates = 0;
+  let simTime    = 0;   // sim-seconds elapsed, paused/scaled with simSpeed — drives checkPrevRelay timing
+
+  const PREV_RELAY_CHECK_DELAY = 10;   // sim-seconds after migration before checking the old relay once
+
+  // Running protocol-health counters, shown in the left stats strip.
+  // Reset on build()/RESET SIM. Add new counters here + a row in STAT_DEFS
+  // below — renderStats() picks them up automatically, nothing else to wire.
+  
+    function calcRelayImbalance() {
+		if (relays.length === 0) return 0;
+		const loads = relays.map(r => r.load);
+		const mean = loads.reduce((a, b) => a + b, 0) / relays.length;
+		const variance = loads.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / relays.length;
+		return Math.sqrt(variance).toFixed(2);
+	  }
+  
+  
+  let stats = {
+    packetsTotal:       0,
+    packetsDelivered:   0,
+    latencySum:         0,
+    latencyCount:       0,
+    misroutes:          0,
+    orphanedMessages:   0,
+    migrations:         0,
+    churnEvents:        0,
+    newConnections:     0,
+    
+    // Live state fields (calculated every frame)
+    activeLinks:        0,
+    avgDegree:          "0.0",
+    relayImbalance:     "0.00",
+    bufferDepth:        0
+  };
+
+   const STAT_DEFS = [
+    { label: "delivery success",      flag: s => s.packetsTotal > 0 && (s.packetsDelivered / s.packetsTotal) < 0.9,
+      value: s => s.packetsTotal ? (s.packetsDelivered / s.packetsTotal * 100).toFixed(1) + "%" : "—" },
+    
+    { label: "avg latency",           flag: s => s.latencyCount > 0 && (s.latencySum / s.latencyCount) > 2.0,
+      value: s => s.latencyCount ? (s.latencySum / s.latencyCount).toFixed(2) + "s" : "—" },
+
+    { label: "misroute rate",         flag: s => s.packetsTotal > 0 && s.misroutes > 0,
+      value: s => s.packetsTotal ? (s.misroutes / s.packetsTotal * 100).toFixed(1) + "%" : "—" },
+
+    { label: "relay imbalance",       flag: s => parseFloat(s.relayImbalance) > 0.2,
+      value: s => s.relayImbalance },
+
+    { label: "active links",          flag: () => false,
+      value: s => s.activeLinks },
+
+    { label: "avg degree",            flag: () => false,
+      value: s => s.avgDegree },
+
+    { label: "buffer depth",          flag: s => s.bufferDepth > 5,
+      value: s => s.bufferDepth },
+
+    { label: "orphaned messages",     flag: s => s.orphanedMessages > 0,
+      value: s => s.orphanedMessages },
+
+    { label: "migrations",            flag: () => false,
+      value: s => s.migrations },
+
+    { label: "churn events",          flag: () => false,
+      value: s => s.churnEvents },
+  ];
+
+  function renderStats() {
+    const el = document.getElementById("stats-body");
+    if (!el) return;
+    el.innerHTML = STAT_DEFS.map(def => `
+      <div class="stat-block">
+        <div class="stat-label">${def.label}</div>
+        <div class="stat-value${def.flag(stats) ? " flag" : ""}">${def.value(stats)}</div>
+      </div>
+    `).join("");
+  }
 
   const canvas = document.getElementById("c");
   const ctx    = canvas.getContext("2d");
@@ -414,13 +582,61 @@ const sim = (() => {
     return { stroke: `hsl(${hue},70%,60%)`, fill: `hsl(${hue},50%,18%)` };
   }
 
+  function randomDegreeTarget() {
+    const half = Math.max(1, Math.round(CFG.CONTACT_AVG * 0.5));
+    return Math.max(1, CFG.CONTACT_AVG - half + Math.floor(Math.random() * (half * 2 + 1)));
+  }
+
+  // Builds a standalone client on the given relay. online defaults to the
+  // same 80%-online roll build() always used; EVOLVE's ARRIVE mechanic
+  // overrides it to true — a node that just joined is actively using it.
+  function makeClient(relay, online = Math.random() > 0.2) {
+    const id  = randId("c");
+    const pos = keyToPos(id);
+    relay.clients++;
+    return {
+      id, x: pos.x, y: pos.y, relay,
+      prevRelay: null, prevRelayCheckAt: null,
+      contacts: [], contactKnownRelay: new Map(),
+      online, msgCount: 0,
+      contactTarget: randomDegreeTarget(),
+    };
+  }
+
+  // Wires two clients as mutual contacts with correct relay knowledge —
+  // this is what a LIVE introduction/registration looks like (fresh info),
+  // as opposed to migration which deliberately leaves the other side stale.
+  function wireMutual(a, b) {
+    if (!a.contacts.includes(b)) { a.contacts.push(b); a.contactKnownRelay.set(b.id, true); }
+    if (!b.contacts.includes(a)) { b.contacts.push(a); b.contactKnownRelay.set(a.id, true); }
+  }
+
   function build() {
     clients = [];
     relays  = [];
     pulses  = [];
     totalMsgs = 0;
     totalMigrates = 0;
-    selected = null;
+	stats = {
+		  packetsTotal:         0,
+		  packetsDelivered:     0,
+		  packetsDropped:       0,
+		  latencySum:           0,
+		  latencyCount:         0,
+		  misroutes:            0,
+		  orphanedMessages:     0,
+		  lostConnections:      0,
+		  restoredConnections:  0,
+		  migrations:           0,
+		  churnEvents:          0,
+		  newConnections:       0,
+		        // Live state (initialize to 0 on reset)
+		  activeLinks:          0,
+		  avgDegree:            "0.0",
+		  relayImbalance:       "0.00",
+		  bufferDepth:          0
+    };
+	selected = null;
 
     for (let i = 0; i < CFG.RELAY_COUNT; i++) {
       relays.push({
@@ -434,35 +650,21 @@ const sim = (() => {
     }
 
     for (let i = 0; i < CFG.CLIENT_COUNT; i++) {
-      const id  = randId("c");
-      const pos = keyToPos(id);
       const relay = relays[Math.floor(Math.random() * relays.length)];
-      relay.clients++;
-      clients.push({
-        id,
-        x: pos.x,
-        y: pos.y,
-        relay,
-        prevRelay: null,
-        contacts: [],
-        online: Math.random() > 0.2,
-        msgCount: 0,
-      });
+      clients.push(makeClient(relay));
     }
 
     for (const c of clients) {
-      const n = CFG.CONTACT_MIN + Math.floor(Math.random() * (CFG.CONTACT_MAX - CFG.CONTACT_MIN + 1));
       const pool = clients.filter(o => o !== c && !c.contacts.includes(o));
       shuffle(pool);
-      for (let i = 0; i < Math.min(n, pool.length); i++) {
-        const other = pool[i];
-        if (!c.contacts.includes(other))  c.contacts.push(other);
-        if (!other.contacts.includes(c))  other.contacts.push(c);
+      for (let i = 0; i < Math.min(c.contactTarget, pool.length); i++) {
+        wireMutual(c, pool[i]);
       }
     }
 
     renderRelayList();
     updateInfo();
+    renderStats();
   }
 
   function shuffle(arr) {
@@ -497,49 +699,128 @@ const sim = (() => {
 
   const BUF_MAX = 8;
 
-  function bufferPush(relay, recipient, color) {
+  function bufferPush(relay, recipient, color, sender = null) {
     if (!relay.buffer[recipient.id]) relay.buffer[recipient.id] = [];
     const buf = relay.buffer[recipient.id];
-    if (buf.length < BUF_MAX) buf.push(color);
+    if (buf.length >= BUF_MAX) {
+      stats.packetsDropped++;
+      godLog(`${ts()} DROP  ${relay.id.split(".")[0]} buffer full — packet for ${recipient.id.slice(0,6)} lost`, "warn");
+      nodeLog(relay.id, `${ts()} buffer full — dropped packet for ${recipient.id.slice(0,6)}`, "warn");
+      return;
+    }
+    buf.push({ color, sender });
     relay.bufSize = Object.values(relay.buffer).reduce((s, b) => s + b.length, 0);
     godLog(`${ts()} BUF   ${relay.id.split(".")[0]} ← ${recipient.id.slice(0,6)}`, "warn");
     nodeLog(relay.id, `${ts()} buffered msg for ${recipient.id.slice(0,6)}`, "warn");
   }
 
-  function bufferFlush(client) {
-    const relay = client.relay;
-    const buf   = relay.buffer[client.id];
+  // relay defaults to the client's current relay (churn online-flush case).
+  // Pass an explicit relay to drain a DIFFERENT relay's buffer for this
+  // client — used by checkPrevRelay() to sweep the relay they just left.
+  function bufferFlush(client, relay = client.relay) {
+    const buf = relay.buffer[client.id];
     if (!buf || !buf.length) return;
     const rp = relayXY(relay);
-    const ep = clientXY(client);
     godLog(`${ts()} FLUSH ${relay.id.split(".")[0]} → ${client.id.slice(0,6)}  (${buf.length} msgs)`, "info");
     nodeLog(client.id, `${ts()} flushed ${buf.length} buffered msg(s) from ${relay.id.split(".")[0]}`, "info");
-    buf.forEach((color, i) => {
-      setTimeout(() => addPulse(rp.x, rp.y, ep.x, ep.y, color, 1.5), i * 80);
+    buf.forEach(({ color, sender }, i) => {
+      setTimeout(() => {
+        const ep = clientXY(client);
+        addPulse(rp.x, rp.y, ep.x, ep.y, color, 1.5, () => {
+          // buffered packet finally delivered — update relay knowledge
+          if (sender) {
+            client.contactKnownRelay.set(sender.id, true);
+            //sender.contactKnownRelay.set(client.id, true);
+          }
+        });
+      }, i * 80);
     });
     delete relay.buffer[client.id];
     relay.bufSize = Object.values(relay.buffer).reduce((s, b) => s + b.length, 0);
   }
 
+  // One-time check-in with the relay a client just migrated away from.
+  // Fires PREV_RELAY_CHECK_DELAY sim-seconds after migration (set in
+  // migrateSelected) and drains whatever's stranded there at that moment.
+  // IMPORTANT: only prevRelayCheckAt gets cleared here, never prevRelay
+  // itself. prevRelay is the standing address that any contact with stale
+  // knowledge will keep misrouting to (see spawnMessage / migrateSelected's
+  // notify-fallback) — it has to survive this check, or stale senders would
+  // start landing at the *correct* relay the instant the timer fires,
+  // regardless of whether they were ever actually corrected.
+  // prevRelayCheckAt == null && prevRelay != null is sufficient to mean
+  // "checked once already" — no separate flag needed.
+  function checkPrevRelay(client) {
+    const relay = client.prevRelay;
+    if (!relay) return;
+    client.prevRelayCheckAt = null;   // one-shot — only the pending-check marker clears
+
+    const cp = clientXY(client);
+    const rp = relayXY(relay);
+    const mc = getComputedColor("--migrate");
+    const buf = relay.buffer[client.id];
+    const stranded = buf ? buf.length : 0;
+
+    nodeLog(client.id, `${ts()} checking previous relay ${relay.id.split(".")[0]}…`, "migrate");
+
+    addPulse(cp.x, cp.y, rp.x, rp.y, mc, 1.2, () => {
+      if (stranded) {
+        godLog(`${ts()} CHECK  ${client.id.slice(0,6)} → ${relay.id.split(".")[0]}  found ${stranded} stranded`, "migrate");
+        bufferFlush(client, relay);
+      } else {
+        nodeLog(client.id, `${ts()} ${relay.id.split(".")[0]} clean — nothing stranded`, "info");
+      }
+    });
+  }
+
   function spawnMessage(sender, recipient, color) {
     if (!sender.online) return;
     const sp = clientXY(sender);
-    const rp = relayXY(recipient.relay);
-    const ep = clientXY(recipient);
 
-    addPulse(sp.x, sp.y, rp.x, rp.y, color, 1.5, () => {
+    // Route to recipient's current relay only if sender has up-to-date knowledge.
+    // If the flag is false (recipient migrated since last contact), use prevRelay —
+    // the stale info the sender still believes is correct.
+    const knowsRelay  = sender.contactKnownRelay.get(recipient.id) === true;
+    const targetRelay = knowsRelay ? recipient.relay : (recipient.prevRelay || recipient.relay);
+    const pulseColor  = knowsRelay ? color : getComputedColor("--danger");
+    const rp0         = relayXY(targetRelay);
+
+    addPulse(sp.x, sp.y, rp0.x, rp0.y, pulseColor, 1.5, () => {
+      const rp = relayXY(targetRelay);
+	  const sentTime = simTime; 
+
+      if (!knowsRelay) {
+        // Misrouted — arrived at stale relay, recipient has since moved on
+		stats.misroutes++;
+        nodeLog(sender.id, `${ts()} → msg to   ${recipient.id.slice(0,6)} ✗ stale:${targetRelay.id.split(".")[0]}`, "warn");
+        godLog(`${ts()} MISROUTE  ${sender.id.slice(0,6)}→${recipient.id.slice(0,6)}  via ${targetRelay.id.split(".")[0]} (stale)`, "warn");
+        bufferPush(targetRelay, recipient, pulseColor, sender);
+        return;
+      }
+
+      // Correctly routed — normal delivery path
+      const ep = clientXY(recipient);
       if (recipient.online) {
-        addPulse(rp.x, rp.y, ep.x, ep.y, color);
+        addPulse(rp.x, rp.y, ep.x, ep.y, color, 1.5, () => {
+          // Delivery confirmed — both sides update relay knowledge via embedded relay info
+          recipient.contactKnownRelay.set(sender.id, true);
+          sender.contactKnownRelay.set(recipient.id, true);
+        });
         nodeLog(sender.id,    `${ts()} → msg to   ${recipient.id.slice(0,6)}`, "msg");
         nodeLog(recipient.id, `${ts()} ← msg from ${sender.id.slice(0,6)}`, "msg");
       } else {
-        bufferPush(recipient.relay, recipient, color);
+        nodeLog(sender.id, `${ts()} → msg to   ${recipient.id.slice(0,6)} (offline, buffered)`, "msg");
+        bufferPush(recipient.relay, recipient, color, sender);
       }
+		stats.packetsDelivered++;
+		stats.latencySum += (simTime - sentTime);
+		stats.latencyCount++;	  
     });
 
     sender.msgCount++;
-    recipient.relay.load = Math.min(1, recipient.relay.load + 0.05);
+    targetRelay.load = Math.min(1, targetRelay.load + 0.05);
     totalMsgs++;
+    stats.packetsTotal++;
   }
 
   function randomMessage() {
@@ -550,51 +831,14 @@ const sim = (() => {
     spawnMessage(sender, recipient, getComputedColor("--packet"));
   }
 
-  function randomMigrate() {
-    const online = clients.filter(c => c.online);
-    if (!online.length) return;
-    const client = online[Math.floor(Math.random() * online.length)];
-    const oldRelay = client.relay;
-    const candidates = relays.filter(r => r !== oldRelay);
-    if (!candidates.length) return;
-    const newRelay = candidates[Math.floor(Math.random() * candidates.length)];
-
-    oldRelay.clients = Math.max(0, oldRelay.clients - 1);
-    newRelay.clients++;
-    client.prevRelay = oldRelay;
-    client.relay = newRelay;
-
-    const cp = clientXY(client);
-    const op = relayXY(oldRelay);
-    const np = relayXY(newRelay);
-    const mc = getComputedColor("--migrate");
-
-    godLog(`${ts()} MIGRATE ${client.id.slice(0,6)} → ${newRelay.id.split(".")[0]} (was ${oldRelay.id.split(".")[0]})`, "migrate");
-    nodeLog(client.id, `${ts()} migrated to ${newRelay.id.split(".")[0]}`, "migrate");
-
-    addPulse(cp.x, cp.y, np.x, np.y, mc, 2, () => {
-      for (const contact of client.contacts) {
-        const rp = relayXY(contact.relay);
-        const ep = clientXY(contact);
-        addPulse(cp.x, cp.y, rp.x, rp.y, mc, 1.5, () => {
-          if (contact.online) {
-            addPulse(rp.x, rp.y, ep.x, ep.y, mc, 1);
-          } else {
-            bufferPush(contact.relay, contact, mc);
-          }
-        });
-      }
-      addPulse(cp.x, cp.y, op.x, op.y, mc, 1);
-    });
-
-    totalMigrates++;
-    renderRelayList();
-    if (selected?.obj === client) updateInfo();
+  function togglePause() {
+    simPaused = !simPaused;
+    document.getElementById("pauseBtn").textContent = simPaused ? "▶ RESUME" : "⏸ PAUSE";
   }
 
   function toggleChurn() {
     churnPaused = !churnPaused;
-    document.querySelector(".ctrl-btn:nth-of-type(3)").textContent =
+    document.getElementById("churnBtn").textContent =
       churnPaused ? "▶ RESUME CHURN" : "⏸ PAUSE CHURN";
   }
 
@@ -642,9 +886,22 @@ const sim = (() => {
         <div class="kv"><span>id</span><span>${c.id.slice(0,10)}…</span></div>
         <div class="kv"><span>status</span><span style="color:${c.online?"var(--online)":"var(--muted)"}">${c.online?"online":"offline"}</span></div>
         <div class="kv"><span>relay</span><span style="color:${c.relay.color.stroke}">${c.relay.id.split(".")[0]}</span></div>
-        <div class="kv"><span>prev relay</span><span style="color:var(--muted)">${c.prevRelay ? c.prevRelay.id.split(".")[0] : "—"}</span></div>
+        <div class="kv"><span>prev relay</span><span style="color:var(--muted)">${c.prevRelay ? c.prevRelay.id.split(".")[0] + (c.prevRelayCheckAt != null ? ` (check in ${Math.max(0, c.prevRelayCheckAt - simTime).toFixed(1)}s)` : "") : "—"}</span></div>
         <div class="kv"><span>contacts</span><span>${c.contacts.length}</span></div>
         <div class="kv"><span>msgs sent</span><span>${c.msgCount}</span></div>
+        <div style="margin-top:8px;font-size:9px;color:var(--muted);letter-spacing:0.1em;border-bottom:1px solid var(--border);padding-bottom:3px;margin-bottom:4px">CONTACTS</div>
+        ${c.contacts.map(ct => {
+          const known = c.contactKnownRelay.get(ct.id) === true;
+          const vo = visuallyOnline(ct);
+          return `<div class="kv" style="margin-bottom:2px">
+            <span style="color:${vo ? ct.relay.color.stroke : "var(--muted)"}">
+              ${ct.id.slice(0,8)}
+            </span>
+            <span style="font-size:8px;color:${known ? ct.relay.color.stroke : "var(--danger)"}">
+              ${known ? ct.relay.id.split(".")[0] : "relay?"}
+            </span>
+          </div>`;
+        }).join("")}
       `;
     } else {
       const r = selected.obj;
@@ -687,7 +944,7 @@ const sim = (() => {
   // ── visual offline delay ──
   // When a node goes offline we record the time. The draw loop treats it as
   // still-online for OFFLINE_VISUAL_DELAY ms so in-flight pulses can finish.
-  const OFFLINE_VISUAL_DELAY = 1800;  // ms
+  const OFFLINE_VISUAL_DELAY = 600;  // ms
   const offlineAt = {};   // clientId → timestamp when they went offline
 
   function visuallyOnline(c) {
@@ -706,7 +963,7 @@ const sim = (() => {
     const { ox, oy, size } = sq();
 
     // key space background
-    ctx.fillStyle = "#030303";
+    ctx.fillStyle = "#010101";
     ctx.fillRect(ox, oy, size, size);
     ctx.strokeStyle = "#1a1a1a";
     ctx.lineWidth = 1;
@@ -739,52 +996,103 @@ const sim = (() => {
       }
     }
 
-    // ── contact edges — dim pass ──
-    for (const c of clients) {
-      const cp = clientXY(c);
-      for (const contact of c.contacts) {
-        if (contact.id < c.id) continue;
-        const key = c.id < contact.id ? c.id + "|" + contact.id : contact.id + "|" + c.id;
-        if (hlPairs.has(key)) continue; // drawn in bright pass below
-        ctx.strokeStyle = hasSel ? "#0e0e0e" : (visuallyOnline(c) && visuallyOnline(contact) ? "#1a241a" : "#131313");
-        ctx.lineWidth = 0.3;
-        ctx.beginPath();
-        ctx.moveTo(cp.x, cp.y);
-        ctx.lineTo(clientXY(contact).x, clientXY(contact).y);
-        ctx.stroke();
-      }
-    }
+// ─────────────────────────────────────────────
+// Build unique contact edge list
+// ─────────────────────────────────────────────
 
-    // ── contact edges — highlighted pass ──
-    if (selected?.type === "client") {
-      const sel = selected.obj;
-      const sp  = clientXY(sel);
-      for (const ct of sel.contacts) {
-        const tp = clientXY(ct);
-        ctx.strokeStyle = ct.online ? sel.relay.color.stroke + "88" : "#55555566";
-        ctx.lineWidth = 1.5;
-        ctx.beginPath();
-        ctx.moveTo(sp.x, sp.y);
-        ctx.lineTo(tp.x, tp.y);
-        ctx.stroke();
-      }
-    }
+const edges = [];
+
+for (const c of clients) {
+  for (const contact of c.contacts) {
+
+    // only one edge per pair
+    if (contact.id < c.id) continue;
+
+    const aKnowsB = c.contactKnownRelay.get(contact.id) === true;
+    const bKnowsA = contact.contactKnownRelay.get(c.id) === true;
+
+    let state;
+    if (!aKnowsB && !bKnowsA)
+      state = "red";
+    else if (!aKnowsB || !bKnowsA)
+      state = "orange";
+    else
+      state = "green";
+
+    edges.push({
+      a: c,
+      b: contact,
+      state
+    });
+  }
+}
+
+
+// ─────────────────────────────────────────────
+// Draw all contact edges exactly once
+// ─────────────────────────────────────────────
+
+for (const e of edges) {
+
+  const ap = clientXY(e.a);
+  const bp = clientXY(e.b);
+
+  let color;
+  let width;
+
+      switch (e.state) {
+
+        case "green":
+          color = "#204020";
+          width = 0.3;
+          break;
+
+        case "orange":
+          color = "#c07020";
+          width = 0.6;
+          break;
+
+        case "red":
+          color = "#a02020";
+          width = 0.6;
+          break;
+         
+  }
+
+  // Dim edges unrelated to the current selection, same treatment the
+  // dimmed/normal passes below give to clients and relays. For a selected
+  // client this is exactly its own contact edges (hlPairs); for a selected
+  // relay it's any edge touching a client on that relay (hlClients).
+  const isRelevant = !hasSel
+    || hlPairs.has(e.a.id + "|" + e.b.id)
+    || (selected?.type === "relay" && (hlClients.has(e.a) || hlClients.has(e.b)));
+
+  ctx.globalAlpha = isRelevant ? 1 : 0.2;
+  ctx.strokeStyle = color;
+  ctx.lineWidth = width;
+  ctx.beginPath();
+  ctx.moveTo(ap.x, ap.y);
+  ctx.lineTo(bp.x, bp.y);
+  ctx.stroke();
+  ctx.globalAlpha = 1;
+}
 
     // ── tether lines (client → relay) ──
-    for (const c of clients) {
-      if (!visuallyOnline(c)) continue;
-      const cp = clientXY(c);
-      const rp = relayXY(c.relay);
-      const isHL = hasSel && hlClients.has(c);
-      ctx.strokeStyle = isHL
-        ? c.relay.color.stroke + "55"
-        : hasSel ? "#0c0c12" : "#1a1530";
-      ctx.lineWidth = isHL ? 0.8 : 0.4;
-      ctx.beginPath();
-      ctx.moveTo(cp.x, cp.y);
-      ctx.lineTo(rp.x, rp.y);
-      ctx.stroke();
-    }
+
+	for (const c of clients) {
+		if (selected?.type === "relay" && c.relay !== selected.obj) continue;
+		ctx.strokeStyle = c.relay.color.stroke;
+		ctx.lineWidth = 1;
+		if (!visuallyOnline(c)) continue;
+
+		const cp = clientXY(c);
+		const rp = relayXY(c.relay);
+
+		ctx.beginPath();
+		ctx.moveTo(cp.x, cp.y);
+		ctx.lineTo(rp.x, rp.y);
+		ctx.stroke();
+	}
 
     // ── relay nodes — dimmed/normal pass ──
     const hlRelays    = [];  // deferred: highlighted/selected relays drawn last
@@ -821,7 +1129,7 @@ const sim = (() => {
       const isDimmed  = hasSel;
       ctx.beginPath();
       ctx.arc(x, y, CFG.CLIENT_RADIUS, 0, Math.PI * 2);
-      ctx.fillStyle   = isDimmed ? "#0d0d0d" : (visuallyOnline(c) ? c.relay.color.fill   : "#1a1a1a");
+      ctx.fillStyle   = c.relay.color.fill;
       ctx.strokeStyle = isDimmed ? "#1a1a1a" : (visuallyOnline(c) ? c.relay.color.stroke : "#2a2a2a");
       ctx.lineWidth   = isDimmed ? 0.5 : 0.8;
       ctx.fill();
@@ -836,7 +1144,7 @@ const sim = (() => {
 
       ctx.beginPath();
       ctx.arc(x, y, radius, 0, Math.PI * 2);
-      ctx.fillStyle   = visuallyOnline(c) ? c.relay.color.fill   : "#1a1a1a";
+      ctx.fillStyle   = c.relay.color.fill;
       ctx.strokeStyle = visuallyOnline(c) ? c.relay.color.stroke : "#555";
       ctx.lineWidth   = isSelected ? 2 : 1.2;
       ctx.fill();
@@ -916,8 +1224,6 @@ const sim = (() => {
     }
   }
 
-  let var_accent = "#4fc3f7";
-
   // ── tick ──
   let lastTime = null;
   function tick(now) {
@@ -925,7 +1231,10 @@ const sim = (() => {
     if (!lastTime) { lastTime = now; return; }
     const rawDt = Math.min((now - lastTime) / 1000, 0.1);
     lastTime = now;
-    const dt = rawDt * simSpeed;
+
+    if (!simPaused) {
+      const dt = rawDt * simSpeed;
+      simTime += dt;
 
     const speed = pulseSpeed * 0.4;
     const completed = [];
@@ -957,21 +1266,57 @@ const sim = (() => {
           if (!wasOnline && c.online) {
             wentOnline++;
             delete offlineAt[c.id];
-            bufferFlush(c);
+            
             nodeLog(c.id, "", "info");
             nodeLog(c.id, `${ts()} registered at ${c.relay.id.split(".")[0]}`, "online");
+			bufferFlush(c);
           } else if (wasOnline && !c.online) {
             wentOffline++;
             offlineAt[c.id] = performance.now();
             nodeLog(c.id, "", "info");
+			nodeLog(c.id, `${ts()} logged off at ${c.relay.id.split(".")[0]}`, "online");
           }
         }
         if (wentOnline || wentOffline)
           godLog(`${ts()} CHURN  +${wentOnline} online  -${wentOffline} offline`, "info");
+        stats.lostConnections     += wentOffline;
+        stats.restoredConnections += wentOnline;
+		stats.churnEvents        += (wentOnline + wentOffline);
+      }
+    }
+
+    // one-time post-migration check-in with the relay just left behind
+    for (const c of clients) {
+      if (c.online && c.prevRelayCheckAt != null && simTime >= c.prevRelayCheckAt) {
+        checkPrevRelay(c);
+      }
+    }
+
+    // EVOLVE — structural growth, once per sim-second per mechanic.
+    // Independent of CHURN/MSG RATE; only gated by simPaused like everything else here.
+    if (evolveActive) {
+      evolveAccum += dt;
+      if (evolveAccum > 1) {
+        evolveAccum = 0;
+
+        if (introduceRate > 0 && Math.random() * 100 < introduceRate) tryIntroduce();
+        if (arriveRate    > 0 && Math.random() * 100 < arriveRate)    tryArrive();
+
+        if (angryRate > 0) {
+          for (const r of relays) {
+            if (r.load < ANGRY_LOAD_THRESHOLD) continue;
+            const onRelay = clients.filter(c => c.online && c.relay === r);
+            for (const c of onRelay) {
+              if (Math.random() * 100 < angryRate) { tryAngryMigrate(c); break; }  // at most one departure/relay/tick
+            }
+          }
+        }
       }
     }
 
     for (const r of relays) r.load = Math.max(0, r.load - dt * 0.1);
+
+    } // end !simPaused
 
     const wrap = document.getElementById("canvas-wrap");
     const dpr  = window.devicePixelRatio || 1;
@@ -993,6 +1338,47 @@ const sim = (() => {
     document.getElementById("hdr-stats").textContent =
       `online: ${online}/${clients.length}  relays: ${relays.length}  packets: ${pulses.length}  buffered: ${buffered}  msgs: ${totalMsgs}  migrates: ${totalMigrates}`;
 
+    // ── CALCULATE LIVE STATS ──
+    
+    // 1. Active Links (Count unique pairs A<->B)
+    let linkSet = new Set();
+    for (const c of clients) {
+      for (const ct of c.contacts) {
+        // Create a unique key for the pair: "idA|idB" where idA < idB
+        const id = c.id < ct.id ? `${c.id}|${ct.id}` : `${ct.id}|${c.id}`;
+        linkSet.add(id);
+      }
+    }
+    stats.activeLinks = linkSet.size;
+
+    // 2. Avg Degree (Avg friends per person) - Guard against divide by zero
+    if (clients.length > 0) {
+      stats.avgDegree = ((stats.activeLinks * 2) / clients.length).toFixed(1);
+    } else {
+      stats.avgDegree = "0.0";
+    }
+
+    // 3. Buffer Depth (Total pending messages)
+    let bufDepth = 0;
+    for (const r of relays) {
+      bufDepth += r.bufSize;
+    }
+    stats.bufferDepth = bufDepth;
+
+    // 4. Relay Imbalance (Std Dev of load) - Guard against empty relay list
+    if (relays.length > 0) {
+      const loads = relays.map(r => r.load);
+      const mean = loads.reduce((a, b) => a + b, 0) / relays.length;
+      const variance = loads.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / relays.length;
+      stats.relayImbalance = Math.sqrt(variance).toFixed(2);
+    } else {
+      stats.relayImbalance = "0.00";
+    }
+
+    // ── END LIVE STATS ──
+
+    renderStats();
+
     if (Math.random() < 0.05) renderRelayList();
   }
 
@@ -1007,15 +1393,161 @@ const sim = (() => {
   }
 
   function init() {
-    var_accent = getComputedColor("--accent");
-    wireSlider("sl-relays",  "val-relays",  "",   v => { CFG.RELAY_COUNT  = v; build(); });
-    wireSlider("sl-clients", "val-clients", "",   v => { CFG.CLIENT_COUNT = v; build(); });
+    wireSlider("sl-relays",   "val-relays",   "",   v => { CFG.RELAY_COUNT  = v; build(); });
+    wireSlider("sl-clients",  "val-clients",  "",   v => { CFG.CLIENT_COUNT = v; build(); });
+    wireSlider("sl-contacts", "val-contacts", "",   v => { CFG.CONTACT_AVG  = v; build(); });
     wireSlider("sl-speed",   "val-speed",   "x",  v => simSpeed   = v);
     wireSlider("sl-msg",     "val-msg",     "/s", v => msgRate     = v);
     wireSlider("sl-churn",   "val-churn",   "%",  v => churnRate   = v);
     wireSlider("sl-pulse",   "val-pulse",   "x",  v => pulseSpeed  = v);
+    wireSlider("sl-introduce", "val-introduce", "%", v => introduceRate = v);
+    wireSlider("sl-arrive",    "val-arrive",    "%", v => arriveRate    = v);
+    wireSlider("sl-angry",     "val-angry",     "%", v => angryRate     = v);
     build();
     requestAnimationFrame(tick);
+  }
+
+  // Same shape as build(), but always seeds exactly 2 clients on 2 distinct
+  // relays with one mutual edge between them. Topology sliders become MAX
+  // ceilings that EVOLVE's mechanics grow toward, rather than fixed counts.
+  function buildEvolveSeed() {
+    clients = [];
+    relays  = [];
+    pulses  = [];
+    totalMsgs = 0;
+    totalMigrates = 0;
+    stats = { packetsTotal: 0, packetsDropped: 0, orphanedMessages: 0, lostConnections: 0, restoredConnections: 0, newConnections: 0 };
+    selected = null;
+
+    for (let i = 0; i < CFG.RELAY_COUNT; i++) {
+      relays.push({
+        id:      `relay${String(i+1).padStart(2,"0")}.mesh`,
+        clients: 0, load: 0, bufSize: 0, buffer: {},
+        color:   relayColor(i, CFG.RELAY_COUNT),
+      });
+    }
+
+    const a = makeClient(relays[0], true);
+    const b = makeClient(relays[1] || relays[0], true);
+    wireMutual(a, b);
+    clients.push(a, b);
+
+    renderRelayList();
+    updateInfo();
+    renderStats();
+  }
+
+  function toggleEvolve() {
+    evolveActive = !evolveActive;
+    const btn = document.getElementById("evolveBtn");
+    const topologyIds = ["sl-relays", "sl-clients", "sl-contacts"];
+
+    if (evolveActive) {
+      btn.textContent = "■ STOP EVOLVE";
+      btn.classList.add("active");
+      topologyIds.forEach(id => { document.getElementById(id).disabled = true; });
+      buildEvolveSeed();
+      godLog(`${ts()} EVOLVE  started — seeded 2:2, growing toward ${CFG.CLIENT_COUNT} clients / ${CFG.RELAY_COUNT} relays`, "info");
+    } else {
+      btn.textContent = "▶ START EVOLVE";
+      btn.classList.remove("active");
+      topologyIds.forEach(id => { document.getElementById(id).disabled = false; });
+      // Sync the topology sliders to the grown state so nudging one later
+      // doesn't silently snap the population back to a stale pre-EVOLVE number.
+      CFG.CLIENT_COUNT = clients.length;
+      document.getElementById("sl-clients").value         = CFG.CLIENT_COUNT;
+      document.getElementById("val-clients").textContent  = CFG.CLIENT_COUNT;
+      godLog(`${ts()} EVOLVE  stopped at ${clients.length} clients`, "info");
+    }
+  }
+
+  // Performs an already-decided migration: client → newRelay. Shared by the
+  // manual MIGRATE SELECTED button and EVOLVE's ANGRY mechanic — everything
+  // downstream of "which relay" (orphan sweep, stale-knowledge reset, the
+  // notify pulses, the 5s check-in) is identical regardless of *why* it
+  // happened, so reasonTag only affects logging.
+  function performMigration(client, newRelay, reasonTag = "manual") {
+    if (!newRelay || newRelay === client.relay) return false;
+
+    client.relay.clients = Math.max(0, client.relay.clients - 1);
+    const oldRelay = client.relay;
+    newRelay.clients++;
+
+    // client.prevRelay is the address stale contacts still misroute to (kept
+    // alive deliberately — see checkPrevRelay). The moment we overwrite it
+    // below, that relay drops off the map entirely: not just from the
+    // self-check, but from spawnMessage's and migrateSelected's misroute
+    // fallback too. Anything still sitting in its buffer for this client —
+    // whether the self-check already ran and this is a post-check straggler,
+    // or the check never got the chance to fire at all — becomes permanently
+    // unreachable right here. Count it and sweep it rather than let it leak.
+    if (client.prevRelay) {
+      const stranded = client.prevRelay.buffer[client.id];
+      if (stranded?.length) {
+        stats.orphanedMessages += stranded.length;
+        godLog(`${ts()} ORPHAN ${client.id.slice(0,6)}  ${stranded.length} msg(s) abandoned at ${client.prevRelay.id.split(".")[0]} (prev relay no longer tracked)`, "warn");
+        nodeLog(client.id, `${ts()} ${stranded.length} msg(s) abandoned at ${client.prevRelay.id.split(".")[0]}`, "warn");
+        delete client.prevRelay.buffer[client.id];
+        client.prevRelay.bufSize = Object.values(client.prevRelay.buffer).reduce((s, b) => s + b.length, 0);
+      }
+    }
+
+    client.prevRelay        = oldRelay;
+    client.prevRelayCheckAt = simTime + PREV_RELAY_CHECK_DELAY;
+    client.relay = newRelay;
+
+    // all contacts lose confirmed relay knowledge for this client
+    for (const contact of client.contacts) {
+      contact.contactKnownRelay.set(client.id, false);
+    }
+
+    const cp = clientXY(client);
+    const op = relayXY(oldRelay);
+    const np = relayXY(newRelay);
+    const mc = getComputedColor("--migrate");
+    const tag = reasonTag === "manual" ? "" : `  [${reasonTag}]`;
+
+    godLog(`${ts()} MIGRATE ${client.id.slice(0,6)} → ${newRelay.id.split(".")[0]} (was ${oldRelay.id.split(".")[0]})${tag}`, "migrate");
+    nodeLog(client.id, `${ts()} migrated to ${newRelay.id.split(".")[0]}${tag}`, "migrate");
+
+    addPulse(cp.x, cp.y, np.x, np.y, mc, 2, () => {
+      for (const contact of client.contacts) {
+        const targetContact = contact;
+
+        // Does the migrating client know where this contact currently is?
+        // If not, the notification goes to the stale relay — same as spawnMessage.
+        const knowsContact  = client.contactKnownRelay.get(targetContact.id) === true;
+        const notifyRelay   = knowsContact ? targetContact.relay : (targetContact.prevRelay || targetContact.relay);
+        const notifyColor   = knowsContact ? mc : getComputedColor("--danger");
+        const rp            = relayXY(notifyRelay);
+        stats.packetsTotal++;
+
+        addPulse(cp.x, cp.y, rp.x, rp.y, notifyColor, 1.5, () => {
+          if (!knowsContact) {
+            // Notification misrouted — contact has moved on from this relay
+            godLog(`${ts()} MIGRATE MISS  ${client.id.slice(0,6)}→${targetContact.id.slice(0,6)}  stale:${notifyRelay.id.split(".")[0]}`, "warn");
+            nodeLog(client.id, `${ts()} notify ✗ stale:${notifyRelay.id.split(".")[0]}`, "warn");
+            bufferPush(notifyRelay, targetContact, notifyColor, client);
+            return;
+          }
+          if (targetContact.online) {
+            const ep = clientXY(targetContact);
+            addPulse(rp.x, rp.y, ep.x, ep.y, mc, 1, () => {
+              targetContact.contactKnownRelay.set(client.id, true);
+            });
+          } else {
+            bufferPush(targetContact.relay, targetContact, mc, client);
+          }
+        });
+      }
+      addPulse(cp.x, cp.y, op.x, op.y, mc, 1);
+    });
+
+    totalMigrates++;
+	stats.migrations++;
+    renderRelayList();
+    updateInfo();
+    return true;
   }
 
   function migrateSelected() {
@@ -1033,36 +1565,114 @@ const sim = (() => {
     const candidates = relays.filter(r => r !== client.relay);
     if (!candidates.length) return;
     const newRelay = candidates[Math.floor(Math.random() * candidates.length)];
+    performMigration(client, newRelay, "manual");
+  }
 
-    client.relay.clients = Math.max(0, client.relay.clients - 1);
-    const oldRelay = client.relay;
-    newRelay.clients++;
-    client.prevRelay = oldRelay;
-    client.relay = newRelay;
+  // ═══════════════════════════════════════
+  //   EVOLVE — structural growth mechanics
+  // ═══════════════════════════════════════
 
-    const cp = clientXY(client);
-    const op = relayXY(oldRelay);
-    const np = relayXY(newRelay);
-    const mc = getComputedColor("--migrate");
+  // INTRODUCE: A and C, both strangers, both under their personal contact
+  // target, get wired together because they share mutual friend B. Drawn as
+  // one pulse straight between A and C — B is the reason, not a relay hop.
+  // A live introduction means fresh info both ways: green from the start.
+  function tryIntroduce() {
+    const eligibleA = clients.filter(c => c.contacts.length > 0 && c.contacts.length < c.contactTarget);
+    if (!eligibleA.length) return false;
+    const a = eligibleA[Math.floor(Math.random() * eligibleA.length)];
+    const b = a.contacts[Math.floor(Math.random() * a.contacts.length)];
 
-    godLog(`${ts()} MIGRATE ${client.id.slice(0,6)} → ${newRelay.id.split(".")[0]} (was ${oldRelay.id.split(".")[0]})`, "migrate");
-    nodeLog(client.id, `${ts()} migrated to ${newRelay.id.split(".")[0]}`, "migrate");
+    const candidates = b.contacts.filter(c =>
+      c !== a && !a.contacts.includes(c) && c.contacts.length < c.contactTarget
+    );
+    if (!candidates.length) return false;
+    const cNode = candidates[Math.floor(Math.random() * candidates.length)];
 
-    addPulse(cp.x, cp.y, np.x, np.y, mc, 2, () => {
-      for (const contact of client.contacts) {
-        const rp = relayXY(contact.relay);
-        const ep = clientXY(contact);
-        addPulse(cp.x, cp.y, rp.x, rp.y, mc, 1.5, () => {
-          if (contact.online) addPulse(rp.x, rp.y, ep.x, ep.y, mc, 1);
-          else bufferPush(contact.relay, contact, mc);
-        });
-      }
-      addPulse(cp.x, cp.y, op.x, op.y, mc, 1);
-    });
+    wireMutual(a, cNode);
+    stats.newConnections++;
 
-    totalMigrates++;
+    const ap = clientXY(a), cp = clientXY(cNode);
+    addPulse(ap.x, ap.y, cp.x, cp.y, getComputedColor("--online"), 1.3);
+    godLog(`${ts()} INTRO  ${a.id.slice(0,6)} ↔ ${cNode.id.slice(0,6)}  (via ${b.id.slice(0,6)})`, "info");
+    nodeLog(a.id,     `${ts()} introduced to ${cNode.id.slice(0,6)} by ${b.id.slice(0,6)}`, "info");
+    nodeLog(cNode.id, `${ts()} introduced to ${a.id.slice(0,6)} by ${b.id.slice(0,6)}`, "info");
+    return true;
+  }
+
+  // ARRIVE: population growth. Normally a fresh node attaches to one random
+  // existing anchor and lands on the ANCHOR'S relay — you join wherever your
+  // friend already is. Rarely (PIONEER_CHANCE), neither side has used the
+  // app before: two fresh nodes claim the next untouched relay together
+  // (the "install from GitHub with a test account" case).
+  function tryArrive() {
+    if (clients.length >= CFG.CLIENT_COUNT) return false;
+
+    const unusedRelay = relays.find(r => r.clients === 0);
+    if (unusedRelay && Math.random() < PIONEER_CHANCE && clients.length + 1 < CFG.CLIENT_COUNT) {
+      const a = makeClient(unusedRelay, true);
+      const b = makeClient(unusedRelay, true);
+      wireMutual(a, b);
+      clients.push(a, b);
+      stats.newConnections++;
+      godLog(`${ts()} ARRIVE pioneer pair ${a.id.slice(0,6)}+${b.id.slice(0,6)} on fresh relay ${unusedRelay.id.split(".")[0]}`, "info");
+      nodeLog(a.id, `${ts()} joined fresh — pioneering ${unusedRelay.id.split(".")[0]} with ${b.id.slice(0,6)}`, "info");
+      nodeLog(b.id, `${ts()} joined fresh — pioneering ${unusedRelay.id.split(".")[0]} with ${a.id.slice(0,6)}`, "info");
+      renderRelayList();
+      return true;
+    }
+
+    const anchorPool = clients.filter(c => c.contacts.length < c.contactTarget);
+    if (!anchorPool.length) return false;
+    const anchor = anchorPool[Math.floor(Math.random() * anchorPool.length)];
+    const fresh  = makeClient(anchor.relay, true);
+    wireMutual(fresh, anchor);
+    clients.push(fresh);
+    stats.newConnections++;
+
+    const ap = clientXY(anchor), fp = clientXY(fresh);
+    addPulse(ap.x, ap.y, fp.x, fp.y, getComputedColor("--accent"), 1.3);
+    godLog(`${ts()} ARRIVE ${fresh.id.slice(0,6)} joins via ${anchor.id.slice(0,6)} on ${anchor.relay.id.split(".")[0]}`, "info");
+    nodeLog(fresh.id, `${ts()} joined via ${anchor.id.slice(0,6)} on ${anchor.relay.id.split(".")[0]}`, "info");
     renderRelayList();
-    updateInfo();
+    return true;
+  }
+
+  // The relays a client could plausibly know about — derived from its own
+  // contacts, mirroring how relay info actually spreads in the protocol.
+  function knownRelaysFor(client) {
+    const set = new Set();
+    for (const contact of client.contacts) {
+      if (contact.relay && contact.relay !== client.relay) set.add(contact.relay);
+    }
+    return [...set];
+  }
+
+  // ANGRY: a client on an overloaded relay decides to leave. Mostly picks
+  // the lightest-loaded relay it actually knows about (via its contacts) —
+  // never a blind random pick, that part's the realism. Rarely
+  // (SELF_HOST_CHANCE) it self-hosts on the next untouched relay instead.
+  // If it has no known alternative AND there's no free relay either, it's
+  // genuinely stuck — that's a real outcome worth showing, not a gap to hide.
+  function tryAngryMigrate(client) {
+    const known       = knownRelaysFor(client);
+    const unusedRelay = relays.find(r => r.clients === 0);
+
+    let target = null, reason = "angry";
+    if (known.length && Math.random() >= SELF_HOST_CHANCE) {
+      target = known.slice().sort((x, y) => x.load - y.load)[0];
+    } else if (unusedRelay) {
+      target = unusedRelay;
+      reason = "self-host";
+    } else if (known.length) {
+      target = known.slice().sort((x, y) => x.load - y.load)[0];
+    }
+
+    if (!target) {
+      godLog(`${ts()} ANGRY  ${client.id.slice(0,6)}  fed up but nowhere to go — staying put`, "warn");
+      nodeLog(client.id, `${ts()} relay overloaded, nowhere known to go`, "warn");
+      return false;
+    }
+    return performMigration(client, target, reason);
   }
 
   function sendFromSelected() {
@@ -1081,7 +1691,11 @@ const sim = (() => {
     spawnMessage(sender, recipient, getComputedColor("--packet"));
   }
 
-  return { init, randomMessage, sendFromSelected, randomMigrate, migrateSelected, toggleChurn, reset, selectRelay };
+  return {
+    init, randomMessage, sendFromSelected, migrateSelected,
+    togglePause, toggleChurn, toggleEvolve, reset, selectRelay,
+    get selected() { return selected; },
+  };
 })();
 
 sim.init();

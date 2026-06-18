@@ -4,7 +4,7 @@
 <meta charset="UTF-8" />
 <title>Meshchat Sync Demo</title>
 <style>
-body { font-family: Arial, sans-serif; display:flex; height:100vh; margin:0; }
+body { font-family: Arial, sans-serif; display:flex; height:100vh; margin:0; background:#202020;}
 .panel { flex:1; padding:10px; border-right:1px solid #333; display:flex; flex-direction:column; }
 .panel:last-child { border-right:none; }
 .header { font-weight:bold; margin-bottom:10px; }
@@ -13,7 +13,56 @@ body { font-family: Arial, sans-serif; display:flex; height:100vh; margin:0; }
 input { flex:1; }
 button { padding:5px; }
 .status { margin-bottom:5px; font-size:12px; }
+
+
+
+h3{
+    margin:0 0 12px;
+    padding:8px;
+    background:#4a4a4a;
+    border-bottom:1px solid #666;
+    text-align:center;
+    color:#fff;
+}
+
+input{
+    width:90%;
+    margin:4px 0;
+    padding:6px;
+    background:#555;
+    color:#fff;
+    border:1px solid #777;
+    border-radius:4px;
+}
+
+button{
+    margin:3px 0;
+    padding:6px 10px;
+    background:#5a5a5a;
+    color:#fff;
+    border:1px solid #777;
+    border-radius:4px;
+    cursor:pointer;
+}
+
+button:hover{
+    background:#6a6a6a;
+}
+
+pre{
+    margin-top:12px;
+    background:#202020;
+    color:#d8d8d8;
+    border:1px solid #444;
+    padding:8px;
+    height:320px;
+    overflow:auto;
+}
+button{
+    min-width:90px;
+}
 </style>
+
 </head>
 <body>
 
@@ -26,7 +75,7 @@ button { padding:5px; }
     <input id="bobInput" placeholder="message..." />
     <button onclick="send('bob')">Send</button>
   </div>
-  <button onclick="resync('bob')">Resync</button>
+  <button onclick="resync('bob');resync('alice');">Resync</button>
 </div>
 
 <div class="panel" id="alicePanel">
@@ -38,7 +87,7 @@ button { padding:5px; }
     <input id="aliceInput" placeholder="message..." />
     <button onclick="send('alice')">Send</button>
   </div>
-  <button onclick="resync('alice')">Resync</button>
+  <button onclick="resync('alice');resync('bob');">Resync</button>
 </div>
 
 <script>
