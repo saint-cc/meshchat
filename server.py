@@ -58,6 +58,12 @@ BUF_MAX_AGE  = int(os.environ.get("BUF_MAX_AGE",  86400))   # seconds before exp
 BUF_MAX_MB   = float(os.environ.get("BUF_MAX_MB",  10))     # max MB per recipient
 BUF_EXPIRE_INTERVAL = 300                                    # seconds between expiry sweeps
 
+# app:migrate packets get their own (much longer) TTL — they're address
+# corrections, not conversation, and are useless if lost. 1 week for now
+# while testing; production target is closer to a year.
+BUF_MAX_AGE_MIGRATE = int(os.environ.get("BUF_MAX_AGE_MIGRATE", 7 * 86400))
+MIGRATE_SUFFIX       = "_migrate.json"   # filename tag — lets buf_expire pick the TTL bucket without opening the file
+
 # Logging
 LOG_FORMAT   = "%(asctime)s  %(levelname)-8s  %(message)s"
 LOG_DATE_FMT = "%H:%M:%S"
@@ -177,6 +183,18 @@ async def deliver(to_id, obj, exclude=None):
         if await send_to(ws, obj): reached += 1
     return reached
 
+async def route_or_buffer(kind, frm, to, msg, ws):
+    """Shared delivery path for from-authenticated, to-routed packet types
+    (app:message, app:migrate). Delivers live if the recipient is
+    connected, otherwise falls back to the offline buffer — buf_write
+    handles per-type overwrite/TTL behaviour on its own."""
+    reached = await deliver(to, msg, exclude=ws)
+    if reached:
+        log.info("%-10s from=%s  to=%s  reached=%d", kind.upper(), short(frm), short(to), reached)
+    else:
+        buf_write(to, msg)
+        log.info("BUF Q      from=%s  to=%s  (offline)  type=%s", short(frm), short(to), kind)
+
 # ══════════════════════════════════════════
 #   AUTH HELPERS
 #   derive_public_id  — mirrors client JS logic exactly
@@ -239,7 +257,13 @@ async def auth_verify(ws, nonce_back: list, addr: str) -> str | None:
 #   Layout: BUF_DIR/<publicId>/<ts>_<uuid>.json
 #   Limits: BUF_MAX_MSGS, BUF_MAX_AGE, BUF_MAX_MB per recipient.
 #   On connect: flush all buffered packets oldest-first, delete on success.
-#   Expiry sweep: background task removes files older than BUF_MAX_AGE.
+#   Expiry sweep: background task removes files older than their TTL bucket.
+#
+#   app:migrate packets are tagged <ts>_<uuid>_migrate.json (MIGRATE_SUFFIX):
+#     - overwrite: only the latest packet per sender is kept (buf_write)
+#     - longer TTL: BUF_MAX_AGE_MIGRATE instead of BUF_MAX_AGE (buf_expire)
+#   Everything else (count/size limits, delivery, flush-on-connect) is
+#   identical to regular packets — same files, same directory, same flow.
 # ══════════════════════════════════════════
 
 def buf_dir(to_id):
@@ -256,7 +280,12 @@ def buf_files(to_id):
     return sorted(glob.glob(pattern, recursive=False))
 
 def buf_write(to_id, msg):
-    """Write a packet to the offline buffer. Enforces per-recipient limits."""
+    """Write a packet to the offline buffer. Enforces per-recipient limits.
+
+    app:migrate packets use overwrite semantics: only the most recent
+    packet from a given sender is kept (any older buffered migrate from
+    that same sender is dropped first), and they're tagged with
+    MIGRATE_SUFFIX so buf_expire applies the longer TTL bucket."""
     try:
         d = buf_dir(to_id)
     except ValueError as e:
@@ -268,7 +297,28 @@ def buf_write(to_id, msg):
         log.warning("BUF        mkdir failed  to=%s  err=%s", short(to_id), e)
         return
 
+    is_migrate = msg.get("type") == "app:migrate"
+    frm        = msg.get("from")
+
     files = buf_files(to_id)
+
+    if is_migrate and frm:
+        # overwrite — drop any existing buffered migrate packet(s) from this sender
+        for fpath in files:
+            if not fpath.endswith(MIGRATE_SUFFIX):
+                continue
+            try:
+                with open(fpath) as f:
+                    old = json.load(f)
+            except Exception:
+                continue
+            if old.get("from") == frm:
+                try:
+                    os.remove(fpath)
+                    log.info("BUF        migrate overwrite  to=%s  from=%s", short(to_id), short(frm))
+                except Exception:
+                    pass
+        files = buf_files(to_id)   # refresh after removals
 
     # enforce message count limit — drop oldest
     while len(files) >= BUF_MAX_MSGS:
@@ -285,12 +335,14 @@ def buf_write(to_id, msg):
         log.warning("BUF        size limit reached  to=%s  dropping", short(to_id))
         return
 
-    fname = os.path.join(d, f"{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}.json")
+    suffix = MIGRATE_SUFFIX if is_migrate else ".json"
+    fname  = os.path.join(d, f"{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}{suffix}")
     try:
         with open(fname, "w") as f:
             json.dump(msg, f)
         stats["buf_in"] += 1
-        log.info("BUF        write  to=%s  file=%s", short(to_id), os.path.basename(fname))
+        log.info("BUF        write  to=%s  file=%s%s", short(to_id), os.path.basename(fname),
+                  "  [migrate]" if is_migrate else "")
     except Exception as e:
         log.warning("BUF        write failed  to=%s  err=%s", short(to_id), e)
 
@@ -312,7 +364,9 @@ async def buf_deliver(to_id, ws):
                         short(to_id), os.path.basename(fpath), e)
 
 async def buf_expire():
-    """Background task — remove buffer files older than BUF_MAX_AGE."""
+    """Background task — remove buffer files older than their TTL bucket.
+    Regular packets use BUF_MAX_AGE; migrate packets (tagged via
+    MIGRATE_SUFFIX) use the much longer BUF_MAX_AGE_MIGRATE."""
     while True:
         await asyncio.sleep(BUF_EXPIRE_INTERVAL)
         now     = time.time()
@@ -325,7 +379,8 @@ async def buf_expire():
                 for entry in os.scandir(rec_dir.path):
                     if not entry.name.endswith(".json"):
                         continue
-                    if now - entry.stat().st_mtime > BUF_MAX_AGE:
+                    max_age = BUF_MAX_AGE_MIGRATE if entry.name.endswith(MIGRATE_SUFFIX) else BUF_MAX_AGE
+                    if now - entry.stat().st_mtime > max_age:
                         try:
                             os.remove(entry.path)
                             dropped += 1
@@ -447,23 +502,18 @@ async def handler(ws):
                 log.warning("UNAUTHED   type=%r  from=%s  peer=%s  dropped", kind, short(frm), addr)
                 await send_to(ws, {"type": "sig:auth_fail", "reason": "not_authenticated"})
 
-            # ── message: from must match an authed identity on this socket ──
-            elif kind == "app:message":
+            # ── message / migrate: from must match an authed identity on this socket ──
+            elif kind in ("app:message", "app:migrate"):
                 frm = msg.get("from", "?")
                 to  = msg.get("to")
                 if not valid_id(to):
-                    log.warning("  message with invalid 'to', dropped")
+                    log.warning("  %s with invalid 'to', dropped", kind)
                     continue
                 if frm not in client_ids:
-                    log.warning("MESSAGE    from=%s  not authed  peer=%s  dropped", short(frm), addr)
+                    log.warning("%-10s from=%s  not authed  peer=%s  dropped", kind.upper(), short(frm), addr)
                     await send_to(ws, {"type": "error", "reason": "not_authenticated"})
                     continue
-                reached = await deliver(to, msg, exclude=ws)
-                if reached:
-                    log.info("MESSAGE    from=%s  to=%s  reached=%d", short(frm), short(to), reached)
-                else:
-                    buf_write(to, msg)
-                    log.info("BUF Q      from=%s  to=%s  (offline)", short(frm), short(to))
+                await route_or_buffer(kind, frm, to, msg, ws)
 
             elif kind == "sig:announce":
                 ids = msg.get("ids", [])
@@ -537,8 +587,8 @@ async def run_signal_server():
     log.info("=" * 50)
     log.info("MeshChat signal server")
     log.info("Listening on %s:%d", WS_HOST, WS_PORT)
-    log.info("Buffer dir: %s  max_msgs=%d  max_age=%ds  max_mb=%.1f",
-             BUF_DIR, BUF_MAX_MSGS, BUF_MAX_AGE, BUF_MAX_MB)
+    log.info("Buffer dir: %s  max_msgs=%d  max_age=%ds  migrate_age=%ds  max_mb=%.1f",
+             BUF_DIR, BUF_MAX_MSGS, BUF_MAX_AGE, BUF_MAX_AGE_MIGRATE, BUF_MAX_MB)
     log.info("=" * 50)
     async with websockets.serve(handler, WS_HOST, WS_PORT):
         asyncio.create_task(log_stats())

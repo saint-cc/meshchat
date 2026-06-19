@@ -1030,8 +1030,16 @@ function sendSignal(obj) {
      { ws, timer, queue, ready }
    Messages only open connections.
    Protocol traffic piggybacks if open, drops if not.
-   Timer: 30s inactivity → graceful close.
+   Timer: 30s inactivity → graceful close (persistent entries exempt).
    Incoming: piped through handleSignal as-is.
+
+   AUTH: every relay connection authenticates BOTH identities, 128 then
+   256, sequentially — same chain connectSignal uses for the main signal
+   socket (startAuth → startAuth256). A single hostname entry may end up
+   carrying traffic for either identity (e.g. a 128-bit legacy contact and
+   a normal 256-bit contact happen to share a relay) — auth has to cover
+   both before the connection is usable, or one of them gets rejected
+   server-side with not_authenticated.
 ══════════════════════════════════════════ */
 const relayConns     = {};   // hostname → { ws, timer, queue:[], ready:false, outbound:true }
 
@@ -1074,7 +1082,7 @@ function getOrOpenRelayConn(url, messageOnly) {
 
   if (!messageOnly) return null;   // don't open for protocol traffic
 
-  const entry = { ws: null, timer: null, queue: [], ready: false, outbound: true, authStep: "idle", authBits: 256 };
+  const entry = { ws: null, timer: null, queue: [], ready: false, outbound: true, authStep: "idle" };
   relayConns[hostname] = entry;
 
   // connection timeout — if not open within 5s, give up and fall back
@@ -1091,40 +1099,60 @@ function getOrOpenRelayConn(url, messageOnly) {
 
     ws.onopen = () => {
       clearTimeout(connectTimeout);
-      // 128-bit persistent connections auth with the 128-bit identity,
-      // all other relay connections auth with the 256-bit identity
-      const bits   = entry.persistent ? 128 : 256;
-      const encKey = bits === 128
-        ? Array.from(base64ToRaw(state.shareableKey128.split(".")[0]))
-        : Array.from(base64ToRaw(state.shareableKey.split(".")[0]));
-      entry.authStep = "await_challenge";
-      entry.authBits = bits;
-      ws.send(JSON.stringify({ type: "sig:auth_init", bits, enc_key: encKey }));
-      mlog.info(`RELAY      open, authing ${bits}-bit  host=${hostname}`);
+      // Every relay connection authenticates BOTH identities, sequentially,
+      // same chain as connectSignal's startAuth → startAuth256 on the main
+      // signal socket. This hostname entry may be reused for traffic from
+      // either identity (e.g. a 128-bit legacy contact and a normal 256-bit
+      // contact sharing the same relay) — a single auth would leave one of
+      // them unauthenticated and rejected server-side.
+      entry.authStep = "await_challenge_128";
+      const encKey128 = Array.from(base64ToRaw(state.shareableKey128.split(".")[0]));
+      ws.send(JSON.stringify({ type: "sig:auth_init", bits: 128, enc_key: encKey128 }));
+      mlog.info(`RELAY      open, authing 128-bit  host=${hostname}`);
     };
 
     ws.onmessage = async (evt) => {
       try {
         const msg = JSON.parse(evt.data);
 
-        // ── auth challenge ──
-        if (entry.authStep === "await_challenge" && msg.type === "sig:auth_challenge") {
+        // ── 128-bit challenge ──
+        if (entry.authStep === "await_challenge_128" && msg.type === "sig:auth_challenge") {
           const iv         = new Uint8Array(msg.iv);
           const data       = new Uint8Array(msg.data);
-          const decryptKey = entry.authBits === 128 ? state.encKey128 : state.encKey;
-          const plainBytes = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, decryptKey, data);
+          const plainBytes = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, state.encKey128, data);
           const nonce      = Array.from(new Uint8Array(plainBytes));
           ws.send(JSON.stringify({ type: "sig:auth_proof", nonce }));
-          entry.authStep = "await_ok";
-          mlog.info(`RELAY      auth proof sent ${entry.authBits}-bit  host=${hostname}`);
+          entry.authStep = "await_ok_128";
+          mlog.info(`RELAY      auth proof sent 128-bit  host=${hostname}`);
           return;
         }
 
-        // ── auth ok — now ready to send ──
-        if (entry.authStep === "await_ok" && msg.type === "sig:auth_ok") {
+        // ── 128-bit ok — chain straight into 256-bit, not ready yet ──
+        if (entry.authStep === "await_ok_128" && msg.type === "sig:auth_ok") {
+          mlog.info(`RELAY      authed 128-bit  host=${hostname}`);
+          entry.authStep = "await_challenge_256";
+          const encKey256 = Array.from(base64ToRaw(state.shareableKey.split(".")[0]));
+          ws.send(JSON.stringify({ type: "sig:auth_init", bits: 256, enc_key: encKey256 }));
+          return;
+        }
+
+        // ── 256-bit challenge ──
+        if (entry.authStep === "await_challenge_256" && msg.type === "sig:auth_challenge") {
+          const iv         = new Uint8Array(msg.iv);
+          const data       = new Uint8Array(msg.data);
+          const plainBytes = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, state.encKey, data);
+          const nonce      = Array.from(new Uint8Array(plainBytes));
+          ws.send(JSON.stringify({ type: "sig:auth_proof", nonce }));
+          entry.authStep = "await_ok_256";
+          mlog.info(`RELAY      auth proof sent 256-bit  host=${hostname}`);
+          return;
+        }
+
+        // ── 256-bit ok — both identities authed, now ready to send ──
+        if (entry.authStep === "await_ok_256" && msg.type === "sig:auth_ok") {
           entry.authStep = "done";
           entry.ready    = true;
-          mlog.info(`RELAY      authed ${entry.authBits}-bit, flushing ${entry.queue.length} msg(s)  host=${hostname}`);
+          mlog.info(`RELAY      authed 128+256, flushing ${entry.queue.length} msg(s)  host=${hostname}`);
           entry.queue.forEach(raw => ws.send(raw));
           entry.queue = [];
           return;
@@ -1132,7 +1160,7 @@ function getOrOpenRelayConn(url, messageOnly) {
 
         // ── auth fail ──
         if (msg.type === "sig:auth_fail") {
-          mlog.warn(`RELAY      auth failed  host=${hostname}  reason=${msg.reason}`);
+          mlog.warn(`RELAY      auth failed  step=${entry.authStep}  host=${hostname}  reason=${msg.reason}`);
           ws.close();
           return;
         }
