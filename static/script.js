@@ -10,6 +10,11 @@
    NOTE: deliberately NOT named short() to avoid
          collision with the url-truncation var in linkify().
 ═══════════════════════════════════════════════════════════════ */
+// Protocol version — informational only for now, surfaced via sig:relay_info
+// so client/server drift shows up in both logs. Not enforced yet; room to
+// add real backwards-compat handling once that's actually needed.
+const CLIENT_VERSION = "0.3.0";
+
 const LOG_MAX_LINES      = 20;
 const LOG_CLEAR_INTERVAL = 5 * 60 * 1000;
 
@@ -862,15 +867,33 @@ async function handleMsgExchange(msg) {
 ══════════════════════════════════════════ */
 const authState = { step: "idle" };
 
+// SIGNAL_URL is the bootstrap default — used only when we have no local
+// truth yet (fresh identity, first load on this origin). Once me.lastRelay
+// exists, it's the actual connection target — same "local storage wins"
+// rule as sig:relay_info. Computed fresh on every call so an edited
+// lastRelay takes effect on the very next connect, not just on reload.
+function getSignalUrl() {
+  const me = state.contacts[state.publicId];
+  return me?.lastRelay || SIGNAL_URL;
+}
+
 function connectSignal() {
-  const ws = new WebSocket(SIGNAL_URL);
-  state.ws = ws;
+  const url = getSignalUrl();
+  const ws  = new WebSocket(url);
+  state.ws  = ws;
   ws.onopen = () => {
-    mlog.info(`WS         connected  ${SIGNAL_URL}`);
+    mlog.info(`WS         connected  ${url}`);
     authState.step = "idle";
     startAuth();
   };
   ws.onclose = () => {
+    // stale guard — if state.ws has already moved on to a newer connection
+    // (e.g. a deliberate reboot after editing our own relay), this close
+    // event belongs to the socket we just replaced. Don't double-reconnect.
+    if (state.ws !== ws) {
+      mlog.debug("WS         stale close ignored (already reconnected)");
+      return;
+    }
     setConnected(false);
     authState.step = "idle";
     mlog.warn("WS         disconnected — retrying in 3s");
@@ -878,6 +901,18 @@ function connectSignal() {
   };
   ws.onerror = () => ws.close();
   ws.onmessage = (evt) => { try { handleSignal(JSON.parse(evt.data)); } catch(e) {} };
+}
+
+// Deliberate reconnect — used when our own lastRelay changes (manual edit
+// or, later, an actual migration commit) and we need the live signal
+// session to follow it immediately rather than wait for the next natural
+// reconnect cycle. Closes the current socket and opens a fresh one right
+// away; the stale guard above stops the old socket's onclose from also
+// scheduling a redundant reconnect a few seconds later.
+function rebootSignal() {
+  mlog.info("WS         reboot — relay changed, reconnecting now");
+  state.ws?.close(1000, "reboot");
+  connectSignal();
 }
 
 function startAuth() {
@@ -958,25 +993,39 @@ function handleSignal(msg) {
     case "sig:auth_fail":      handleAuthFail(msg);      break;
     case "sig:relay_info":
       if (state.contacts[state.publicId]) {
-        const me = state.contacts[state.publicId];
-        if (msg.wss)   me.lastRelay      = msg.wss;
+        const me     = state.contacts[state.publicId];
+        const isFresh = !me.lastRelay;   // no local truth yet — first time this identity has loaded here
+
+        mlog.info(`RELAY_INFO version = ${msg.version || "?"} (local = ${CLIENT_VERSION})`);
+
+        if (isFresh && msg.wss) {
+          me.lastRelay = msg.wss;
+          mlog.info(`RELAY_INFO fresh — adopted wss=${msg.wss}`);
+        } else if (msg.wss && msg.wss !== me.lastRelay) {
+          // confirmation only — local storage is the source of truth once we have one.
+          // A deliberate migration is the only thing allowed to change lastRelay.
+          mlog.warn(`RELAY_INFO mismatch — server says wss=${msg.wss}  local=${me.lastRelay}  keeping local`);
+        }
         me.lastRelaySeen = Date.now();
-        // Rebuild shareableKey to include relay WSS as third dot-segment (base64 of wss)
+
+        // shareableKey reflects OUR local truth, not whatever this connection just announced
         const baseKey = state.shareableKey.split(".").slice(0, 2).join(".");
-        state.shareableKey = msg.wss
-          ? baseKey + "." + btoa(msg.wss)
+        state.shareableKey = me.lastRelay
+          ? baseKey + "." + btoa(me.lastRelay)
           : baseKey;
         me.shareableKey = state.shareableKey;
-        // Close any relay connection we may have opened to our own relay before knowing it was ours
+
+        // Close any outbound relay connection we may have opened to this host before
+        // realising it's the one we're already signal-connected to — keyed on the
+        // literal announced host, independent of the fresh/local-truth decision above.
         if (msg.wss) {
           const ownHost = relayHostname(msg.wss);
           if (ownHost && relayConns[ownHost]) {
-            mlog.info(`RELAY_INFO closing self-relay conn  host=${ownHost}`);
+            mlog.info(`RELAY_INFO closing redundant conn to signal host  host=${ownHost}`);
             relayConns[ownHost].ws?.close(1000, "same relay");
             delete relayConns[ownHost];
           }
         }
-        mlog.info(`RELAY_INFO wss=${msg.wss || "—"}  key updated`);
         saveContacts();
       }
       break;
@@ -1100,11 +1149,12 @@ function getOrOpenRelayConn(url, messageOnly) {
     ws.onopen = () => {
       clearTimeout(connectTimeout);
       // Every relay connection authenticates BOTH identities, sequentially,
-      // same chain as connectSignal's startAuth → startAuth256 on the main
-      // signal socket. This hostname entry may be reused for traffic from
-      // either identity (e.g. a 128-bit legacy contact and a normal 256-bit
-      // contact sharing the same relay) — a single auth would leave one of
-      // them unauthenticated and rejected server-side.
+      // same chain connectSignal uses for the main signal socket (startAuth
+      // → startAuth256). A single hostname entry may end up carrying
+      // traffic for either identity (e.g. a 128-bit legacy contact and a
+      // normal 256-bit contact happen to share a relay) — auth has to
+      // cover both before the connection is usable, or one of them gets
+      // rejected server-side with not_authenticated.
       entry.authStep = "await_challenge_128";
       const encKey128 = Array.from(base64ToRaw(state.shareableKey128.split(".")[0]));
       ws.send(JSON.stringify({ type: "sig:auth_init", bits: 128, enc_key: encKey128 }));
@@ -2020,6 +2070,7 @@ function contactAction(action) {
 
   if(action==="edit"){
     title.textContent="EDIT CONTACT";
+    const isMe = c.publicId === state.publicId;
 
     // info display
     const info = document.createElement("div");
@@ -2033,28 +2084,62 @@ function contactAction(action) {
       `<strong style="color:var(--dim)">blocked</strong> ${c.blocked ? "yes" : "no"}`;
     body.appendChild(info);
 
+    // Wrapping in a <form> helps Firefox honour autocomplete="off" outright.
+    // Chrome largely ignores autocomplete="off" on login-heuristic fields by
+    // design (since ~2014), so this alone won't stop it there — the readonly
+    // trick below is what actually does the work for Chrome.
+    const editForm = document.createElement("form");
+    editForm.autocomplete = "off";
+    editForm.style.cssText = "display:flex;flex-direction:column;gap:12px";
+    editForm.onsubmit = (e) => e.preventDefault();
+    body.appendChild(editForm);
+
     const nameInput = document.createElement("input");
-    nameInput.value       = c.name;
-    nameInput.placeholder = "contact name";
+    nameInput.value        = c.name;
+    nameInput.placeholder  = "contact name";
+    nameInput.name         = "mc-edit-name";
     nameInput.autocomplete = "off";
-    body.appendChild(nameInput);
+    editForm.appendChild(nameInput);
 
-    const keyInput = document.createElement("input");
-    keyInput.placeholder  = c.legacy128
-      ? "paste new key to update (optional)"
-      : "paste new key to update (optional)";
-    keyInput.autocomplete = "off";
-    keyInput.spellcheck   = false;
-    body.appendChild(keyInput);
+    // key field — not applicable to self. Changing your OWN key isn't a
+    // contact edit, it's effectively a different identity (new encKey,
+    // new derived publicId) — that's a re-login, not something this modal
+    // should offer. Same reasoning as why sync/block/delete are hidden
+    // for self elsewhere in this menu.
+    let keyInput = null;
+    if (!isMe) {
+      keyInput = document.createElement("input");
+      keyInput.placeholder  = c.legacy128
+        ? "paste new key to update (optional)"
+        : "paste new key to update (optional)";
+      keyInput.name         = "mc-edit-key";
+      keyInput.autocomplete = "off";
+      keyInput.spellcheck   = false;
+      editForm.appendChild(keyInput);
+    }
 
-    // relay override — useful for 128-bit contacts without wss in key
+    // relay override — useful for 128-bit contacts without wss in key.
+    // Chrome's credential-suggestion dropdown ignores autocomplete="off" on
+    // fields it heuristically flags as login-related, but it never targets
+    // readonly fields. Start readonly, drop it the instant the field is
+    // focused (before any keystroke) — invisible to the user, but Chrome
+    // never gets a chance to attach its autofill UI in the first place.
+    // The randomized name suffix also means Chrome has never seen this
+    // exact field before, so it has nothing to correlate against anyway.
     const relayInput = document.createElement("input");
-    relayInput.placeholder  = "relay wss override (optional)";
-    relayInput.value        = c.lastRelay || "";
-    relayInput.autocomplete = "off";
-    relayInput.spellcheck   = false;
+    relayInput.type          = "url";
+    relayInput.placeholder   = "relay wss override (optional)";
+    relayInput.value         = "wss://";
+    relayInput.name          = "mc-edit-relay-wss-" + Math.random().toString(36).slice(2, 8);
+    relayInput.autocomplete  = "off";
+    relayInput.spellcheck    = false;
+    relayInput.autocapitalize = "off";
+    relayInput.setAttribute("data-lpignore", "true");     // LastPass
+    relayInput.setAttribute("data-1p-ignore", "true");    // 1Password
     relayInput.setAttribute("list", "relayDatalist");
-    body.appendChild(relayInput);
+    relayInput.readOnly = true;
+    relayInput.addEventListener("focus", () => { relayInput.readOnly = false; }, { once: true });
+    editForm.appendChild(relayInput);
 
     // datalist — unique WSS values collected from all contacts
     const datalist = document.createElement("datalist");
@@ -2082,7 +2167,8 @@ function contactAction(action) {
       c.lastStateChange = Date.now();
 
       // relay override
-      const relayVal = relayInput.value.trim();
+      const relayVal  = relayInput.value.trim();
+      const prevRelay = c.lastRelay;
       if (relayVal && relayVal !== c.lastRelay) {
         c.lastRelay = relayVal;
         if (c.legacy128) openPersistentRelay(relayVal);
@@ -2090,8 +2176,9 @@ function contactAction(action) {
       } else if (!relayVal) {
         c.lastRelay = null;
       }
+      const ownRelayChanged = c.publicId === state.publicId && c.lastRelay !== prevRelay;
 
-      const newKey = keyInput.value.trim();
+      const newKey = keyInput ? keyInput.value.trim() : "";
       if (newKey) {
         try {
           if (c.legacy128) {
@@ -2127,6 +2214,7 @@ function contactAction(action) {
       updateChatRelayInfo(state.currentChat);
       renderContactList();
       closeContactAction();
+      if (ownRelayChanged) rebootSignal();
     };
     nameInput.onkeydown = (e) => { if (e.key === "Enter") document.getElementById("contactActionConfirm").click(); };
 
