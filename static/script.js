@@ -1150,6 +1150,92 @@ function resetRelayTimer(hostname) {
   }, RELAY_IDLE_MS);
 }
 
+// Disposable connectivity probe for the MIGRATE panel — "is this a relay
+// that speaks the protocol correctly" (full dual-auth chain), not just
+// "does a socket open." Deliberately separate from relayConns: never
+// registered, never reused, always closed on its own regardless of
+// outcome. Resolves { ok, reason? } rather than throwing, since a failed
+// test is an expected, displayable outcome, not an error.
+const RELAY_TEST_TIMEOUT_MS = 5000;
+
+function testRelayConnection(url) {
+  return new Promise((resolve) => {
+    let settled = false;
+    let ws;
+
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try { ws?.close(1000, "test complete"); } catch(e) {}
+      resolve(result);
+    };
+
+    try {
+      ws = new WebSocket(url);
+    } catch(e) {
+      resolve({ ok: false, reason: "invalid url" });
+      return;
+    }
+
+    const timer = setTimeout(() => finish({ ok: false, reason: "timeout" }), RELAY_TEST_TIMEOUT_MS);
+
+    let step = "idle";
+
+    ws.onopen = () => {
+      step = "await_challenge_128";
+      const encKey128 = Array.from(base64ToRaw(state.shareableKey128.split(".")[0]));
+      ws.send(JSON.stringify({ type: "sig:auth_init", bits: 128, enc_key: encKey128 }));
+    };
+
+    ws.onmessage = async (evt) => {
+      try {
+        const msg = JSON.parse(evt.data);
+
+        if (step === "await_challenge_128" && msg.type === "sig:auth_challenge") {
+          const iv         = new Uint8Array(msg.iv);
+          const data       = new Uint8Array(msg.data);
+          const plainBytes = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, state.encKey128, data);
+          ws.send(JSON.stringify({ type: "sig:auth_proof", nonce: Array.from(new Uint8Array(plainBytes)) }));
+          step = "await_ok_128";
+          return;
+        }
+
+        if (step === "await_ok_128" && msg.type === "sig:auth_ok") {
+          step = "await_challenge_256";
+          const encKey256 = Array.from(base64ToRaw(state.shareableKey.split(".")[0]));
+          ws.send(JSON.stringify({ type: "sig:auth_init", bits: 256, enc_key: encKey256 }));
+          return;
+        }
+
+        if (step === "await_challenge_256" && msg.type === "sig:auth_challenge") {
+          const iv         = new Uint8Array(msg.iv);
+          const data       = new Uint8Array(msg.data);
+          const plainBytes = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, state.encKey, data);
+          ws.send(JSON.stringify({ type: "sig:auth_proof", nonce: Array.from(new Uint8Array(plainBytes)) }));
+          step = "await_ok_256";
+          return;
+        }
+
+        if (step === "await_ok_256" && msg.type === "sig:auth_ok") {
+          finish({ ok: true });
+          return;
+        }
+
+        if (msg.type === "sig:auth_fail") {
+          finish({ ok: false, reason: msg.reason || "auth_fail" });
+          return;
+        }
+        // anything else during a test is ignored — this is a probe, not a real session
+      } catch(e) {
+        finish({ ok: false, reason: "error: " + e.message });
+      }
+    };
+
+    ws.onerror = () => finish({ ok: false, reason: "connection error" });
+    ws.onclose = () => finish({ ok: false, reason: "closed early" });
+  });
+}
 
 function getOrOpenRelayConn(url, messageOnly) {
   const hostname = relayHostname(url);
@@ -2003,6 +2089,22 @@ function openChat(id) {
   document.getElementById("blockToggleBtn").style.display   = isMe ? "none" : "";
   document.querySelector("#contactDropdown .danger").style.display = isMe ? "none" : "";
   if (!isMe) document.getElementById("blockToggleBtn").textContent = c.blocked ? "UNBLOCK" : "BLOCK";
+  // MIGRATE is self-only — inverse of sync/block/delete above. Injected
+  // dynamically rather than added to the static markup, since it didn't
+  // exist when the dropdown was originally built.
+  let migrateBtn = document.getElementById("migrateBtn");
+  if (isMe) {
+    if (!migrateBtn) {
+      migrateBtn = document.createElement("button");
+      migrateBtn.id = "migrateBtn";
+      migrateBtn.textContent = "MIGRATE";
+      migrateBtn.onclick = () => contactAction("migrate");
+      document.getElementById("contactDropdown").appendChild(migrateBtn);
+    }
+    migrateBtn.style.display = "";
+  } else if (migrateBtn) {
+    migrateBtn.style.display = "none";
+  }
   document.getElementById("contactDropdown").classList.remove("open");
   renderContactList();
   renderMessages();
@@ -2323,6 +2425,142 @@ function contactAction(action) {
       document.getElementById("chatMessages").innerHTML = "";
       await saveContacts(); renderContactList(); closeContactAction();
     };
+
+  } else if (action === "migrate") {
+    title.textContent = "MIGRATE RELAY";
+
+    const hint = document.createElement("div");
+    hint.className = "hint";
+    hint.innerHTML =
+      "Test a relay before migrating — only the <strong style='color:var(--text)'>most recently passed</strong> " +
+      "test can be migrated to. Contact and self-device notifications aren't built yet — this only " +
+      "updates your own relay locally and reconnects.";
+    body.appendChild(hint);
+
+    const listWrap = document.createElement("div");
+    listWrap.style.cssText = "display:flex;flex-direction:column;gap:8px;margin-top:4px";
+    body.appendChild(listWrap);
+
+    // Local to this modal's lifecycle — reset every time it opens. A pass
+    // from a previous visit shouldn't silently authorize a migrate now;
+    // the relay could be down by the time you come back.
+    let lastTestedUrl = null;
+    let testInFlight  = false;
+    const rows = [];   // { getUrl, migrateBtn }
+
+    function refreshMigrateButtons() {
+      for (const row of rows) {
+        const url = row.getUrl();
+        row.migrateBtn.disabled = !(url && url === lastTestedUrl);
+      }
+    }
+
+    function buildRow(fixedUrl, isManual) {
+      const rowEl = document.createElement("div");
+      rowEl.style.cssText = "display:flex;gap:6px;align-items:center";
+
+      let getUrl;
+      if (isManual) {
+        const inputEl = document.createElement("input");
+        inputEl.type            = "url";
+        inputEl.value           = "wss://";
+        inputEl.placeholder     = "manual relay wss://…";
+        inputEl.name            = "mc-migrate-manual-" + Math.random().toString(36).slice(2, 8);
+        inputEl.autocomplete    = "off";
+        inputEl.spellcheck      = false;
+        inputEl.autocapitalize  = "off";
+        inputEl.setAttribute("data-lpignore", "true");
+        inputEl.setAttribute("data-1p-ignore", "true");
+        inputEl.readOnly = true;
+        inputEl.addEventListener("focus", () => { inputEl.readOnly = false; }, { once: true });
+        inputEl.style.flex = "1";
+        inputEl.addEventListener("input", refreshMigrateButtons);
+        rowEl.appendChild(inputEl);
+        getUrl = () => inputEl.value.trim();
+      } else {
+        const labelEl = document.createElement("div");
+        labelEl.textContent = fixedUrl;
+        labelEl.style.cssText = "flex:1;font-size:11px;color:var(--dim);word-break:break-all";
+        rowEl.appendChild(labelEl);
+        getUrl = () => fixedUrl;
+      }
+
+      const statusEl = document.createElement("span");
+      statusEl.textContent = "untested";
+      statusEl.style.cssText = "font-size:9px;min-width:62px;text-align:center;color:var(--muted)";
+
+      const testBtn = document.createElement("button");
+      testBtn.className = "btn-alt";
+      testBtn.textContent = "TEST";
+      testBtn.style.cssText = "flex:0 0 auto;padding:6px 10px;font-size:10px";
+
+      const migrateBtn = document.createElement("button");
+      migrateBtn.className = "btn-confirm";
+      migrateBtn.textContent = "MIGRATE";
+      migrateBtn.style.cssText = "flex:0 0 auto;padding:6px 10px;font-size:10px";
+      migrateBtn.disabled = true;
+
+      testBtn.onclick = async () => {
+        const url = getUrl();
+        if (!url || url === "wss://") {
+          statusEl.textContent = "enter a url";
+          statusEl.style.color = "var(--danger)";
+          return;
+        }
+        if (testInFlight) return;
+        testInFlight = true;
+        testBtn.disabled = true;
+        statusEl.textContent = "testing…";
+        statusEl.style.color = "var(--accent)";
+        mlog.info(`MIGRATE    testing ${url}`);
+        const result = await testRelayConnection(url);
+        testInFlight = false;
+        testBtn.disabled = false;
+        if (result.ok) {
+          lastTestedUrl = url;
+          statusEl.textContent = "✓ passed";
+          statusEl.style.color = "var(--online)";
+          mlog.info(`MIGRATE    test passed  ${url}`);
+        } else {
+          statusEl.textContent = "✗ " + (result.reason || "failed");
+          statusEl.style.color = "var(--danger)";
+          mlog.warn(`MIGRATE    test failed  ${url}  reason=${result.reason}`);
+        }
+        refreshMigrateButtons();
+      };
+
+      migrateBtn.onclick = () => {
+        const url = getUrl();
+        if (url !== lastTestedUrl) return;   // shouldn't be reachable — button would be disabled
+        const me      = state.contacts[state.publicId];
+        const oldRelay = me.lastRelay;
+        me.prevRelay     = oldRelay;
+        me.prevRelaySeen = Date.now();
+        me.lastRelay     = url;
+        saveContacts();
+        mlog.info(`MIGRATE    committed  ${oldRelay || "(none)"} → ${url}  (contact/self notify not yet implemented)`);
+        rebootSignal();
+        closeContactAction();
+      };
+
+      rowEl.appendChild(statusEl);
+      rowEl.appendChild(testBtn);
+      rowEl.appendChild(migrateBtn);
+      rows.push({ getUrl, migrateBtn });
+      return rowEl;
+    }
+
+    const knownRelays = new Set();
+    for (const contact of Object.values(state.contacts)) {
+      if (contact.lastRelay) knownRelays.add(contact.lastRelay);
+    }
+    for (const url of knownRelays) {
+      listWrap.appendChild(buildRow(url, false));
+    }
+    listWrap.appendChild(buildRow(null, true));
+
+    btns.innerHTML = '<button class="btn-cancel" onclick="closeContactAction()">CLOSE</button>';
+    document.getElementById("contactActionOverlay").classList.add("open");
   }
 }
 
