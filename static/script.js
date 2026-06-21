@@ -2359,6 +2359,10 @@ document.getElementById("loginButton").onclick = async (e) => {
 	state.publicId128     = await derivePublicId(k128.encKey128);
 	state.shareableKey128 = rawToBase64(k128.encKey128) + "." + rawToBase64(k128.signKey128);
 	mlog.info(`LOGIN128   ${pid(state.publicId128)}`);
+	// device identity — local-only, never backed up, never synced. Get-or-create
+	// every boot: same device + same identity always yields the same id.
+	state.deviceId = await getOrCreateDeviceId();
+	mlog.info(`DEVICE     ${pid(state.deviceId)}`);
     await loadContacts();
 	if(!state.contacts[state.publicId]){
 	  const parts=state.shareableKey.split(".");
