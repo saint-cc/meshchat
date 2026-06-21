@@ -33,6 +33,11 @@ WS_PORT = int(os.environ.get("WS_PORT", 8888))
 # Relay identity — sent to clients on request
 RELAY_WSS_URL = os.environ.get("RELAY_WSS_URL", "")   # e.g. wss://yourrelay.example.com/ws/
 
+# Protocol version — informational only for now, surfaced in sig:relay_info
+# so client/server version drift shows up in both logs. Not enforced yet;
+# room to add real backwards-compat handling once this is actually needed.
+PROTOCOL_VERSION = os.environ.get("PROTOCOL_VERSION", "0.3.0")
+
 # Connection limits
 MAX_CONNECTIONS        = int(os.environ.get("MAX_CONNECTIONS",        50))   # total WS sessions
 MAX_CONNECTIONS_PER_IP = int(os.environ.get("MAX_CONNECTIONS_PER_IP", 15))   # per source IP
@@ -539,11 +544,9 @@ async def handler(ws):
                          kind.upper()[:12], short(frm), short(to), reached)
 
             elif kind == "sig:relay_req":
-                if RELAY_WSS_URL:
-                    await send_to(ws, {"type": "sig:relay_info", "wss": RELAY_WSS_URL})
-                    log.info("RELAY_INFO sent to %s", short(last_id()))
-                else:
-                    log.debug("RELAY_INFO requested but not configured, skipped")
+                await send_to(ws, {"type": "sig:relay_info", "wss": RELAY_WSS_URL or None, "version": PROTOCOL_VERSION})
+                log.info("RELAY_INFO sent to %s  wss=%s  version=%s",
+                         short(last_id()), RELAY_WSS_URL or "—", PROTOCOL_VERSION)
 
             elif kind == "sig:ping":
                 await send_to(ws, {"type": "sig:pong"})

@@ -91,6 +91,7 @@ const SIGNAL_URL =isSecure
 const STORAGE_KEY     = "meshchat_contacts";
 const PEER_BACKUP_KEY = "meshchat_peer_backups_v1";
 const PEER_TOKEN_KEY  = "meshchat_peer_tokens_v1";
+const DEVICE_KEY_STORAGE = "meshchat_device_seed_v1";
 const EXCHANGE_COUNT  = 10;
 
 /* ══════════════════════════════════════════
@@ -207,6 +208,31 @@ async function hkdfExpand(master){
 async function derivePublicId(rawKey) {
   const hash = await crypto.subtle.digest("SHA-256", rawKey);
   return btoa(String.fromCharCode(...new Uint8Array(hash).slice(0, 12))).replace(/\+/g,'-').replace(/\//g,'_').replace(/=/g,'');
+}
+
+// Device identity — local-only, never synced, never included in any
+// backup/export. The raw seed is the durable secret; deviceId is just its
+// derived public form, same shape as publicId/publicId128 (SHA-256[0:12]
+// base64url via derivePublicId — reused directly, not reimplemented).
+// Deliberately generated through the SAME curve family already in use
+// for signing (ed25519.getPublicKey) rather than pulling in a new
+// dependency. A future X25519 (DH) key for real per-device forward
+// secrecy can be derived from this same seed later via the standard
+// birational Ed25519↔X25519 conversion — no re-keying, no redistribution,
+// no "deviceId v1 vs v2" when that work actually happens.
+async function getOrCreateDeviceId() {
+  const storageKey = DEVICE_KEY_STORAGE + "_" + state.publicId;
+  let seed;
+  const existing = localStorage.getItem(storageKey);
+  if (existing) {
+    seed = base64ToRaw(existing);
+  } else {
+    seed = crypto.getRandomValues(new Uint8Array(32));
+    localStorage.setItem(storageKey, rawToBase64(seed));
+    mlog.info("DEVICE     new device identity generated");
+  }
+  const publicKey = ed25519.getPublicKey(seed);
+  return await derivePublicId(publicKey);
 }
 
 // Stable reaction message ID: same sender + same target always → same ID.
@@ -365,6 +391,12 @@ function mergeContactMeta(local, remote) {
     local.blocked         = remote.blocked;
     local.lastStateChange = remote.lastStateChange;
   }
+  // Backups/restores carry lastRelay too — same timestamp-guarded adoption
+  // as updateRelay() already does for relay info embedded in messages.
+  // This is what lets a second device pick up a relay change made on a
+  // first device, purely through normal backup/restore traffic — no
+  // migrate packet involved, since nothing here is a deliberate migration.
+  if (remote.lastRelay) updateRelay(local, remote.lastRelay, remote.lastRelaySeen);
 }
 
 function getLast(contactId, n = EXCHANGE_COUNT) { return (state.contacts[contactId]?.messages || []).slice(-n); }
@@ -594,7 +626,8 @@ async function handleBackupPush(msg) {
     try {
       const plain = await decryptObject(state.cryptoKey, msg.blob);
       if (typeof plain !== "object" || Array.isArray(plain)) return;
-      const restored = await deserialiseContacts(plain);
+      const restored      = await deserialiseContacts(plain);
+      const prevSelfRelay = state.contacts[state.publicId]?.lastRelay;
       for (const [id, contact] of Object.entries(restored)) {
         if (!state.contacts[id]) state.contacts[id] = contact;
         else {
@@ -606,6 +639,10 @@ async function handleBackupPush(msg) {
       renderContactList();
 	  if (state.currentChat) renderMessages();
       mlog.info(`← BACKUP_PUSH  from self — merged other-me`);
+      if (state.contacts[state.publicId]?.lastRelay !== prevSelfRelay) {
+        mlog.info(`BACKUP_PUSH    self relay changed via other device — rebooting signal`);
+        rebootSignal();
+      }
     } catch(e) {
       mlog.warn(`← BACKUP_PUSH  from self — decrypt failed`);
     }
@@ -792,7 +829,8 @@ async function handleRestorePush(msg) {
       mlog.warn(`← RESTORE_PUSH from ${pid(msg.from)} — bad structure, dropped`);
       return;
     }
-    const restored = await deserialiseContacts(plain);
+    const restored      = await deserialiseContacts(plain);
+    const prevSelfRelay = state.contacts[state.publicId]?.lastRelay;
     let added = 0, msgsMerged = 0;
     for (const [id, contact] of Object.entries(restored)) {
       if (!state.contacts[id]) {
@@ -814,6 +852,10 @@ async function handleRestorePush(msg) {
 	if (state.currentChat) renderMessages();
     mlog.info(`← RESTORE_PUSH from ${pid(msg.from)} — +${added} contacts  +${msgsMerged} msgs`);
     setSyncStatus("restored from network ✓");
+    if (state.contacts[state.publicId]?.lastRelay !== prevSelfRelay) {
+      mlog.info(`RESTORE_PUSH   self relay changed via other device — rebooting signal`);
+      rebootSignal();
+    }
   } catch(e) {
     mlog.warn(`← RESTORE_PUSH from ${pid(msg.from)} — decrypt failed, dropped`);
   }
@@ -1763,6 +1805,12 @@ async function importBackup(file, passphrase) {
   const plain     = await decryptObject(importKey, parsed.blob);
   if (typeof plain !== "object") throw new Error("backup data corrupt");
   const restored  = await deserialiseContacts(plain);
+  // Same latent gap as the network backup/restore paths: a self entry in
+  // here could carry a newer lastRelay (e.g. importing a file exported from
+  // another device after it migrated). Rare and deliberate compared to the
+  // automatic background paths, but the same mergeContactMeta call below
+  // means it's exposed to the same situation, so check it too.
+  const prevSelfRelay = state.contacts[state.publicId]?.lastRelay;
   let added = 0;
   for (const [id, contact] of Object.entries(restored)) {
     if (!state.contacts[id]) { state.contacts[id] = contact; added++; }
@@ -1774,6 +1822,10 @@ async function importBackup(file, passphrase) {
   await saveContacts();
   mlog.info(`BACKUP     imported — +${added} contacts`);
   renderContactList();
+  if (state.contacts[state.publicId]?.lastRelay !== prevSelfRelay) {
+    mlog.info(`BACKUP     self relay changed via import — rebooting signal`);
+    rebootSignal();
+  }
 }
 
 /* ══════════════════════════════════════════
