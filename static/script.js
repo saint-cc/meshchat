@@ -2510,6 +2510,14 @@ function contactAction(action) {
         if (testInFlight) return;
         testInFlight = true;
         testBtn.disabled = true;
+        // Starting ANY new test attempt immediately revokes whatever
+        // passed before — trust is only "the one JUST tested," not "the
+        // one that happened to pass at some earlier point." Without this,
+        // retesting the same url and getting a failure this time wouldn't
+        // actually disable its migrate button, since success was the only
+        // thing ever writing to lastTestedUrl.
+        lastTestedUrl = null;
+        refreshMigrateButtons();
         statusEl.textContent = "testing…";
         statusEl.style.color = "var(--accent)";
         mlog.info(`MIGRATE    testing ${url}`);
@@ -2550,10 +2558,19 @@ function contactAction(action) {
       return rowEl;
     }
 
-    const knownRelays = new Set();
+    // Excludes our own current relay — migrating "to" where we already are
+    // isn't a migration. Includes prevRelay (wherever we last migrated
+    // FROM) even if no contact currently references it — once we've moved
+    // away, nothing keeps that address in any contact's lastRelay, so
+    // without this it could silently fall out of the known set entirely,
+    // leaving no easy way back if the new relay turns out to be bad.
+    const me           = state.contacts[state.publicId];
+    const currentRelay = me?.lastRelay;
+    const knownRelays  = new Set();
     for (const contact of Object.values(state.contacts)) {
-      if (contact.lastRelay) knownRelays.add(contact.lastRelay);
+      if (contact.lastRelay && contact.lastRelay !== currentRelay) knownRelays.add(contact.lastRelay);
     }
+    if (me?.prevRelay && me.prevRelay !== currentRelay) knownRelays.add(me.prevRelay);
     for (const url of knownRelays) {
       listWrap.appendChild(buildRow(url, false));
     }
