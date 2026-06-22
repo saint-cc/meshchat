@@ -78,7 +78,6 @@ setInterval(() => {
 const state = {
   user: null, publicId: null, shareableKey: null,
   keys: null, cryptoKey: null, encKey: null,
-  encKey128: null, publicId128: null, shareableKey128: null,
   contacts: {}, peerBackups: {}, peerTokens: {},
   currentChat: null, ws: null, online: new Set(),
   unread: {}
@@ -212,7 +211,7 @@ async function derivePublicId(rawKey) {
 
 // Device identity — local-only, never synced, never included in any
 // backup/export. The raw seed is the durable secret; deviceId is just its
-// derived public form, same shape as publicId/publicId128 (SHA-256[0:12]
+// derived public form, same shape as publicId (SHA-256[0:12]
 // base64url via derivePublicId — reused directly, not reimplemented).
 // Deliberately generated through the SAME curve family already in use
 // for signing (ed25519.getPublicKey) rather than pulling in a new
@@ -248,70 +247,6 @@ function base64ToRaw(b64) { return Uint8Array.from(atob(b64.replace(/-/g,'+').re
 
 async function importEncKey(raw)  { return crypto.subtle.importKey("raw", raw, { name: "AES-GCM" }, false, ["encrypt","decrypt"]); }
 async function importSignKey(raw) { return crypto.subtle.importKey("raw", raw, { name: "HMAC", hash: "SHA-256" }, false, ["sign","verify"]); }
-
-/* ── 128-bit helpers for legacy contacts ([128] type) ── */
-async function importEncKey128(raw) {
-  // raw must be 16 bytes (AES-128)
-  return crypto.subtle.importKey("raw", raw, { name: "AES-GCM" }, false, ["encrypt","decrypt"]);
-}
-
-async function encryptMessage128(recipientEncKey128, payload) {
-  const iv     = crypto.getRandomValues(new Uint8Array(12));
-  const cipher = await crypto.subtle.encrypt(
-    { name: "AES-GCM", iv },
-    recipientEncKey128,
-    new TextEncoder().encode(JSON.stringify(payload))
-  );
-  return { v: 1, bits: 128, iv: Array.from(iv), data: Array.from(new Uint8Array(cipher)) };
-}
-
-async function decryptMessage128(blob) {
-  // decrypts with our own 128-bit enc key (state.encKey128)
-  const plain = await crypto.subtle.decrypt(
-    { name: "AES-GCM", iv: new Uint8Array(blob.iv) },
-    state.encKey128,
-    new Uint8Array(blob.data)
-  );
-  return JSON.parse(new TextDecoder().decode(plain));
-}
-
-// AES-GCM auth tag as MAC — reuses the AES-128 key, deterministic over fixed IV.
-// Signing scheme may be refined once C64 side is confirmed.
-async function signBlob128(blob, macKey) {
-  const iv  = new Uint8Array(12); // fixed zero IV → deterministic tag
-  const enc = await crypto.subtle.encrypt(
-    { name: "AES-GCM", iv },
-    macKey,
-    new TextEncoder().encode(JSON.stringify(blob))
-  );
-  return Array.from(new Uint8Array(enc).slice(-16)); // GCM auth tag = last 16 bytes
-}
-
-async function verifyBlob128(blob, sig, macKey) {
-  try {
-    const expected = await signBlob128(blob, macKey);
-    return expected.length === sig.length && expected.every((b, i) => b === sig[i]);
-  } catch { return false; }
-}
-
-async function derive128Keys(name, passphrase) {
-  // Same PBKDF2 salt as master, different HKDF labels, 128-bit output
-  const enc      = new TextEncoder();
-  const saltData = await crypto.subtle.digest("SHA-256", enc.encode("meshchat-v1:" + name.toLowerCase().trim()));
-  const baseKey  = await crypto.subtle.importKey("raw", enc.encode(passphrase), { name: "PBKDF2" }, false, ["deriveBits"]);
-  const bits     = await crypto.subtle.deriveBits(
-    { name: "PBKDF2", salt: saltData, iterations: 1000, hash: "SHA-256" },
-    baseKey, 256
-  );
-  const hkdfKey = await crypto.subtle.importKey("raw", new Uint8Array(bits), { name: "HKDF" }, false, ["deriveBits"]);
-  const derive  = async (label) => new Uint8Array(
-    await crypto.subtle.deriveBits(
-      { name: "HKDF", hash: "SHA-256", salt: new Uint8Array(16), info: enc.encode("meshchat-v1-128:" + label) },
-      hkdfKey, 128
-    )
-  );
-  return { encKey128: await derive("encryption"), signKey128: await derive("signing") };
-}
 
 async function compress(str) {
   const stream = new CompressionStream("gzip");
@@ -419,7 +354,7 @@ function pollBatchSize() {
 
 function pollContacts() {
   const others = Object.keys(state.contacts)
-    .filter(id => id !== state.publicId && !state.contacts[id].legacy128)
+    .filter(id => id !== state.publicId)
     .sort(() => Math.random() - 0.5)
     .slice(0, pollBatchSize() - 1);
   sendSignal({ type: "sig:announce", ids: [state.publicId, ...others] });
@@ -446,33 +381,18 @@ function serialiseContacts() {
                 blocked: c.blocked || false,
                 lastStateChange: c.lastStateChange || 0,
                 lastRelay:       c.lastRelay       || null,
-                lastRelaySeen:   c.lastRelaySeen    || 0,
-                legacy128:       c.legacy128        || false,
-                signKeyBytes128: c.signKeyBytes128  || null };
+                lastRelaySeen:   c.lastRelaySeen    || 0 };
   return out;
 }
 
 async function deserialiseContacts(raw){
   const out={};
   for(const[id,c]of Object.entries(raw)){
-    if (c.legacy128) {
-      // 128-bit contact: encKey128.signKey128 (16 bytes each)
-      const parts = c.shareableKey.split(".");
-      const encKeyBytes  = base64ToRaw(parts[0]);
-      const signKeyBytes = c.signKeyBytes128 ? new Uint8Array(c.signKeyBytes128) : base64ToRaw(parts[1]);
-      out[id] = { ...c,
-        encKey:         await importEncKey128(encKeyBytes),
-        signKey128:     await importEncKey128(signKeyBytes),
-        signKeyBytes128: Array.from(signKeyBytes),
-        legacy128: true,
-      };
-    } else {
-      const parts=c.shareableKey.split(".");
-      const encKeyBytes=base64ToRaw(parts[0]);
-      const signPublicKey=parts.length>=2?base64ToRaw(parts[1]):null;
-      // parts[2] is base64-encoded relay WSS — preserved as-is in shareableKey
-      out[id]={...c,encKey:await importEncKey(encKeyBytes),signPublicKey};
-    }
+    const parts=c.shareableKey.split(".");
+    const encKeyBytes=base64ToRaw(parts[0]);
+    const signPublicKey=parts.length>=2?base64ToRaw(parts[1]):null;
+    // parts[2] is base64-encoded relay WSS — preserved as-is in shareableKey
+    out[id]={...c,encKey:await importEncKey(encKeyBytes),signPublicKey};
   }
   return out;
 }
@@ -563,7 +483,6 @@ const pendingBackupOffer = {};   // id → { blob, ts }
 async function pushBackupToContacts(blob) {
   for (const id of Object.keys(state.contacts)) {
 	const contact = state.contacts[id];
-	if (contact.legacy128) continue;  // 128-bit contacts don't participate in backup
     const onOwnRelay = state.online.has(id) && 
 	  (!contact.lastRelay || contact.lastRelay === state.contacts[state.publicId]?.lastRelay);
 	const hasOpenRelay = contact.lastRelay && 
@@ -668,7 +587,7 @@ async function handleBackupPush(msg) {
 async function handleTokenRequest(msg) {
   if (!msg.from) return;
   const contact = state.contacts[msg.from];
-  if (!contact || contact.blocked || contact.legacy128) return;
+  if (!contact || contact.blocked) return;
   markOnline(msg.from);
   mlog.info(`← TOKEN_REQ    from ${pid(msg.from)} — generating token`);
   const token = await encryptObject(state.cryptoKey, {
@@ -696,7 +615,7 @@ const pendingRestoreRequest = new Set();
 
 async function sendRestoreRequest(id) {
   const contact = state.contacts[id];
-  if (!contact || contact.blocked || contact.legacy128) return;
+  if (!contact || contact.blocked) return;
   if (pendingRestoreRequest.has(id)) {
     mlog.debug(`RESTORE_REQ already pending  to ${pid(id)}`);
     return;
@@ -865,7 +784,6 @@ async function handleRestorePush(msg) {
    MSG EXCHANGE (manual SYNC button)
 ══════════════════════════════════════════ */
 function initiateExchange(contactId) {
-  if (state.contacts[contactId]?.legacy128) { setSyncStatus("sync not available for [128] contacts"); return; }
   if (!state.online.has(contactId)) {
     setSyncStatus("contact offline");
     mlog.info(`→ SYNC         to   ${pid(contactId)} — offline, aborted`);
@@ -903,8 +821,7 @@ async function handleMsgExchange(msg) {
 ══════════════════════════════════════════ */
 /* ══════════════════════════════════════════
    AUTH STATE
-   Sequential: 128-bit first (if we have one), then 256-bit.
-   authStep: "idle" | "await_challenge_128" | "await_challenge_256" | "done"
+   authStep: "idle" | "await_challenge" | "done"
    After "done" the usual post-connect flow runs.
 ══════════════════════════════════════════ */
 const authState = { step: "idle" };
@@ -958,64 +875,36 @@ function rebootSignal() {
 }
 
 function startAuth() {
-  // 128-bit first if we have that identity
-  if (state.encKey128 && state.publicId128) {
-    authState.step = "await_challenge_128";
-    state.ws.send(JSON.stringify({
-      type:    "sig:auth_init",
-      bits:    128,
-      enc_key: Array.from(base64ToRaw(state.shareableKey128.split(".")[0])),
-    }));
-    mlog.info("AUTH       init 128-bit");
-  } else {
-    startAuth256();
-  }
-}
-
-function startAuth256() {
-  authState.step = "await_challenge_256";
+  authState.step = "await_challenge";
   state.ws.send(JSON.stringify({
     type:    "sig:auth_init",
-    bits:    256,
     enc_key: Array.from(base64ToRaw(state.shareableKey.split(".")[0])),
   }));
-  mlog.info("AUTH       init 256-bit");
+  mlog.info("AUTH       init");
 }
 
 async function handleAuthChallenge(msg) {
-  const bits = msg.bits;
   try {
     const iv         = new Uint8Array(msg.iv);
     const data       = new Uint8Array(msg.data);
-    const encKey     = bits === 128 ? state.encKey128 : state.encKey;
-    const plainBytes = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, encKey, data);
+    const plainBytes = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, state.encKey, data);
     const nonce      = Array.from(new Uint8Array(plainBytes));
     state.ws.send(JSON.stringify({ type: "sig:auth_proof", nonce }));
-    mlog.info(`AUTH       proof sent  bits=${bits}`);
+    mlog.info("AUTH       proof sent");
   } catch(e) {
-    mlog.err(`AUTH       decrypt failed bits=${bits}: ${e.message}`);
+    mlog.err(`AUTH       decrypt failed: ${e.message}`);
   }
 }
 
 function handleAuthOk(msg) {
-  mlog.info(`AUTH OK    id=${pid(msg.public_id)}  bits=${authState.step === "await_challenge_128" ? 128 : 256}`);
+  mlog.info(`AUTH OK    id=${pid(msg.public_id)}`);
 
-  if (authState.step === "await_challenge_128") {
-    // 128-bit done — now do 256-bit
-    startAuth256();
-    return;
-  }
-
-  // 256-bit done — fully authenticated, run post-connect flow
+  // fully authenticated, run post-connect flow
   authState.step = "done";
   setConnected(true);
   state.ws.send(JSON.stringify({ type: "sig:relay_req" }));
   pollContacts();
   schedulePoll();
-  // Re-open persistent relay connections for 128-bit contacts
-  for (const c of Object.values(state.contacts)) {
-    if (c.legacy128 && c.lastRelay && !c.blocked) openPersistentRelay(c.lastRelay);
-  }
 }
 
 function handleAuthFail(msg) {
@@ -1100,6 +989,7 @@ function handleSignal(msg) {
     case "sync:token_req":  		 markOnline(msg.from); 		handleTokenRequest(msg);  break;
     case "sync:token_resp": 		 markOnline(msg.from); 		handleTokenResponse(msg); break;
     case "app:message":              receiveMessage(msg);       break;
+    case "app:migrate":               handleMigrate(msg);        break;
     case "app:sync":         markOnline(msg.from);		handleMsgExchange(msg);    break;
     case "sync:backup_offer":         markOnline(msg.from);		handleBackupOffer(msg);    break;
     case "sync:backup_accept":        markOnline(msg.from);		handleBackupAccept(msg);   break;
@@ -1124,13 +1014,8 @@ function sendSignal(obj) {
    Timer: 30s inactivity → graceful close (persistent entries exempt).
    Incoming: piped through handleSignal as-is.
 
-   AUTH: every relay connection authenticates BOTH identities, 128 then
-   256, sequentially — same chain connectSignal uses for the main signal
-   socket (startAuth → startAuth256). A single hostname entry may end up
-   carrying traffic for either identity (e.g. a 128-bit legacy contact and
-   a normal 256-bit contact happen to share a relay) — auth has to cover
-   both before the connection is usable, or one of them gets rejected
-   server-side with not_authenticated.
+   AUTH: every relay connection authenticates the identity — same chain
+   connectSignal uses for the main signal socket (startAuth).
 ══════════════════════════════════════════ */
 const relayConns     = {};   // hostname → { ws, timer, queue:[], ready:false, outbound:true }
 
@@ -1141,7 +1026,7 @@ function relayHostname(url) {
 function resetRelayTimer(hostname) {
   const entry = relayConns[hostname];
   if (!entry) return;
-  if (entry.persistent) return;   // 128-bit relay — never idle-close
+  if (entry.persistent) return;   // persistent relay — never idle-close
   clearTimeout(entry.timer);
   entry.timer = setTimeout(() => {
     mlog.info(`RELAY      idle close  host=${hostname}`);
@@ -1151,7 +1036,7 @@ function resetRelayTimer(hostname) {
 }
 
 // Disposable connectivity probe for the MIGRATE panel — "is this a relay
-// that speaks the protocol correctly" (full dual-auth chain), not just
+// that speaks the protocol correctly" (full auth chain), not just
 // "does a socket open." Deliberately separate from relayConns: never
 // registered, never reused, always closed on its own regardless of
 // outcome. Resolves { ok, reason? } rather than throwing, since a failed
@@ -1183,41 +1068,25 @@ function testRelayConnection(url) {
     let step = "idle";
 
     ws.onopen = () => {
-      step = "await_challenge_128";
-      const encKey128 = Array.from(base64ToRaw(state.shareableKey128.split(".")[0]));
-      ws.send(JSON.stringify({ type: "sig:auth_init", bits: 128, enc_key: encKey128 }));
+      step = "await_challenge";
+      const encKey = Array.from(base64ToRaw(state.shareableKey.split(".")[0]));
+      ws.send(JSON.stringify({ type: "sig:auth_init", enc_key: encKey }));
     };
 
     ws.onmessage = async (evt) => {
       try {
         const msg = JSON.parse(evt.data);
 
-        if (step === "await_challenge_128" && msg.type === "sig:auth_challenge") {
-          const iv         = new Uint8Array(msg.iv);
-          const data       = new Uint8Array(msg.data);
-          const plainBytes = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, state.encKey128, data);
-          ws.send(JSON.stringify({ type: "sig:auth_proof", nonce: Array.from(new Uint8Array(plainBytes)) }));
-          step = "await_ok_128";
-          return;
-        }
-
-        if (step === "await_ok_128" && msg.type === "sig:auth_ok") {
-          step = "await_challenge_256";
-          const encKey256 = Array.from(base64ToRaw(state.shareableKey.split(".")[0]));
-          ws.send(JSON.stringify({ type: "sig:auth_init", bits: 256, enc_key: encKey256 }));
-          return;
-        }
-
-        if (step === "await_challenge_256" && msg.type === "sig:auth_challenge") {
+        if (step === "await_challenge" && msg.type === "sig:auth_challenge") {
           const iv         = new Uint8Array(msg.iv);
           const data       = new Uint8Array(msg.data);
           const plainBytes = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, state.encKey, data);
           ws.send(JSON.stringify({ type: "sig:auth_proof", nonce: Array.from(new Uint8Array(plainBytes)) }));
-          step = "await_ok_256";
+          step = "await_ok";
           return;
         }
 
-        if (step === "await_ok_256" && msg.type === "sig:auth_ok") {
+        if (step === "await_ok" && msg.type === "sig:auth_ok") {
           finish({ ok: true });
           return;
         }
@@ -1240,15 +1109,7 @@ function testRelayConnection(url) {
 function getOrOpenRelayConn(url, messageOnly) {
   const hostname = relayHostname(url);
 
-  mlog.debug(`RELAY      contact ws:${url}`);
-  mlog.debug(`RELAY      our relay ws:${state.contacts[state.publicId].lastRelay}`);
-
   if (!hostname) return null;
-
-  if (url === state.contacts[state.publicId].lastRelay) {
-    mlog.info(`RELAY      local relay, using signal directly`);
-    return null;
-  }
 
   // only reuse connections WE opened — never piggyback on inbound
   if (relayConns[hostname]?.outbound) return relayConns[hostname];
@@ -1276,61 +1137,33 @@ function getOrOpenRelayConn(url, messageOnly) {
 
     ws.onopen = () => {
       clearTimeout(connectTimeout);
-      // Every relay connection authenticates BOTH identities, sequentially,
-      // same chain connectSignal uses for the main signal socket (startAuth
-      // → startAuth256). A single hostname entry may end up carrying
-      // traffic for either identity (e.g. a 128-bit legacy contact and a
-      // normal 256-bit contact happen to share a relay) — auth has to
-      // cover both before the connection is usable, or one of them gets
-      // rejected server-side with not_authenticated.
-      entry.authStep = "await_challenge_128";
-      const encKey128 = Array.from(base64ToRaw(state.shareableKey128.split(".")[0]));
-      ws.send(JSON.stringify({ type: "sig:auth_init", bits: 128, enc_key: encKey128 }));
-      mlog.info(`RELAY      open, authing 128-bit  host=${hostname}`);
+      entry.authStep = "await_challenge";
+      const encKey = Array.from(base64ToRaw(state.shareableKey.split(".")[0]));
+      ws.send(JSON.stringify({ type: "sig:auth_init", enc_key: encKey }));
+      mlog.info(`RELAY      open, authing  host=${hostname}`);
     };
 
     ws.onmessage = async (evt) => {
       try {
         const msg = JSON.parse(evt.data);
 
-        // ── 128-bit challenge ──
-        if (entry.authStep === "await_challenge_128" && msg.type === "sig:auth_challenge") {
-          const iv         = new Uint8Array(msg.iv);
-          const data       = new Uint8Array(msg.data);
-          const plainBytes = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, state.encKey128, data);
-          const nonce      = Array.from(new Uint8Array(plainBytes));
-          ws.send(JSON.stringify({ type: "sig:auth_proof", nonce }));
-          entry.authStep = "await_ok_128";
-          mlog.info(`RELAY      auth proof sent 128-bit  host=${hostname}`);
-          return;
-        }
-
-        // ── 128-bit ok — chain straight into 256-bit, not ready yet ──
-        if (entry.authStep === "await_ok_128" && msg.type === "sig:auth_ok") {
-          mlog.info(`RELAY      authed 128-bit  host=${hostname}`);
-          entry.authStep = "await_challenge_256";
-          const encKey256 = Array.from(base64ToRaw(state.shareableKey.split(".")[0]));
-          ws.send(JSON.stringify({ type: "sig:auth_init", bits: 256, enc_key: encKey256 }));
-          return;
-        }
-
-        // ── 256-bit challenge ──
-        if (entry.authStep === "await_challenge_256" && msg.type === "sig:auth_challenge") {
+        // ── challenge ──
+        if (entry.authStep === "await_challenge" && msg.type === "sig:auth_challenge") {
           const iv         = new Uint8Array(msg.iv);
           const data       = new Uint8Array(msg.data);
           const plainBytes = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, state.encKey, data);
           const nonce      = Array.from(new Uint8Array(plainBytes));
           ws.send(JSON.stringify({ type: "sig:auth_proof", nonce }));
-          entry.authStep = "await_ok_256";
-          mlog.info(`RELAY      auth proof sent 256-bit  host=${hostname}`);
+          entry.authStep = "await_ok";
+          mlog.info(`RELAY      auth proof sent  host=${hostname}`);
           return;
         }
 
-        // ── 256-bit ok — both identities authed, now ready to send ──
-        if (entry.authStep === "await_ok_256" && msg.type === "sig:auth_ok") {
+        // ── ok — authed, now ready to send ──
+        if (entry.authStep === "await_ok" && msg.type === "sig:auth_ok") {
           entry.authStep = "done";
           entry.ready    = true;
-          mlog.info(`RELAY      authed 128+256, flushing ${entry.queue.length} msg(s)  host=${hostname}`);
+          mlog.info(`RELAY      authed, flushing ${entry.queue.length} msg(s)  host=${hostname}`);
           entry.queue.forEach(raw => ws.send(raw));
           entry.queue = [];
           return;
@@ -1378,30 +1211,6 @@ function getOrOpenRelayConn(url, messageOnly) {
   }
 
   return entry;
-}
-// Open a relay connection for a 128-bit contact and keep it alive.
-// Marks the entry as persistent so resetRelayTimer never closes it.
-// Reconnects automatically on drop.
-function openPersistentRelay(wss) {
-  const hostname = relayHostname(wss);
-  if (!hostname) return;
-  if (relayConns[hostname]?.persistent) return;   // already open
-
-  const entry = getOrOpenRelayConn(wss, true);
-  if (entry) {
-    entry.persistent = true;
-    mlog.info(`RELAY[128] persistent open  host=${hostname}`);
-
-    // patch onclose to reconnect
-    const origWs = entry.ws;
-    if (origWs) {
-      origWs.addEventListener("close", () => {
-        if (relayConns[hostname]?.persistent) return;   // already replaced
-        mlog.info(`RELAY[128] reconnecting  host=${hostname}`);
-        setTimeout(() => openPersistentRelay(wss), RELAY_RECONNECT_MS);
-      }, { once: true });
-    }
-  }
 }
 
 
@@ -1593,30 +1402,20 @@ async function getAudioUrl(msgId) {
 ══════════════════════════════════════════ */
 async function receiveMessage(msg) {
   if (!msg.from || !msg.blob) return;
-  // look up by 256-bit id first, then 128-bit id
-  const contact = state.contacts[msg.from] ||
-    (msg.from === state.publicId128 ? state.contacts[state.publicId] : null);
+  const contact = state.contacts[msg.from];
   if (!contact || contact.blocked) return;
   markOnline(msg.from);
   try {
     let plain, valid;
-    if (contact.legacy128 || msg.blob.bits === 128) {
-      plain = await decryptMessage128(msg.blob);
-      valid = msg.sig && contact.signKey128
-        ? await verifyBlob128(msg.blob, msg.sig, contact.signKey128)
-        : false;
-      mlog.info(`← MSG[128]      from ${pid(msg.from)}  sig:${valid ? "✓" : "✗"}`);
-    } else {
-      plain = await decryptMessage(msg.blob);
-      valid = msg.sig && contact.signPublicKey
-        ? verifyBlob(msg.blob, msg.sig, contact.signPublicKey)
-        : false;
-      if (plain.relay?.wss) {
-        updateRelay(contact, plain.relay.wss, plain.ts || Date.now());
-        if (state.currentChat === msg.from) updateChatRelayInfo(msg.from);
-      }
-      mlog.info(`← MSG          from ${pid(msg.from)}  sig:${valid ? "✓" : "✗"}`);
+    plain = await decryptMessage(msg.blob);
+    valid = msg.sig && contact.signPublicKey
+      ? verifyBlob(msg.blob, msg.sig, contact.signPublicKey)
+      : false;
+    if (plain.relay?.wss) {
+      updateRelay(contact, plain.relay.wss, plain.ts || Date.now());
+      if (state.currentChat === msg.from) updateChatRelayInfo(msg.from);
     }
+    mlog.info(`← MSG          from ${pid(msg.from)}  sig:${valid ? "✓" : "✗"}`);
 
     const msgObj = { id: plain.id, from: msg.from, ts: plain.ts || Date.now(), valid };
 
@@ -1654,6 +1453,75 @@ async function receiveMessage(msg) {
   }
 }
 
+/* ══════════════════════════════════════════
+   MIGRATE — receive side
+   Packet: { type: "app:migrate", from, to, blob: encrypted{ newRelay, ts } }
+   Decryption is identical to a regular message — always state.encKey,
+   regardless of sender, since this scheme is symmetric (a contact who
+   has your shareableKey already holds the same key you decrypt with).
+   The two branches below only diverge in what happens AFTER decrypt:
+     - from a contact  → same passive learning already used for relay
+       info embedded in regular messages, just arriving as its own
+       dedicated, overwrite-buffered packet instead.
+     - from self        → another of our own devices migrated (or
+       replanted a breadcrumb). Adopt silently — no notify packets, no
+       ceremony, just follow.
+══════════════════════════════════════════ */
+async function handleMigrate(msg) {
+  if (!msg.from || !msg.blob) return;
+  const contact = state.contacts[msg.from];
+  if (!contact || contact.blocked) return;
+  markOnline(msg.from);
+
+  let plain;
+  try {
+    plain = await decryptMessage(msg.blob);
+  } catch(e) {
+    mlog.warn(`← MIGRATE      from ${pid(msg.from)} — decrypt failed`);
+    return;
+  }
+
+  if (!plain.newRelay) {
+    mlog.warn(`← MIGRATE      from ${pid(msg.from)} — missing newRelay, dropped`);
+    return;
+  }
+
+  if (msg.from === state.publicId) {
+    // Same timestamp-guarded adoption as every other relay update in this
+    // app (updateRelay) — an out-of-order or stale-buffered copy can't
+    // regress us, regardless of which device sent it or when it arrives.
+    const me        = state.contacts[state.publicId];
+    const beforeUrl = me.lastRelay;
+    updateRelay(me, plain.newRelay, plain.ts);
+    if (me.lastRelay !== beforeUrl) {
+      mlog.info(`← MIGRATE      from self — following to ${plain.newRelay}`);
+      me.prevRelay     = beforeUrl;
+      me.prevRelaySeen = Date.now();
+      await saveContacts();
+      renderContactList();
+      rebootSignal();
+      // NOT YET BUILT: replanting a fresh breadcrumb at beforeUrl pointing
+      // to plain.newRelay, so a straggler device even further behind this
+      // one can still find its way. Needs an explicit-URL send — sendToRelay
+      // only knows how to route via a contact's lastRelay, and that helper
+      // doesn't exist yet. Until it does, a third device that's behind
+      // both this one and whoever sent this packet has nowhere to look.
+    } else {
+      mlog.debug(`← MIGRATE      from self — ${plain.newRelay} not newer, ignored`);
+    }
+  } else {
+    const before = contact.lastRelay;
+    updateRelay(contact, plain.newRelay, plain.ts);
+    if (contact.lastRelay !== before) {
+      mlog.info(`← MIGRATE      from ${pid(msg.from)} — relay updated to ${plain.newRelay}`);
+      await saveContacts();
+      if (state.currentChat === msg.from) updateChatRelayInfo(msg.from);
+    } else {
+      mlog.debug(`← MIGRATE      from ${pid(msg.from)} — ${plain.newRelay} not newer, ignored`);
+    }
+  }
+}
+
 async function pushMiniBackup(contactId) {
   const contact = state.contacts[contactId];
   if (!contact) return;
@@ -1671,24 +1539,17 @@ async function sendMessage() {
   if (!contact?.encKey) return;
   const ts = Date.now(), id = crypto.randomUUID();
 
-  let blob, sig, fromId;
-  if (contact.legacy128) {
-    fromId = state.publicId128;
-    blob   = await encryptMessage128(contact.encKey, { id, text, ts });
-    sig    = state.signKey128 ? await signBlob128(blob, state.signKey128) : null;
-  } else {
-    fromId = state.publicId;
-    const me    = state.contacts[state.publicId];
-    const relay = me?.lastRelay ? { wss: me.lastRelay } : undefined;
-    blob = await encryptMessage(contact.encKey, { id, text, ts, ...(relay ? { relay } : {}) });
-    sig  = await signBlob(blob);
-  }
+  const fromId = state.publicId;
+  const me     = state.contacts[state.publicId];
+  const relay  = me?.lastRelay ? { wss: me.lastRelay } : undefined;
+  const blob   = await encryptMessage(contact.encKey, { id, text, ts, ...(relay ? { relay } : {}) });
+  const sig    = await signBlob(blob);
 
   const msgObj = { type: "app:message", from: fromId, to: contact.publicId, blob, ...(sig ? { sig } : {}) };
   const viaRelay = sendToRelay(state.currentChat, msgObj, true);
   if (!viaRelay) sendSignal(msgObj);
   contact.messages.push({ id, from: fromId, text, ts, valid: true });
-  mlog.info(`→ MSG${contact.legacy128?"[128]":""}      to   ${pid(state.currentChat)}  via=${viaRelay ? "relay" : "signal(fallback)"}`);
+  mlog.info(`→ MSG          to   ${pid(state.currentChat)}  via=${viaRelay ? "relay" : "signal(fallback)"}`);
   mlog.debug(`MSG content: "${text.slice(0,40)}${text.length>40?"…":""}"  id=${id}`);
   await saveContacts();
   input.value = "";
@@ -1830,40 +1691,6 @@ async function addContact(name,shareableKey,save=true){
   renderContactList();
   return true;
 }
-// Add a 128-bit legacy contact (e.g. C64).
-// key128 format: encKey128b64.signKey128b64  (each 16 bytes, base64url)
-async function addContact128(name, key128, save=true) {
-  if (!name || !key128) return false;
-  let encKeyBytes, signKeyBytes, relayWss = null;
-  try {
-    const parts = key128.split(".");
-    if (parts.length < 2 || parts.length > 3) throw new Error("expected encKey.signKey[.relayWss]");
-    encKeyBytes  = base64ToRaw(parts[0]);
-    signKeyBytes = base64ToRaw(parts[1]);
-    if (encKeyBytes.length !== 16 || signKeyBytes.length !== 16) throw new Error("keys must be 16 bytes");
-    if (parts.length === 3 && parts[2]) relayWss = atob(parts[2]);
-  } catch(e) {
-    mlog.warn("CONTACT128 bad key: " + e.message);
-    return false;
-  }
-  const publicId = await derivePublicId(encKeyBytes);   // SHA-256(encKey128)[0..12]
-  if (state.contacts[publicId]) return !!state.contacts[publicId];
-  state.contacts[publicId] = {
-    name, publicId, shareableKey: key128,
-    encKey: await importEncKey128(encKeyBytes),
-    signKey128: await importEncKey128(signKeyBytes),
-    signKeyBytes128: Array.from(signKeyBytes),
-    messages: [], legacy128: true,
-    lastRelay: relayWss || null,
-  };
-  if (save) await saveContacts();
-  mlog.info(`CONTACT128 added ${name}  ${pid(publicId)}${relayWss ? "  wss=" + relayWss : ""}`);
-  // open relay connection immediately and keep it alive
-  if (relayWss) openPersistentRelay(relayWss);
-  renderContactList();
-  return true;
-}
-
 
 
 /* ══════════════════════════════════════════
@@ -1929,16 +1756,11 @@ function buildMyQR(key) {
 
 function switchTab(tab) {
   if (tab !== "scan" && scannerRunning) stopScanner();
-  ["show","scan","paste","legacy"].forEach(t => {
+  ["show","scan","paste"].forEach(t => {
     const T = t.charAt(0).toUpperCase() + t.slice(1);
     document.getElementById("tab"   + T)?.classList.toggle("active", t === tab);
     document.getElementById("panel" + T)?.classList.toggle("active", t === tab);
   });
-  // show own 128 key when on legacy tab
-  if (tab === "legacy") {
-    const el = document.getElementById("myKey128Display");
-    if (el) el.textContent = state.shareableKey128 || "—";
-  }
 }
 
 async function toggleScanner() { scannerRunning ? stopScanner() : await startScanner(); }
@@ -2043,7 +1865,6 @@ function renderContactList() {
       '<div class="contactInfo">' +
         '<div class="contactName">' + esc(c.name) +
           (isMe ? ' <span style="font-size:9px;color:var(--muted);letter-spacing:0.08em">YOU</span>' : '') +
-          (c.legacy128 ? ' <span title="128-bit legacy contact" style="font-size:9px;color:var(--accent);letter-spacing:0.06em;border:1px solid var(--border);padding:0 3px">[128]</span>' : '') +
           (hasBackup ? ' <span title="backup stored" style="font-size:9px;color:var(--muted);letter-spacing:0.04em">🗄</span>' : '') +
         '</div>' +
         '<div class="contactId">' + c.publicId.slice(0,16) + '…</div>' +
@@ -2126,7 +1947,7 @@ function renderMessages() {
   }
 
   visible.forEach(m => {
-    const mine = m.from === state.publicId || m.from === state.publicId128;
+    const mine = m.from === state.publicId;
     const wrap = document.createElement("div");
     wrap.style.cssText = "display:flex;flex-direction:column;align-items:" + (mine ? "flex-end" : "flex-start");
     const bubble = document.createElement("div");
@@ -2232,7 +2053,6 @@ function contactAction(action) {
     info.innerHTML =
       `<strong style="color:var(--dim)">id</strong> ${esc(c.publicId)}<br>` +
       `<strong style="color:var(--dim)">key</strong> ${esc(c.shareableKey)}<br>` +
-      (c.legacy128 ? `<strong style="color:var(--dim)">[128]</strong> yes<br>` : "") +
       `<strong style="color:var(--dim)">relay</strong> ${esc(c.lastRelay || "—")}<br>` +
       `<strong style="color:var(--dim)">msgs</strong> ${c.messages?.length || 0}<br>` +
       `<strong style="color:var(--dim)">blocked</strong> ${c.blocked ? "yes" : "no"}`;
@@ -2263,16 +2083,14 @@ function contactAction(action) {
     let keyInput = null;
     if (!isMe) {
       keyInput = document.createElement("input");
-      keyInput.placeholder  = c.legacy128
-        ? "paste new key to update (optional)"
-        : "paste new key to update (optional)";
+      keyInput.placeholder  = "paste new key to update (optional)";
       keyInput.name         = "mc-edit-key";
       keyInput.autocomplete = "off";
       keyInput.spellcheck   = false;
       editForm.appendChild(keyInput);
     }
 
-    // relay override — useful for 128-bit contacts without wss in key.
+    // relay override — useful for contacts without wss in their key.
     // Chrome's credential-suggestion dropdown ignores autocomplete="off" on
     // fields it heuristically flags as login-related, but it never targets
     // readonly fields. Start readonly, drop it the instant the field is
@@ -2325,7 +2143,6 @@ function contactAction(action) {
       const prevRelay = c.lastRelay;
       if (relayVal && relayVal !== c.lastRelay) {
         c.lastRelay = relayVal;
-        if (c.legacy128) openPersistentRelay(relayVal);
         mlog.info(`CONTACT    relay updated  ${pid(c.publicId)}  wss=${relayVal}`);
       } else if (!relayVal) {
         c.lastRelay = null;
@@ -2335,27 +2152,15 @@ function contactAction(action) {
       const newKey = keyInput ? keyInput.value.trim() : "";
       if (newKey) {
         try {
-          if (c.legacy128) {
-            const parts = newKey.split(".");
-            if (parts.length < 2) throw new Error("expected encKey.signKey");
-            const encKeyBytes  = base64ToRaw(parts[0]);
-            const signKeyBytes = base64ToRaw(parts[1]);
-            if (encKeyBytes.length !== 16 || signKeyBytes.length !== 16) throw new Error("keys must be 16 bytes");
-            c.shareableKey      = newKey;
-            c.encKey            = await importEncKey128(encKeyBytes);
-            c.signKey128        = await importEncKey128(signKeyBytes);
-            c.signKeyBytes128   = Array.from(signKeyBytes);
-          } else {
-            const parts = newKey.split(".");
-            if (parts.length < 2 || parts.length > 3) throw new Error("invalid key format");
-            const encKeyBytes   = base64ToRaw(parts[0]);
-            const signPublicKey = base64ToRaw(parts[1]);
-            if (encKeyBytes.length !== 32 || signPublicKey.length !== 32) throw new Error("invalid key length");
-            c.shareableKey  = newKey;
-            c.encKey        = await importEncKey(encKeyBytes);
-            c.signPublicKey = signPublicKey;
-            if (parts.length === 3 && parts[2] && !relayVal) c.lastRelay = atob(parts[2]);
-          }
+          const parts = newKey.split(".");
+          if (parts.length < 2 || parts.length > 3) throw new Error("invalid key format");
+          const encKeyBytes   = base64ToRaw(parts[0]);
+          const signPublicKey = base64ToRaw(parts[1]);
+          if (encKeyBytes.length !== 32 || signPublicKey.length !== 32) throw new Error("invalid key length");
+          c.shareableKey  = newKey;
+          c.encKey        = await importEncKey(encKeyBytes);
+          c.signPublicKey = signPublicKey;
+          if (parts.length === 3 && parts[2] && !relayVal) c.lastRelay = atob(parts[2]);
           mlog.info(`CONTACT    key updated  ${pid(c.publicId)}`);
         } catch(e) {
           mlog.warn("CONTACT    key update failed: " + e.message);
@@ -2607,13 +2412,6 @@ document.getElementById("loginButton").onclick = async (e) => {
 	state.shareableKey=rawToBase64(keys.encryptionKey)+"."+rawToBase64(signPublicKey);
 	state.cryptoKey=await importEncKey(keys.backupKey);
 	state.encKey=await importEncKey(keys.encryptionKey);
-	// derive 128-bit identity
-	const k128 = await derive128Keys(name, pass);
-	state.encKey128       = await importEncKey128(k128.encKey128);
-	state.signKey128      = await importEncKey128(k128.signKey128);
-	state.publicId128     = await derivePublicId(k128.encKey128);
-	state.shareableKey128 = rawToBase64(k128.encKey128) + "." + rawToBase64(k128.signKey128);
-	mlog.info(`LOGIN128   ${pid(state.publicId128)}`);
 	// device identity — local-only, never backed up, never synced. Get-or-create
 	// every boot: same device + same identity always yields the same id.
 	state.deviceId = await getOrCreateDeviceId();
@@ -2661,9 +2459,8 @@ document.getElementById("exportOverlay").onclick = (e) => { if (e.target === doc
 document.getElementById("modalConfirm").onclick = async () => {
   const name    = document.getElementById("modalContactName").value.trim();
   const key     = document.getElementById("modalContactKey").value.trim();
-  const legacy  = document.getElementById("tabLegacy")?.classList.contains("active");
   if (!name || !key) return;
-  const ok = legacy ? await addContact128(name, key) : await addContact(name, key);
+  const ok = await addContact(name, key);
   if (ok) closeModal();
 };
 

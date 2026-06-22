@@ -419,7 +419,7 @@ async def log_stats():
 # ══════════════════════════════════════════
 
 async def handler(ws):
-    client_ids = []   # public_ids authed this socket, sequential (128-bit first if any)
+    client_ids = []   # public_ids authed this socket
     limiter    = RateLimiter()
     addr       = peer_info(ws)
 
@@ -477,14 +477,13 @@ async def handler(ws):
             # ── auth_init: client presents enc key, server sends challenge ──
             if kind == "sig:auth_init":
                 enc_key_list = msg.get("enc_key")
-                bits         = msg.get("bits", 256)
-                if not enc_key_list or bits not in (128, 256):
+                bits         = 256
+                if not enc_key_list:
                     log.warning("AUTH       bad auth_init  peer=%s", addr)
                     await send_to(ws, {"type": "sig:auth_fail", "reason": "bad_init"})
                     continue
                 enc_key_bytes = bytes(enc_key_list)
-                expected_len  = 16 if bits == 128 else 32
-                if len(enc_key_bytes) != expected_len:
+                if len(enc_key_bytes) != 32:
                     log.warning("AUTH       wrong key length  bits=%d  got=%d  peer=%s",
                                 bits, len(enc_key_bytes), addr)
                     await send_to(ws, {"type": "sig:auth_fail", "reason": "bad_key_length"})
