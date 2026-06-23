@@ -13,7 +13,7 @@
 // Protocol version — informational only for now, surfaced via sig:relay_info
 // so client/server drift shows up in both logs. Not enforced yet; room to
 // add real backwards-compat handling once that's actually needed.
-const CLIENT_VERSION = "0.3.1";
+const CLIENT_VERSION = "0.3.0";
 
 const LOG_MAX_LINES      = 20;
 const LOG_CLEAR_INTERVAL = 5 * 60 * 1000;
@@ -317,7 +317,15 @@ function updateRelay(contact, wss, ts) {
 function mergeMessages(a, b) {
   const byId = {};
   for (const m of [...(a||[]),...(b||[])]) if (m.id) byId[m.id] = m;
-  return Object.values(byId).sort((x,y) => x.ts - y.ts);
+  // ts alone isn't a reliable order for near-simultaneous messages — two
+  // events with equal/very-close ts would otherwise tiebreak on whichever
+  // side of the merge happened to list them first, which flips depending
+  // on merge direction (send-side push vs. receive-side merge vs. restore
+  // merge) and is exactly what causes a message to visibly jump position
+  // between renders. id is stable and arbitrary but always the same for
+  // the same message, so adding it as the tiebreak makes the result of
+  // this sort identical no matter which order a/b were merged in.
+  return Object.values(byId).sort((x,y) => (x.ts - y.ts) || (x.id < y.id ? -1 : x.id > y.id ? 1 : 0));
 }
 
 function mergeContactMeta(local, remote) {
@@ -931,13 +939,22 @@ function handleSignal(msg) {
 
         if (isFresh && msg.wss) {
           me.lastRelay = msg.wss;
-          mlog.info(`RELAY_INFO fresh — adopted wss=${msg.wss}`);
+          // Placeholder, not a confirmed fact — this is just whichever relay
+          // happened to answer first, the lowest-confidence source there is.
+          // lastRelaySeen=0 keeps it that way: any genuinely-dated record that
+          // arrives later via restore/backup (even an old one) will correctly
+          // outrank it through updateRelay's timestamp guard. Stamping this
+          // with Date.now() would make "we just discovered this" look like
+          // "we just confirmed this," letting a fresh guess beat real history.
+          me.lastRelaySeen = 0;
+          mlog.info(`RELAY_INFO fresh — adopted wss=${msg.wss} (placeholder, pending confirmation)`);
         } else if (msg.wss && msg.wss !== me.lastRelay) {
           // confirmation only — local storage is the source of truth once we have one.
           // A deliberate migration is the only thing allowed to change lastRelay.
+          // lastRelaySeen is deliberately left untouched here too — we didn't
+          // confirm anything, we ignored a contradicting announcement.
           mlog.warn(`RELAY_INFO mismatch — server says wss=${msg.wss}  local=${me.lastRelay}  keeping local`);
         }
-        me.lastRelaySeen = Date.now();
 
         // shareableKey reflects OUR local truth, not whatever this connection just announced
         const baseKey = state.shareableKey.split(".").slice(0, 2).join(".");
@@ -1332,7 +1349,7 @@ async function sendImageMessage(file) {
       const viaRelayImg = sendToRelay(state.currentChat, imgMsgObj, true);
       if (!viaRelayImg) sendSignal(imgMsgObj);
 
-      contact.messages.push({ id, from: state.publicId, type: "image", mimeType, ts, valid: true });
+      contact.messages = mergeMessages(contact.messages, [{ id, from: state.publicId, type: "image", mimeType, ts, valid: true }]);
       await saveContacts();
       renderMessages();
       mlog.info(`→ IMAGE        to   ${pid(state.currentChat)}  ${w}×${h}  via=${viaRelayImg ? "relay" : "signal(fallback)"}`);
@@ -1371,7 +1388,7 @@ async function sendAudioMessage(blob) {
     if (!viaRelayAud) sendSignal(audioMsgObj);
 
     // stub in messages — data stays in audioCache only
-    contact.messages.push({ id, from: state.publicId, type: "audio", mimeType, ts, valid: true });
+    contact.messages = mergeMessages(contact.messages, [{ id, from: state.publicId, type: "audio", mimeType, ts, valid: true }]);
     await saveContacts();
     renderMessages();
     mlog.info(`→ AUDIO        to   ${pid(state.currentChat)}  size=${blob.size}b  via=${viaRelayAud ? "relay" : "signal(fallback)"}`);
@@ -1548,7 +1565,7 @@ async function sendMessage() {
   const msgObj = { type: "app:message", from: fromId, to: contact.publicId, blob, ...(sig ? { sig } : {}) };
   const viaRelay = sendToRelay(state.currentChat, msgObj, true);
   if (!viaRelay) sendSignal(msgObj);
-  contact.messages.push({ id, from: fromId, text, ts, valid: true });
+  contact.messages = mergeMessages(contact.messages, [{ id, from: fromId, text, ts, valid: true }]);
   mlog.info(`→ MSG          to   ${pid(state.currentChat)}  via=${viaRelay ? "relay" : "signal(fallback)"}`);
   mlog.debug(`MSG content: "${text.slice(0,40)}${text.length>40?"…":""}"  id=${id}`);
   await saveContacts();
@@ -1936,7 +1953,13 @@ function renderMessages() {
   const container = document.getElementById("chatMessages");
   container.innerHTML = "";
   if (!state.currentChat) return;
-  const msgs = state.contacts[state.currentChat]?.messages || [];
+  // Defensive — storage should already be sorted (every mutation path goes
+  // through mergeMessages), but render shouldn't be the thing that silently
+  // breaks if some future code path appends without merging. Same ts/id
+  // tiebreak as mergeMessages, so this is a no-op when storage is already
+  // correct and never produces an order that conflicts with it.
+  const msgs = [...(state.contacts[state.currentChat]?.messages || [])]
+    .sort((x,y) => (x.ts - y.ts) || (x.id < y.id ? -1 : x.id > y.id ? 1 : 0));
 
   // filter out reaction messages — they render as overlays on their target bubbles
   const visible = msgs.filter(m => m.type !== "reaction");
