@@ -40,17 +40,6 @@ Three keys are expanded from the master secret via HKDF-SHA-256:
 | `meshchat-v1:backup`     | AES-256-GCM backup file encryption |
 | `meshchat-v1:signing`    | Ed25519 signing seed |
 
-### 128-bit (legacy / IoT)
-
-A second identity is derived in parallel for constrained devices (e.g. 8-bit hardware):
-
-```
-PBKDF2(iterations=1000) → HKDF-SHA-256 → 128-bit enc key + 128-bit sign key
-HKDF labels: "meshchat-v1-128:encryption" / "meshchat-v1-128:signing"
-```
-
-The 128-bit identity uses AES-128-GCM for all encryption. It is a first-class identity on the network — it can send and receive messages and authenticate to relays — but does not participate in the backup distribution protocol.
-
 ### PublicId
 
 A stable identifier for routing and contact lookup, identical formula for both bit widths:
@@ -75,16 +64,6 @@ All three segments are base64url encoded. The third segment is `btoa(wssUrl)` �
 
 Implementations must decode the third segment with `atob()` before use. Segments beyond the third must be ignored for forward compatibility.
 
-**128-bit shareable format:**
-```
-<encKey128_b64>.<signKey128_b64>.<relayWss_b64>
-```
-Keys are 16 bytes each. The third segment is optional as above.
-
-This string is safe to share publicly — it contains no private key material.
-
----
-
 ## Relay Authentication
 
 Authentication happens on connect, before routing or buffer delivery. The protocol is a simple challenge-response proving possession of the enc key. It gates *receiving* only — fire-and-forget sending requires no auth.
@@ -92,8 +71,8 @@ Authentication happens on connect, before routing or buffer delivery. The protoc
 ### Sequence
 
 ```
-client → server:  auth_init      { enc_key: [...bytes], bits: 256|128 }
-server → client:  auth_challenge { bits: 256|128, iv: [...], data: [...] }
+client → server:  auth_init      { enc_key: [...bytes], bits: 256 }
+server → client:  auth_challenge { bits: 256, iv: [...], data: [...] }
 client → server:  auth_proof     { nonce: [...bytes] }
 server → client:  auth_ok        { public_id: "..." }
              or:  auth_fail      { reason: "..." }
@@ -106,12 +85,6 @@ server → client:  auth_ok        { public_id: "..." }
 5. Client proceeds with `get_relay_info`, presence polling, and normal operation
 
 The server never trusts the client's claimed publicId — it derives it authoritatively from the presented enc key.
-
-### Sequential dual-identity connect
-
-A client with both a 128-bit and 256-bit identity authenticates them sequentially on the same socket — 128-bit first, then 256-bit. Each completes its full challenge-response cycle before the next begins. Only one pending challenge exists per socket at any time.
-
-A socket with only a 128-bit identity authenticated is fully valid (IoT / send-receive only device).
 
 ### Cross-relay connections
 
@@ -133,7 +106,7 @@ On `auth_fail` the client does not retry immediately — the socket `onclose` ha
 
 ## Encryption
 
-**Message encryption** uses the recipient's encryption key (AES-256-GCM or AES-128-GCM for legacy):
+**Message encryption** uses the recipient's encryption key (AES-256-GCM):
 ```
 ciphertext = AES-GCM(
   key  = recipient.encryptionKey,
@@ -143,10 +116,9 @@ ciphertext = AES-GCM(
 wire = { v: 1, iv: [...], data: [...] }
 ```
 
-**Message signing** uses the sender's Ed25519 signing key (256-bit) or AES-GCM auth tag (128-bit):
+**Message signing** uses the sender's Ed25519 signing key (256-bit):
 ```
 sig = Ed25519.sign(JSON(wire), sender.signingKeySeed)       // 256-bit
-sig = AESGCM_auth_tag(JSON(wire), sender.signKey128)        // 128-bit
 ```
 
 The recipient verifies the signature against the sender's signing public key (known from the shareable address). Invalid signatures are flagged but not dropped — the message is displayed with a warning.
@@ -202,10 +174,6 @@ When sending to a contact on a different relay:
 - Timer resets on every outbound message; protocol traffic does not reset it
 - Connections are keyed by hostname — one connection serves all contacts on the same relay
 - On connection failure or timeout (5s), queued messages fall back to the main signal connection
-
-### 128-bit Persistent Connections
-
-A 128-bit contact (IoT device) uses a persistent relay connection that never idle-closes and reconnects automatically on drop. The connection authenticates with `auth_init bits=128` on open.
 
 ### Offline Delivery
 
@@ -273,7 +241,7 @@ On reconnect and successful auth, the relay flushes all buffered packets oldest-
 
 ## Peer Backup Protocol
 
-Contacts back each other up automatically. The backup blob is the sender's encrypted contact store — encrypted with the backup key, unreadable to the peer storing it. 128-bit contacts do not participate in backup distribution.
+Contacts back each other up automatically. The backup blob is the sender's encrypted contact store — encrypted with the backup key, unreadable to the peer storing it. 
 
 **Distribution:**
 1. After saving contacts, sender broadcasts `backup_offer { size }` to all reachable contacts
