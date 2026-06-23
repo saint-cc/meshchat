@@ -1270,6 +1270,37 @@ function sendToRelay(contactId, obj, messageOnly) {
   return true;
 }
 
+// Same send mechanics as sendToRelay, but addressed by a literal URL
+// instead of a contact's lastRelay — for the two cases where there's no
+// contact relationship to route through:
+//   - notifying another of OUR OWN devices still parked at the relay we
+//     just left (no lastRelay lookup applies to ourselves)
+//   - replanting a breadcrumb at a relay we're passively leaving behind
+// Deliberately has NO sendSignal fallback. sendToRelay's fallback makes
+// sense because "couldn't reach contact's relay" can still be salvaged by
+// our own relay buffering it for them. Here there is no salvage path —
+// this packet's entire purpose is "reach this specific relay," and our
+// own relay buffering it under our own identity wouldn't deliver it to
+// anyone. If the URL is unreachable, the packet is dropped; the caller
+// logs and moves on rather than silently misrouting it elsewhere.
+function sendViaRelayUrl(url, obj) {
+  const entry = getOrOpenRelayConn(url, true);
+  if (!entry) return false;
+
+  const raw = JSON.stringify(obj);
+  if (entry.ready && entry.ws?.readyState === WebSocket.OPEN) {
+    entry.ws.send(raw);
+  } else if (!entry.ready) {
+    entry.queue.push(raw);
+  } else {
+    entry.ready = false;
+    entry.queue.push(raw);
+  }
+
+  resetRelayTimer(relayHostname(url));
+  return true;
+}
+
 /* ══════════════════════════════════════════
    AUDIO MESSAGES
    audioCache: msgId → { encBlob, mimeType }
@@ -1472,17 +1503,23 @@ async function receiveMessage(msg) {
 
 /* ══════════════════════════════════════════
    MIGRATE — receive side
-   Packet: { type: "app:migrate", from, to, blob: encrypted{ newRelay, ts } }
+   Packet: { type: "app:migrate", from, to, blob: encrypted{ newRelay, ts }, sig }
    Decryption is identical to a regular message — always state.encKey,
    regardless of sender, since this scheme is symmetric (a contact who
    has your shareableKey already holds the same key you decrypt with).
+   Signature is verified the same way receiveMessage does it — this packet
+   redirects routing, so unlike most other packet types it must NOT be
+   trusted on decryption success alone. The relay is untrusted
+   infrastructure; cryptographic proof is the only trust boundary.
    The two branches below only diverge in what happens AFTER decrypt:
      - from a contact  → same passive learning already used for relay
        info embedded in regular messages, just arriving as its own
        dedicated, overwrite-buffered packet instead.
      - from self        → another of our own devices migrated (or
        replanted a breadcrumb). Adopt silently — no notify packets, no
-       ceremony, just follow.
+       ceremony, just follow. Also replants a breadcrumb at the relay we
+       ourselves are leaving behind, so a straggler device even further
+       behind than us can still find the trail.
 ══════════════════════════════════════════ */
 async function handleMigrate(msg) {
   if (!msg.from || !msg.blob) return;
@@ -1495,6 +1532,14 @@ async function handleMigrate(msg) {
     plain = await decryptMessage(msg.blob);
   } catch(e) {
     mlog.warn(`← MIGRATE      from ${pid(msg.from)} — decrypt failed`);
+    return;
+  }
+
+  const sigValid = msg.sig && contact.signPublicKey
+    ? verifyBlob(msg.blob, msg.sig, contact.signPublicKey)
+    : false;
+  if (!sigValid) {
+    mlog.warn(`← MIGRATE      from ${pid(msg.from)} — signature invalid, dropped`);
     return;
   }
 
@@ -1517,12 +1562,24 @@ async function handleMigrate(msg) {
       await saveContacts();
       renderContactList();
       rebootSignal();
-      // NOT YET BUILT: replanting a fresh breadcrumb at beforeUrl pointing
-      // to plain.newRelay, so a straggler device even further behind this
-      // one can still find its way. Needs an explicit-URL send — sendToRelay
-      // only knows how to route via a contact's lastRelay, and that helper
-      // doesn't exist yet. Until it does, a third device that's behind
-      // both this one and whoever sent this packet has nowhere to look.
+      // Replant a fresh breadcrumb at the relay we're leaving behind
+      // (beforeUrl), pointing at the same fact we just adopted — same
+      // newRelay, same ts. Reusing plain.ts rather than Date.now() means
+      // relaying this doesn't manufacture new freshness; it's still the
+      // same historical fact, just left somewhere a straggler device can
+      // still find it. No contact relationship applies to ourselves, so
+      // this has to go by explicit URL.
+      if (beforeUrl) {
+        try {
+          const blob = await encryptMessage(me.encKey, { newRelay: plain.newRelay, ts: plain.ts });
+          const sig  = await signBlob(blob);
+          const breadcrumbObj = { type: "app:migrate", from: state.publicId, to: state.publicId, blob, sig };
+          const sent = sendViaRelayUrl(beforeUrl, breadcrumbObj);
+          mlog.info(`→ MIGRATE      breadcrumb replanted @ ${beforeUrl}  sent=${sent}`);
+        } catch(e) {
+          mlog.warn(`→ MIGRATE      breadcrumb replant failed: ${e.message}`);
+        }
+      }
     } else {
       mlog.debug(`← MIGRATE      from self — ${plain.newRelay} not newer, ignored`);
     }
@@ -1535,6 +1592,53 @@ async function handleMigrate(msg) {
       if (state.currentChat === msg.from) updateChatRelayInfo(msg.from);
     } else {
       mlog.debug(`← MIGRATE      from ${pid(msg.from)} — ${plain.newRelay} not newer, ignored`);
+    }
+  }
+}
+
+/* ══════════════════════════════════════════
+   MIGRATE — send side
+   Dispatched once, at commit time, by the MIGRATE panel's commit handler.
+   Two kinds of recipients:
+     - every non-self, non-blocked contact, addressed normally via
+       sendToRelay (their lastRelay) with the usual sendSignal fallback —
+       no different from how a regular message picks its route.
+     - ourselves, at the relay we're leaving behind, in case another of
+       our own devices is still parked there. No contact relationship
+       applies to our own identity, so this one has to go by explicit
+       URL (sendViaRelayUrl) — and deliberately has no signal fallback,
+       since "couldn't reach the old relay" has no salvageable fallback
+       destination the way a contact's unreachable relay does.
+══════════════════════════════════════════ */
+async function notifyMigration(newRelay, ts, oldRelay) {
+  const payload = { newRelay, ts };
+
+  for (const id of Object.keys(state.contacts)) {
+    if (id === state.publicId) continue;
+    const contact = state.contacts[id];
+    if (!contact?.encKey || contact.blocked) continue;
+    try {
+      const blob = await encryptMessage(contact.encKey, payload);
+      const sig  = await signBlob(blob);
+      const migMsgObj = { type: "app:migrate", from: state.publicId, to: id, blob, sig };
+      const viaRelay  = sendToRelay(id, migMsgObj, true);
+      if (!viaRelay) sendSignal(migMsgObj);
+      mlog.info(`→ MIGRATE      to   ${pid(id)}  via=${viaRelay ? "relay" : "signal(fallback)"}`);
+    } catch(e) {
+      mlog.warn(`→ MIGRATE      to   ${pid(id)} — encrypt failed: ${e.message}`);
+    }
+  }
+
+  if (oldRelay) {
+    const me = state.contacts[state.publicId];
+    try {
+      const blob = await encryptMessage(me.encKey, payload);
+      const sig  = await signBlob(blob);
+      const selfMsgObj = { type: "app:migrate", from: state.publicId, to: state.publicId, blob, sig };
+      const sent = sendViaRelayUrl(oldRelay, selfMsgObj);
+      mlog.info(`→ MIGRATE      to self @ old relay ${oldRelay}  sent=${sent}`);
+    } catch(e) {
+      mlog.warn(`→ MIGRATE      to self @ old relay — encrypt failed: ${e.message}`);
     }
   }
 }
@@ -2261,8 +2365,8 @@ function contactAction(action) {
     hint.className = "hint";
     hint.innerHTML =
       "Test a relay before migrating — only the <strong style='color:var(--text)'>most recently passed</strong> " +
-      "test can be migrated to. Contact and self-device notifications aren't built yet — this only " +
-      "updates your own relay locally and reconnects.";
+      "test can be migrated to. On commit, all contacts and any other device of yours still at the old " +
+      "relay are notified automatically.";
     body.appendChild(hint);
 
     const listWrap = document.createElement("div");
@@ -2365,17 +2469,26 @@ function contactAction(action) {
         refreshMigrateButtons();
       };
 
-      migrateBtn.onclick = () => {
+      migrateBtn.onclick = async () => {
         const url = getUrl();
         if (url !== lastTestedUrl) return;   // shouldn't be reachable — button would be disabled
         const me      = state.contacts[state.publicId];
         const oldRelay = me.lastRelay;
+        const ts       = Date.now();
         me.prevRelay     = oldRelay;
-        me.prevRelaySeen = Date.now();
+        me.prevRelaySeen = ts;
         me.lastRelay     = url;
-        saveContacts();
-        mlog.info(`MIGRATE    committed  ${oldRelay || "(none)"} → ${url}  (contact/self notify not yet implemented)`);
+        // Deliberate migration is the most authoritative thing that can
+        // happen to this field — give it a real timestamp now, the same
+        // one going out on the wire to contacts/self. Leaving this
+        // untouched would risk a stale lastRelaySeen (e.g. 0 from an
+        // earlier fresh-bootstrap adoption) letting an old restore/backup
+        // override something we just set on purpose.
+        me.lastRelaySeen = ts;
+        await saveContacts();
+        mlog.info(`MIGRATE    committed  ${oldRelay || "(none)"} → ${url}`);
         rebootSignal();
+        notifyMigration(url, ts, oldRelay);
         closeContactAction();
       };
 
