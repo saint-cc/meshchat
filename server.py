@@ -39,7 +39,7 @@ RELAY_WSS_URL = os.environ.get("RELAY_WSS_URL", "")   # e.g. wss://yourrelay.exa
 PROTOCOL_VERSION = os.environ.get("PROTOCOL_VERSION", "0.3.1")
 
 # Connection limits
-MAX_CONNECTIONS        = int(os.environ.get("MAX_CONNECTIONS",        50))   # total WS sessions
+MAX_CONNECTIONS        = int(os.environ.get("MAX_CONNECTIONS",        100))   # total WS sessions
 MAX_CONNECTIONS_PER_IP = int(os.environ.get("MAX_CONNECTIONS_PER_IP", 15))   # per source IP
 
 # Rate limiter
