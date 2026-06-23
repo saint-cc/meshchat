@@ -36,7 +36,7 @@ RELAY_WSS_URL = os.environ.get("RELAY_WSS_URL", "")   # e.g. wss://yourrelay.exa
 # Protocol version — informational only for now, surfaced in sig:relay_info
 # so client/server version drift shows up in both logs. Not enforced yet;
 # room to add real backwards-compat handling once this is actually needed.
-PROTOCOL_VERSION = os.environ.get("PROTOCOL_VERSION", "0.3.0")
+PROTOCOL_VERSION = os.environ.get("PROTOCOL_VERSION", "0.3.1")
 
 # Connection limits
 MAX_CONNECTIONS        = int(os.environ.get("MAX_CONNECTIONS",        50))   # total WS sessions
@@ -102,6 +102,8 @@ log = logging.getLogger("signal")
 connected: dict[str, set] = {}   # publicId → set of websockets
 pending_auth: dict = {}          # ws → { enc_key, nonce, ts, bits }
 ip_conns: dict[str, int] = {}    # ip → active connection count
+ws_to_ids: dict = {}             # ws → set of publicIds (reverse of connected; O(1) cleanup)
+buf_locks: dict = {}             # to_id → asyncio.Lock (serializes per-recipient buffer writes)
 
 stats = {
     "bytes_in":  0, "bytes_out": 0,
@@ -131,7 +133,7 @@ def peer_info(ws):
         return ip
     except Exception:
         try:    return str(ws.remote_address)
-        except: return "unknown"
+        except Exception: return "unknown"
 
 def unique_keys():
     """Number of distinct registered public IDs."""
@@ -173,11 +175,14 @@ async def send_to(ws, obj):
         return True
     except Exception as e:
         log.warning("  send failed: %s", e)
-        # actively prune dead socket from all registered IDs
-        for id_, sockets in list(connected.items()):
-            sockets.discard(ws)
-            if not sockets:
-                del connected[id_]
+        # Prune dead socket via reverse map — O(ids_per_socket) instead of
+        # O(unique_keys). ws_to_ids is populated in auth_verify.
+        for cid in ws_to_ids.pop(ws, set()):
+            sockets = connected.get(cid)
+            if sockets:
+                sockets.discard(ws)
+                if not sockets:
+                    del connected[cid]
         return False
 
 async def deliver(to_id, obj, exclude=None):
@@ -197,7 +202,7 @@ async def route_or_buffer(kind, frm, to, msg, ws):
     if reached:
         log.info("%-10s from=%s  to=%s  reached=%d", kind.upper(), short(frm), short(to), reached)
     else:
-        buf_write(to, msg)
+        await buf_write(to, msg)
         log.info("BUF Q      from=%s  to=%s  (offline)  type=%s", short(frm), short(to), kind)
 
 # ══════════════════════════════════════════
@@ -251,6 +256,7 @@ async def auth_verify(ws, nonce_back: list, addr: str) -> str | None:
     if public_id not in connected:
         connected[public_id] = set()
     connected[public_id].add(ws)
+    ws_to_ids.setdefault(ws, set()).add(public_id)
     log.info("AUTH OK    id=%s  bits=%d  peer=%s  keys=%d  sessions=%d",
              short(public_id), entry["bits"], addr, unique_keys(), session_count())
     await send_to(ws, {"type": "sig:auth_ok", "public_id": public_id})
@@ -284,8 +290,8 @@ def buf_files(to_id):
     pattern = os.path.join(d, "*.json")
     return sorted(glob.glob(pattern, recursive=False))
 
-def buf_write(to_id, msg):
-    """Write a packet to the offline buffer. Enforces per-recipient limits.
+def _buf_write_sync(to_id, msg):
+    """Sync body of buf_write — runs in a worker thread, no awaits.
 
     app:migrate packets use overwrite semantics: only the most recent
     packet from a given sender is kept (any older buffered migrate from
@@ -308,22 +314,29 @@ def buf_write(to_id, msg):
     files = buf_files(to_id)
 
     if is_migrate and frm:
-        # overwrite — drop any existing buffered migrate packet(s) from this sender
+        # overwrite — drop any existing buffered migrate packet(s) from this
+        # sender. Mutate `files` in place instead of re-calling buf_files()
+        # (avoids a second glob+sort on the hot path).
+        kept = []
         for fpath in files:
             if not fpath.endswith(MIGRATE_SUFFIX):
+                kept.append(fpath)
                 continue
             try:
                 with open(fpath) as f:
                     old = json.load(f)
             except Exception:
+                kept.append(fpath)
                 continue
             if old.get("from") == frm:
                 try:
                     os.remove(fpath)
                     log.info("BUF        migrate overwrite  to=%s  from=%s", short(to_id), short(frm))
                 except Exception:
-                    pass
-        files = buf_files(to_id)   # refresh after removals
+                    kept.append(fpath)  # couldn't delete, keep in list
+            else:
+                kept.append(fpath)
+        files = kept
 
     # enforce message count limit — drop oldest
     while len(files) >= BUF_MAX_MSGS:
@@ -351,16 +364,50 @@ def buf_write(to_id, msg):
     except Exception as e:
         log.warning("BUF        write failed  to=%s  err=%s", short(to_id), e)
 
-async def buf_deliver(to_id, ws):
-    """Flush all buffered packets for a reconnecting client. Delete on success."""
-    files = buf_files(to_id)
-    if not files:
-        return
-    log.info("BUF        flush  to=%s  count=%d", short(to_id), len(files))
+def _get_buf_lock(to_id):
+    """Return (creating if needed) the per-recipient asyncio.Lock."""
+    lock = buf_locks.get(to_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        buf_locks[to_id] = lock
+    return lock
+
+async def buf_write(to_id, msg):
+    """Async wrapper: serializes per-recipient writes via a lock, offloads
+    sync file I/O to a worker thread so the event loop stays unblocked.
+    The lock prevents count/size-check races between concurrent writes for
+    the same recipient."""
+    lock = _get_buf_lock(to_id)
+    async with lock:
+        await asyncio.to_thread(_buf_write_sync, to_id, msg)
+
+def _buf_read_all(files):
+    """Read all buffer files in one thread call. Returns list parallel to
+    `files`: parsed msg dict on success, None on failure."""
+    results = []
     for fpath in files:
         try:
             with open(fpath) as f:
-                msg = json.load(f)
+                results.append(json.load(f))
+        except Exception:
+            results.append(None)
+    return results
+
+async def buf_deliver(to_id, ws):
+    """Flush all buffered packets for a reconnecting client. Delete on success.
+    File reads are batched into a single worker-thread call so the event
+    loop stays unblocked even when the buffer is large."""
+    files = await asyncio.to_thread(buf_files, to_id)
+    if not files:
+        return
+    log.info("BUF        flush  to=%s  count=%d", short(to_id), len(files))
+    messages = await asyncio.to_thread(_buf_read_all, files)
+    for fpath, msg in zip(files, messages):
+        if msg is None:
+            log.warning("BUF        flush error  to=%s  file=%s  err=read failed",
+                        short(to_id), os.path.basename(fpath))
+            continue
+        try:
             if await send_to(ws, msg):
                 os.remove(fpath)
                 stats["buf_out"] += 1
@@ -498,7 +545,13 @@ async def handler(ws):
                     continue
                 public_id = await auth_verify(ws, nonce_back, addr)
                 if public_id:
-                    client_ids.append(public_id)
+                    if not client_ids:
+                        client_ids.append(public_id)
+                    elif client_ids[0] != public_id:
+                        log.warning("AUTH       socket already authed as %s, rejecting %s  peer=%s",
+                                    short(client_ids[0]), short(public_id), addr)
+                        await send_to(ws, {"type": "sig:auth_fail", "reason": "already_authenticated"})
+                    # else: re-auth with same identity — no-op (idempotent), useful for session refresh)
 
             # ── everything below requires at least one authed identity ──
             elif not is_authed():
@@ -526,8 +579,14 @@ async def handler(ws):
                     continue
                 ids     = [i for i in ids[:10] if valid_id(i)]
                 matched = [i for i in ids if i in connected]
-                for matched_id in matched:
-                    await deliver(matched_id, {"type": "sig:seen", "id": last_id()}, exclude=ws)
+                if matched:
+                    seen_msg = {"type": "sig:seen", "id": last_id()}
+                    # Fan out in parallel — sequential awaits would serialize
+                    # delivery across all matched recipients.
+                    await asyncio.gather(
+                        *(deliver(mid, seen_msg, exclude=ws) for mid in matched),
+                        return_exceptions=True,
+                    )
 
             elif kind in ("app:sync", "sync:backup_offer", "sync:backup_accept",
                           "sync:backup_push", "sync:restore_req",
@@ -579,6 +638,8 @@ async def handler(ws):
                 else:
                     log.info("SESSION-   id=%s  peer=%s  sessions_left=%d",
                              short(cid), addr, remaining)
+        # drop reverse-map entry (send_to's failure path may have popped it already)
+        ws_to_ids.pop(ws, None)
 
 # ══════════════════════════════════════════
 #   SIGNAL SERVER ENTRYPOINT (async)

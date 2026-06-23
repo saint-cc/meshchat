@@ -13,7 +13,7 @@
 // Protocol version — informational only for now, surfaced via sig:relay_info
 // so client/server drift shows up in both logs. Not enforced yet; room to
 // add real backwards-compat handling once that's actually needed.
-const CLIENT_VERSION = "0.3.0";
+const CLIENT_VERSION = "0.3.1";
 
 const LOG_MAX_LINES      = 20;
 const LOG_CLEAR_INTERVAL = 5 * 60 * 1000;
