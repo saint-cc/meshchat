@@ -36,7 +36,7 @@ RELAY_WSS_URL = os.environ.get("RELAY_WSS_URL", "")   # e.g. wss://yourrelay.exa
 # Protocol version — informational only for now, surfaced in sig:relay_info
 # so client/server version drift shows up in both logs. Not enforced yet;
 # room to add real backwards-compat handling once this is actually needed.
-PROTOCOL_VERSION = os.environ.get("PROTOCOL_VERSION", "0.3.1")
+PROTOCOL_VERSION = os.environ.get("PROTOCOL_VERSION", "0.3.2")
 
 # Connection limits
 MAX_CONNECTIONS        = int(os.environ.get("MAX_CONNECTIONS",        100))   # total WS sessions
@@ -197,13 +197,29 @@ async def route_or_buffer(kind, frm, to, msg, ws):
     """Shared delivery path for from-authenticated, to-routed packet types
     (app:message, app:migrate). Delivers live if the recipient is
     connected, otherwise falls back to the offline buffer — buf_write
-    handles per-type overwrite/TTL behaviour on its own."""
+    handles per-type overwrite/TTL behaviour on its own.
+
+    app:migrate is the one exception to "buffer only if delivery failed":
+    it always gets written to the durable buffer in addition to any live
+    delivery. Its entire purpose is to be found later by a device that
+    isn't online yet — including, critically, another session of the
+    SAME identity that's still mid-disconnect from the relay being left
+    behind. `deliver()` only excludes the literal sending socket, not
+    other live sessions for the same publicId, so a self-targeted
+    breadcrumb can be "reached" by a stale-but-not-yet-closed session of
+    ours and never make it into the buffer at all — exactly the case
+    this packet type exists to survive. The overwrite-per-sender,
+    long-TTL semantics in buf_write already make this free when nobody
+    ends up needing the buffered copy."""
     reached = await deliver(to, msg, exclude=ws)
     if reached:
         log.info("%-10s from=%s  to=%s  reached=%d", kind.upper(), short(frm), short(to), reached)
-    else:
+    if not reached or kind == "app:migrate":
         await buf_write(to, msg)
-        log.info("BUF Q      from=%s  to=%s  (offline)  type=%s", short(frm), short(to), kind)
+        if reached:
+            log.info("BUF Q      from=%s  to=%s  (also buffered — migrate, durability required)  type=%s", short(frm), short(to), kind)
+        else:
+            log.info("BUF Q      from=%s  to=%s  (offline)  type=%s", short(frm), short(to), kind)
 
 # ══════════════════════════════════════════
 #   AUTH HELPERS
@@ -515,11 +531,11 @@ async def handler(ws):
             stats["msgs_in"]  += 1
 
             kind = msg.get("type", "?")
-            log.info("IN  %-20s peer=%s  size=%-8s total_in=%s  total_out=%s",
-                     kind, addr,
-                     fmt_bytes(len(raw)),
-                     fmt_bytes(stats["bytes_in"]),
-                     fmt_bytes(stats["bytes_out"]))
+            #log.info("IN  %-20s peer=%s  size=%-8s total_in=%s  total_out=%s",
+            #         kind, addr,
+            #         fmt_bytes(len(raw)),
+            #         fmt_bytes(stats["bytes_in"]),
+            #         fmt_bytes(stats["bytes_out"]))
 
             # ── auth_init: client presents enc key, server sends challenge ──
             if kind == "sig:auth_init":
