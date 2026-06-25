@@ -380,22 +380,55 @@ def _buf_write_sync(to_id, msg):
     except Exception as e:
         log.warning("BUF        write failed  to=%s  err=%s", short(to_id), e)
 
-def _get_buf_lock(to_id):
-    """Return (creating if needed) the per-recipient asyncio.Lock."""
-    lock = buf_locks.get(to_id)
-    if lock is None:
-        lock = asyncio.Lock()
-        buf_locks[to_id] = lock
+buf_lock_refs: dict = {}         # to_id → active reference count for buf_locks[to_id]
+buf_locks_guard = asyncio.Lock()  # protects buf_locks/buf_lock_refs dict structure only —
+                                   # held only for the brief get-or-create / refcount bookkeeping,
+                                   # never across the actual (potentially slow) file I/O below.
+
+async def _acquire_buf_lock(to_id):
+    """Get-or-create the per-recipient lock and acquire it, registering a
+    reference so a concurrent release elsewhere can't evict it out from
+    under us. Incrementing the refcount happens BEFORE we wait on the lock
+    itself, so anyone trying to evict while we're queued will see the
+    non-zero count and back off."""
+    async with buf_locks_guard:
+        lock = buf_locks.get(to_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            buf_locks[to_id] = lock
+        buf_lock_refs[to_id] = buf_lock_refs.get(to_id, 0) + 1
+    await lock.acquire()
     return lock
+
+async def _release_buf_lock(to_id, lock):
+    """Release the lock, then drop our reference. Only the holder that
+    brings the refcount to zero evicts the dict entries — and only if
+    buf_locks[to_id] is still the exact same Lock object we held (guards
+    against a pathological reorder where the entry was already replaced)."""
+    lock.release()
+    async with buf_locks_guard:
+        remaining = buf_lock_refs.get(to_id, 1) - 1
+        if remaining <= 0:
+            buf_lock_refs.pop(to_id, None)
+            if buf_locks.get(to_id) is lock:
+                del buf_locks[to_id]
+        else:
+            buf_lock_refs[to_id] = remaining
 
 async def buf_write(to_id, msg):
     """Async wrapper: serializes per-recipient writes via a lock, offloads
     sync file I/O to a worker thread so the event loop stays unblocked.
     The lock prevents count/size-check races between concurrent writes for
-    the same recipient."""
-    lock = _get_buf_lock(to_id)
-    async with lock:
+    the same recipient. Unlike a plain to_id → Lock dict, the lock entry
+    is evicted once unreferenced — otherwise any syntactically-valid `to`
+    (it need not correspond to a real identity — see valid_id) leaves a
+    permanent Lock object behind, an unbounded memory leak an authenticated
+    client could trigger at will simply by sending to junk recipient ids."""
+    lock = await _acquire_buf_lock(to_id)
+    try:
         await asyncio.to_thread(_buf_write_sync, to_id, msg)
+    finally:
+        await _release_buf_lock(to_id, lock)
 
 def _buf_read_all(files):
     """Read all buffer files in one thread call. Returns list parallel to
@@ -669,7 +702,7 @@ async def run_signal_server():
     log.info("Buffer dir: %s  max_msgs=%d  max_age=%ds  migrate_age=%ds  max_mb=%.1f",
              BUF_DIR, BUF_MAX_MSGS, BUF_MAX_AGE, BUF_MAX_AGE_MIGRATE, BUF_MAX_MB)
     log.info("=" * 50)
-    async with websockets.serve(handler, WS_HOST, WS_PORT):
+    async with websockets.serve(handler, WS_HOST, WS_PORT, max_size=WS_MAX_SIZE):
         asyncio.create_task(log_stats())
         asyncio.create_task(buf_expire())
         await asyncio.Future()
