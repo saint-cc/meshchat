@@ -2,6 +2,8 @@
 
 A decentralised, encrypted messaging protocol built on WebSocket relay servers. No accounts, no central authority, no plaintext.
 
+Current client/server implementation version: `0.3.2`, surfaced informationally via the `version` field on `sig:relay_info` for drift visibility (not yet enforced).
+
 ---
 
 ## Core Concepts
@@ -157,9 +159,10 @@ The `relay` field carries the sender's current relay WSS URL. Recipients update 
 Every outbound message is sent to the **contact's relay WSS** — never to the sender's own relay, never based on online presence.
 
 Priority:
-1. `contact.lastRelay` known and differs from sender's relay → open or reuse connection to their relay
-2. `contact.lastRelay` is the same as sender's relay → send via main signal connection
-3. No `lastRelay` known → send via main signal connection (last resort)
+1. `contact.lastRelay` known → open or reuse a connection to their relay (`sendToRelay`)
+2. No `lastRelay` known → send via the main signal connection (`sendSignal`, last resort)
+
+If the contact's relay is unreachable, the fallback lands on the sender's own signal connection, which buffers the message server-side until the contact reconnects.
 
 `state.online` / `seen` signals are **UI only** (the green dot). They have no effect on routing decisions.
 
@@ -191,6 +194,43 @@ On reconnect and successful auth, the relay flushes all buffered packets oldest-
 - `BUF_MAX_MSGS` — maximum buffered packets (default 100, drops oldest)
 - `BUF_MAX_MB`  — maximum total size in MB (default 10, drops new)
 - `BUF_MAX_AGE` — expiry in seconds (default 86400 = 24h, swept periodically)
+- `app:migrate` packets use different semantics entirely — overwrite-per-sender and a longer TTL — see [Relay Migration](#relay-migration) below.
+
+---
+
+## Relay Migration
+
+A deliberate relay change is announced via a dedicated packet type so contacts (and a user's other devices) can update their routing without waiting for a regular message:
+
+```json
+{
+  "type": "app:migrate",
+  "from": "<publicId>",
+  "to":   "<publicId>",
+  "blob": { "v": 1, "iv": [...], "data": [...] },
+  "sig":  [...]
+}
+```
+
+The encrypted payload is `{ newRelay, ts }` — same encryption scheme as a regular message (`encryptMessage`), and decrypted the same way on receipt: always with the receiver's own `encKey`, regardless of who sent it. This scheme is symmetric — a contact who already holds your shareable address holds the same key you decrypt with.
+
+**Signature is mandatory.** Unlike a regular message — where an invalid signature is flagged but the message is still displayed — an `app:migrate` packet with a missing or invalid signature is dropped outright. This packet redirects routing, so unlike message content it must not be trusted on decryption success alone.
+
+**On commit**, the migrating client:
+1. Stamps its own `lastRelay`/`lastRelaySeen` with the new address and the current time. No timestamp guard applies here — a deliberate migration *is* the new ground truth, not a candidate update competing with one.
+2. Notifies every non-blocked contact, addressed normally (`sendToRelay` to their last-known relay, falling back to `sendSignal`).
+3. Sends a copy to *itself*, addressed explicitly to the relay being left behind (`oldRelay`), in case another of the user's own devices is still parked there. This goes by literal URL rather than contact lookup — no contact relationship applies to one's own identity — and deliberately has **no signal fallback**: if the old relay is unreachable there's no salvageable fallback destination the way there is for an unreachable contact relay.
+
+**On receipt**, handling diverges by sender:
+- **From self** (another of the user's own devices) — adopted silently through the same timestamp-guarded `updateRelay` used everywhere else: no ceremony, no notify-back. If adopting moves `lastRelay` forward, the receiving device replants a breadcrumb at the relay it is *itself* now leaving behind, carrying the same `newRelay`/`ts` it just adopted (not a fresh timestamp), so a third, further-behind device can still find the trail.
+- **From a contact** — same passive relay-learning already used for the `relay` field embedded in regular messages, just arriving as its own dedicated packet instead of riding along with conversation traffic.
+
+**Server-side buffering** uses different semantics from regular packets, specifically because of what this packet type is for:
+- **Always durably buffered**, even when a live recipient session is reached — a stale-but-not-yet-closed session of the *same* identity could otherwise swallow the only copy meant for a device that's still catching up.
+- **Overwrite-per-sender** — a newly buffered `app:migrate` packet replaces any older one already buffered from the same sender, rather than queuing a backlog of stale relay-change history.
+- **Long TTL** (`BUF_MAX_AGE_MIGRATE`, default 7 days vs. 24h for ordinary packets) — an address correction is still useful long after a normal message would be.
+
+**Not yet implemented:** a confirmation/warning UI before committing a migration, a boot-time drain of the previous relay's buffer, breadcrumb replanting initiated by passive-follower devices (today only the device that received the original migrate notice replants), and a decision on delete-on-read vs. persist-until-TTL for migrate packets specifically.
 
 ---
 
@@ -203,6 +243,7 @@ On reconnect and successful auth, the relay flushes all buffered packets oldest-
 | `sig:auth_proof`       | `nonce`                         | no  | Return decrypted nonce |
 | `sig:announce`         | `ids[]`                         | no  | Check local presence of up to 10 IDs |
 | `app:message`          | `from`, `to`, `blob`, `sig`     | yes | Deliver message — `from` must match authed identity on this socket |
+| `app:migrate`          | `from`, `to`, `blob`, `sig`     | yes | Notify of a relay migration — `from` must match authed identity; always durably buffered in addition to live delivery (see [Relay Migration](#relay-migration)) |
 | `app:sync`             | `from`, `to`, `msgs[]`, `reply` | no  | Manual sync exchange |
 | `sync:backup_offer`    | `from`, `to`, `size`            | no  | Offer backup blob to peer |
 | `sync:backup_accept`   | `from`, `to`                    | no  | Accept a backup offer |
@@ -221,15 +262,16 @@ On reconnect and successful auth, the relay flushes all buffered packets oldest-
 | `sig:auth_challenge` | `bits`, `iv`, `data` | Encrypted nonce for client to decrypt |
 | `sig:auth_ok`        | `public_id`          | Auth succeeded, routing active |
 | `sig:auth_fail`      | `reason`             | Auth failed or unauthed packet dropped |
-| `sig:relay_info`     | `wss`                | Relay's own WSS URL |
+| `sig:relay_info`     | `wss`, `version`     | Relay's own WSS URL and protocol version (version is informational only — surfaced for drift visibility, not yet enforced) |
 | `sig:seen`           | `id`                 | A queried ID is locally connected |
 | `sig:pong`           | —                    | Keepalive response |
 | `error`              | `reason`             | Protocol error (e.g. rate limited, not_authenticated) |
 
 ### Notes
-- `app:message` is the only type that requires auth AND validates `from` ∈ `client_ids` on the socket.
-  All other types that require auth (`sig:relay_req`, `sig:ping`) only require the socket to be authed,
+- `app:message` and `app:migrate` are the only types that require auth AND validate `from` ∈ `client_ids` on the socket.
+  Other types that require auth (`sig:relay_req`, `sig:ping`) only require the socket to be authed,
   not a matching `from`.
+- `app:migrate` is always written to the durable buffer in addition to any live delivery, even when a recipient session is reached — its purpose is to be found later by a device that isn't online yet, including another session of the same identity that's still mid-disconnect from the relay being left behind.
 - Sync and backup types are intentionally unauthenticated — they are e2e encrypted and
   routed by the server without inspection.
 - When connecting to a foreign relay to send, the client runs the same challenge-response
@@ -269,7 +311,10 @@ All message stores use last-write-wins merge by message ID:
 function mergeMessages(a, b) {
   const byId = {};
   for (const m of [...a, ...b]) if (m.id) byId[m.id] = m;
-  return Object.values(byId).sort((x, y) => x.ts - y.ts);
+  // ts alone isn't a reliable order for near-simultaneous messages — id is
+  // added as a stable tiebreak so the result is identical regardless of
+  // which side of the merge a message originated from.
+  return Object.values(byId).sort((x, y) => (x.ts - y.ts) || (x.id < y.id ? -1 : x.id > y.id ? 1 : 0));
 }
 ```
 
@@ -297,6 +342,10 @@ Relay WSS coordinates propagate passively through the network:
 
 A client stores `lastRelay` and `lastRelaySeen` per contact. The WSS address is a last-known location, not a permanent home. It updates automatically as contacts move between relays.
 
+Updates are timestamp-guarded: a new `lastRelay` value is only adopted if its timestamp is newer than the one already stored (`updateRelay`). This rule applies uniformly to relay info embedded in messages, peer backups, restores, file imports, and migration notices alike — local storage is always the source of truth. A relay server's own `sig:relay_info` response is treated as a confirmation, not an authoritative fact, except on a completely fresh identity with no local record yet — in which case it's adopted as an unconfirmed placeholder timestamped `0`, so any genuinely-dated record arriving later can still outrank it.
+
+The relay itself is untrusted infrastructure. Cryptographic proof — signatures, encryption — is the only trust boundary; the relay's say-so, or which domain it runs on, is never trusted on its own. Relays never forward to one another; all topology lives in client state and propagates passively through ordinary traffic.
+
 ---
 
 ## Server Configuration
@@ -308,7 +357,8 @@ A client stores `lastRelay` and `lastRelaySeen` per contact. The WSS address is 
 | `RELAY_WSS_URL` | —             | Public WSS URL of this relay (required for cross-relay) |
 | `BUF_DIR`       | `./relay_buf` | Offline message buffer directory |
 | `BUF_MAX_MSGS`  | `100`         | Max buffered messages per recipient |
-| `BUF_MAX_AGE`   | `86400`       | Buffer expiry in seconds (24h) |
+| `BUF_MAX_AGE`   | `86400`       | Buffer expiry in seconds (24h) — regular packets |
+| `BUF_MAX_AGE_MIGRATE` | `604800` | Buffer expiry in seconds (7d) — `app:migrate` packets only |
 | `BUF_MAX_MB`    | `10`          | Max buffer size per recipient in MB |
 | `AUTH_TIMEOUT`  | `15`          | Seconds to complete challenge-response before disconnect |
 
