@@ -115,7 +115,7 @@ server {
 
         limit_req zone=req_limit burst=20 nodelay;
 
-        proxy_pass http://172.16.3.35:8000;
+        proxy_pass http://127.0.0.1:8000;
 
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
