@@ -1017,19 +1017,9 @@ function handleSignal(msg) {
 }
 
 function sendSignal(obj) {
-  // Route once — try an already-open relay connection first (protocol
-  // traffic never opens one, per sendToRelay's messageOnly=false), falling
-  // back to the main signal socket only if that didn't happen. Previously
-  // this sent down BOTH channels whenever both were viable, which
-  // double-delivered any non-app:message packet to the recipient (e.g.
-  // sync:restore_push hitting the cooldown race) — same packet, twice,
-  // each one a fully valid delivery from the server's point of view.
-  const viaRelay = (obj.to && obj.type !== "app:message")
-    ? sendToRelay(obj.to, obj, false)
-    : false;
-  if (!viaRelay && state.ws?.readyState === WebSocket.OPEN) {
-    state.ws.send(JSON.stringify(obj));
-  }
+  if (state.ws?.readyState === WebSocket.OPEN) state.ws.send(JSON.stringify(obj));
+  // piggyback protocol traffic on open relay connections — never opens one, never resets timer
+  if (obj.to && obj.type !== "app:message") sendToRelay(obj.to, obj, false);
 }
 
 /* ══════════════════════════════════════════
@@ -1097,7 +1087,13 @@ function testRelayConnection(url) {
     ws.onopen = () => {
       step = "await_challenge";
       const encKey = Array.from(base64ToRaw(state.shareableKey.split(".")[0]));
-      ws.send(JSON.stringify({ type: "sig:auth_init", enc_key: encKey }));
+      // no_receive: this probe closes itself the instant auth_ok arrives — it
+      // must never be registered as a recipient server-side, or a buffer
+      // flush racing the deliberate close can either warn harmlessly (the
+      // common case) or, in the unlucky ordering, have the server delete a
+      // buffered packet (e.g. a migrate breadcrumb) it believes was delivered
+      // to a socket that was actually already gone or about to discard it.
+      ws.send(JSON.stringify({ type: "sig:auth_init", enc_key: encKey, no_receive: true }));
     };
 
     ws.onmessage = async (evt) => {
@@ -1138,25 +1134,6 @@ function getOrOpenRelayConn(url, messageOnly) {
 
   if (!hostname) return null;
 
-  // Never open a second, independently-authed connection to a host we're
-  // already connected to as ourselves via the main signal socket. Without
-  // this, e.g. sending a restore_req to a contact who happens to share our
-  // own relay host opens a redundant outbound connection auth'd as us on
-  // that same host — the server then has two live sockets registered under
-  // our public_id there and (correctly, per its own fan-out logic) delivers
-  // every reply to BOTH, double-firing whatever handler receives it (this
-  // is what caused the double restore_push observed in testing). The
-  // existing sig:relay_info cleanup closes this kind of redundant
-  // connection reactively, after the fact; this stops it from ever being
-  // opened in the first place. Falls through to the caller's existing
-  // sendSignal fallback, same as "no relay connection available" already
-  // does — our own signal socket reaches this host already.
-  const ownHost = relayHostname(getSignalUrl());
-  if (ownHost && hostname === ownHost) {
-    mlog.debug(`RELAY      skipping conn to own signal host  host=${hostname}`);
-    return null;
-  }
-  
   // only reuse connections WE opened — never piggyback on inbound
   if (relayConns[hostname]?.outbound) return relayConns[hostname];
   if (relayConns[hostname] && !relayConns[hostname].outbound) {

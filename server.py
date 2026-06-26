@@ -233,17 +233,23 @@ def derive_public_id(enc_key_bytes: bytes) -> str:
     digest = hashlib.sha256(enc_key_bytes).digest()[:12]
     return base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
 
-async def auth_challenge(ws, enc_key_bytes: bytes, bits: int):
-    """Generate a random nonce, encrypt it to the client's enc key, send challenge."""
+async def auth_challenge(ws, enc_key_bytes: bytes, bits: int, no_receive: bool = False):
+    """Generate a random nonce, encrypt it to the client's enc key, send challenge.
+
+    no_receive: caller is a disposable probe (e.g. testRelayConnection) that
+    has no business being treated as a reachable recipient — it intends to
+    close itself the moment auth_ok arrives. Carried through to auth_verify
+    so registration and buffer flush can be skipped for it specifically."""
     nonce_plain = secrets.token_bytes(32)
     iv          = secrets.token_bytes(12)
     aesgcm      = AESGCM(enc_key_bytes)
     ciphertext  = aesgcm.encrypt(iv, nonce_plain, None)
     pending_auth[id(ws)] = {
-        "enc_key": enc_key_bytes,
-        "nonce":   nonce_plain,
-        "ts":      time.monotonic(),
-        "bits":    bits,
+        "enc_key":     enc_key_bytes,
+        "nonce":       nonce_plain,
+        "ts":          time.monotonic(),
+        "bits":        bits,
+        "no_receive":  no_receive,
     }
     await send_to(ws, {
         "type": "sig:auth_challenge",
@@ -251,7 +257,8 @@ async def auth_challenge(ws, enc_key_bytes: bytes, bits: int):
         "iv":   list(iv),
         "data": list(ciphertext),
     })
-    log.info("AUTH       challenge sent  bits=%d  peer=%s", bits, peer_info(ws))
+    log.info("AUTH       challenge sent  bits=%d  peer=%s%s", bits, peer_info(ws),
+              "  [no_receive]" if no_receive else "")
 
 async def auth_verify(ws, nonce_back: list, addr: str) -> str | None:
     """Verify proof, register identity, flush buffer. Returns public_id or None on failure."""
@@ -269,14 +276,18 @@ async def auth_verify(ws, nonce_back: list, addr: str) -> str | None:
         return None
 
     public_id = derive_public_id(entry["enc_key"])
-    if public_id not in connected:
-        connected[public_id] = set()
-    connected[public_id].add(ws)
-    ws_to_ids.setdefault(ws, set()).add(public_id)
-    log.info("AUTH OK    id=%s  bits=%d  peer=%s  keys=%d  sessions=%d",
-             short(public_id), entry["bits"], addr, unique_keys(), session_count())
+    no_receive = entry.get("no_receive", False)
+    if not no_receive:
+        if public_id not in connected:
+            connected[public_id] = set()
+        connected[public_id].add(ws)
+        ws_to_ids.setdefault(ws, set()).add(public_id)
+    log.info("AUTH OK    id=%s  bits=%d  peer=%s  keys=%d  sessions=%d%s",
+             short(public_id), entry["bits"], addr, unique_keys(), session_count(),
+             "  [no_receive — not registered]" if no_receive else "")
     await send_to(ws, {"type": "sig:auth_ok", "public_id": public_id})
-    await buf_deliver(public_id, ws)
+    if not no_receive:
+        await buf_deliver(public_id, ws)
     return public_id
 
 # ══════════════════════════════════════════
@@ -574,6 +585,7 @@ async def handler(ws):
             if kind == "sig:auth_init":
                 enc_key_list = msg.get("enc_key")
                 bits         = 256
+                no_receive   = bool(msg.get("no_receive", False))
                 if not enc_key_list:
                     log.warning("AUTH       bad auth_init  peer=%s", addr)
                     await send_to(ws, {"type": "sig:auth_fail", "reason": "bad_init"})
@@ -584,7 +596,7 @@ async def handler(ws):
                                 bits, len(enc_key_bytes), addr)
                     await send_to(ws, {"type": "sig:auth_fail", "reason": "bad_key_length"})
                     continue
-                await auth_challenge(ws, enc_key_bytes, bits)
+                await auth_challenge(ws, enc_key_bytes, bits, no_receive)
 
             # ── auth_proof: client returns decrypted nonce ──
             elif kind == "sig:auth_proof":
