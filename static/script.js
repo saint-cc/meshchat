@@ -83,15 +83,12 @@ const state = {
   unread: {}
 };
 
-const isSecure        = window.location.protocol === "https:";
-const SIGNAL_URL =isSecure
-  ? `wss://${window.location.hostname}/ws/`
-  : `ws://${window.location.hostname}:8888`;
-const STORAGE_KEY     = "meshchat_contacts";
-const PEER_BACKUP_KEY = "meshchat_peer_backups_v1";
-const PEER_TOKEN_KEY  = "meshchat_peer_tokens_v1";
+const SIGNAL_URL		=`wss://${window.location.hostname}/ws/`;
+const STORAGE_KEY		= "meshchat_contacts";
+const PEER_BACKUP_KEY	= "meshchat_peer_backups_v1";
+const PEER_TOKEN_KEY	= "meshchat_peer_tokens_v1";
 const DEVICE_KEY_STORAGE = "meshchat_device_seed_v1";
-const EXCHANGE_COUNT  = 10;
+const EXCHANGE_COUNT	= 10;
 
 /* ══════════════════════════════════════════
    RESTORE HANDSHAKE — rate limiting
