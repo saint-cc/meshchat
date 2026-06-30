@@ -80,7 +80,7 @@ const state = {
   keys: null, cryptoKey: null, encKey: null,
   contacts: {}, peerBackups: {}, peerTokens: {},
   currentChat: null, ws: null, online: new Set(),
-  unread: {}
+  unread: {}, knownDeviceFingerprints: {}
 };
 
 const SIGNAL_URL		=`wss://${window.location.hostname}/ws/`;
@@ -236,6 +236,12 @@ async function getOrCreateDeviceId() {
 async function deriveReactionId(myPublicId, targetMsgId) {
   const enc  = new TextEncoder();
   const hash = await crypto.subtle.digest("SHA-256", enc.encode("reaction:" + myPublicId + ":" + targetMsgId));
+  return btoa(String.fromCharCode(...new Uint8Array(hash).slice(0, 12))).replace(/\+/g,'-').replace(/\//g,'_').replace(/=/g,'');
+}
+
+async function computeBackupFingerprint() {
+  const enc  = new TextEncoder();
+  const hash = await crypto.subtle.digest("SHA-256", enc.encode(JSON.stringify(serialiseContacts())));
   return btoa(String.fromCharCode(...new Uint8Array(hash).slice(0, 12))).replace(/\+/g,'-').replace(/\//g,'_').replace(/=/g,'');
 }
 
@@ -494,16 +500,26 @@ async function pushBackupToContacts(blob) {
 	  relayConns[relayHostname(contact.lastRelay)]?.outbound;
 	if (!onOwnRelay && !hasOpenRelay) continue;
 
-    if (id === state.publicId) {
-      // self-sync: no negotiation needed, push directly
-      try {
-        const freshBlob = await encryptObject(state.cryptoKey, serialiseContacts());
-        sendSignal({ type: "sync:backup_push", from: state.publicId, to: id, blob: freshBlob });
-        mlog.info(`→ BACKUP_PUSH  to self — sent fresh data`);
-      } catch(e) {
-        mlog.warn(`→ BACKUP_PUSH  to self — encrypt failed`);
-      }
-      continue;
+	if (id === state.publicId) {
+		// self-sync: no negotiation needed, push directly — unless every
+		// device we've heard from this session already has this exact content.
+		try {
+			const fingerprint = await computeBackupFingerprint();
+			const knownIds    = Object.keys(state.knownDeviceFingerprints);
+			const allCaughtUp = knownIds.length > 0 &&
+			  knownIds.every(devId => state.knownDeviceFingerprints[devId] === fingerprint);
+			if (allCaughtUp) {
+				mlog.debug(`→ BACKUP_PUSH  to self — skipped, ${knownIds.length} known device(s) already current`);
+				continue;
+			}
+			const freshBlob = await encryptObject(state.cryptoKey, serialiseContacts());
+			sendSignal({ type: "sync:backup_push", from: state.publicId, to: id, blob: freshBlob,
+						 deviceId: state.deviceId, fingerprint });
+			mlog.info(`→ BACKUP_PUSH  to self — sent fresh data`);
+		} catch(e) {
+			mlog.warn(`→ BACKUP_PUSH  to self — encrypt failed`);
+		}
+		continue;
     }
 
     // estimate wire size before sending
@@ -525,6 +541,19 @@ function handleBackupOffer(msg) {
 
 function handleBackupAccept(msg) {
   if (!msg.from) return;
+
+  // device-fingerprint ack (self-sync freshness tracking) — disambiguated
+  // from the normal contact-offer accept by the presence of deviceId,
+  // which the regular handshake never sets.
+  if (msg.deviceId) {
+    if (msg.deviceId === state.deviceId) return;  // own echo, shouldn't happen
+    if (msg.fingerprint) {
+      state.knownDeviceFingerprints[msg.deviceId] = msg.fingerprint;
+      mlog.debug(`← BACKUP_ACK   from device ${msg.deviceId.slice(0,8)} — fingerprint recorded`);
+    }
+    return;
+  }
+  
   const pending = pendingBackupOffer[msg.from];
   if (!pending) {
     mlog.debug(`BACKUP_ACCEPT  from ${pid(msg.from)} — no pending offer, ignored`);
@@ -546,32 +575,45 @@ async function handleBackupPush(msg) {
   if (state.contacts[msg.from]?.blocked) return;
   markOnline(msg.from);
 
-  if (msg.from === state.publicId) {
-    try {
-      const plain = await decryptObject(state.cryptoKey, msg.blob);
-      if (typeof plain !== "object" || Array.isArray(plain)) return;
-      const restored      = await deserialiseContacts(plain);
-      const prevSelfRelay = state.contacts[state.publicId]?.lastRelay;
-      for (const [id, contact] of Object.entries(restored)) {
-        if (!state.contacts[id]) state.contacts[id] = contact;
-        else {
-          mergeContactMeta(state.contacts[id], contact);
-          state.contacts[id].messages = mergeMessages(state.contacts[id].messages, contact.messages);
-        }
-      }
-      await saveContacts();
-      renderContactList();
-	  if (state.currentChat) renderMessages();
-      mlog.info(`← BACKUP_PUSH  from self — merged other-me`);
-      if (state.contacts[state.publicId]?.lastRelay !== prevSelfRelay) {
-        mlog.info(`BACKUP_PUSH    self relay changed via other device — rebooting signal`);
-        rebootSignal();
-      }
-    } catch(e) {
-      mlog.warn(`← BACKUP_PUSH  from self — decrypt failed`);
-    }
-    return;
-  }
+	if (msg.from === state.publicId) {
+		if (msg.deviceId && msg.deviceId === state.deviceId) return;  // own echo, shouldn't happen but be defensive
+		try {
+		  const plain = await decryptObject(state.cryptoKey, msg.blob);
+		  if (typeof plain !== "object" || Array.isArray(plain)) return;
+		  const restored      = await deserialiseContacts(plain);
+		  const prevSelfRelay = state.contacts[state.publicId]?.lastRelay;
+		  for (const [id, contact] of Object.entries(restored)) {
+			if (!state.contacts[id]) state.contacts[id] = contact;
+			else {
+			  mergeContactMeta(state.contacts[id], contact);
+			  state.contacts[id].messages = mergeMessages(state.contacts[id].messages, contact.messages);
+			}
+		  }
+		  await saveContacts();
+		  renderContactList();
+		  if (state.currentChat) renderMessages();
+		  mlog.info(`← BACKUP_PUSH  from self — merged other-me`);
+		  if (state.contacts[state.publicId]?.lastRelay !== prevSelfRelay) {
+			mlog.info(`BACKUP_PUSH    self relay changed via other device — rebooting signal`);
+			rebootSignal();
+		  }
+		  // record sender's fingerprint, then ack back with our own post-merge
+		  // fingerprint — reuses backup_accept's shape, disambiguated by the
+		  // presence of deviceId (never set on the normal contact handshake).
+		  if (msg.deviceId && msg.fingerprint) {
+			state.knownDeviceFingerprints[msg.deviceId] = msg.fingerprint;
+		  }
+		  if (msg.deviceId) {
+			const ownFingerprint = await computeBackupFingerprint();
+			sendSignal({ type: "sync:backup_accept", from: state.publicId, to: state.publicId,
+						 deviceId: state.deviceId, fingerprint: ownFingerprint });
+			mlog.debug(`→ BACKUP_ACK   to self — fingerprint ${ownFingerprint}`);
+		  }
+		} catch(e) {
+		  mlog.warn(`← BACKUP_PUSH  from self — decrypt failed`);
+		}
+		return;
+	}
 
   if (!state.contacts[msg.from]) {
     mlog.warn(`← BACKUP_PUSH  from ${pid(msg.from)} — unknown contact, dropped`);
