@@ -2744,5 +2744,18 @@ if (imageBtn && imageInput) {
     if (file) { sendImageMessage(file); imageInput.value = ""; }
   });
 }
-
+document.getElementById("chatInput").addEventListener("paste", (e) => {
+  if (!state.currentChat) return;
+  const items = e.clipboardData?.items;
+  if (!items) return;
+  for (const item of items) {
+    if (item.type.startsWith("image/")) {
+      e.preventDefault();
+      const file = item.getAsFile();
+      if (file) sendImageMessage(file);
+      return;
+    }
+  }
+  // no image item found — fall through to normal text paste
+});
 setRandomLoginNotice();
