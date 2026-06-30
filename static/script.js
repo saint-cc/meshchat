@@ -1131,6 +1131,16 @@ function getOrOpenRelayConn(url, messageOnly) {
 
   if (!hostname) return null;
 
+  // same as our own home relay — never open a second connection to the
+  // host we're already signal-connected to. Every caller already falls
+  // back to sendSignal/state.ws when this returns null, so the home
+  // relay continues to be reached, just over the existing socket instead
+  // of a redundant duplicate that gets separately registered server-side.
+  if (hostname === relayHostname(getSignalUrl())) {
+    mlog.debug(`RELAY      skipping conn to home relay  host=${hostname}`);
+    return null;
+  }
+
   // only reuse connections WE opened — never piggyback on inbound
   if (relayConns[hostname]?.outbound) return relayConns[hostname];
   if (relayConns[hostname] && !relayConns[hostname].outbound) {
