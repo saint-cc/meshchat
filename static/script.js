@@ -78,7 +78,7 @@ setInterval(() => {
 const state = {
   user: null, publicId: null, shareableKey: null,
   keys: null, cryptoKey: null, encKey: null,
-  contacts: {}, peerBackups: {}, peerTokens: {},
+  contacts: {}, peerBackups: {}, peerTokens: {}, knownDevices: {},
   currentChat: null, ws: null, online: new Set(),
   unread: {}, knownDeviceFingerprints: {}
 };
@@ -87,6 +87,7 @@ const SIGNAL_URL		=`wss://${window.location.hostname}/ws/`;
 const STORAGE_KEY		= "meshchat_contacts";
 const PEER_BACKUP_KEY	= "meshchat_peer_backups_v1";
 const PEER_TOKEN_KEY	= "meshchat_peer_tokens_v1";
+const DEVICE_REGISTRY_KEY = "meshchat_known_devices_v1";
 const DEVICE_KEY_STORAGE = "meshchat_device_seed_v1";
 const EXCHANGE_COUNT	= 10;
 
@@ -477,6 +478,27 @@ function savePeerTokens() {
   catch(e) {}
 }
 
+function loadDeviceRegistry() {
+  try {
+    state.knownDevices = JSON.parse(localStorage.getItem(DEVICE_REGISTRY_KEY + "_" + state.publicId) || "{}");
+    mlog.debug(`STORAGE    device registry loaded: ${Object.keys(state.knownDevices).length} identity(ies)`);
+  } catch(e) { state.knownDevices = {}; }
+}
+
+function saveDeviceRegistry() {
+  try { localStorage.setItem(DEVICE_REGISTRY_KEY + "_" + state.publicId, JSON.stringify(state.knownDevices)); }
+  catch(e) {}
+}
+
+// shared by app:message receipt and the existing self-sync fingerprint
+// tagging — local-only knowledge, never part of serialiseContacts()/backup.
+function recordKnownDevice(identityId, deviceId) {
+  if (!identityId || !deviceId) return;
+  if (!state.knownDevices[identityId]) state.knownDevices[identityId] = {};
+  state.knownDevices[identityId][deviceId] = Date.now();
+  saveDeviceRegistry();
+}
+
 /* ══════════════════════════════════════════
    PEER BACKUP DISTRIBUTION
    Protocol (non-self peers):
@@ -549,6 +571,7 @@ function handleBackupAccept(msg) {
     if (msg.deviceId === state.deviceId) return;  // own echo, shouldn't happen
     if (msg.fingerprint) {
       state.knownDeviceFingerprints[msg.deviceId] = msg.fingerprint;
+	  recordKnownDevice(state.publicId, msg.deviceId);
       mlog.debug(`← BACKUP_ACK   from device ${msg.deviceId.slice(0,8)} — fingerprint recorded`);
     }
     return;
@@ -602,6 +625,7 @@ async function handleBackupPush(msg) {
 		  // presence of deviceId (never set on the normal contact handshake).
 		  if (msg.deviceId && msg.fingerprint) {
 			state.knownDeviceFingerprints[msg.deviceId] = msg.fingerprint;
+			recordKnownDevice(state.publicId, msg.deviceId);
 		  }
 		  if (msg.deviceId) {
 			const ownFingerprint = await computeBackupFingerprint();
@@ -1430,8 +1454,8 @@ async function sendImageMessage(file) {
       const encBlob = await encryptObject(state.encKey, { data: base64, mimeType });
       imageCache[id] = { encBlob, mimeType };
 
-      const imgMsgObj  = { type: "app:message", from: state.publicId,
-                   to: state.currentChat, blob: encrypted, sig };
+	  const imgMsgObj  = { type: "app:message", from: state.publicId,
+				 to: state.currentChat, blob: encrypted, sig, deviceId: state.deviceId };
       const viaRelayImg = sendToRelay(state.currentChat, imgMsgObj, true);
       if (!viaRelayImg) sendSignal(imgMsgObj);
 
@@ -1468,9 +1492,9 @@ async function sendAudioMessage(blob) {
     const encBlob = await encryptObject(state.encKey, { data: base64, mimeType });
     audioCache[id] = { encBlob, mimeType };
 
-    const audioMsgObj = { type: "app:message", from: state.publicId,
-                 to: state.currentChat, blob: encrypted, sig };
-    const viaRelayAud  = sendToRelay(state.currentChat, audioMsgObj, true);
+
+	const audioMsgObj = { type: "app:message", from: state.publicId,
+             to: state.currentChat, blob: encrypted, sig, deviceId: state.deviceId };    const viaRelayAud  = sendToRelay(state.currentChat, audioMsgObj, true);
     if (!viaRelayAud) sendSignal(audioMsgObj);
 
     // stub in messages — data stays in audioCache only
@@ -1508,6 +1532,7 @@ async function receiveMessage(msg) {
   const contact = state.contacts[msg.from];
   if (!contact || contact.blocked) return;
   markOnline(msg.from);
+  if (msg.deviceId) recordKnownDevice(msg.from, msg.deviceId);
   try {
     let plain, valid;
     plain = await decryptMessage(msg.blob);
@@ -1721,7 +1746,7 @@ async function sendMessage() {
   const blob   = await encryptMessage(contact.encKey, { id, text, ts, ...(relay ? { relay } : {}) });
   const sig    = await signBlob(blob);
 
-  const msgObj = { type: "app:message", from: fromId, to: contact.publicId, blob, ...(sig ? { sig } : {}) };
+  const msgObj = { type: "app:message", from: fromId, to: contact.publicId, blob, deviceId: state.deviceId, ...(sig ? { sig } : {}) };
   const viaRelay = sendToRelay(state.currentChat, msgObj, true);
   if (!viaRelay) sendSignal(msgObj);
   contact.messages = mergeMessages(contact.messages, [{ id, from: fromId, text, ts, valid: true }]);
@@ -1752,7 +1777,7 @@ async function sendReaction(targetMsgId, emoji) {
   const blob     = await encryptMessage(contact.encKey, payload);
   const sig      = await signBlob(blob);
 
-  const reactMsgObj = { type: "app:message", from: state.publicId, to: state.currentChat, blob, sig };
+  const reactMsgObj = { type: "app:message", from: state.publicId, to: state.currentChat, blob, sig, deviceId: state.deviceId };
   const viaRelayReact = sendToRelay(state.currentChat, reactMsgObj, true);
   if (!viaRelayReact) sendSignal(reactMsgObj);
   const msgObj = { id, from: state.publicId, type: "reaction", targetId: targetMsgId, emoji, ts, valid: true };
@@ -1997,6 +2022,19 @@ function toggleShowBlocked() {
   renderContactList();
 }
 
+function toggleDevicePopover(id, li) {
+  const pop = li.querySelector('.devicePopover[data-pop="' + id + '"]');
+  if (!pop) return;
+  const isOpen = pop.classList.contains("open");
+  document.querySelectorAll(".devicePopover.open").forEach(p => p.classList.remove("open"));
+  if (isOpen) return;
+  const devices = Object.keys(state.knownDevices[id] || {});
+  pop.innerHTML = devices.length
+    ? devices.map(d => '<div class="devicePopoverRow">' + esc(pid(d)) + '</div>').join("")
+    : '<div class="devicePopoverRow unknown">unknown</div>';
+  pop.classList.add("open");
+}
+
 function renderContactList() {
   const list  = document.getElementById("contactList");
   list.innerHTML = "";
@@ -2047,8 +2085,11 @@ function renderContactList() {
         (preview ? '<div class="contactPreview">' + esc(preview) + '</div>' : '') +
       '</div>' +
       (unread > 0 ? '<div class="unreadBadge">' + unread + '</div>' : '') +
-      '<div class="contactStatus" data-dot-id="' + c.publicId + '"></div>';
+      '<div class="contactStatus" data-dot-id="' + c.publicId + '"></div>' +
+      '<button class="deviceInfoBtn" title="known devices" data-id="' + c.publicId + '">+</button>' +
+      '<div class="devicePopover" data-pop="' + c.publicId + '"></div>';
     list.appendChild(li);
+	li.querySelector(".deviceInfoBtn").onclick = (e) => { e.stopPropagation(); toggleDevicePopover(c.publicId, li); };
   });
 }
 
@@ -2085,6 +2126,9 @@ function openChat(id) {
   document.getElementById("syncBtn").style.display          = isMe ? "none" : "";
   document.getElementById("blockToggleBtn").style.display   = isMe ? "none" : "";
   document.querySelector("#contactDropdown .danger").style.display = isMe ? "none" : "";
+  document.addEventListener("click", () => {
+    document.querySelectorAll(".devicePopover.open").forEach(p => p.classList.remove("open"));
+  });
   if (!isMe) document.getElementById("blockToggleBtn").textContent = c.blocked ? "UNBLOCK" : "BLOCK";
   // MIGRATE is self-only — inverse of sync/block/delete above. Injected
   // dynamically rather than added to the static markup, since it didn't
@@ -2619,6 +2663,7 @@ document.getElementById("loginButton").onclick = async (e) => {
 	}
     loadPeerBackups();
     loadPeerTokens();
+	loadDeviceRegistry();
     document.getElementById("loginScreen").style.display  = "none";
     document.getElementById("appContainer").style.display = "flex";
     mlog.info(`LOGIN      ${name}  ${pid(state.publicId)}`);
