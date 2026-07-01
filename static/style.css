@@ -539,10 +539,19 @@
 }
 .devicePopover.open { display: block; }
 .devicePopoverRow {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
   padding: 4px 12px;
   font-size: 10px;
   color: var(--dim);
   white-space: nowrap;
+  gap: 10px;
+}
+.devicePopoverDate {
+  font-size: 9px;
+  color: var(--muted);
+  letter-spacing: 0.05em;
 }
 .devicePopoverRow.unknown {
   color: var(--muted);

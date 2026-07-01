@@ -13,7 +13,7 @@
 // Protocol version — informational only for now, surfaced via sig:relay_info
 // so client/server drift shows up in both logs. Not enforced yet; room to
 // add real backwards-compat handling once that's actually needed.
-const CLIENT_VERSION = "0.3.2";
+const CLIENT_VERSION = "0.3.3";
 
 const LOG_MAX_LINES      = 20;
 const LOG_CLEAR_INTERVAL = 5 * 60 * 1000;
@@ -481,8 +481,28 @@ function savePeerTokens() {
 function loadDeviceRegistry() {
   try {
     state.knownDevices = JSON.parse(localStorage.getItem(DEVICE_REGISTRY_KEY + "_" + state.publicId) || "{}");
+    // soft prune — 90 days, max 20 devices per identity
+    const cutoff = Date.now() - 90 * 24 * 60 * 60 * 1000;
+    for (const identityId of Object.keys(state.knownDevices)) {
+      const devs = state.knownDevices[identityId];
+      let entries = Object.entries(devs).filter(([, ts]) => ts > cutoff);
+      if (entries.length > 20) {
+        entries = entries.sort(([, a], [, b]) => b - a).slice(0, 20);
+      }
+      state.knownDevices[identityId] = Object.fromEntries(entries);
+    }
+    saveDeviceRegistry();
     mlog.debug(`STORAGE    device registry loaded: ${Object.keys(state.knownDevices).length} identity(ies)`);
   } catch(e) { state.knownDevices = {}; }
+}
+
+function relativeDate(ts) {
+  const days = Math.floor((Date.now() - ts) / (24 * 60 * 60 * 1000));
+  if (days === 0) return "today";
+  if (days === 1) return "yesterday";
+  if (days < 7)  return `${days}d ago`;
+  if (days < 30) return `${Math.floor(days / 7)}w ago`;
+  return `${Math.floor(days / 30)}mo ago`;
 }
 
 function saveDeviceRegistry() {
@@ -701,6 +721,7 @@ async function sendRestoreRequest(id) {
     publicId_B:    id,
     wss:           state.contacts[state.publicId]?.lastRelay || null,
     signPublicKey: rawToBase64(state.contacts[state.publicId]?.signPublicKey),
+	deviceId:      state.deviceId,
   });
   const token = state.peerTokens[id] || null;
   const reqObj = { type: "sync:restore_req", from: state.publicId, to: id, blob, ...(token ? { token } : {}) };
@@ -732,6 +753,8 @@ async function handleRestoreRequest(msg) {
     mlog.info(`← RESTORE_REQ  from ${pid(msg.from)} — blocked, ignored`);
     return;
   }
+  
+  if (plain.deviceId && state.contacts[msg.from]) recordKnownDevice(msg.from, plain.deviceId);
 
   if (!canRestore(msg.from)) {
     mlog.info(`← RESTORE_REQ  from ${pid(msg.from)} — cooldown, no ack`);
@@ -758,6 +781,7 @@ async function handleRestoreRequest(msg) {
       mlog.warn(`← RESTORE_REQ  from ${pid(msg.from)} — token invalid, dropped`);
       return;
     }
+	
   } else if (fresh) {
     mlog.info(`← RESTORE_REQ  from ${pid(msg.from)} — fresh client, no token, ignored`);
     return;
@@ -769,7 +793,7 @@ async function handleRestoreRequest(msg) {
   }
 
   // send ack — cross domain if we have their wss
-  const ackObj = { type: "sync:restore_ack", from: state.publicId, to: msg.from };
+  const ackObj = { type: "sync:restore_ack", from: state.publicId, to: msg.from, deviceId: state.deviceId };
   const senderWss = plain.wss || state.contacts[msg.from]?.lastRelay || null;
   let ackSent = false;
   if (senderWss) {
@@ -790,6 +814,7 @@ async function handleRestoreRequest(msg) {
 async function handleRestoreAck(msg) {
   if (!msg.from || !msg.to) return;
   if (msg.to !== state.publicId) return;
+  if (msg.deviceId) recordKnownDevice(msg.from, msg.deviceId);
 
   if (msg.from === state.publicId) {
     const freshBlob = await encryptObject(state.cryptoKey, serialiseContacts());
@@ -2028,9 +2053,15 @@ function toggleDevicePopover(id, li) {
   const isOpen = pop.classList.contains("open");
   document.querySelectorAll(".devicePopover.open").forEach(p => p.classList.remove("open"));
   if (isOpen) return;
-  const devices = Object.keys(state.knownDevices[id] || {});
+  const devices = Object.entries(state.knownDevices[id] || {})
+    .sort(([, a], [, b]) => b - a);   // most recent first
   pop.innerHTML = devices.length
-    ? devices.map(d => '<div class="devicePopoverRow">' + esc(pid(d)) + '</div>').join("")
+    ? devices.map(([devId, ts]) =>
+        `<div class="devicePopoverRow">` +
+          `<span>${esc(pid(devId))}</span>` +
+          `<span class="devicePopoverDate">${relativeDate(ts)}</span>` +
+        `</div>`
+      ).join("")
     : '<div class="devicePopoverRow unknown">unknown</div>';
   pop.classList.add("open");
 }
