@@ -2651,6 +2651,7 @@ document.getElementById("loginButton").onclick = async (e) => {
 	// every boot: same device + same identity always yields the same id.
 	state.deviceId = await getOrCreateDeviceId();
 	mlog.info(`DEVICE     ${pid(state.deviceId)}`);
+	
     await loadContacts();
 	if(!state.contacts[state.publicId]){
 	  const parts=state.shareableKey.split(".");
@@ -2664,6 +2665,8 @@ document.getElementById("loginButton").onclick = async (e) => {
     loadPeerBackups();
     loadPeerTokens();
 	loadDeviceRegistry();
+	recordKnownDevice(state.publicId, state.deviceId);
+	
     document.getElementById("loginScreen").style.display  = "none";
     document.getElementById("appContainer").style.display = "flex";
     mlog.info(`LOGIN      ${name}  ${pid(state.publicId)}`);
