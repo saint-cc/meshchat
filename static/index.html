@@ -50,8 +50,8 @@ if ("serviceWorker" in navigator) {
     <div id="loginBox">
       <h2>MESHCHAT</h2>
       <div class="subtitle">decentralised · encrypted · yours</div>
-      <input id="inputName" name="mesh_user" placeholder="user" autocomplete="username" spellcheck="false">
-      <input id="inputPassphrase" name="password" type="password" placeholder="passphrase" autocomplete="current-password">
+      <input id="inputName" placeholder="user" autocomplete="username" spellcheck="false">
+      <input id="inputPassphrase" type="password" placeholder="passphrase" autocomplete="current-password">
 	  <label>
 		<input type="checkbox" onchange="togglePw(this)">
 		Show password
@@ -64,7 +64,7 @@ if ("serviceWorker" in navigator) {
 		}
 		</script>
 		
-      <button id="loginButton" type="submit">ENTER</button>
+      <button id="loginButton" type="button">ENTER</button>
       <div id="loginStatus"></div>
 	  <div class="bar-container">
         <div id="barEntr" class="barEntr"></div>
