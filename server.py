@@ -36,7 +36,7 @@ RELAY_WSS_URL = os.environ.get("RELAY_WSS_URL", "")   # e.g. wss://yourrelay.exa
 # Protocol version — informational only for now, surfaced in sig:relay_info
 # so client/server version drift shows up in both logs. Not enforced yet;
 # room to add real backwards-compat handling once this is actually needed.
-PROTOCOL_VERSION = os.environ.get("PROTOCOL_VERSION", "0.3.2")
+PROTOCOL_VERSION = os.environ.get("PROTOCOL_VERSION", "0.3.3")
 
 # Connection limits
 MAX_CONNECTIONS        = int(os.environ.get("MAX_CONNECTIONS",        100))   # total WS sessions
