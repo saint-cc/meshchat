@@ -10,15 +10,38 @@ function transition(id, event) {
 	const conn = contact.conn ??= { phase: "idle", tier: "signal", legacy: false };
 
 	const oldPhase = conn.phase;
+	
 	switch (conn.phase) {
 
 	  case "idle":
 		if (event.type === "rtc_available")
 		  conn.phase = "offering";
+
+		if (event.type === "offer_received")
+		  conn.phase = "answering";
 		break;
 
 	  case "offering":
 		if (event.type === "offer_sent")
+		  conn.phase = "negotiating";
+
+		if (event.type === "rtc_failed")
+		  conn.phase = "failed";
+
+		// glare — both sides offered at once. Lower publicId stays
+		// offerer and ignores the incoming offer; higher publicId yields.
+		if (event.type === "offer_received") {
+		  if (state.publicId > id) {
+			conn.phase = "answering";
+			mlog.debug(`SM  ${pid(id)}  glare — yielding, we answer`);
+		  } else {
+			mlog.debug(`SM  ${pid(id)}  glare — holding, we offer`);
+		  }
+		}
+		break;
+
+	  case "answering":
+		if (event.type === "answer_sent")
 		  conn.phase = "negotiating";
 
 		if (event.type === "rtc_failed")
@@ -45,6 +68,7 @@ function transition(id, event) {
 	}
 
 	if (conn.phase !== oldPhase) {
+		conn.tier = conn.phase === "connected" ? "rtc" : "signal";
 		mlog.info(`SM  ${pid(id)}  ${oldPhase} → ${conn.phase}`);
 		onStateEnter(id, oldPhase, conn.phase);
 	}
@@ -77,7 +101,7 @@ function route(id, obj) {
    Called by setPhase, never directly
 ══════════════════════════════════════════ */
 function onStateEnter(id, oldState, newState) {
-  switch (newState.phase) {
+  switch (newState) {
 
     case "offering":
       rtcOffer(id);
