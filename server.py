@@ -658,6 +658,10 @@ async def handler(ws):
                 if not valid_id(to):
                     log.warning("  %s with invalid 'to', dropped", kind)
                     continue
+                if frm not in client_ids:
+                    log.warning("%-10s from=%s  not authed  peer=%s  dropped", kind.upper(), short(frm), addr)
+                    await send_to(ws, {"type": "error", "reason": "not_authenticated"})
+                    continue
                 reached = await deliver(to, msg, exclude=ws)
                 log.info("%-12s from=%s  to=%s  reached=%d",
                          kind.upper()[:12], short(frm), short(to), reached)

@@ -165,8 +165,7 @@ if ("serviceWorker" in navigator) {
     <div class="qr-tabs">
       <button class="qr-tab active" id="tabShow"  onclick="switchTab('show')">MY QR</button>
       <button class="qr-tab"        id="tabScan"  onclick="switchTab('scan')">SCAN</button>
-      <button class="qr-tab"        id="tabPaste" onclick="switchTab('paste')">PASTE</button>
-      <button class="qr-tab"        id="tabLegacy" onclick="switchTab('legacy')">[128]</button>
+      <button class="qr-tab"        id="tabPaste" onclick="switchTab('paste')">PASTE</button>      
     </div>
     <div class="qr-panel active" id="panelShow">
       <div id="myKeyBox" title="click to copy">
@@ -184,14 +183,7 @@ if ("serviceWorker" in navigator) {
     </div>
     <div class="qr-panel" id="panelPaste">
       <div class="hint">paste their key below</div>
-    </div>
-    <div class="qr-panel" id="panelLegacy">
-      <div class="hint">128-bit legacy contact (e.g. C64).<br>paste their <strong>encKey128.signKey128</strong> key below.<br>this contact can send and receive messages only.</div>
-      <div id="myKey128Box" title="click to copy" style="background:var(--bg);border:1px solid var(--border);padding:10px 12px;font-size:11px;display:flex;flex-direction:column;gap:4px;color:var(--muted);cursor:pointer;transition:border-color 0.2s" onclick="navigator.clipboard.writeText(state.shareableKey128||'')">
-        <span>your 128-bit key — click to copy</span>
-        <strong id="myKey128Display" style="color:var(--text);word-break:break-all;font-size:10px;letter-spacing:0.03em;line-height:1.5">—</strong>
-      </div>
-    </div>
+    </div>   
     <input id="modalContactName" placeholder="contact name" autocomplete="off">
     <input id="modalContactKey"  placeholder="their key" autocomplete="off" spellcheck="false">
     <div class="hint">name is local only — only you see it.</div>
