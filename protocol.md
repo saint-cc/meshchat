@@ -299,20 +299,20 @@ The registry is displayed in a per-contact device popover in the UI. Contacts wi
 
 | Type | Fields | Auth required | Description |
 |---|---|---|---|
-| `sig:auth_init`     | `enc_key`, `bits`, `no_receive?`          | no  | Begin challenge-response. `no_receive: true` skips registration and buffer flush (used by probes) |
-| `sig:auth_proof`    | `nonce`                                   | no  | Return decrypted nonce |
-| `sig:announce`      | `ids[]`                                   | no  | Check local presence of up to 10 IDs |
+| `sig:auth_init`     | `enc_key`, `bits`, `no_receive?`          | yes  | Begin challenge-response. `no_receive: true` skips registration and buffer flush (used by probes) |
+| `sig:auth_proof`    | `nonce`                                   | yes  | Return decrypted nonce |
+| `sig:announce`      | `ids[]`                                   | yes  | Check local presence of up to 10 IDs |
 | `app:message`       | `from`, `to`, `blob`, `sig`, `deviceId?`  | yes | Deliver message — `from` must match authed identity on this socket |
 | `app:migrate`       | `from`, `to`, `blob`, `sig`               | yes | Notify of a relay migration — always durably buffered in addition to live delivery |
-| `app:sync`          | `from`, `to`, `msgs[]`, `reply`           | no  | Manual sync exchange |
-| `sync:backup_offer` | `from`, `to`, `size`                      | no  | Offer backup blob to peer |
-| `sync:backup_accept`| `from`, `to`, `deviceId?`, `fingerprint?` | no  | Accept a backup offer. With `deviceId`/`fingerprint`: device-freshness ack on the self-sync path |
-| `sync:backup_push`  | `from`, `to`, `blob`, `deviceId?`, `fingerprint?` | no | Push backup blob. With `deviceId`/`fingerprint` on self-targeted push: carries sender device identity for freshness tracking |
-| `sync:restore_req`  | `from`, `to`, `blob`                      | no  | Request peer send their stored backup |
-| `sync:restore_ack`  | `from`, `to`                              | no  | Acknowledge restore request |
-| `sync:restore_push` | `from`, `to`, `blob`                      | no  | Push stored backup to requester |
-| `sync:token_req`    | `from`, `to`                              | no  | Request a contact token |
-| `sync:token_resp`   | `from`, `to`, `token`                     | no  | Deliver a contact token |
+| `app:sync`          | `from`, `to`, `msgs[]`, `reply`           | yes  | Manual sync exchange |
+| `sync:backup_offer` | `from`, `to`, `size`                      | yes  | Offer backup blob to peer |
+| `sync:backup_accept`| `from`, `to`, `deviceId?`, `fingerprint?` | yes  | Accept a backup offer. With `deviceId`/`fingerprint`: device-freshness ack on the self-sync path |
+| `sync:backup_push`  | `from`, `to`, `blob`, `deviceId?`, `fingerprint?` | yes | Push backup blob. With `deviceId`/`fingerprint` on self-targeted push: carries sender device identity for freshness tracking |
+| `sync:restore_req`  | `from`, `to`, `blob`                      | yes  | Request peer send their stored backup |
+| `sync:restore_ack`  | `from`, `to`                              | yes  | Acknowledge restore request |
+| `sync:restore_push` | `from`, `to`, `blob`                      | yes  | Push stored backup to requester |
+| `sync:token_req`    | `from`, `to`                              | yes  | Request a contact token |
+| `sync:token_resp`   | `from`, `to`, `token`                     | yes  | Deliver a contact token |
 | `sig:relay_req`     | —                                         | yes | Request relay's own WSS URL |
 | `sig:ping`          | —                                         | yes | Keepalive |
 
@@ -330,11 +330,10 @@ The registry is displayed in a per-contact device popover in the UI. Contacts wi
 
 ### Notes
 
-- `app:message` and `app:migrate` are the only types that require auth AND validate `from` ∈ `client_ids` on the socket. Other auth-required types (`sig:relay_req`, `sig:ping`) only require the socket to be authed, not a matching `from`.
+- `app:message`, `app:migrate`, `app:sync`, and all `sync:*` types require auth AND validate `from` ∈ `client_ids` on the socket. `sig:relay_req` and `sig:ping` only require the socket to be authed (no `from` field to check). `sig:announce` has no `from` field at all — its response targets the socket's own authed identity via `last_id()`.
 - `app:migrate` is always written to the durable buffer in addition to any live delivery.
 - `sync:backup_accept` and `sync:backup_push` carry optional `deviceId`/`fingerprint` fields used exclusively on the self-sync path. These fields are never set on the contact backup path. Old clients that omit them are handled gracefully.
-- Sync and backup types are intentionally unauthenticated — they are e2e encrypted and routed by the server without inspection.
-- `sig:announce` is unauthenticated to allow presence probing before auth completes.
+- Sync and backup types are e2e encrypted and routed by the server without inspection of contents — but the socket itself must be authed before any of these are accepted. This closes a prior gap where an unauthenticated connection could reach these branches before completing the challenge-response.
 
 ---
 
