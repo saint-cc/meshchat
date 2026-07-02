@@ -1333,7 +1333,53 @@ function getOrOpenRelayConn(url, messageOnly) {
 
   return entry;
 }
+const MIGRATE_DRAIN_DELAY_MS = 10_000;
+const MIGRATE_DRAIN_OPEN_MS  = 3_000;
+let migrationLocked = false;
 
+function drainOldRelay(url) {
+  if (!url) { migrationLocked = false; return; }
+  let recovered = 0;
+  const ws = new WebSocket(url);
+  let step = "idle", closeTimer;
+
+  ws.onopen = () => {
+    step = "await_challenge";
+    const encKey = Array.from(base64ToRaw(state.shareableKey.split(".")[0]));
+    ws.send(JSON.stringify({ type: "sig:auth_init", enc_key: encKey }));
+  };
+
+  ws.onmessage = async (evt) => {
+    const msg = JSON.parse(evt.data);
+    if (step === "await_challenge" && msg.type === "sig:auth_challenge") {
+      const iv = new Uint8Array(msg.iv), data = new Uint8Array(msg.data);
+      const plain = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, state.encKey, data);
+      ws.send(JSON.stringify({ type: "sig:auth_proof", nonce: Array.from(new Uint8Array(plain)) }));
+      step = "await_ok";
+      return;
+    }
+    if (step === "await_ok" && msg.type === "sig:auth_ok") {
+      step = "draining";
+      mlog.info(`MIGRATE    drain — connected to old relay, waiting for flush`);
+      closeTimer = setTimeout(() => ws.close(1000, "drain complete"), MIGRATE_DRAIN_OPEN_MS);
+      return;
+    }
+    if (msg.type === "sig:auth_fail") { ws.close(); return; }
+    recovered++;
+    handleSignal(msg);
+  };
+
+  ws.onclose = () => {
+    clearTimeout(closeTimer);
+    if (recovered > 0) {
+      mlog.warn(`MIGRATE    drain recovered ${recovered} msg(s) left at old relay — a contact hadn't picked up the migrate notice in time`);
+    } else {
+      mlog.debug(`MIGRATE    drain — nothing left behind`);
+    }
+    migrationLocked = false;
+  };
+  ws.onerror = () => ws.close();
+}
 
 /* ══════════════════════════════════════════
    ROUTING RULE — read this before touching send logic
@@ -2489,6 +2535,17 @@ function contactAction(action) {
     };
 
   } else if (action === "migrate") {
+	  
+	  if (migrationLocked) {
+	    title.textContent = "MIGRATE RELAY";
+	    const hint = document.createElement("div");
+	    hint.className = "hint";
+	    hint.textContent = "A migration was just committed and the old relay is still being checked for stragglers. Try again in a few seconds.";
+	    body.appendChild(hint);
+	    btns.innerHTML = '<button class="btn-cancel" onclick="closeContactAction()">CLOSE</button>';
+	    document.getElementById("contactActionOverlay").classList.add("open");
+	    return;
+	  }
     title.textContent = "MIGRATE RELAY";
 
     const hint = document.createElement("div");
@@ -2599,28 +2656,11 @@ function contactAction(action) {
         refreshMigrateButtons();
       };
 
-      migrateBtn.onclick = async () => {
-        const url = getUrl();
-        if (url !== lastTestedUrl) return;   // shouldn't be reachable — button would be disabled
-        const me      = state.contacts[state.publicId];
-        const oldRelay = me.lastRelay;
-        const ts       = Date.now();
-        me.prevRelay     = oldRelay;
-        me.prevRelaySeen = ts;
-        me.lastRelay     = url;
-        // Deliberate migration is the most authoritative thing that can
-        // happen to this field — give it a real timestamp now, the same
-        // one going out on the wire to contacts/self. Leaving this
-        // untouched would risk a stale lastRelaySeen (e.g. 0 from an
-        // earlier fresh-bootstrap adoption) letting an old restore/backup
-        // override something we just set on purpose.
-        me.lastRelaySeen = ts;
-        await saveContacts();
-        mlog.info(`MIGRATE    committed  ${oldRelay || "(none)"} → ${url}`);
-        rebootSignal();
-        notifyMigration(url, ts, oldRelay);
-        closeContactAction();
-      };
+	  migrateBtn.onclick = () => {
+	    const url = getUrl();
+	    if (url !== lastTestedUrl) return;   // shouldn't be reachable — button would be disabled
+	    showMigrateWarning(url);
+	  };
 
       rowEl.appendChild(statusEl);
       rowEl.appendChild(testBtn);
@@ -2654,6 +2694,54 @@ function contactAction(action) {
 
 function closeContactAction() {
   document.getElementById("contactActionOverlay").classList.remove("open");
+}
+
+async function commitMigration(url) {
+  const me       = state.contacts[state.publicId];
+  const oldRelay = me.lastRelay;
+  const ts       = Date.now();
+  me.prevRelay     = oldRelay;
+  me.prevRelaySeen = ts;
+  me.lastRelay     = url;
+  me.lastRelaySeen = ts;
+  await saveContacts();
+  mlog.info(`MIGRATE    committed  ${oldRelay || "(none)"} → ${url}`);
+  rebootSignal();
+  notifyMigration(url, ts, oldRelay);
+  closeContactAction();
+}
+
+function showMigrateWarning(url) {
+  const title = document.getElementById("contactActionTitle");
+  const body  = document.getElementById("contactActionBody");
+  const btns  = document.getElementById("contactActionBtns");
+  body.innerHTML = btns.innerHTML = "";
+
+  title.textContent = "CONFIRM MIGRATION";
+
+  const warn = document.createElement("div");
+  warn.className = "hint";
+  warn.style.cssText = "color:var(--danger);line-height:1.6";
+  warn.textContent =
+    "This takes effect immediately and cannot be undone — every contact and " +
+    "any other device of yours will be notified and will start routing to the " +
+    "new relay right away. If it turns out to be unreachable or misbehaving, " +
+    "messages sent to you in the meantime may not reach you until you migrate again.";
+  body.appendChild(warn);
+
+  const cancelBtn = document.createElement("button");
+  cancelBtn.className   = "btn-cancel";
+  cancelBtn.textContent = "WAIT, NO!";
+  cancelBtn.onclick     = () => contactAction("migrate");   // rebuilds the panel fresh
+
+  const confirmBtn = document.createElement("button");
+  confirmBtn.className   = "btn-confirm";
+  confirmBtn.style.cssText = "background:var(--danger);border-color:var(--danger)";
+  confirmBtn.textContent = "I KNOW WHAT I AM DOING";
+  confirmBtn.onclick     = () => commitMigration(url);
+
+  btns.appendChild(cancelBtn);
+  btns.appendChild(confirmBtn);
 }
 
 /* ══════════════════════════════════════════
