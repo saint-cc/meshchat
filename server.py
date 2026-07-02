@@ -663,8 +663,8 @@ async def handler(ws):
                     await send_to(ws, {"type": "error", "reason": "not_authenticated"})
                     continue
                 reached = await deliver(to, msg, exclude=ws)
-                log.info("%-12s from=%s  to=%s  reached=%d",
-                         kind.upper()[:12], short(frm), short(to), reached)
+                log.info("%-16s from=%s  to=%s  reached=%d",
+                         kind.upper()[:16], short(frm), short(to), reached)
 
             elif kind == "sig:relay_req":
                 await send_to(ws, {"type": "sig:relay_info", "wss": RELAY_WSS_URL or None, "version": PROTOCOL_VERSION})
