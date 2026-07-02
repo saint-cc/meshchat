@@ -2,7 +2,7 @@
 
 A decentralised, encrypted messaging protocol built on WebSocket relay servers. No accounts, no central authority, no plaintext.
 
-Current client/server implementation version: `0.3.2`, surfaced informationally via the `version` field on `sig:relay_info` for drift visibility (not yet enforced).
+Current client/server implementation version: `0.3.3`, surfaced informationally via the `version` field on `sig:relay_info` for drift visibility (not yet enforced).
 
 ---
 
