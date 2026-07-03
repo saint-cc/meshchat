@@ -1,51 +1,53 @@
 /* ══════════════════════════════════════════
-   STATE MACHINE
+   CALL STATE MACHINE
    transition(id, event) — pure logic, no side effects
-   Valid phases: idle | offering | answering | negotiating | connected | failed
-   Valid tiers:  signal | relay | rtc
+   Valid phases: idle | calling | ringing | negotiating | connected | failed
+   Valid roles:  caller | callee (set on entering calling/ringing, cleared on idle)
+
+   Manual only — no passive/background check. A call only exists once
+   the user has either clicked "call" (caller) or an invite has arrived
+   (callee, possibly on several of the contact's devices at once).
+
+   Multi-device dedup does NOT live in this file — it happens one level
+   up, wherever incoming call_invite/call_claim packets are handled.
+   By the time transition() sees "claimed", the dedup question ("was it
+   us or one of our other devices that answered") has already been
+   resolved by whoever calls transition() — this machine only tracks
+   the state of the call THIS device is party to.
 ══════════════════════════════════════════ */
 function transition(id, event) {
 	const contact = state.contacts[id];
 	if (!contact) return;
-	const conn = contact.conn ??= { phase: "idle", tier: "signal", legacy: false };
+	const conn = contact.call ??= { phase: "idle", role: null };
 
 	const oldPhase = conn.phase;
-	
+
 	switch (conn.phase) {
 
 	  case "idle":
-		if (event.type === "rtc_available")
-		  conn.phase = "offering";
+		if (event.type === "call_started")     // user clicked call
+		  { conn.phase = "calling"; conn.role = "caller"; }
 
-		if (event.type === "offer_received")
-		  conn.phase = "answering";
+		if (event.type === "invite_received")  // contact is calling us
+		  { conn.phase = "ringing"; conn.role = "callee"; }
 		break;
 
-	  case "offering":
-		if (event.type === "offer_sent")
+	  case "calling":
+		if (event.type === "claim_received")   // one of their devices answered
 		  conn.phase = "negotiating";
 
-		if (event.type === "rtc_failed")
-		  conn.phase = "failed";
-
-		// glare — both sides offered at once. Lower publicId stays
-		// offerer and ignores the incoming offer; higher publicId yields.
-		if (event.type === "offer_received") {
-		  if (state.publicId > id) {
-			conn.phase = "answering";
-			mlog.debug(`SM  ${pid(id)}  glare — yielding, we answer`);
-		  } else {
-			mlog.debug(`SM  ${pid(id)}  glare — holding, we offer`);
-		  }
-		}
+		if (event.type === "call_cancelled" || event.type === "no_answer")
+		  { conn.phase = "idle"; conn.role = null; }
 		break;
 
-	  case "answering":
-		if (event.type === "answer_sent")
+	  case "ringing":
+		if (event.type === "claimed_here")     // user answered on THIS device
 		  conn.phase = "negotiating";
 
-		if (event.type === "rtc_failed")
-		  conn.phase = "failed";
+		if (event.type === "claimed_elsewhere" || event.type === "call_cancelled")
+		  // another of our devices answered, or caller gave up —
+		  // either way, stop ringing here, silently
+		  { conn.phase = "idle"; conn.role = null; }
 		break;
 
 	  case "negotiating":
@@ -57,62 +59,62 @@ function transition(id, event) {
 		break;
 
 	  case "connected":
-		if (event.type === "rtc_closed")
-		  conn.phase = "idle";
+		if (event.type === "call_ended" || event.type === "rtc_closed")
+		  { conn.phase = "idle"; conn.role = null; }
+
+		if (event.type === "rtc_failed")
+		  conn.phase = "failed";
 		break;
 
 	  case "failed":
 		if (event.type === "reset")
-		  conn.phase = "idle";
+		  { conn.phase = "idle"; conn.role = null; }
 		break;
 	}
 
 	if (conn.phase !== oldPhase) {
-		conn.tier = conn.phase === "connected" ? "rtc" : "signal";
-		mlog.info(`SM  ${pid(id)}  ${oldPhase} → ${conn.phase}`);
-		onStateEnter(id, oldPhase, conn.phase);
+		mlog.info(`CALL  ${pid(id)}  ${oldPhase} → ${conn.phase}${conn.role ? " ("+conn.role+")" : ""}`);
+		onStateEnter(id, oldPhase, conn.phase, conn.role);
 	}
-	return { from: oldPhase, to: conn.phase }
+	return { from: oldPhase, to: conn.phase };
 }
 
-/* ══════════════════════════════════════════
-   ROUTER
-   route(id, obj) — consult state, pick transport
-   Messages open new connections, protocol traffic only piggybacks
-══════════════════════════════════════════ */
-function route(id, obj) {
-	const tier = state.contacts[id]?.conn?.tier;
-	const isMessage = obj.type === "message";
-
-	switch(tier){
-		case "rtc":			
-			rtcSend(id, obj); break;
-		case "relay":
-			if (!sendToRelay(id, obj, isMessage)) sendSignal(obj);
-			break;
-		default:
-			sendSignal(obj); break;
-	}
-
-}
 /* ══════════════════════════════════════════
    ON STATE ENTER
-   transport(id, phase) — side effects on phase entry
-   Called by setPhase, never directly
+   Side effects on phase entry. Called by transition(), never directly.
+   role disambiguates "negotiating" — caller makes the offer once claimed,
+   callee waits for it and answers.
 ══════════════════════════════════════════ */
-function onStateEnter(id, oldState, newState) {
-  switch (newState) {
+function onStateEnter(id, oldPhase, newPhase, role) {
+  switch (newPhase) {
 
-    case "offering":
-      rtcOffer(id);
+    case "calling":
+      sendCallInvite(id);
+      break;
+
+    case "ringing":
+      showIncomingCallUI(id);
+      break;
+
+    case "negotiating":
+      if (role === "caller") rtcOffer(id);
+      // callee waits for the offer to arrive, then calls rtcAnswer(id)
+      // itself from the signal handler — nothing to do on entry here
       break;
 
     case "connected":
-      mlog.info(`RTC UP ${pid(id)}`);
+      mlog.info(`CALL UP  ${pid(id)}`);
+      hideIncomingCallUI(id);
       break;
 
     case "failed":
+      mlog.warn(`CALL FAILED  ${pid(id)}`);
       rtcClose(id);
+      break;
+
+    case "idle":
+      if (oldPhase === "ringing" || oldPhase === "calling")
+        hideIncomingCallUI(id);
       break;
   }
 }

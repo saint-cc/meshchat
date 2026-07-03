@@ -1365,7 +1365,17 @@ function drainOldRelay(url) {
       return;
     }
     if (msg.type === "sig:auth_fail") { ws.close(); return; }
-    recovered++;
+	
+	// Our own breadcrumb, consumed by our own drain — buf_deliver just
+    // deleted it server-side. Put it straight back so a straggler device
+    // arriving after we've disconnected can still find it. Reuse the
+    // blob/sig as-is — same fact, no re-encryption needed.
+    if (msg.type === "app:migrate" && msg.from === state.publicId && msg.to === state.publicId) {
+      sendViaRelayUrl(url, msg);
+      mlog.info(`MIGRATE    drain — own breadcrumb consumed, replanted`);
+      return;   // don't also run it through handleMigrate — nothing to adopt, we already know
+    }
+	recovered++;
     handleSignal(msg);
   };
 
@@ -2708,6 +2718,11 @@ async function commitMigration(url) {
   mlog.info(`MIGRATE    committed  ${oldRelay || "(none)"} → ${url}`);
   rebootSignal();
   notifyMigration(url, ts, oldRelay);
+
+  if (oldRelay) {
+    migrationLocked = true;
+    setTimeout(() => drainOldRelay(oldRelay), MIGRATE_DRAIN_DELAY_MS);
+  }
   closeContactAction();
 }
 
