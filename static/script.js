@@ -1015,6 +1015,14 @@ let sessionFresh = true;
 
 function handleSignal(msg) {
   switch(msg.type) {
+    case "call:invite": handleCallInvite(msg); break;
+    case "call:claim":  handleCallClaim(msg);  break;
+    case "call:cancel": handleCallCancel(msg); break;
+    case "call:end":    handleCallEnd(msg);    break;
+	case "call:offer":  handleCallOffer(msg);  break;
+	case "call:answer": handleCallAnswer(msg); break;
+	case "call:ice":     handleCallIce(msg);    break;
+	
     case "sig:auth_challenge": handleAuthChallenge(msg); break;
     case "sig:auth_ok":        handleAuthOk(msg);        break;
     case "sig:auth_fail":      handleAuthFail(msg);      break;
@@ -1950,6 +1958,443 @@ function showReactionPicker(anchor, msgId, current) {
 }
 
 /* ══════════════════════════════════════════
+   CALLING — wire packets
+   call:invite / call:claim / call:cancel / call:end
+   Not encrypted — from/to are already visible on the wire for every
+   packet type, and there's no payload here worth hiding. Still signed
+   mandatorily, same as app:migrate: these drive UI/state transitions
+   (ringing, negotiating) rather than just being displayed with a
+   warning, so an unsigned/invalid packet is dropped outright.
+   callId ties every packet to one call attempt. Dedup / staleness
+   rejection lives HERE, not in statemachine.js — by the time
+   transition() is called, the "is this for the call in flight, or from
+   one of our own devices, or stale" question has already been resolved.
+══════════════════════════════════════════ */
+
+function signCallPacket(obj) {
+  const { type, from, to, callId, deviceId, ts, blob } = obj;
+  return signBlob({ type, from, to, callId, deviceId: deviceId || null, ts, blob: blob || null });
+}
+
+function verifyCallPacket(obj, contactSignPublicKey) {
+  if (!obj.sig || !contactSignPublicKey) return false;
+  const { type, from, to, callId, deviceId, ts, blob } = obj;
+  return verifyBlob({ type, from, to, callId, deviceId: deviceId || null, ts, blob: blob || null }, obj.sig, contactSignPublicKey);
+}
+
+function sendCallPacket(toId, type, callId) {
+  const obj = { type, from: state.publicId, to: toId, callId, ts: Date.now(), deviceId: state.deviceId };
+  obj.sig = signCallPacket(obj);
+  const viaRelay = sendToRelay(toId, obj, false);
+  if (!viaRelay) sendSignal(obj);
+  mlog.info(`→ ${type.toUpperCase()}  to ${pid(toId)}  callId=${pid(callId)}  via=${viaRelay ? "relay" : "signal(fallback)"}`);
+}
+
+/* ── send side — called from onStateEnter / user actions ── */
+
+function sendCallInvite(id) {
+  const contact = state.contacts[id];
+  if (!contact?.call?.callId) return;
+  sendCallPacket(id, "call:invite", contact.call.callId);
+}
+
+// user-facing: initiate a call
+function startCall(contactId) {
+  const contact = state.contacts[contactId];
+  if (!contact || contact.blocked) return;
+  if (contact.call && contact.call.phase !== "idle") return;
+  contact.call = { callId: crypto.randomUUID(), phase: "idle", role: null };
+  transition(contactId, { type: "call_started" });
+}
+
+// user-facing: answer an incoming call on THIS device
+function answerCall(contactId) {
+  const contact = state.contacts[contactId];
+  if (!contact?.call?.callId || contact.call.phase !== "ringing") return;
+  const callId = contact.call.callId;
+  transition(contactId, { type: "claimed_here" });
+  sendCallPacket(contactId, "call:claim", callId);          // tell the caller
+  sendCallPacket(state.publicId, "call:claim", callId);     // tell our other devices to stop ringing
+}
+
+// user-facing: give up before answer / hang up
+function cancelCall(contactId) {
+  const contact = state.contacts[contactId];
+  if (!contact?.call?.callId) return;
+  sendCallPacket(contactId, "call:cancel", contact.call.callId);
+  transition(contactId, { type: "call_cancelled" });
+}
+
+function endCall(contactId) {
+  const contact = state.contacts[contactId];
+  if (!contact?.call?.callId) return;
+  sendCallPacket(contactId, "call:end", contact.call.callId);
+  transition(contactId, { type: "call_ended" });
+}
+
+/* ── receive side ── */
+
+async function handleCallInvite(msg) {
+  if (!msg.from || !msg.to || !msg.callId || msg.to !== state.publicId) return;
+  const contact = state.contacts[msg.from];
+  if (!contact || contact.blocked) return;
+  if (!verifyCallPacket(msg, contact.signPublicKey)) {
+    mlog.warn(`← CALL INVITE  from ${pid(msg.from)} — signature invalid, dropped`);
+    return;
+  }
+  markOnline(msg.from);
+
+  // A second invite while we're already past idle with this contact isn't
+  // a new call — could be a retry or a duplicate in-flight packet. Don't
+  // let it stomp a callId we (or another of our devices) may already be
+  // mid-negotiation on.
+  if (contact.call && contact.call.phase !== "idle") {
+    mlog.debug(`← CALL INVITE  from ${pid(msg.from)} — already in call (phase=${contact.call.phase}), ignored`);
+    return;
+  }
+
+  contact.call = { callId: msg.callId, phase: "idle", role: null };
+  transition(msg.from, { type: "invite_received" });
+}
+
+async function handleCallClaim(msg) {
+  if (!msg.from || !msg.to || !msg.callId || msg.to !== state.publicId) return;
+
+  if (msg.from === state.publicId) {
+    // one of OUR OTHER devices answered — verify against our own signing
+    // key, not a contact's, since this is self-addressed.
+    const me = state.contacts[state.publicId];
+    if (!verifyCallPacket(msg, me.signPublicKey)) {
+      mlog.warn(`← CALL CLAIM   from self — signature invalid, dropped`);
+      return;
+    }
+    if (msg.deviceId === state.deviceId) return; // our own echo, shouldn't happen
+    const contactId = Object.keys(state.contacts)
+      .find(id => state.contacts[id].call?.callId === msg.callId);
+    if (!contactId) return; // stale — we're not tracking this callId (anymore)
+    mlog.info(`← CALL CLAIM   from self — claimed on another device`);
+    transition(contactId, { type: "claimed_elsewhere" });
+    return;
+  }
+
+  const contact = state.contacts[msg.from];
+  if (!contact || contact.blocked) return;
+  if (!verifyCallPacket(msg, contact.signPublicKey)) {
+    mlog.warn(`← CALL CLAIM   from ${pid(msg.from)} — signature invalid, dropped`);
+    return;
+  }
+  if (contact.call?.callId !== msg.callId) {
+    mlog.debug(`← CALL CLAIM   from ${pid(msg.from)} — callId mismatch/stale, ignored`);
+    return;
+  }
+  markOnline(msg.from);
+  transition(msg.from, { type: "claim_received" });
+}
+
+async function handleCallCancel(msg) {
+  if (!msg.from || !msg.to || !msg.callId || msg.to !== state.publicId) return;
+  const contact = state.contacts[msg.from];
+  if (!contact) return;
+  if (!verifyCallPacket(msg, contact.signPublicKey)) {
+    mlog.warn(`← CALL CANCEL  from ${pid(msg.from)} — signature invalid, dropped`);
+    return;
+  }
+  if (contact.call?.callId !== msg.callId) return; // stale/unrelated call
+  transition(msg.from, { type: "call_cancelled" });
+}
+
+async function handleCallEnd(msg) {
+  if (!msg.from || !msg.to || !msg.callId || msg.to !== state.publicId) return;
+  const contact = state.contacts[msg.from];
+  if (!contact) return;
+  if (!verifyCallPacket(msg, contact.signPublicKey)) {
+    mlog.warn(`← CALL END     from ${pid(msg.from)} — signature invalid, dropped`);
+    return;
+  }
+  if (contact.call?.callId !== msg.callId) return;
+  transition(msg.from, { type: "call_ended" });
+}
+
+//  send + receive for offer/answer/ice
+
+async function sendCallSDP(id, type, sdp) {
+  const contact = state.contacts[id];
+  if (!contact?.call?.callId || !contact.encKey) return;
+  const blob = await encryptMessage(contact.encKey, { sdp });
+  const obj  = { type, from: state.publicId, to: id, callId: contact.call.callId, ts: Date.now(), deviceId: state.deviceId, blob };
+  obj.sig = signCallPacket(obj);
+  const viaRelay = sendToRelay(id, obj, false);
+  if (!viaRelay) sendSignal(obj);
+  mlog.info(`→ ${type.toUpperCase()}  to ${pid(id)}  callId=${pid(contact.call.callId)}  via=${viaRelay ? "relay" : "signal(fallback)"}`);
+}
+
+async function sendCallIce(id, candidate) {
+  const contact = state.contacts[id];
+  if (!contact?.call?.callId || !contact.encKey) return;
+  const blob = await encryptMessage(contact.encKey, candidate.toJSON());
+  const obj  = { type: "call:ice", from: state.publicId, to: id, callId: contact.call.callId, ts: Date.now(), deviceId: state.deviceId, blob };
+  obj.sig = signCallPacket(obj);
+  const viaRelay = sendToRelay(id, obj, false);
+  if (!viaRelay) sendSignal(obj);
+  mlog.debug(`→ CALL ICE     to ${pid(id)}  callId=${pid(contact.call.callId)}`);
+}
+
+async function handleCallOffer(msg) {
+  if (!msg.from || !msg.to || !msg.callId || msg.to !== state.publicId) return;
+  const contact = state.contacts[msg.from];
+  if (!contact || contact.blocked) return;
+  if (!verifyCallPacket(msg, contact.signPublicKey)) {
+    mlog.warn(`← CALL OFFER   from ${pid(msg.from)} — signature invalid, dropped`);
+    return;
+  }
+  if (contact.call?.callId !== msg.callId || contact.call.role !== "callee") {
+    mlog.debug(`← CALL OFFER   from ${pid(msg.from)} — not expecting offer (phase=${contact.call?.phase}, role=${contact.call?.role}), ignored`);
+    return;
+  }
+  markOnline(msg.from);
+  let plain;
+  try { plain = await decryptMessage(msg.blob); }
+  catch(e) { mlog.warn(`← CALL OFFER   from ${pid(msg.from)} — decrypt failed`); return; }
+
+  try {
+    const pc = await createPeerConnection(msg.from);
+    await pc.setRemoteDescription({ type: "offer", sdp: plain.sdp });
+    await flushIceQueue(msg.from);
+    const stream = await getLocalStream();
+    stream.getTracks().forEach(t => pc.addTrack(t, stream));
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+    await sendCallSDP(msg.from, "call:answer", answer.sdp);
+    mlog.info(`← CALL OFFER   from ${pid(msg.from)} — answered`);
+  } catch(e) {
+    mlog.err(`RTC        answer failed: ${e.message}`);
+    transition(msg.from, { type: "rtc_failed" });
+  }
+}
+
+async function handleCallAnswer(msg) {
+  if (!msg.from || !msg.to || !msg.callId || msg.to !== state.publicId) return;
+  const contact = state.contacts[msg.from];
+  if (!contact || contact.blocked) return;
+  if (!verifyCallPacket(msg, contact.signPublicKey)) {
+    mlog.warn(`← CALL ANSWER  from ${pid(msg.from)} — signature invalid, dropped`);
+    return;
+  }
+  if (contact.call?.callId !== msg.callId || contact.call.role !== "caller") {
+    mlog.debug(`← CALL ANSWER  from ${pid(msg.from)} — not expecting answer, ignored`);
+    return;
+  }
+  markOnline(msg.from);
+  const entry = rtcConns[msg.from];
+  if (!entry) { mlog.warn(`← CALL ANSWER  from ${pid(msg.from)} — no pc, dropped`); return; }
+  try {
+    const plain = await decryptMessage(msg.blob);
+    await entry.pc.setRemoteDescription({ type: "answer", sdp: plain.sdp });
+    await flushIceQueue(msg.from);
+    mlog.info(`← CALL ANSWER  from ${pid(msg.from)} — remote set`);
+  } catch(e) {
+    mlog.err(`← CALL ANSWER  from ${pid(msg.from)} — failed: ${e.message}`);
+    transition(msg.from, { type: "rtc_failed" });
+  }
+}
+
+async function handleCallIce(msg) {
+  if (!msg.from || !msg.to || !msg.callId || msg.to !== state.publicId) return;
+  const contact = state.contacts[msg.from];
+  if (!contact || contact.blocked) return;
+  if (!verifyCallPacket(msg, contact.signPublicKey)) {
+    mlog.warn(`← CALL ICE     from ${pid(msg.from)} — signature invalid, dropped`);
+    return;
+  }
+  if (contact.call?.callId !== msg.callId) return; // stale/unrelated call
+
+  let plain;
+  try { plain = await decryptMessage(msg.blob); }
+  catch(e) { mlog.warn(`← CALL ICE     from ${pid(msg.from)} — decrypt failed`); return; }
+
+  const entry = rtcConns[msg.from];
+  if (!entry) return;
+  if (entry.pc.remoteDescription) {
+    try { await entry.pc.addIceCandidate(plain); }
+    catch(e) { mlog.debug(`RTC        addIceCandidate failed: ${e.message}`); }
+  } else {
+    entry.iceQueue.push(plain);
+  }
+}
+
+/* ── RTC/UI stubs — statemachine.js's onStateEnter already calls these
+   unconditionally; real implementations are the NEXT step, not this one.
+   Kept as visible no-ops so entering ringing/negotiating/failed doesn't
+   throw before that work happens. ── */
+let incomingCallContactId = null;
+
+function showIncomingCallUI(id) {
+  incomingCallContactId = id;
+  const contact = state.contacts[id];
+  document.getElementById("incomingCallName").textContent = (contact?.name || pid(id)) + " is calling…";
+  document.getElementById("incomingCallBanner").classList.add("open");
+  updateCallHeaderBtn(id);
+}
+
+function hideIncomingCallUI(id) {
+  if (incomingCallContactId === id) {
+    incomingCallContactId = null;
+    document.getElementById("incomingCallBanner").classList.remove("open");
+  }
+  updateCallHeaderBtn(id);
+}
+
+/* ══════════════════════════════════════════
+   RTC — audio only for now (video deliberately
+   deferred). One RTCPeerConnection per contact,
+   keyed by contactId. iceQueue holds candidates
+   that arrive before the remote description is
+   set (trickle ICE races the SDP exchange).
+══════════════════════════════════════════ */
+const RTC_CONFIG = { iceServers: [{ urls: "stun:stun.l.google.com:19302" }] };
+const rtcConns   = {};   // contactId → { pc, iceQueue: [] }
+
+// Single shared local stream — fine under the current manual-only,
+// one-call-at-a-time assumption baked into the state machine. If that
+// assumption ever changes (concurrent calls to different contacts),
+// this needs to become per-call.
+let localStream = null;
+
+async function getLocalStream() {
+  if (localStream) return localStream;
+  try {
+    localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    mlog.info("RTC        mic acquired");
+  } catch(e) {
+    mlog.warn(`RTC        mic unavailable (${e.message}) — using synthetic test track`);
+    localStream = createSyntheticAudioStream();
+  }
+  return localStream;
+}
+
+// Silent (near-silent, actually — 0 gain sine) audio track for testing the
+// RTC signaling path without real hardware. NOT for production use — this
+// exists purely so offer/answer/ICE can be validated end-to-end on a
+// machine with no mic. Remove or gate behind a debug flag once real
+// hardware testing starts.
+function createSyntheticAudioStream() {
+  const ctx  = new AudioContext();
+  const osc  = ctx.createOscillator();
+  const gain = ctx.createGain();
+  gain.gain.value = 0;   // silent — just needs to be a live track, not actually audible
+  osc.connect(gain);
+  const dest = ctx.createMediaStreamDestination();
+  gain.connect(dest);
+  osc.start();
+  return dest.stream;
+}
+
+function releaseLocalStream() {
+  if (localStream) {
+    localStream.getTracks().forEach(t => t.stop());
+    localStream = null;
+    mlog.debug("RTC        mic released");
+  }
+}
+
+async function createPeerConnection(id) {
+  if (rtcConns[id]?.pc) return rtcConns[id].pc;
+  const pc = new RTCPeerConnection(RTC_CONFIG);
+  rtcConns[id] = { pc, iceQueue: [] };
+
+  pc.onicecandidate = (e) => { if (e.candidate) sendCallIce(id, e.candidate); };
+
+  pc.ontrack = (e) => {
+    let audioEl = document.getElementById("remoteAudio_" + id);
+    if (!audioEl) {
+      audioEl = document.createElement("audio");
+      audioEl.id = "remoteAudio_" + id;
+      audioEl.autoplay = true;
+      document.body.appendChild(audioEl);
+    }
+    audioEl.srcObject = e.streams[0];
+    mlog.info(`RTC        remote track attached  ${pid(id)}`);
+  };
+
+  pc.onconnectionstatechange = () => {
+    mlog.debug(`RTC        state=${pc.connectionState}  ${pid(id)}`);
+    if (pc.connectionState === "connected") transition(id, { type: "rtc_connected" });
+    else if (pc.connectionState === "failed") transition(id, { type: "rtc_failed" });
+    else if (pc.connectionState === "closed") transition(id, { type: "rtc_closed" });
+  };
+
+  return pc;
+}
+
+async function flushIceQueue(id) {
+  const entry = rtcConns[id];
+  if (!entry) return;
+  for (const cand of entry.iceQueue) {
+    try { await entry.pc.addIceCandidate(cand); }
+    catch(e) { mlog.debug(`RTC        queued ICE add failed: ${e.message}`); }
+  }
+  entry.iceQueue = [];
+}
+
+// real implementation — replaces the old stub
+async function rtcOffer(id) {
+  try {
+    const pc     = await createPeerConnection(id);
+    const stream = await getLocalStream();
+    stream.getTracks().forEach(t => pc.addTrack(t, stream));
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    await sendCallSDP(id, "call:offer", offer.sdp);
+    mlog.info(`RTC        offer sent  ${pid(id)}`);
+  } catch(e) {
+    mlog.err(`RTC        offer failed: ${e.message}`);
+    transition(id, { type: "rtc_failed" });
+  }
+}
+
+// real implementation — replaces the old stub
+function rtcClose(id) {
+  const entry = rtcConns[id];
+  if (entry) { entry.pc.close(); delete rtcConns[id]; }
+  const audioEl = document.getElementById("remoteAudio_" + id);
+  if (audioEl) { audioEl.srcObject = null; audioEl.remove(); }
+  releaseLocalStream();
+  mlog.debug(`RTC        closed  ${pid(id)}`);
+}
+
+// Reflects call.phase on the header button — only touches the DOM if the
+// contact in question is the one currently open, same guard pattern as
+// updateChatRelayInfo.
+function updateCallHeaderBtn(id) {
+  if (id !== state.currentChat) return;
+  const btn = document.getElementById("callBtn");
+  if (!btn) return;
+  const isMe   = id === state.publicId;
+  const phase  = state.contacts[id]?.call?.phase || "idle";
+  const GLYPH  = { idle: "☎", calling: "☎…", ringing: "☎…", negotiating: "☎…", connected: "⏹", failed: "☎" };
+  const TITLE  = { idle: "Call", calling: "Calling… (click to cancel)", ringing: "Incoming — use the popup",
+                   negotiating: "Connecting… (click to cancel)", connected: "Hang up", failed: "Call failed (click to reset)" };
+  btn.className   = "state-" + phase;
+  btn.classList.toggle("visible", !isMe);
+  btn.textContent = GLYPH[phase]  || "☎";
+  btn.title       = TITLE[phase]  || "Call";
+  btn.disabled    = phase === "ringing";   // answer/decline only via the popup, to avoid two conflicting controls
+}
+
+document.getElementById("callBtn").onclick = () => {
+  const id = state.currentChat;
+  if (!id || id === state.publicId) return;
+  const phase = state.contacts[id]?.call?.phase || "idle";
+  if (phase === "idle")                              startCall(id);
+  else if (phase === "calling" || phase === "negotiating") cancelCall(id);
+  else if (phase === "connected")                    endCall(id);
+  else if (phase === "failed")                       transition(id, { type: "reset" });
+};
+
+document.getElementById("answerCallBtn").onclick  = () => { if (incomingCallContactId) answerCall(incomingCallContactId); };
+document.getElementById("declineCallBtn").onclick = () => { if (incomingCallContactId) cancelCall(incomingCallContactId); };
+
+/* ══════════════════════════════════════════
    CONTACTS
 ══════════════════════════════════════════ */
 async function addContact(name,shareableKey,save=true){
@@ -2207,6 +2652,7 @@ function openChat(id) {
   nameEl.textContent = c.name;
   idEl.textContent   = c.publicId.slice(0,16) + "…";
   updateChatRelayInfo(id);
+  updateCallHeaderBtn(id);
   const menuBtn = document.getElementById("contactMenuBtn");
   const isMe    = c.publicId === state.publicId;
   menuBtn.classList.add("visible");

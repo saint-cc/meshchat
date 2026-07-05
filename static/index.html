@@ -114,6 +114,7 @@ if ("serviceWorker" in navigator) {
           <div id="chatHeaderName" style="display:none"></div>
           <div id="chatHeaderId"   style="display:none"></div>
           <div id="chatHeaderRelay" style="display:none;font-size:10px;color:var(--muted);margin-top:2px;letter-spacing:0.05em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis"></div>
+		  <button id="callBtn" title="Call">☎</button>
         </div>						
 		<button id="contactMenuBtn" title="Contact options">⋯</button>
       </div>
@@ -148,6 +149,14 @@ if ("serviceWorker" in navigator) {
   <div id="meshLogBody"></div>
 </div>
 
+<!-- incoming Call -->
+<div id="incomingCallBanner">
+  <div id="incomingCallName"></div>
+  <div class="incomingCallBtns">
+    <button id="answerCallBtn">ANSWER</button>
+    <button id="declineCallBtn">DECLINE</button>
+  </div>
+</div>
 
 <!-- CONTACT ACTION MODAL -->
 <div id="contactActionOverlay" class="overlay">

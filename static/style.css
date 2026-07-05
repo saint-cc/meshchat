@@ -557,3 +557,37 @@
   color: var(--muted);
   font-style: italic;
 }
+
+#callBtn {
+  background: none; border: 1px solid var(--border); color: var(--online);
+  width: 28px; height: 28px; font-size: 14px; cursor: pointer;
+  display: none; align-items: center; justify-content: center;
+  transition: border-color 0.2s, color 0.2s, background 0.2s;
+  flex-shrink: 0; margin-right: 8px;
+}
+#callBtn.visible { display: flex; }
+#callBtn:hover { border-color: var(--online); background: var(--surface2); }
+#callBtn.state-calling, #callBtn.state-ringing, #callBtn.state-negotiating {
+  color: var(--accent); border-color: var(--accent); animation: pulse 1s infinite;
+}
+#callBtn.state-connected { color: var(--danger); border-color: var(--danger); animation: none; }
+#callBtn.state-failed { color: var(--danger); border-color: var(--danger); animation: none; }
+#callBtn:disabled { opacity: 0.5; cursor: default; animation: none; }
+
+#incomingCallBanner {
+  display: none;
+  position: fixed; top: 0; left: 50%; transform: translateX(-50%);
+  background: var(--surface2); border: 1px solid var(--accent); border-top: none;
+  padding: 14px 20px; z-index: 500;
+  flex-direction: column; align-items: center; gap: 10px;
+  box-shadow: 0 4px 16px rgba(0,0,0,.6);
+}
+#incomingCallBanner.open { display: flex; }
+#incomingCallName { font-size: 13px; letter-spacing: 0.1em; color: var(--accent); }
+.incomingCallBtns { display: flex; gap: 8px; }
+.incomingCallBtns button {
+  padding: 8px 16px; font-family: inherit; font-size: 11px; letter-spacing: 0.1em;
+  border: 1px solid var(--border); cursor: pointer;
+}
+#answerCallBtn  { background: var(--online); color: #000; border-color: var(--online); font-weight: bold; }
+#declineCallBtn { background: none; color: var(--danger); border-color: var(--danger); }

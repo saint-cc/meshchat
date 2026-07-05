@@ -54,8 +54,8 @@ function transition(id, event) {
 		if (event.type === "rtc_connected")
 		  conn.phase = "connected";
 
-		if (event.type === "rtc_failed")
-		  conn.phase = "failed";
+		if (event.type === "rtc_failed" || event.type === "call_ended" || event.type === "call_cancelled")
+		  { conn.phase = "idle"; conn.role = null; }
 		break;
 
 	  case "connected":
@@ -97,6 +97,7 @@ function onStateEnter(id, oldPhase, newPhase, role) {
       break;
 
     case "negotiating":
+      if (oldPhase === "ringing") hideIncomingCallUI(id);
       if (role === "caller") rtcOffer(id);
       // callee waits for the offer to arrive, then calls rtcAnswer(id)
       // itself from the signal handler — nothing to do on entry here
@@ -115,6 +116,8 @@ function onStateEnter(id, oldPhase, newPhase, role) {
     case "idle":
       if (oldPhase === "ringing" || oldPhase === "calling")
         hideIncomingCallUI(id);
+	  rtcClose(id);   // ← added — safe no-op if no pc exists for this contact
       break;
   }
+  updateCallHeaderBtn(id);
 }

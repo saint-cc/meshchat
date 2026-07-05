@@ -652,7 +652,9 @@ async def handler(ws):
             elif kind in ("app:sync", "sync:backup_offer", "sync:backup_accept",
                           "sync:backup_push", "sync:restore_req",
                           "sync:restore_ack", "sync:restore_push",
-                          "sync:token_req", "sync:token_resp"):
+                          "sync:token_req", "sync:token_resp",
+                          "call:invite", "call:claim", "call:cancel", "call:end",
+                          "call:offer", "call:answer", "call:ice"):
                 frm = msg.get("from", "?")
                 to  = msg.get("to")
                 if not valid_id(to):
