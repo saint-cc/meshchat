@@ -2263,7 +2263,9 @@ let localStream = null;
 async function getLocalStream() {
   if (localStream) return localStream;
   try {
-    localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    localStream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+    });
     mlog.info("RTC        mic acquired");
   } catch(e) {
     mlog.warn(`RTC        mic unavailable (${e.message}) — using synthetic test track`);
