@@ -1378,11 +1378,11 @@ function drainOldRelay(url) {
     // deleted it server-side. Put it straight back so a straggler device
     // arriving after we've disconnected can still find it. Reuse the
     // blob/sig as-is — same fact, no re-encryption needed.
-    if (msg.type === "app:migrate" && msg.from === state.publicId && msg.to === state.publicId) {
-      sendViaRelayUrl(url, msg);
-      mlog.info(`MIGRATE    drain — own breadcrumb consumed, replanted`);
-      return;   // don't also run it through handleMigrate — nothing to adopt, we already know
-    }
+	if (msg.type === "app:migrate" && msg.from === state.publicId && msg.to === state.publicId) {
+	  ws.send(JSON.stringify(msg));
+	  mlog.info(`MIGRATE    drain — own breadcrumb consumed, replanted`);
+	  return;
+	}
 	recovered++;
     handleSignal(msg);
   };
