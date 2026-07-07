@@ -2,7 +2,7 @@
 
 A decentralised, encrypted messaging protocol built on WebSocket relay servers. No accounts, no central authority, no plaintext.
 
-Current client/server implementation version: `0.3.3`, surfaced informationally via the `version` field on `sig:relay_info` for drift visibility (not yet enforced).
+Current client/server implementation version: `0.3.4`, surfaced informationally via the `version` field on `sig:relay_info` for drift visibility (not yet enforced).
 
 ---
 
@@ -293,6 +293,91 @@ The registry is displayed in a per-contact device popover in the UI. Contacts wi
 
 ---
 
+## Voice Calling
+
+Audio calls are negotiated peer-to-peer over WebRTC. The relay carries only small, signed signaling packets to set up the call — it never sees or forwards media, and (unlike messages) these packets are not encrypted, since `from`/`to` are already visible on the wire for every packet type and there's nothing else here worth hiding.
+
+**No TURN server.** ICE uses public STUN only — three servers for resilience (`stun.l.google.com:19302`, `stun1.l.google.com:19302`, `global.stun.twilio.com:3478`). Having no TURN is a permanent architectural decision, not a gap to be filled in later — some NAT pairings will never connect, and the UI should say so honestly rather than retrying forever or hiding the failure.
+
+### Signaling packets — invite / claim / cancel / end
+
+```json
+{
+  "type":     "call:invite",
+  "from":     "<publicId>",
+  "to":       "<publicId>",
+  "callId":   "<uuid>",
+  "ts":       1234567890123,
+  "deviceId": "<deviceId>",
+  "sig":      [...]
+}
+```
+
+Four types: `call:invite`, `call:claim`, `call:cancel`, `call:end`. All share this shape and carry no `blob` — there is no payload here worth encrypting. `callId` ties every packet to one call attempt and is generated once by the caller at call start.
+
+**Signature is mandatory** — the same rule as `app:migrate`: these packets drive state transitions (ringing, negotiating, hangup), not just displayed content, so an unsigned or invalid one is dropped outright rather than flagged and shown. The signed payload is `{ type, from, to, callId, deviceId, ts, blob: null }`.
+
+Routing follows the normal contact-relay priority (`sendToRelay` → `sendSignal` fallback) — no special-cased delivery path.
+
+### Signaling packets — offer / answer / ice (WebRTC negotiation)
+
+```json
+{
+  "type":     "call:offer",
+  "from":     "<publicId>",
+  "to":       "<publicId>",
+  "callId":   "<uuid>",
+  "ts":       1234567890123,
+  "deviceId": "<deviceId>",
+  "blob":     { "v": 1, "iv": [...], "data": [...] },
+  "sig":      [...]
+}
+```
+
+Three types: `call:offer`, `call:answer`, `call:ice`. Unlike the invite/claim/cancel/end group, these carry a `blob` — the SDP (`{ sdp }`) or one ICE candidate (`candidate.toJSON()`) — encrypted with the recipient's `encKey` via the same `encryptMessage` scheme as a regular message. The signed payload is `{ type, from, to, callId, deviceId, ts, blob }` — **the ciphertext itself is inside the signature**, the same protection `app:migrate` relies on, so the relay can't swap the encrypted SDP/ICE payload for another without invalidating the signature.
+
+Only accepted while `contact.call.callId` matches and the local role is the expected one for that packet (`call:offer` only while `role === "callee"`, `call:answer` only while `role === "caller"`). `call:ice` candidates arriving before the remote description is set are queued (`iceQueue`) and flushed once it's applied, since trickle ICE races the SDP exchange.
+
+On `call:offer` receipt the callee builds the `RTCPeerConnection`, sets the remote description, flushes any queued ICE, acquires the local media stream, creates and sets the answer, and sends it back as `call:answer`. Local media uses `getUserMedia({ audio: { echoCancellation, noiseSuppression, autoGainControl } })`, falling back to a silent synthetic oscillator track in environments with no microphone (dev/testing only).
+
+### Call state machine
+
+Per-contact call state (`contact.call = { callId, phase, role }`), phases:
+
+```
+idle → calling ⇄ negotiating → connected → idle
+  ↑        ↓                        ↓
+  └── ringing                    failed → idle
+```
+
+| Phase | Meaning |
+|---|---|
+| `idle` | No active call with this contact |
+| `calling` | We invited them, awaiting claim (role: `caller`) |
+| `ringing` | They invited us, awaiting local answer (role: `callee`) |
+| `negotiating` | Claimed on one side; WebRTC offer/answer/ICE exchange in progress |
+| `connected` | Media flowing |
+| `failed` | ICE/RTC failure — requires explicit reset back to `idle` |
+
+The state machine (`transition()` in `statemachine.js`) is pure logic — dedup and staleness decisions (is this claim for the call in flight? is it from one of our own devices?) are resolved by the caller of `transition()` before it's invoked, not inside it.
+
+### Multi-device dedup
+
+An invite can reach several of the callee's devices at once. When one device answers, `answerCall()` sends `call:claim` twice:
+
+1. To the caller — advances their state `calling → negotiating`.
+2. **Self-targeted**, to the callee's own identity — every other device of theirs sees `from === state.publicId`, verifies it against their *own* signing key rather than a contact's, and transitions any device still `ringing` on that same `callId` to `idle` (`claimed_elsewhere`) — silently, no UI ceremony.
+
+The device that actually claimed the call ignores its own echo by comparing `deviceId`.
+
+### Role and negotiation
+
+`role` (`caller` | `callee`) is set on entering `calling`/`ringing` and cleared on return to `idle`. On entering `negotiating`, the caller makes the WebRTC offer (`rtcOffer()` — acquires local media, creates and sets the offer, sends `call:offer`); the callee waits for it and answers via `handleCallOffer()`. This asymmetry lives in `onStateEnter()`, not in the wire protocol.
+
+**Not yet implemented:** ICE connection state / candidate-type (`host`/`srflx`/`relay`) logging for diagnosing NAT failure patterns, an ICE-restart retry path for transient failures, and honest UI messaging distinguishing "still trying" from "this NAT pairing will not connect."
+
+---
+
 ## Signal Server Protocol
 
 ### Client → Server
@@ -313,6 +398,13 @@ The registry is displayed in a per-contact device popover in the UI. Contacts wi
 | `sync:restore_push` | `from`, `to`, `blob`                      | yes  | Push stored backup to requester |
 | `sync:token_req`    | `from`, `to`                              | yes  | Request a contact token |
 | `sync:token_resp`   | `from`, `to`, `token`                     | yes  | Deliver a contact token |
+| `call:invite`       | `from`, `to`, `callId`, `ts`, `deviceId?`, `sig` | yes | Invite a contact to a call — mandatory signature |
+| `call:claim`        | `from`, `to`, `callId`, `ts`, `deviceId?`, `sig` | yes | Answer a call — also sent self-targeted for multi-device dedup |
+| `call:cancel`       | `from`, `to`, `callId`, `ts`, `deviceId?`, `sig` | yes | Cancel/decline before connection |
+| `call:end`          | `from`, `to`, `callId`, `ts`, `deviceId?`, `sig` | yes | Hang up an active or negotiating call |
+| `call:offer`        | `from`, `to`, `callId`, `ts`, `deviceId?`, `blob`, `sig` | yes | WebRTC SDP offer — `blob` encrypted with recipient's `encKey`, signed with `blob` included |
+| `call:answer`       | `from`, `to`, `callId`, `ts`, `deviceId?`, `blob`, `sig` | yes | WebRTC SDP answer — same encryption/signing as `call:offer` |
+| `call:ice`          | `from`, `to`, `callId`, `ts`, `deviceId?`, `blob`, `sig` | yes | One ICE candidate — same encryption/signing as `call:offer` |
 | `sig:relay_req`     | —                                         | yes | Request relay's own WSS URL |
 | `sig:ping`          | —                                         | yes | Keepalive |
 
@@ -334,6 +426,8 @@ The registry is displayed in a per-contact device popover in the UI. Contacts wi
 - `app:migrate` is always written to the durable buffer in addition to any live delivery.
 - `sync:backup_accept` and `sync:backup_push` carry optional `deviceId`/`fingerprint` fields used exclusively on the self-sync path. These fields are never set on the contact backup path. Old clients that omit them are handled gracefully.
 - Sync and backup types are e2e encrypted and routed by the server without inspection of contents — but the socket itself must be authed before any of these are accepted. This closes a prior gap where an unauthenticated connection could reach these branches before completing the challenge-response.
+- All seven `call:*` types are delivered live-only via the same `deliver()`/`from`-validation path as `app:sync` and the `sync:*` types; unlike `app:message`/`app:migrate` they are never durably buffered, so a callee who is offline simply never rings.
+- `call:invite`/`call:claim`/`call:cancel`/`call:end` carry no `blob` — signed only, nothing to encrypt. `call:offer`/`call:answer`/`call:ice` carry an encrypted `blob` (SDP or one ICE candidate) and sign the ciphertext along with the envelope, same protection principle as `app:migrate`.
 
 ---
 
