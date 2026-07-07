@@ -2251,7 +2251,13 @@ function hideIncomingCallUI(id) {
    that arrive before the remote description is
    set (trickle ICE races the SDP exchange).
 ══════════════════════════════════════════ */
-const RTC_CONFIG = { iceServers: [{ urls: "stun:stun.l.google.com:19302" }] };
+const RTC_CONFIG = {
+  iceServers: [
+    { urls: "stun:stun.l.google.com:19302" },
+    { urls: "stun:stun1.l.google.com:19302" },
+    { urls: "stun:global.stun.twilio.com:3478" }
+  ]
+};
 const rtcConns   = {};   // contactId → { pc, iceQueue: [] }
 
 // Single shared local stream — fine under the current manual-only,
