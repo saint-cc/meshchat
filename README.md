@@ -1,23 +1,24 @@
-````markdown
 # MeshChat
 
 Decentralised, end-to-end encrypted messaging built around cryptographic identities rather than accounts.
 
 No registration. No central identity provider. No plaintext.
 
-Messages are encrypted in the browser before they leave your device. Relay servers transport and 
+Messages are encrypted in the browser before they leave your device. Relay servers transport and
 temporarily buffer ciphertext, but never possess your private keys or message contents.
+
+Protocol version: `0.3.4` (see `protocol.md` for the full spec).
 
 ---
 
 ## How it works
 
-Your identity is derived locally from your username and passphrase using PBKDF2 + HKDF. The same 
+Your identity is derived locally from your username and passphrase using PBKDF2 + HKDF. The same
 credentials always produce the same cryptographic identity.
 
 There are no accounts to create and no passwords stored on any server. Your passphrase **is** your identity.
 
-Contacts are added by exchanging a shareable address (QR code or copy-paste). This contains your encryption 
+Contacts are added by exchanging a shareable address (QR code or copy-paste). This contains your encryption
 public key, signing public key and current relay address. No registration or central directory is required.
 
 Messages are encrypted with AES-256-GCM for the recipient and signed with Ed25519 before leaving your device.
@@ -27,9 +28,11 @@ Messages are encrypted with AES-256-GCM for the recipient and signed with Ed2551
 ## Features
 
 - End-to-end encrypted text, image and audio messages
+- Voice calling — peer-to-peer WebRTC audio, signaled through the relay (relay never sees or forwards media)
 - Message signing and verification
 - No accounts, email addresses or phone numbers
-- Roaming identities — move freely between relay servers
+- Roaming identities — migrate deliberately between relay servers, with contacts and your other devices notified automatically
+- Device awareness — each client tracks which devices (yours and contacts') it has seen traffic from, shown in the UI
 - No central directory or identity provider
 - Direct client-to-relay delivery across different relays
 - Offline delivery through temporary encrypted relay buffers
@@ -39,6 +42,13 @@ Messages are encrypted with AES-256-GCM for the recipient and signed with Ed2551
 - Encrypted backup export / import
 - Progressive Web App (PWA)
 - Installable and offline-capable for reading conversations
+
+### Voice calling limitations
+
+Calling uses public STUN servers only — **there is no TURN server, and none is planned.** This is a
+deliberate architectural decision, not a gap to be filled in later. Some NAT/firewall pairings will
+never be able to connect directly, and retrying will not help in those cases. See `protocol.md` for
+the signaling details.
 
 ---
 
@@ -145,18 +155,18 @@ server {
 
 ### Static files
 
-The client files (`index.html`, `style.css`, `script.js`, `manifest.json`, `sw.js`) are inside a `static/` 
+The client files (`index.html`, `style.css`, `script.js`, `manifest.json`, `sw.js`) are inside a `static/`
 directory next to `server.py`.
 
 ---
 
 ## Relay authentication
 
-When a client connects, the relay authenticates the session by verifying ownership of the presented public 
-key through 
+When a client connects, the relay authenticates the session by verifying ownership of the presented public
+key through
 a challenge-response exchange.
 
-This allows the relay to associate active connections and offline message buffers with authenticated 
+This allows the relay to associate active connections and offline message buffers with authenticated
 identities without ever learning private keys or passphrases.
 
 Relay authentication protects against identity spoofing while preserving end-to-end encryption.
@@ -167,13 +177,13 @@ Relay authentication protects against identity spoofing while preserving end-to-
 
 MeshChat separates **transport** from **trust**.
 
-Relay servers are intentionally simple transport nodes. They forward ciphertext, temporarily buffer encrypted 
+Relay servers are intentionally simple transport nodes. They forward ciphertext, temporarily buffer encrypted
 messages for offline users, and authenticate ownership of public identities during connection.
 
 Trust resides entirely in cryptographic identities generated locally by each client.
 
-There is no global directory, no relay-to-relay communication and no central authority coordinating the network. 
-Contacts learn each other's current relay location directly, allowing identities to migrate between relays 
+There is no global directory, no relay-to-relay communication and no central authority coordinating the network.
+Contacts learn each other's current relay location directly, allowing identities to migrate between relays
 while remaining reachable.
 
 ---
@@ -196,12 +206,14 @@ while remaining reachable.
 * passphrases
 * contact names
 * encrypted backups
+* call audio (media is peer-to-peer; the relay only carries signed call setup packets)
 
 ### Important limitations
 
 * Passphrase security is everything.
 * Static identities mean there is currently **no forward secrecy**.
 * Relay operators can observe IP addresses.
+* No TURN server — some NAT pairings will never be able to establish a voice call.
 * MeshChat is **not** an anonymity network and is not a replacement for Tor.
 
 See `known-limitations.md` for a complete discussion.
@@ -217,7 +229,7 @@ Messages are delivered directly to the recipient's current relay.
 3. Bob's client opens a temporary connection directly to Alice's relay.
 4. Alice's relay immediately delivers the message if she is connected.
 5. Otherwise the encrypted message is buffered until Alice reconnects.
-6. When Alice migrates to another relay, her contacts automatically learn her new location through normal protocol traffic.
+6. When Alice migrates to another relay, her contacts automatically learn her new location through normal protocol traffic, and any of her own other devices still at the old relay are notified directly.
 
 Relay servers never communicate with one another.
 
@@ -235,7 +247,7 @@ Relay servers never communicate with one another.
 
 ## Protocol
 
-See `protocol.md` for the complete protocol specification, packet formats, routing rules, synchronization protocol and backup protocol.
+See `protocol.md` for the complete protocol specification, packet formats, routing rules, synchronization protocol, voice calling signaling, and backup protocol.
 
 ---
 
@@ -244,6 +256,3 @@ See `protocol.md` for the complete protocol specification, packet formats, routi
 MeshChat is an experimental research project exploring decentralised, roaming, end-to-end encrypted messaging.
 
 The protocol is still evolving and should not yet be considered stable.
-
-```
-```
