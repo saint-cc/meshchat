@@ -577,6 +577,9 @@ async def handle_shell_offer(ws, identity: "Identity", contacts_by_id: dict, msg
             @channel.on("open")
             def on_data_open():
                 asyncio.ensure_future(session.start_pty())
+                
+            if channel.readyState == "open":
+                asyncio.ensure_future(session.start_pty())
 
         elif channel.label == "shell-ctrl":
             session.ctrl_ch = channel

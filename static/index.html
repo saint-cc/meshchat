@@ -5,6 +5,9 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0"> 
 <title>MeshChat</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' fill='%23000'/%3E%3Cpath d='M3 8h10' stroke='%2300ffcc' stroke-width='2'/%3E%3Ccircle cx='8' cy='8' r='2' fill='%2300ffcc'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="https://unpkg.com/xterm@5.3.0/css/xterm.css">
+<script src="https://unpkg.com/xterm@5.3.0/lib/xterm.js"></script>
+<script src="https://unpkg.com/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
 <script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
 <script type="module">
@@ -224,6 +227,22 @@ if ("serviceWorker" in navigator) {
     </div>
   </div>
 </div>
+
+<div id="shellTerminalPanel" class="overlay">
+  <div class="modal-box" style="width:min(880px, 92vw);max-width:92vw;padding:0;overflow:hidden">
+    <div id="shellTerminalHeader" style="display:flex;align-items:center;justify-content:space-between;padding:10px 14px;border-bottom:1px solid var(--border)">
+      <span id="shellTerminalName" style="font-size:11px;letter-spacing:0.08em;color:var(--dim)">shell</span>
+      <button id="shellTerminalEndBtn" class="btn-cancel" style="padding:4px 10px;font-size:10px">END SESSION</button>
+    </div>
+    <div id="shellTerminalContainer" style="height:60vh;padding:8px;background:#0a0a0a"></div>
+  </div>
+</div>
+
+<style>
+#shellTerminalPanel.overlay { display: none; }
+#shellTerminalPanel.overlay.open { display: flex; align-items: center; justify-content: center; }
+.xterm { height: 100%; }
+</style>
 
 <a
     href="https://github.com/saint-cc/meshchat"

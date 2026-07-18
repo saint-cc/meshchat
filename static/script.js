@@ -1032,6 +1032,13 @@ function handleSignal(msg) {
 	case "call:offer":  handleCallOffer(msg);  break;
 	case "call:answer": handleCallAnswer(msg); break;
 	case "call:ice":     handleCallIce(msg);    break;
+	case "shell:invite": handleShellInvite(msg); break;
+	case "shell:claim":  handleShellClaim(msg);  break;
+	case "shell:cancel": handleShellCancel(msg); break;
+	case "shell:end":    handleShellEnd(msg);    break;	
+    case "shell:offer":  handleShellOffer(msg);  break;
+    case "shell:answer": handleShellAnswer(msg); break;
+    case "shell:ice":    handleShellIce(msg);    break;
 	
     case "sig:auth_challenge": handleAuthChallenge(msg); break;
     case "sig:auth_ok":        handleAuthOk(msg);        break;
@@ -1992,6 +1999,16 @@ function verifyCallPacket(obj, contactSignPublicKey) {
   return verifyBlob({ type, from, to, callId, deviceId: deviceId || null, ts, blob: blob || null }, obj.sig, contactSignPublicKey);
 }
 
+function signShellPacket(obj) {
+  const { type, from, to, sessionId, deviceId, ts, blob } = obj;
+  return signBlob({ type, from, to, sessionId, deviceId: deviceId || null, ts, blob: blob || null });
+}
+
+function verifyShellPacket(obj, contactSignPublicKey) {
+  if (!obj.sig || !contactSignPublicKey) return false;
+  const { type, from, to, sessionId, deviceId, ts, blob } = obj;
+  return verifyBlob({ type, from, to, sessionId, deviceId: deviceId || null, ts, blob: blob || null }, obj.sig, contactSignPublicKey);
+}
 function sendCallPacket(toId, type, callId) {
   const obj = { type, from: state.publicId, to: toId, callId, ts: Date.now(), deviceId: state.deviceId };
   obj.sig = signCallPacket(obj);
@@ -2125,6 +2142,120 @@ async function handleCallEnd(msg) {
   transition(msg.from, { type: "call_ended" });
 }
 
+async function handleShellInvite(msg) {
+  if (!msg.from || !msg.to || !msg.sessionId || msg.to !== state.publicId) return;
+  const contact = state.contacts[msg.from];
+  if (!contact || contact.blocked) return;
+  if (!verifyShellPacket(msg, contact.signPublicKey)) {
+    mlog.warn(`← SHELL INVITE from ${pid(msg.from)} — signature invalid, dropped`);
+    return;
+  }
+  markOnline(msg.from);
+  if (contact.shell && contact.shell.phase !== "idle") {
+    mlog.debug(`← SHELL INVITE from ${pid(msg.from)} — already in session (phase=${contact.shell.phase}), ignored`);
+    return;
+  }
+  contact.shell = { sessionId: msg.sessionId, phase: "idle", role: null };
+  transition(msg.from, { type: "invite_received" }, "shell");
+}
+
+async function handleShellClaim(msg) {
+  if (!msg.from || !msg.to || !msg.sessionId || msg.to !== state.publicId) return;
+  const contact = state.contacts[msg.from];
+  if (!contact || contact.blocked) return;
+  if (!verifyShellPacket(msg, contact.signPublicKey)) {
+    mlog.warn(`← SHELL CLAIM  from ${pid(msg.from)} — signature invalid, dropped`);
+    return;
+  }
+  if (contact.shell?.sessionId !== msg.sessionId) {
+    mlog.debug(`← SHELL CLAIM  from ${pid(msg.from)} — sessionId mismatch/stale, ignored`);
+    return;
+  }
+  markOnline(msg.from);
+  transition(msg.from, { type: "claim_received" }, "shell");
+}
+
+async function handleShellCancel(msg) {
+  if (!msg.from || !msg.to || !msg.sessionId || msg.to !== state.publicId) return;
+  const contact = state.contacts[msg.from];
+  if (!contact) return;
+  if (!verifyShellPacket(msg, contact.signPublicKey)) {
+    mlog.warn(`← SHELL CANCEL from ${pid(msg.from)} — signature invalid, dropped`);
+    return;
+  }
+  if (contact.shell?.sessionId !== msg.sessionId) return;
+  transition(msg.from, { type: "call_cancelled" }, "shell");
+}
+
+async function handleShellEnd(msg) {
+  if (!msg.from || !msg.to || !msg.sessionId || msg.to !== state.publicId) return;
+  const contact = state.contacts[msg.from];
+  if (!contact) return;
+  if (!verifyShellPacket(msg, contact.signPublicKey)) {
+    mlog.warn(`← SHELL END    from ${pid(msg.from)} — signature invalid, dropped`);
+    return;
+  }
+  if (contact.shell?.sessionId !== msg.sessionId) return;
+  transition(msg.from, { type: "call_ended" }, "shell");
+}
+
+async function handleShellOffer(msg) {
+  // Client-side is not expected to receive shell:offer today — the human
+  // is always the offerer per the agreed asymmetry, and agent.py never
+  // initiates. Guarded and logged rather than silently ignored, in case
+  // that assumption changes later (human-to-human shell sharing).
+  mlog.debug(`← SHELL OFFER  from ${pid(msg.from)} — unexpected, human client is always offerer, ignored`);
+}
+ 
+async function handleShellAnswer(msg) {
+  if (!msg.from || !msg.to || !msg.sessionId || msg.to !== state.publicId) return;
+  const contact = state.contacts[msg.from];
+  if (!contact || contact.blocked) return;
+  if (!verifyShellPacket(msg, contact.signPublicKey)) {
+    mlog.warn(`← SHELL ANSWER from ${pid(msg.from)} — signature invalid, dropped`);
+    return;
+  }
+  if (contact.shell?.sessionId !== msg.sessionId || contact.shell.role !== "caller") {
+    mlog.debug(`← SHELL ANSWER from ${pid(msg.from)} — not expecting answer, ignored`);
+    return;
+  }
+  markOnline(msg.from);
+  const entry = shellConns[msg.from];
+  if (!entry) { mlog.warn(`← SHELL ANSWER from ${pid(msg.from)} — no pc, dropped`); return; }
+  try {
+    const plain = await decryptMessage(msg.blob);
+    await entry.pc.setRemoteDescription({ type: "answer", sdp: plain.sdp });
+    await flushShellIceQueue(msg.from);
+    mlog.info(`← SHELL ANSWER from ${pid(msg.from)} — remote set`);
+  } catch(e) {
+    mlog.err(`← SHELL ANSWER from ${pid(msg.from)} — failed: ${e.message}`);
+    transition(msg.from, { type: "rtc_failed" }, "shell");
+  }
+}
+ 
+async function handleShellIce(msg) {
+  if (!msg.from || !msg.to || !msg.sessionId || msg.to !== state.publicId) return;
+  const contact = state.contacts[msg.from];
+  if (!contact || contact.blocked) return;
+  if (!verifyShellPacket(msg, contact.signPublicKey)) {
+    mlog.warn(`← SHELL ICE    from ${pid(msg.from)} — signature invalid, dropped`);
+    return;
+  }
+  if (contact.shell?.sessionId !== msg.sessionId) return; // stale/unrelated session
+ 
+  let plain;
+  try { plain = await decryptMessage(msg.blob); }
+  catch(e) { mlog.warn(`← SHELL ICE    from ${pid(msg.from)} — decrypt failed`); return; }
+ 
+  const entry = shellConns[msg.from];
+  if (!entry) return;
+  if (entry.pc.remoteDescription) {
+    try { await entry.pc.addIceCandidate(plain); }
+    catch(e) { mlog.debug(`SHELL RTC  addIceCandidate failed: ${e.message}`); }
+  } else {
+    entry.iceQueue.push(plain);
+  }
+}
 //  send + receive for offer/answer/ice
 
 async function sendCallSDP(id, type, sdp) {
@@ -2494,7 +2625,11 @@ function endShell(id) {
      openShellTerminal — the xterm.js panel, the actual visible payoff
 ══════════════════════════════════════════ */
 function sendShellPacket(id, type, sessionId) {
-  mlog.info(`SHELL      would send ${type}  to=${pid(id)}  session=${pid(sessionId)} — not implemented yet`);
+  const obj = { type, from: state.publicId, to: id, sessionId, ts: Date.now(), deviceId: state.deviceId };
+  obj.sig = signShellPacket(obj);
+  const viaRelay = sendToRelay(id, obj, false);
+  if (!viaRelay) sendSignal(obj);
+  mlog.info(`→ ${type.toUpperCase()}  to ${pid(id)}  session=${pid(sessionId)}  via=${viaRelay ? "relay" : "signal(fallback)"}`);
 }
 
 function sendShellInvite(id) {
@@ -2511,17 +2646,217 @@ function hideIncomingShellUI(id) {
   mlog.debug(`SHELL      hideIncomingShellUI(${pid(id)}) — stub`);
 }
 
-function shellRtcOffer(id) {
-  mlog.info(`SHELL      would open data channels + send offer  to=${pid(id)} — not implemented yet`);
+const shellConns = {};   // contactId → { pc, dataCh, ctrlCh, iceQueue: [] }
+ 
+async function sendShellSDP(id, type, sdp) {
+  const contact = state.contacts[id];
+  if (!contact?.shell?.sessionId || !contact.encKey) return;
+  const blob = await encryptMessage(contact.encKey, { sdp });
+  const obj  = { type, from: state.publicId, to: id, sessionId: contact.shell.sessionId,
+                 ts: Date.now(), deviceId: state.deviceId, blob };
+  obj.sig = signShellPacket(obj);
+  const viaRelay = sendToRelay(id, obj, false);
+  if (!viaRelay) sendSignal(obj);
+  mlog.info(`→ ${type.toUpperCase()}  to ${pid(id)}  session=${pid(contact.shell.sessionId)}  via=${viaRelay ? "relay" : "signal(fallback)"}`);
 }
-
+ 
+async function sendShellIce(id, candidate) {
+  const contact = state.contacts[id];
+  if (!contact?.shell?.sessionId || !contact.encKey) return;
+  const blob = await encryptMessage(contact.encKey, candidate.toJSON());
+  const obj  = { type: "shell:ice", from: state.publicId, to: id, sessionId: contact.shell.sessionId,
+                 ts: Date.now(), deviceId: state.deviceId, blob };
+  obj.sig = signShellPacket(obj);
+  const viaRelay = sendToRelay(id, obj, false);
+  if (!viaRelay) sendSignal(obj);
+  mlog.debug(`→ SHELL ICE    to ${pid(id)}  session=${pid(contact.shell.sessionId)}`);
+}
+ 
+function createShellPeerConnection(id) {
+  if (shellConns[id]?.pc) return shellConns[id].pc;
+  const pc = new RTCPeerConnection(RTC_CONFIG);   // reuse the same STUN-only config as calls
+  const entry = { pc, dataCh: null, ctrlCh: null, iceQueue: [] };
+  shellConns[id] = entry;
+ 
+  pc.onicecandidate = (e) => { if (e.candidate) sendShellIce(id, e.candidate); };
+ 
+  pc.onconnectionstatechange = () => {
+    mlog.debug(`SHELL RTC  state=${pc.connectionState}  ${pid(id)}`);
+    if (pc.connectionState === "connected") transition(id, { type: "rtc_connected" }, "shell");
+    else if (pc.connectionState === "failed") transition(id, { type: "rtc_failed" }, "shell");
+    else if (pc.connectionState === "closed") transition(id, { type: "rtc_closed" }, "shell");
+  };
+ 
+  return pc;
+}
+ 
+async function flushShellIceQueue(id) {
+  const entry = shellConns[id];
+  if (!entry) return;
+  for (const cand of entry.iceQueue) {
+    try { await entry.pc.addIceCandidate(cand); }
+    catch(e) { mlog.debug(`SHELL RTC  queued ICE add failed: ${e.message}`); }
+  }
+  entry.iceQueue = [];
+}
+ 
+// real implementation — replaces the old stub. Human is always the
+// offerer (mirrors rtcOffer for calls), but unlike calls there is media
+// to acquire — this creates the two data channels up front instead.
+async function shellRtcOffer(id) {
+  try {
+    const pc    = createShellPeerConnection(id);
+    const entry = shellConns[id];
+ 
+    entry.dataCh = pc.createDataChannel("shell-data");
+    entry.ctrlCh = pc.createDataChannel("shell-ctrl");
+    wireShellDataChannel(id, entry.dataCh);
+    wireShellCtrlChannel(id, entry.ctrlCh);
+ 
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    await sendShellSDP(id, "shell:offer", offer.sdp);
+    mlog.info(`SHELL RTC  offer sent  ${pid(id)}`);
+  } catch(e) {
+    mlog.err(`SHELL RTC  offer failed: ${e.message}`);
+    transition(id, { type: "rtc_failed" }, "shell");
+  }
+}
+ 
+// real implementation — replaces the old stub
 function shellRtcClose(id) {
-  mlog.debug(`SHELL      shellRtcClose(${pid(id)}) — stub, safe no-op`);
+  const entry = shellConns[id];
+  if (entry) {
+    entry.dataCh?.close();
+    entry.ctrlCh?.close();
+    entry.pc.close();
+    delete shellConns[id];
+  }
+  const termEntry = shellTerminals[id];
+  if (termEntry) { termEntry.term.dispose(); delete shellTerminals[id]; }
+  closeShellTerminalUI(id);
+  mlog.debug(`SHELL RTC  closed  ${pid(id)}`);
+}
+ 
+// Wiring for the two data channels — shared by the offerer (channels
+// created locally in shellRtcOffer) so both sides end up with identical
+// message handling once open. The callee-side equivalent doesn't exist
+// yet client-side because the human is always the offerer; this is here
+// purely for the human's own local channels.
+function wireShellDataChannel(id, ch) {
+  ch.binaryType = "arraybuffer"; 
+  ch.onopen = () => mlog.info(`SHELL RTC  data channel open  ${pid(id)}`);
+  ch.onclose = () => mlog.debug(`SHELL RTC  data channel closed  ${pid(id)}`);
+  ch.onmessage = (e) => {
+    // raw pty bytes from the agent — terminal wiring (step 4) consumes this.
+    // Left as a visible hook rather than a silent drop so step 4 has an
+    // obvious place to attach.
+    if (typeof onShellDataReceived === "function") onShellDataReceived(id, e.data);
+  };
+}
+ 
+function wireShellCtrlChannel(id, ch) {
+  ch.onopen = () => mlog.debug(`SHELL RTC  ctrl channel open  ${pid(id)}`);
+  ch.onclose = () => mlog.debug(`SHELL RTC  ctrl channel closed  ${pid(id)}`);
+  ch.onmessage = () => {}; // agent doesn't send ctrl messages back today — nothing to handle yet
+}
+ 
+// Send resize over the ctrl channel — step 4 (terminal UI) will call this
+// on window/panel resize. Exposed now so that wiring is a one-line call
+// once xterm.js is in place, not another RTC-layer change.
+function sendShellResize(id, cols, rows) {
+  const ch = shellConns[id]?.ctrlCh;
+  if (!ch || ch.readyState !== "open") return;
+  ch.send(JSON.stringify({ type: "resize", cols, rows }));
 }
 
-function openShellTerminal(id) {
-  mlog.info(`SHELL      would open terminal panel  contact=${pid(id)} — not implemented yet`);
+/* ══════════════════════════════════════════
+   SHELL TERMINAL — one xterm.js instance per contact, keyed the same
+   way shellConns is. Kept separate from shellConns because a terminal
+   can legitimately outlive a brief data-channel hiccup (not currently
+   exploited, but no reason to couple their lifecycles tighter than
+   necessary).
+ 
+   Bytes can start arriving the instant the agent's data channel opens
+   and its pty spawns — which the connected-phase log showed happening
+   right after (not before) openShellTerminal() is invoked, but nothing
+   guarantees that ordering. term.write() called before term.open() is
+   safe — xterm.js buffers writes internally until a renderer exists —
+   so no separate pending-bytes queue is needed here.
+══════════════════════════════════════════ */
+const shellTerminals = {};   // contactId → { term, fitAddon }
+let currentShellContactId = null;
+ 
+function ensureShellTerminal(id) {
+  if (shellTerminals[id]) return shellTerminals[id];
+  const term = new Terminal({
+    cursorBlink: true,
+    fontSize: 13,
+    fontFamily: "monospace",
+    theme: { background: "#0a0a0a", foreground: "#c8c8c8" },
+  });
+  const fitAddon = new FitAddon.FitAddon();
+  term.loadAddon(fitAddon);
+ 
+  // keystrokes → data channel. Guarded on readyState so typing into a
+  // stale/closed session (e.g. right as it's tearing down) doesn't throw.
+  term.onData((data) => {
+    const conn = shellConns[id];
+    if (conn?.dataCh?.readyState === "open") conn.dataCh.send(data);
+  });
+ 
+  const entry = { term, fitAddon };
+  shellTerminals[id] = entry;
+  return entry;
 }
+ 
+function fitAndSendResize(id) {
+  const entry = shellTerminals[id];
+  if (!entry) return;
+  entry.fitAddon.fit();
+  sendShellResize(id, entry.term.cols, entry.term.rows);
+}
+ 
+// real implementation — replaces the old stub. Called by
+// onShellStateEnter() on entering "connected" (statemachine.js, unchanged).
+function openShellTerminal(id) {
+  const { term } = ensureShellTerminal(id);
+  const contact = state.contacts[id];
+  document.getElementById("shellTerminalName").textContent = (contact?.name || pid(id)) + " — shell";
+  document.getElementById("shellTerminalPanel").classList.add("open");
+ 
+  const container = document.getElementById("shellTerminalContainer");
+  if (!term.element) term.open(container);   // only attach once per Terminal instance
+ 
+  currentShellContactId = id;
+  // layout isn't settled until the panel's actually visible/painted —
+  // same reason chat scroll positioning elsewhere waits a frame.
+  requestAnimationFrame(() => { fitAndSendResize(id); term.focus(); });
+}
+ 
+function closeShellTerminalUI(id) {
+  if (currentShellContactId !== id) return;
+  document.getElementById("shellTerminalPanel").classList.remove("open");
+  currentShellContactId = null;
+}
+ 
+// receive-side hook, called from wireShellDataChannel's onmessage
+// (shell-rtc-step3.js, Drop-in C above) with a Uint8Array of raw pty
+// output. Writing straight to term is safe pre-open — see comment above.
+function onShellDataReceived(id, data) {
+  const { term } = ensureShellTerminal(id);
+  term.write(data);
+}
+ 
+// window resize — only meaningful while a shell panel is actually open;
+// the guard avoids fitting/resizing a terminal nobody's looking at.
+window.addEventListener("resize", () => {
+  if (currentShellContactId) fitAndSendResize(currentShellContactId);
+});
+ 
+document.getElementById("shellTerminalEndBtn").onclick = () => {
+  if (currentShellContactId) endShell(currentShellContactId);
+};
 
 /* ══════════════════════════════════════════
    CONTACTS
@@ -2848,7 +3183,7 @@ function renderMessages() {
   // still distinguishes what you typed from what came back; only the
   // positioning changes. Reactions don't mean anything on command output,
   // so they're skipped entirely for these chats rather than left dangling.
-  const isAgentChat = state.contacts[state.currentChat].type === "agent";
+  const isAgentChat = state.contacts[state.currentChat]?.type === "agent";
 
   visible.forEach(m => {
     const mine = m.from === state.publicId;
