@@ -27,13 +27,18 @@ listed in CONTACTS below (out of band, same as any MeshChat address).
 
 import asyncio
 import base64
+import fcntl
 import hashlib
 import json
 import logging
 import os
+import pty
 import shlex
+import signal
+import struct
 import subprocess
 import sys
+import termios
 import time
 import uuid
 
@@ -45,21 +50,33 @@ from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives.hashes import SHA256
 
+# aiortc is only needed for the shell-escalation feature (see SHELL CONFIG
+# below) — the bounded command whitelist works fine without it. Kept
+# optional so this file still runs on a box where aiortc doesn't install
+# cleanly (it pulls in native deps like libavcodec/libopus).
+try:
+    from aiortc import (
+        RTCConfiguration, RTCIceServer, RTCPeerConnection, RTCSessionDescription,
+    )
+    from aiortc.sdp import candidate_from_sdp
+    AIORTC_AVAILABLE = True
+except ImportError:
+    AIORTC_AVAILABLE = False
+
 # ══════════════════════════════════════════
 #   CONFIG — edit before running
 # ══════════════════════════════════════════
 
-USERNAME   = "agent-bot"                                # this agent's MeshChat username
-PASSPHRASE = "change-this-passphrase"                   # this agent's MeshChat passphrase
-RELAY_WSS  = "wss://meshchat.yourdomain.com/ws/"        # relay this agent connects to
+USERNAME   = "agent-bot"                            # this agent's MeshChat username
+PASSPHRASE = "change-this-passphrase"                # this agent's MeshChat passphrase
+RELAY_WSS  = "wss://yourrelay.example.com/ws/"       # relay this agent connects to
 
 # Who is allowed to send it commands. name -> shareable key
 # ("encKey_b64url.signPubKey_b64url" or with a third ".relay_b64" segment —
 # the relay segment is ignored here; see NOTE below).
 CONTACTS = {
-
+    "saint": "PASTE_SHAREABLE_KEY_HERE",
 }
-
 
 # Whitelist — nothing outside this dict is executed. Each entry:
 #   needs_arg     — must have at least one non-flag argument (blocks cat/head/
@@ -102,6 +119,51 @@ LOG_LEVEL        = logging.INFO
 # that relay's offline buffer) — there's no outbound cross-relay connection
 # here the way script.js's sendToRelay/getOrOpenRelayConn does. Fine for a
 # same-relay PoC; extend later if that stops being true.
+
+# ══════════════════════════════════════════
+#   SHELL ESCALATION (WebRTC) — PREP ONLY
+#   ---------------------------------------
+#   This half of the file is not reachable yet. server.py doesn't route
+#   shell:* packet types (they'd currently hit the "UNKNOWN, dropped"
+#   branch), and script.js doesn't send them. Everything below is written
+#   against the shape we agreed on so nothing here needs to change again
+#   once those two catch up — it's just dead code until then. The pty and
+#   session-lifecycle pieces (ShellSession, spawn_pty_shell, idle timeout)
+#   have no WebRTC dependency and can be sanity-tested standalone today.
+#
+#   Agreed shape:
+#     shell:invite / shell:cancel / shell:end   — signed only, no blob
+#                                                  (mirrors call:invite/cancel/end)
+#     shell:offer  / shell:answer / shell:ice   — blob+sig, ciphertext
+#                                                  inside the signature
+#                                                  (mirrors call:offer/answer/ice)
+#   Two data channels, opened by the human side (the offerer):
+#     "shell-data" — raw pty bytes, ordered+reliable
+#     "shell-ctrl" — JSON control messages, currently just
+#                    {"type":"resize","cols":N,"rows":N}
+#   No TURN — same permanent decision as audio calls. If ICE fails, there
+#   is no escalation, full stop; the bounded command whitelist above is
+#   the fallback and needs no WebRTC to work.
+#
+#   Trust tiers are DELIBERATELY separate: being in CONTACTS (bounded
+#   command access) does NOT imply shell access. Only names also listed
+#   in SHELL_CONTACTS can ever get a full pty.
+# ══════════════════════════════════════════
+
+SHELL_CONTACTS        = set()     # subset of CONTACTS names allowed to request a full shell — empty = disabled
+SHELL_IDLE_TIMEOUT_S  = 300       # ssh-style — no bytes either direction for this long, session dies
+SHELL_IDLE_CHECK_S    = 5         # how often the watchdog checks
+
+RTC_ICE_SERVERS = [
+    RTCIceServer(urls="stun:stun.l.google.com:19302"),
+    RTCIceServer(urls="stun:stun1.l.google.com:19302"),
+    RTCIceServer(urls="stun:global.stun.twilio.com:3478"),
+] if AIORTC_AVAILABLE else []
+
+# contact public_id -> ShellSession — one active session per contact, enforced
+# in handle_shell_invite. A second invite while one is already live is ignored,
+# same rule as contact.call in script.js's state machine.
+SHELL_SESSIONS = {}
 
 # ══════════════════════════════════════════
 #   LOGGING
@@ -284,6 +346,298 @@ def run_command(text: str, cwd_holder: dict) -> str:
 
 
 # ══════════════════════════════════════════
+#   PTY PLUMBING — no aiortc dependency, testable standalone
+#   (spawn a shell, read/write it, resize it)
+# ══════════════════════════════════════════
+
+def _set_winsize(fd: int, rows: int, cols: int):
+    winsize = struct.pack("HHHH", rows, cols, 0, 0)
+    fcntl.ioctl(fd, termios.TIOCSWINSZ, winsize)
+
+
+def spawn_pty_shell(cols: int = 80, rows: int = 24):
+    """Fork a pty-attached interactive shell. Returns (pid, master_fd) to
+    the parent; never returns in the child (execs or exits)."""
+    pid_, master_fd = pty.fork()
+    if pid_ == 0:
+        shell = os.environ.get("SHELL", "/bin/bash")
+        os.execvp(shell, [shell, "-i"])
+        os._exit(1)  # unreachable unless execvp itself fails
+    _set_winsize(master_fd, rows, cols)
+    return pid_, master_fd
+
+
+class ShellSession:
+    """One escalated shell for one contact.
+
+    Lifecycle: created when an eligible shell:invite is accepted, torn
+    down on shell:end/cancel, ICE failure, the pty's own process exiting,
+    or SHELL_IDLE_TIMEOUT_S of silence in both directions (ssh-style —
+    idle means no bytes crossing the data channel either way, not "tab
+    not focused").
+
+    aiortc's DataChannel API mirrors the browser's (on("message"),
+    on("open"), .send()), so the channel-facing half of this class reads
+    the same as script.js's RTC code once that side exists.
+    """
+
+    def __init__(self, contact: dict, session_id: str, loop: asyncio.AbstractEventLoop):
+        self.contact       = contact
+        self.session_id    = session_id
+        self.loop          = loop
+        self.pc            = None
+        self.data_ch       = None   # raw pty bytes
+        self.ctrl_ch       = None   # JSON control messages (resize, ...)
+        self.master_fd     = None
+        self.pid           = None
+        self.last_activity = time.monotonic()
+        self._idle_task    = None
+        self._closed       = False
+
+    def touch(self):
+        self.last_activity = time.monotonic()
+
+    async def start_pty(self, cols: int = 80, rows: int = 24):
+        if self.master_fd is not None:
+            return   # already started — data channel reopen/duplicate open event
+        self.pid, self.master_fd = spawn_pty_shell(cols, rows)
+        os.set_blocking(self.master_fd, False)
+        self.loop.add_reader(self.master_fd, self._on_pty_readable)
+        self._idle_task = self.loop.create_task(self._idle_watchdog())
+        log.info("SHELL      pty started  contact=%s  pid=%d  session=%s",
+                  self.contact["name"], self.pid, pid(self.session_id))
+
+    def _on_pty_readable(self):
+        try:
+            data = os.read(self.master_fd, 4096)
+        except BlockingIOError:
+            return
+        except OSError:
+            data = b""   # pty closed out from under us — treat like EOF below
+        if not data:
+            self.loop.create_task(self.close("pty exited"))
+            return
+        self.touch()
+        if self.data_ch is not None and getattr(self.data_ch, "readyState", None) == "open":
+            self.data_ch.send(data)
+
+    def write_input(self, data: bytes):
+        if self.master_fd is None:
+            return
+        self.touch()
+        try:
+            os.write(self.master_fd, data)
+        except OSError as e:
+            log.warning("SHELL      write failed  contact=%s  err=%s", self.contact["name"], e)
+
+    def resize(self, cols: int, rows: int):
+        if self.master_fd is None or self.pid is None:
+            return
+        try:
+            _set_winsize(self.master_fd, rows, cols)
+            os.kill(self.pid, signal.SIGWINCH)
+        except (OSError, ProcessLookupError):
+            pass
+
+    async def _idle_watchdog(self):
+        try:
+            while not self._closed:
+                await asyncio.sleep(SHELL_IDLE_CHECK_S)
+                if time.monotonic() - self.last_activity > SHELL_IDLE_TIMEOUT_S:
+                    log.info("SHELL      idle timeout (%ds)  contact=%s",
+                              SHELL_IDLE_TIMEOUT_S, self.contact["name"])
+                    await self.close("idle timeout")
+                    return
+        except asyncio.CancelledError:
+            pass
+
+    async def close(self, reason: str = ""):
+        if self._closed:
+            return
+        self._closed = True
+        log.info("SHELL      closing  contact=%s  reason=%s", self.contact["name"], reason)
+
+        if self._idle_task:
+            self._idle_task.cancel()
+        if self.master_fd is not None:
+            try:
+                self.loop.remove_reader(self.master_fd)
+            except (ValueError, OSError):
+                pass
+            try:
+                os.close(self.master_fd)
+            except OSError:
+                pass
+        if self.pid:
+            try:
+                os.kill(self.pid, signal.SIGHUP)
+            except ProcessLookupError:
+                pass
+        for ch in (self.data_ch, self.ctrl_ch):
+            if ch is not None:
+                try:
+                    ch.close()
+                except Exception:
+                    pass
+        if self.pc is not None:
+            try:
+                await self.pc.close()
+            except Exception:
+                pass
+        SHELL_SESSIONS.pop(self.contact["public_id"], None)
+
+
+# ══════════════════════════════════════════
+#   SHELL SIGNALING — signed packets, mirrors signCallPacket/verifyCallPacket
+# ══════════════════════════════════════════
+
+def sign_shell_packet(identity: "Identity", obj: dict) -> list:
+    payload = {
+        "type": obj["type"], "from": obj["from"], "to": obj["to"],
+        "sessionId": obj["sessionId"], "deviceId": obj.get("deviceId"),
+        "ts": obj["ts"], "blob": obj.get("blob"),
+    }
+    return sign_blob(identity.sign_key, payload)
+
+
+def verify_shell_packet(obj: dict, pubkey: Ed25519PublicKey) -> bool:
+    if not obj.get("sig"):
+        return False
+    payload = {
+        "type": obj["type"], "from": obj["from"], "to": obj["to"],
+        "sessionId": obj["sessionId"], "deviceId": obj.get("deviceId"),
+        "ts": obj["ts"], "blob": obj.get("blob"),
+    }
+    return verify_blob(payload, obj["sig"], pubkey)
+
+
+async def handle_shell_invite(ws, identity: "Identity", contacts_by_id: dict, msg: dict):
+    """Agent is always the callee here — only the human client escalates.
+    Auto-accepts (no human on this end to click answer) iff the sender is
+    both a known contact AND explicitly in SHELL_CONTACTS. Being whitelisted
+    for bounded commands does NOT imply shell eligibility."""
+    if not AIORTC_AVAILABLE:
+        log.warning("SHELL      invite received but aiortc isn't installed — ignoring")
+        return
+    frm = msg.get("from")
+    contact = contacts_by_id.get(frm)
+    if not contact or contact["name"] not in SHELL_CONTACTS:
+        log.warning("SHELL      invite from %s — not shell-eligible, ignored", pid(frm))
+        return
+    if not verify_shell_packet(msg, contact["sign_pub"]):
+        log.warning("SHELL      invite from %s — bad signature, dropped", contact["name"])
+        return
+    if contact["public_id"] in SHELL_SESSIONS:
+        log.info("SHELL      invite from %s — session already active, ignored (one per contact)", contact["name"])
+        return
+
+    session_id = msg["sessionId"]
+    session = ShellSession(contact, session_id, asyncio.get_event_loop())
+    SHELL_SESSIONS[contact["public_id"]] = session
+
+    claim = {"type": "shell:claim", "from": identity.public_id, "to": frm,
+             "sessionId": session_id, "ts": int(time.time() * 1000)}
+    claim["sig"] = sign_shell_packet(identity, claim)
+    await ws.send(json.dumps(claim))
+    log.info("SHELL      invite accepted  contact=%s  session=%s", contact["name"], pid(session_id))
+    # human side sends shell:offer next — see handle_shell_offer
+
+
+async def handle_shell_offer(ws, identity: "Identity", contacts_by_id: dict, msg: dict):
+    if not AIORTC_AVAILABLE:
+        return
+    frm = msg.get("from")
+    contact = contacts_by_id.get(frm)
+    session = SHELL_SESSIONS.get(contact["public_id"]) if contact else None
+    if not contact or not session or session.session_id != msg.get("sessionId"):
+        log.warning("SHELL      offer from %s — no matching session, dropped", pid(frm))
+        return
+    if not verify_shell_packet(msg, contact["sign_pub"]):
+        log.warning("SHELL      offer from %s — bad signature, dropped", contact["name"])
+        return
+
+    try:
+        plain = decrypt_message(identity.aesgcm, msg["blob"])
+    except Exception as e:
+        log.warning("SHELL      offer from %s — decrypt failed: %s", contact["name"], e)
+        return
+
+    pc = RTCPeerConnection(configuration=RTCConfiguration(iceServers=RTC_ICE_SERVERS))
+    session.pc = pc
+
+    @pc.on("datachannel")
+    def on_datachannel(channel):
+        if channel.label == "shell-data":
+            session.data_ch = channel
+
+            @channel.on("message")
+            def on_data_message(data):
+                session.write_input(data.encode() if isinstance(data, str) else data)
+
+            @channel.on("open")
+            def on_data_open():
+                asyncio.ensure_future(session.start_pty())
+
+        elif channel.label == "shell-ctrl":
+            session.ctrl_ch = channel
+
+            @channel.on("message")
+            def on_ctrl_message(data):
+                try:
+                    ctrl = json.loads(data)
+                    if ctrl.get("type") == "resize":
+                        session.resize(int(ctrl.get("cols", 80)), int(ctrl.get("rows", 24)))
+                except Exception:
+                    pass
+
+    @pc.on("iceconnectionstatechange")
+    async def on_ice_state():
+        if pc.iceConnectionState in ("failed", "closed"):
+            await session.close(f"ice {pc.iceConnectionState}")
+
+    await pc.setRemoteDescription(RTCSessionDescription(sdp=plain["sdp"], type="offer"))
+    answer = await pc.createAnswer()
+    await pc.setLocalDescription(answer)
+
+    blob = encrypt_message(contact["aesgcm"], {"sdp": pc.localDescription.sdp})
+    obj = {"type": "shell:answer", "from": identity.public_id, "to": frm,
+           "sessionId": session.session_id, "ts": int(time.time() * 1000), "blob": blob}
+    obj["sig"] = sign_shell_packet(identity, obj)
+    await ws.send(json.dumps(obj))
+    log.info("SHELL      answer sent  contact=%s", contact["name"])
+
+
+async def handle_shell_ice(identity: "Identity", contacts_by_id: dict, msg: dict):
+    if not AIORTC_AVAILABLE:
+        return
+    frm = msg.get("from")
+    contact = contacts_by_id.get(frm)
+    session = SHELL_SESSIONS.get(contact["public_id"]) if contact else None
+    if not contact or not session or session.session_id != msg.get("sessionId") or session.pc is None:
+        return
+    if not verify_shell_packet(msg, contact["sign_pub"]):
+        return
+    try:
+        plain = decrypt_message(identity.aesgcm, msg["blob"])
+        if not plain.get("candidate"):
+            return
+        cand = candidate_from_sdp(plain["candidate"].split(":", 1)[1])
+        cand.sdpMid        = plain.get("sdpMid")
+        cand.sdpMLineIndex = plain.get("sdpMLineIndex")
+        await session.pc.addIceCandidate(cand)
+    except Exception as e:
+        log.debug("SHELL      ice candidate error  contact=%s  err=%s", contact["name"], e)
+
+
+async def handle_shell_end(contacts_by_id: dict, msg: dict):
+    frm = msg.get("from")
+    contact = contacts_by_id.get(frm)
+    session = SHELL_SESSIONS.get(contact["public_id"]) if contact else None
+    if session and session.session_id == msg.get("sessionId"):
+        await session.close("shell:end/cancel received")
+
+
+# ══════════════════════════════════════════
 #   PROTOCOL — auth handshake + message loop
 # ══════════════════════════════════════════
 
@@ -305,7 +659,6 @@ async def do_auth(ws, identity: Identity):
 
 
 async def send_reply(ws, identity: Identity, contact: dict, text: str):
-    await asyncio.sleep(0.5)
     payload = {"id": str(uuid.uuid4()), "type": "text", "text": text, "ts": int(time.time() * 1000)}
     blob    = encrypt_message(contact["aesgcm"], payload)
     sig     = sign_blob(identity.sign_key, blob)
@@ -365,6 +718,16 @@ async def run():
         contacts_by_id[c["public_id"]] = c
         log.info("CONTACT    %-12s → %s", name, pid(c["public_id"]))
 
+    if SHELL_CONTACTS:
+        unknown = SHELL_CONTACTS - set(CONTACTS)
+        if unknown:
+            log.warning("SHELL      SHELL_CONTACTS references unknown name(s): %s", ", ".join(sorted(unknown)))
+        if not AIORTC_AVAILABLE:
+            log.warning("SHELL      SHELL_CONTACTS is set but aiortc isn't installed — shell escalation disabled")
+        else:
+            log.info("SHELL      escalation enabled for: %s  (still inert — see SHELL ESCALATION section)",
+                      ", ".join(sorted(SHELL_CONTACTS)))
+
     cwd_holder = {"cwd": os.path.expanduser("~")}
 
     while True:
@@ -377,10 +740,22 @@ async def run():
                         msg = json.loads(raw)
                     except json.JSONDecodeError:
                         continue
-                    if msg.get("type") == "app:message":
+                    kind = msg.get("type")
+                    if kind == "app:message":
                         await handle_message(ws, identity, contacts_by_id, cwd_holder, msg)
-                    elif msg.get("type") == "sig:auth_fail":
+                    elif kind == "sig:auth_fail":
                         log.warning("relay rejected traffic: %s", msg.get("reason"))
+                    # shell:* — inert today, see SHELL ESCALATION section above;
+                    # server.py doesn't route these types yet, so in practice
+                    # this branch is currently unreachable.
+                    elif kind == "shell:invite":
+                        await handle_shell_invite(ws, identity, contacts_by_id, msg)
+                    elif kind == "shell:offer":
+                        await handle_shell_offer(ws, identity, contacts_by_id, msg)
+                    elif kind == "shell:ice":
+                        await handle_shell_ice(identity, contacts_by_id, msg)
+                    elif kind in ("shell:end", "shell:cancel"):
+                        await handle_shell_end(contacts_by_id, msg)
                     # calls / sync / migrate etc. — not implemented, ignored silently
         except (websockets.exceptions.ConnectionClosed, OSError) as e:
             log.warning("WS         disconnected (%s) — retrying in %ds", e, RECONNECT_DELAY)
@@ -389,9 +764,16 @@ async def run():
         await asyncio.sleep(RECONNECT_DELAY)
 
 
+async def _shutdown():
+    for session in list(SHELL_SESSIONS.values()):
+        await session.close("agent shutting down")
+
+
 if __name__ == "__main__":
     try:
         asyncio.run(run())
     except KeyboardInterrupt:
         print("\nshutting down")
+        if SHELL_SESSIONS:
+            asyncio.run(_shutdown())
         sys.exit(0)
