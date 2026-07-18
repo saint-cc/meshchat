@@ -120,8 +120,11 @@
   #chatMessages::-webkit-scrollbar { width: 4px; }
   #chatMessages::-webkit-scrollbar-thumb { background: var(--border); }
   .message { position: relative; max-width: 65%; padding: 9px 14px 22px 14px; font-size: 13px; line-height: 1.5; word-break: break-word; white-space: pre-wrap;}
-.message.no-reaction-pad { padding-bottom: 9px; }
+.message.no-reaction-pad { padding-bottom: 9px; align-self: flex-start;}
   .message.mine    { background: var(--mine);   align-self: flex-end;   color: var(--accent); }
+  .message.mine.no-reaction-pad {
+    align-self: flex-start;
+}
   .message.theirs  { background: var(--theirs); align-self: flex-start; border: 1px solid var(--border); }
   .message.invalid { border-color: var(--danger) !important; opacity: 0.6; }
   .msgMeta { font-size: 10px; color: var(--muted); margin-top: 3px; }
@@ -602,7 +605,7 @@
 }
 #shellBtn.visible { display: flex; }
 #shellBtn:hover { border-color: var(--accent); background: var(--surface2); }
-#shellBtn.state-requesting, #shellBtn.state-negotiating {
+#shellBtn.state-calling, #shellBtn.state-negotiating {
   color: var(--accent); border-color: var(--accent); animation: pulse 1s infinite;
 }
 #shellBtn.state-connected { color: var(--danger); border-color: var(--danger); animation: none; }

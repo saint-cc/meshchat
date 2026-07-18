@@ -659,6 +659,7 @@ async def do_auth(ws, identity: Identity):
 
 
 async def send_reply(ws, identity: Identity, contact: dict, text: str):
+    await asyncio.sleep(0.5)
     payload = {"id": str(uuid.uuid4()), "type": "text", "text": text, "ts": int(time.time() * 1000)}
     blob    = encrypt_message(contact["aesgcm"], payload)
     sig     = sign_blob(identity.sign_key, blob)

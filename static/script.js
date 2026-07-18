@@ -2387,16 +2387,37 @@ function updateCallHeaderBtn(id) {
   if (id !== state.currentChat) return;
   const btn = document.getElementById("callBtn");
   if (!btn) return;
-  const isMe   = id === state.publicId;
+  const isMe    = id === state.publicId;
+  const isAgent = state.contacts[id]?.type === "agent";   // agent.py never implements call:* — nothing to show
   const phase  = state.contacts[id]?.call?.phase || "idle";
   const GLYPH  = { idle: "☎", calling: "☎…", ringing: "☎…", negotiating: "☎…", connected: "⏹", failed: "☎" };
   const TITLE  = { idle: "Call", calling: "Calling… (click to cancel)", ringing: "Incoming — use the popup",
                    negotiating: "Connecting… (click to cancel)", connected: "Hang up", failed: "Call failed (click to reset)" };
   btn.className   = "state-" + phase;
-  btn.classList.toggle("visible", !isMe);
+  btn.classList.toggle("visible", !isMe && !isAgent);
   btn.textContent = GLYPH[phase]  || "☎";
   btn.title       = TITLE[phase]  || "Call";
   btn.disabled    = phase === "ringing";   // answer/decline only via the popup, to avoid two conflicting controls
+}
+
+// Mirrors updateCallHeaderBtn now that the shell FSM exists (see
+// statemachine.js) — visibility gate is unchanged from 0.3.5, but phase
+// now drives the glyph/title/state-class the same way it does for calls.
+function updateShellHeaderBtn(id) {
+  if (id !== state.currentChat) return;
+  const btn = document.getElementById("shellBtn");
+  if (!btn) return;
+  const isMe    = id === state.publicId;
+  const isAgent = state.contacts[id]?.type === "agent";
+  const phase   = state.contacts[id]?.shell?.phase || "idle";
+  const GLYPH = { idle: "⌁", calling: "⌁…", ringing: "⌁…", negotiating: "⌁…", connected: "⏹", failed: "⌁" };
+  const TITLE = { idle: "Shell", calling: "Requesting… (click to cancel)", ringing: "Incoming — use the popup",
+                  negotiating: "Connecting… (click to cancel)", connected: "End session", failed: "Session failed (click to reset)" };
+  btn.className   = "state-" + phase;
+  btn.classList.toggle("visible", isAgent && !isMe);
+  btn.textContent = GLYPH[phase] || "⌁";
+  btn.title       = TITLE[phase] || "Shell";
+  btn.disabled    = phase === "ringing";   // parity with callBtn — unreachable against agent.py today, see statemachine.js
 }
 
 document.getElementById("callBtn").onclick = () => {
@@ -2411,6 +2432,96 @@ document.getElementById("callBtn").onclick = () => {
 
 document.getElementById("answerCallBtn").onclick  = () => { if (incomingCallContactId) answerCall(incomingCallContactId); };
 document.getElementById("declineCallBtn").onclick = () => { if (incomingCallContactId) cancelCall(incomingCallContactId); };
+
+// Prep only — no shell:invite, no session FSM, no data channels yet.
+// Visible now that agent contacts exist, so it needs to say SOMETHING
+// rather than silently do nothing on click.
+document.getElementById("shellBtn").onclick = () => {
+  const id = state.currentChat;
+  if (!id || id === state.publicId) return;
+  const phase = state.contacts[id]?.shell?.phase || "idle";
+  if (phase === "idle")                                     startShell(id);
+  else if (phase === "calling" || phase === "negotiating")  cancelShell(id);
+  else if (phase === "connected")                           endShell(id);
+  else if (phase === "failed")                               transition(id, { type: "reset" }, "shell");
+};
+
+/* ══════════════════════════════════════════
+   SHELL ESCALATION — user-facing entry points
+   Mirrors startCall/cancelCall/endCall exactly, shell-flavored. Real
+   signing/sending (sendShellInvite etc.) is still a stub — see the
+   "SHELL UI/RTC stubs" section below — so these correctly advance local
+   FSM state and update the header button, but nothing reaches the wire
+   yet. sessionId plays the same role callId does for calls: assigned
+   once here, never touched again by transition() itself.
+══════════════════════════════════════════ */
+function startShell(id) {
+  const contact = state.contacts[id];
+  if (!contact || contact.blocked) return;
+  if (contact.type !== "agent") return;   // shell only makes sense for agent contacts — mirrors the header button's own gate
+  if (contact.shell && contact.shell.phase !== "idle") return;
+  contact.shell = { sessionId: crypto.randomUUID(), phase: "idle", role: null };
+  transition(id, { type: "session_started" }, "shell");
+}
+
+function cancelShell(id) {
+  const contact = state.contacts[id];
+  if (!contact?.shell?.sessionId) return;
+  sendShellPacket(id, "shell:cancel", contact.shell.sessionId);
+  transition(id, { type: "session_cancelled" }, "shell");
+}
+
+function endShell(id) {
+  const contact = state.contacts[id];
+  if (!contact?.shell?.sessionId) return;
+  sendShellPacket(id, "shell:end", contact.shell.sessionId);
+  transition(id, { type: "session_ended" }, "shell");
+}
+
+/* ══════════════════════════════════════════
+   SHELL UI/RTC stubs — statemachine.js's onShellStateEnter already calls
+   these unconditionally, same pattern the original "RTC/UI stubs" used
+   for calls: visible no-ops so entering negotiating/connected/failed
+   doesn't throw before that work happens. Each one names the piece of
+   work it's standing in for:
+     sendShellInvite / sendShellPacket — real signing (signShellPacket,
+       mirroring agent.py's already-tested version) + wire send
+     showIncomingShellUI / hideIncomingShellUI — unreachable against
+       agent.py today (it auto-claims), kept for human-to-human parity
+     shellRtcOffer / shellRtcClose — RTCPeerConnection + the two data
+       channels (shell-data, shell-ctrl), mirrors rtcOffer/rtcClose but
+       createDataChannel instead of getUserMedia/addTrack
+     openShellTerminal — the xterm.js panel, the actual visible payoff
+══════════════════════════════════════════ */
+function sendShellPacket(id, type, sessionId) {
+  mlog.info(`SHELL      would send ${type}  to=${pid(id)}  session=${pid(sessionId)} — not implemented yet`);
+}
+
+function sendShellInvite(id) {
+  const contact = state.contacts[id];
+  if (!contact?.shell?.sessionId) return;
+  sendShellPacket(id, "shell:invite", contact.shell.sessionId);
+}
+
+function showIncomingShellUI(id) {
+  mlog.debug(`SHELL      showIncomingShellUI(${pid(id)}) — stub, unreachable against agent.py today`);
+}
+
+function hideIncomingShellUI(id) {
+  mlog.debug(`SHELL      hideIncomingShellUI(${pid(id)}) — stub`);
+}
+
+function shellRtcOffer(id) {
+  mlog.info(`SHELL      would open data channels + send offer  to=${pid(id)} — not implemented yet`);
+}
+
+function shellRtcClose(id) {
+  mlog.debug(`SHELL      shellRtcClose(${pid(id)}) — stub, safe no-op`);
+}
+
+function openShellTerminal(id) {
+  mlog.info(`SHELL      would open terminal panel  contact=${pid(id)} — not implemented yet`);
+}
 
 /* ══════════════════════════════════════════
    CONTACTS
@@ -2611,10 +2722,12 @@ function renderContactList() {
     if (c.blocked && !showBlocked) return;
 
     const isMe  = c.publicId === state.publicId;
+    const isAgent = c.type === "agent";
     const li    = document.createElement("li");
     li.className = "contactItem"
       + (state.currentChat === c.publicId ? " active" : "")
-      + (c.blocked ? " blocked" : "");
+      + (c.blocked ? " blocked" : "")
+      + (isAgent ? " agent-contact" : "");
     li.dataset.id = c.publicId;
     li.onclick    = () => openChat(c.publicId);
     const unread  = state.unread[c.publicId] || 0;
@@ -2633,6 +2746,7 @@ function renderContactList() {
       '<div class="contactInfo">' +
         '<div class="contactName">' + esc(c.name) +
           (isMe ? ' <span style="font-size:9px;color:var(--muted);letter-spacing:0.08em">YOU</span>' : '') +
+          (isAgent ? ' <span class="agentBadge" title="agent contact — shell-capable">⌁ agent</span>' : '') +
           (hasBackup ? ' <span title="backup stored" style="font-size:9px;color:var(--muted);letter-spacing:0.04em">🗄</span>' : '') +
         '</div>' +
         '<div class="contactId">' + c.publicId.slice(0,16) + '…</div>' +
@@ -2675,6 +2789,7 @@ function openChat(id) {
   idEl.textContent   = c.publicId.slice(0,16) + "…";
   updateChatRelayInfo(id);
   updateCallHeaderBtn(id);
+  updateShellHeaderBtn(id);
   const menuBtn = document.getElementById("contactMenuBtn");
   const isMe    = c.publicId === state.publicId;
   menuBtn.classList.add("visible");
@@ -2727,12 +2842,20 @@ function renderMessages() {
     return;
   }
 
+  // Agent contacts read more like a terminal session than a conversation —
+  // command and response both flow left, top to bottom, instead of the
+  // normal mine-right/theirs-left bubble split. Colour (mine/theirs class)
+  // still distinguishes what you typed from what came back; only the
+  // positioning changes. Reactions don't mean anything on command output,
+  // so they're skipped entirely for these chats rather than left dangling.
+  const isAgentChat = state.contacts[state.currentChat].type === "agent";
+
   visible.forEach(m => {
     const mine = m.from === state.publicId;
     const wrap = document.createElement("div");
-    wrap.style.cssText = "display:flex;flex-direction:column;align-items:" + (mine ? "flex-end" : "flex-start");
+    wrap.style.cssText = "display:flex;flex-direction:column;align-items:" + (isAgentChat ? "flex-start" : (mine ? "flex-end" : "flex-start"));
     const bubble = document.createElement("div");
-    bubble.className = "message " + (mine ? "mine" : "theirs") + (m.valid === false ? " invalid" : "");
+    bubble.className = "message " + (mine ? "mine" : "theirs") + (m.valid === false ? " invalid" : "") + (isAgentChat ? " no-reaction-pad" : "");
 
     if (m.type === "audio") {
       if (m.expired || !audioCache[m.id]) {
@@ -2785,7 +2908,7 @@ function renderMessages() {
                      + d.toLocaleTimeString([], { hour:"2-digit", minute:"2-digit" })
                      + (m.valid === false ? " · ⚠ unverified" : "");
 
-    bubble.appendChild(buildReactionRow(m.id, msgs, mine));
+    if (!isAgentChat) bubble.appendChild(buildReactionRow(m.id, msgs, mine));
     wrap.appendChild(bubble);
     wrap.appendChild(meta);
     container.appendChild(wrap);
