@@ -49,26 +49,49 @@ from cryptography.hazmat.primitives.hashes import SHA256
 #   CONFIG — edit before running
 # ══════════════════════════════════════════
 
-USERNAME   = "agent-bot"                               # this agent's MeshChat username
-PASSPHRASE = "change-this-passphrase"          # this agent's MeshChat passphrase
-RELAY_WSS  = "wss://meshchat.somedomain.com/ws/"       # relay this agent connects to
+USERNAME   = "agent-bot"                                # this agent's MeshChat username
+PASSPHRASE = "change-this-passphrase"                   # this agent's MeshChat passphrase
+RELAY_WSS  = "wss://meshchat.yourdomain.com/ws/"        # relay this agent connects to
 
 # Who is allowed to send it commands. name -> shareable key
 # ("encKey_b64url.signPubKey_b64url" or with a third ".relay_b64" segment —
 # the relay segment is ignored here; see NOTE below).
 CONTACTS = {
-    "admin1": "",
+
 }
 
-ALLOWED_COMMANDS = {
-    "ls",
-    "cd",
-    "pwd",
-    "cat",
 
-}   # PoC whitelist — nothing else is executed
+# Whitelist — nothing outside this dict is executed. Each entry:
+#   needs_arg     — must have at least one non-flag argument (blocks cat/head/
+#                   tail/file from being invoked bare, which would otherwise
+#                   sit reading stdin forever since nothing is piped to it)
+#   no_args       — informational commands; any args the caller sent are
+#                   dropped rather than passed through
+#   blocked_flags — exact-match flags that would make the command not
+#                   terminate on its own (tail -f and friends). This is a
+#                   simple exact-token check, not a real arg parser — it
+#                   won't catch a combined short flag like "-nf". Good
+#                   enough for a whitelist of contacts you already trust;
+#                   tighten if that assumption stops holding.
+COMMAND_SPECS = {
+    "ls":       {},
+    "cd":       {},
+    "pwd":      {"no_args": True},
+    "cat":      {"needs_arg": True},
+    "head":     {"needs_arg": True},
+    "tail":     {"needs_arg": True, "blocked_flags": {"-f", "-F", "--follow", "--retry"}},
+    "file":     {"needs_arg": True},
+    "df":       {},
+    "du":       {},
+    "whoami":   {"no_args": True},
+    "hostname": {"no_args": True},
+    "uptime":   {"no_args": True},
+}
 MAX_OUTPUT_CHARS = 4000
-COMMAND_TIMEOUT  = 10             # seconds, per command
+COMMAND_TIMEOUT  = 10             # seconds, per command — also the cap on a
+                                   # blocked-flag command's non-terminating
+                                   # cousin slipping through some other way;
+                                   # see the TimeoutExpired handling below
 RECONNECT_DELAY  = 5              # seconds, on disconnect
 LOG_LEVEL        = logging.INFO
 
@@ -191,100 +214,73 @@ def parse_contact(name: str, shareable_key: str) -> dict:
 # ══════════════════════════════════════════
 #   COMMAND EXECUTION — ls / cd only
 # ══════════════════════════════════════════
+
 def run_command(text: str, cwd_holder: dict) -> str:
     try:
         parts = shlex.split(text)
     except ValueError as e:
         return f"error parsing command: {e}"
-
     if not parts:
         return "(empty command)"
 
     cmd = parts[0]
+    if cmd not in COMMAND_SPECS:
+        return f"command not allowed — whitelisted: {', '.join(sorted(COMMAND_SPECS))}"
 
-    if cmd not in ALLOWED_COMMANDS:
-        return f"command not allowed — whitelisted: {', '.join(sorted(ALLOWED_COMMANDS))}"
+    spec = COMMAND_SPECS[cmd]
+    args = parts[1:]
 
-    cwd = os.path.abspath(cwd_holder["cwd"])
+    if spec.get("no_args"):
+        args = []   # informational commands — drop whatever was passed rather than error
 
-    # ──────────────────────────────────────
-    # cd
-    # ──────────────────────────────────────
+    blocked = spec.get("blocked_flags")
+    if blocked:
+        hit = blocked.intersection(args)
+        if hit:
+            return f"{cmd}: not allowed here — blocked flag(s): {', '.join(sorted(hit))} (would never terminate)"
+
+    if spec.get("needs_arg") and not any(not a.startswith("-") for a in args):
+        return f"{cmd}: requires at least one argument (a bare invocation would block reading stdin)"
+
+    cwd = cwd_holder["cwd"]
+
     if cmd == "cd":
-        target = parts[1] if len(parts) > 1 else os.path.expanduser("~")
-
+        target  = args[0] if args else os.path.expanduser("~")
         newpath = target if os.path.isabs(target) else os.path.join(cwd, target)
-        newpath = os.path.abspath(os.path.normpath(newpath))
-
+        newpath = os.path.normpath(newpath)
         if os.path.isdir(newpath):
             cwd_holder["cwd"] = newpath
             return newpath
-
         return f"cd: no such directory: {target}"
 
-    # ──────────────────────────────────────
-    # pwd
-    # ──────────────────────────────────────
-    if cmd == "pwd":
-        return cwd
-
-    # ──────────────────────────────────────
-    # cat
-    # ──────────────────────────────────────
-    if cmd == "cat":
-        if len(parts) < 2:
-            return "cat: missing filename"
-
-        filename = os.path.abspath(
-            os.path.join(cwd, parts[1])
+    # argv list, never shell=True — nothing in args can break out into shell
+    # syntax, it's all literal arguments passed straight to the binary.
+    # stdin is always /dev/null: with no pipe attached, a command that would
+    # otherwise wait on stdin (e.g. a bare "cat") would hang until the
+    # COMMAND_TIMEOUT kill instead of erroring immediately.
+    timed_out = False
+    try:
+        proc = subprocess.run(
+            [cmd] + args, cwd=cwd, capture_output=True, text=True,
+            timeout=COMMAND_TIMEOUT, stdin=subprocess.DEVNULL,
         )
+        out = proc.stdout + (("\n" + proc.stderr) if proc.stderr else "")
+    except subprocess.TimeoutExpired as e:
+        # Python still hands back whatever stdout/stderr had been read
+        # before the kill — treat it as a snapshot rather than a failure.
+        # This is what lets something like a slow `du` on a huge tree come
+        # back with partial results instead of nothing.
+        timed_out = True
+        out = (e.stdout or "") + (("\n" + e.stderr) if e.stderr else "")
+    except Exception as e:
+        out = f"error: {e}"
 
-        # prevent escaping current directory
-        if not filename.startswith(cwd + os.sep):
-            return "cat: access denied"
-
-        try:
-            with open(filename, "r", errors="replace") as f:
-                out = f.read()
-
-        except FileNotFoundError:
-            return f"cat: file not found: {parts[1]}"
-
-        except IsADirectoryError:
-            return f"cat: {parts[1]} is a directory"
-
-        except Exception as e:
-            return f"cat: {e}"
-
-        return out
-
-    # ──────────────────────────────────────
-    # ls
-    # ──────────────────────────────────────
-    if cmd == "ls":
-        try:
-            proc = subprocess.run(
-                ["ls"] + parts[1:],
-                cwd=cwd,
-                capture_output=True,
-                text=True,
-                timeout=COMMAND_TIMEOUT,
-            )
-
-            out = proc.stdout
-            if proc.stderr:
-                out += "\n" + proc.stderr
-
-        except subprocess.TimeoutExpired:
-            out = "error: command timed out"
-
-        except Exception as e:
-            out = f"error: {e}"
-
-        out = out.strip() or "(no output)"
-        return out
-
-    return "command implemented but no handler found"
+    out = out.strip() or "(no output)"
+    if len(out) > MAX_OUTPUT_CHARS:
+        out = out[:MAX_OUTPUT_CHARS] + f"\n… truncated ({len(out)} chars total)"
+    if timed_out:
+        out += f"\n… [killed after {COMMAND_TIMEOUT}s — showing partial output]"
+    return out
 
 
 # ══════════════════════════════════════════
@@ -309,7 +305,7 @@ async def do_auth(ws, identity: Identity):
 
 
 async def send_reply(ws, identity: Identity, contact: dict, text: str):
-    await asyncio.sleep(0.3)
+    await asyncio.sleep(0.5)
     payload = {"id": str(uuid.uuid4()), "type": "text", "text": text, "ts": int(time.time() * 1000)}
     blob    = encrypt_message(contact["aesgcm"], payload)
     sig     = sign_blob(identity.sign_key, blob)
