@@ -13,7 +13,7 @@
 // Protocol version — informational only for now, surfaced via sig:relay_info
 // so client/server drift shows up in both logs. Not enforced yet; room to
 // add real backwards-compat handling once that's actually needed.
-const CLIENT_VERSION = "0.3.4";
+const CLIENT_VERSION = "0.3.5";
 
 const LOG_MAX_LINES      = 20;
 const LOG_CLEAR_INTERVAL = 5 * 60 * 1000;
@@ -337,6 +337,15 @@ function mergeContactMeta(local, remote) {
     local.name            = remote.name;
     local.blocked         = remote.blocked;
     local.lastStateChange = remote.lastStateChange;
+    // type deliberately does NOT follow name/blocked's unconditional
+    // overwrite. An older peer that never serialized this field would
+    // send remote.type === undefined, and blindly adopting that on any
+    // newer lastStateChange (e.g. triggered by an unrelated name change)
+    // would silently downgrade a contact you deliberately marked "agent"
+    // back to "human" — quietly hiding the shell button, not a cosmetic
+    // regression the way a stale name would be. Only adopt an explicit
+    // value; otherwise keep whatever's already local.
+    if (remote.type) local.type = remote.type;
   }
   // Backups/restores carry lastRelay too — same timestamp-guarded adoption
   // as updateRelay() already does for relay info embedded in messages.
@@ -391,6 +400,7 @@ function serialiseContacts() {
     out[id] = { name: c.name, publicId: c.publicId, shareableKey: c.shareableKey,
                 messages: c.messages.slice(-15).map(m => m.type === "audio" ? {...m, data:null, expired:true} : m),
                 blocked: c.blocked || false,
+                type:            c.type            || "human",
                 lastStateChange: c.lastStateChange || 0,
                 lastRelay:       c.lastRelay       || null,
                 lastRelaySeen:   c.lastRelaySeen    || 0 };
@@ -2405,7 +2415,7 @@ document.getElementById("declineCallBtn").onclick = () => { if (incomingCallCont
 /* ══════════════════════════════════════════
    CONTACTS
 ══════════════════════════════════════════ */
-async function addContact(name,shareableKey,save=true){
+async function addContact(name,shareableKey,save=true,type="human"){
   if(!name||!shareableKey)return false;
   let encKeyBytes,signPublicKey,relayWss=null;
   try{
@@ -2419,10 +2429,14 @@ async function addContact(name,shareableKey,save=true){
   catch(e){return false;}
   const publicId=await derivePublicId(encKeyBytes);
   if(publicId===state.publicId||state.contacts[publicId])return!!state.contacts[publicId];
+  // type is local-only UI metadata — never on the wire, never trusted as a
+  // security boundary. It just decides which button (call vs shell) shows
+  // in the header. Real enforcement of shell access lives entirely in the
+  // agent's own SHELL_CONTACTS allowlist. Anything but "agent" is "human".
   state.contacts[publicId]={name,publicId,shareableKey,encKey:await importEncKey(encKeyBytes),signPublicKey,messages:[],
-    lastRelay:relayWss||null};
+    lastRelay:relayWss||null, type: type==="agent"?"agent":"human"};
   if(save)await saveContacts();
-  mlog.info(`CONTACT    added ${name}  ${pid(publicId)}${relayWss?" wss="+relayWss:""}`);
+  mlog.info(`CONTACT    added ${name}  ${pid(publicId)}${relayWss?" wss="+relayWss:""}${type==="agent"?"  [agent]":""}`);
   renderContactList();
   return true;
 }
@@ -2784,6 +2798,8 @@ function openModal() {
   document.getElementById("modalContactName").value   = "";
   document.getElementById("modalContactKey").value    = "";
   document.getElementById("scanResult").textContent   = "";
+  document.getElementById("modalContactIsAgent").checked = false;
+  document.getElementById("agentToggleRow").style.display = "flex";
   buildMyQR(state.shareableKey);
   switchTab("show");
   document.getElementById("modalOverlay").classList.add("open");
@@ -3286,8 +3302,9 @@ document.getElementById("exportOverlay").onclick = (e) => { if (e.target === doc
 document.getElementById("modalConfirm").onclick = async () => {
   const name    = document.getElementById("modalContactName").value.trim();
   const key     = document.getElementById("modalContactKey").value.trim();
+  const isAgent = document.getElementById("modalContactIsAgent").checked;
   if (!name || !key) return;
-  const ok = await addContact(name, key);
+  const ok = await addContact(name, key, true, isAgent ? "agent" : "human");
   if (ok) closeModal();
 };
 

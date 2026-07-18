@@ -75,7 +75,7 @@ RELAY_WSS  = "wss://yourrelay.example.com/ws/"       # relay this agent connects
 # ("encKey_b64url.signPubKey_b64url" or with a third ".relay_b64" segment —
 # the relay segment is ignored here; see NOTE below).
 CONTACTS = {
-    "saint": "PASTE_SHAREABLE_KEY_HERE",
+    "admin": "PASTE_SHAREABLE_KEY_HERE",
 }
 
 # Whitelist — nothing outside this dict is executed. Each entry:

@@ -36,7 +36,7 @@ RELAY_WSS_URL = os.environ.get("RELAY_WSS_URL", "")   # e.g. wss://yourrelay.exa
 # Protocol version — informational only for now, surfaced in sig:relay_info
 # so client/server version drift shows up in both logs. Not enforced yet;
 # room to add real backwards-compat handling once this is actually needed.
-PROTOCOL_VERSION = os.environ.get("PROTOCOL_VERSION", "0.3.4")
+PROTOCOL_VERSION = os.environ.get("PROTOCOL_VERSION", "0.3.5")
 
 # Connection limits
 MAX_CONNECTIONS        = int(os.environ.get("MAX_CONNECTIONS",        100))   # total WS sessions
@@ -654,7 +654,9 @@ async def handler(ws):
                           "sync:restore_ack", "sync:restore_push",
                           "sync:token_req", "sync:token_resp",
                           "call:invite", "call:claim", "call:cancel", "call:end",
-                          "call:offer", "call:answer", "call:ice"):
+                          "call:offer", "call:answer", "call:ice",
+                          "shell:invite", "shell:claim", "shell:cancel", "shell:end",
+                          "shell:offer", "shell:answer", "shell:ice"):
                 frm = msg.get("from", "?")
                 to  = msg.get("to")
                 if not valid_id(to):

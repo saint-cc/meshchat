@@ -115,7 +115,8 @@ if ("serviceWorker" in navigator) {
           <div id="chatHeaderId"   style="display:none"></div>
           <div id="chatHeaderRelay" style="display:none;font-size:10px;color:var(--muted);margin-top:2px;letter-spacing:0.05em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis"></div>		  
         </div>		
-		<button id="callBtn" title="Call">☎</button>		
+		<button id="callBtn" title="Call">☎</button>
+		<button id="shellBtn" title="Shell — agent contacts only">⌁</button>
 		<button id="contactMenuBtn" title="Contact options">⋯</button>
       </div>
       <div class="contact-dropdown" id="contactDropdown">
@@ -195,6 +196,12 @@ if ("serviceWorker" in navigator) {
     </div>   
     <input id="modalContactName" placeholder="contact name" autocomplete="off">
     <input id="modalContactKey"  placeholder="their key" autocomplete="off" spellcheck="false">
+    <!-- prep for agent-contact escalation — hidden until script.js reads/wires it.
+         When shown, this lets addContact() tag contact.type = "agent" vs "human". -->
+    <div id="agentToggleRow" style="display:none;align-items:center;gap:8px;font-size:11px;color:var(--muted)">
+      <input type="checkbox" id="modalContactIsAgent">
+      <label for="modalContactIsAgent">this is an agent (enables shell access, not just chat)</label>
+    </div>
     <div class="hint">name is local only — only you see it.</div>
     <div class="modal-btns">
       <button class="btn-cancel"  id="modalCancel">CANCEL</button>
