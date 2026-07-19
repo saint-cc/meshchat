@@ -13,7 +13,7 @@
 // Protocol version — informational only for now, surfaced via sig:relay_info
 // so client/server drift shows up in both logs. Not enforced yet; room to
 // add real backwards-compat handling once that's actually needed.
-const CLIENT_VERSION = "0.3.6";
+const CLIENT_VERSION = "0.3.7";
 
 const LOG_MAX_LINES      = 20;
 const LOG_CLEAR_INTERVAL = 5 * 60 * 1000;
@@ -1025,20 +1025,21 @@ let sessionFresh = true;
 
 function handleSignal(msg) {
   switch(msg.type) {
-    case "call:invite": handleCallInvite(msg); break;
-    case "call:claim":  handleCallClaim(msg);  break;
-    case "call:cancel": handleCallCancel(msg); break;
-    case "call:end":    handleCallEnd(msg);    break;
-	case "call:offer":  handleCallOffer(msg);  break;
-	case "call:answer": handleCallAnswer(msg); break;
-	case "call:ice":     handleCallIce(msg);    break;
-	case "shell:invite": handleShellInvite(msg); break;
-	case "shell:claim":  handleShellClaim(msg);  break;
-	case "shell:cancel": handleShellCancel(msg); break;
-	case "shell:end":    handleShellEnd(msg);    break;	
-    case "shell:offer":  handleShellOffer(msg);  break;
-    case "shell:answer": handleShellAnswer(msg); break;
-    case "shell:ice":    handleShellIce(msg);    break;
+    case "call:invite":	handleCallInvite(msg);  break;
+    case "call:claim":  handleCallClaim(msg);   break;
+    case "call:cancel": handleCallCancel(msg);  break;
+    case "call:end":    handleCallEnd(msg);     break;
+	case "call:offer":  handleCallOffer(msg);   break;
+	case "call:answer": handleCallAnswer(msg);  break;
+	case "call:ice":    handleCallIce(msg);     break;
+	case "shell:invite":handleShellInvite(msg); break;
+	case "shell:claim": handleShellClaim(msg);  break;
+	case "shell:cancel":handleShellCancel(msg); break;
+	case "shell:end":   handleShellEnd(msg);    break;	
+    case "shell:offer": handleShellOffer(msg);  break;
+    case "shell:answer":handleShellAnswer(msg); break;
+    case "shell:ice":   handleShellIce(msg);    break;
+	
 	
     case "sig:auth_challenge": handleAuthChallenge(msg); break;
     case "sig:auth_ok":        handleAuthOk(msg);        break;
@@ -1113,17 +1114,18 @@ function handleSignal(msg) {
       renderContactList();
       break;
 
-    case "sync:restore_req": markOnline(msg.from);		handleRestoreRequest(msg); break;
-    case "sync:restore_ack":     markOnline(msg.from);		handleRestoreAck(msg);     break;
-    case "sync:restore_push":         markOnline(msg.from);		handleRestorePush(msg);    break;
-    case "sync:token_req":  		 markOnline(msg.from); 		handleTokenRequest(msg);  break;
-    case "sync:token_resp": 		 markOnline(msg.from); 		handleTokenResponse(msg); break;
-    case "app:message":              receiveMessage(msg);       break;
-    case "app:migrate":               handleMigrate(msg);        break;
-    case "app:sync":         markOnline(msg.from);		handleMsgExchange(msg);    break;
-    case "sync:backup_offer":         markOnline(msg.from);		handleBackupOffer(msg);    break;
-    case "sync:backup_accept":        markOnline(msg.from);		handleBackupAccept(msg);   break;
-    case "sync:backup_push":          markOnline(msg.from);		handleBackupPush(msg);     break;
+    case "sync:restore_req":			markOnline(msg.from);		handleRestoreRequest(msg); 	break;
+    case "sync:restore_ack":     		markOnline(msg.from);		handleRestoreAck(msg);     	break;
+    case "sync:restore_push":         	markOnline(msg.from);		handleRestorePush(msg);    	break;
+    case "sync:token_req":  		 	markOnline(msg.from); 		handleTokenRequest(msg);  	break;
+    case "sync:token_resp": 		 	markOnline(msg.from); 		handleTokenResponse(msg); 	break;
+    case "app:message":              	receiveMessage(msg);       	break;
+    case "app:migrate":               	handleMigrate(msg);        	break;
+	case "app:burn": 					handleBurn(msg); 			break;
+    case "app:sync":         			markOnline(msg.from);		handleMsgExchange(msg);    	break;
+    case "sync:backup_offer":         	markOnline(msg.from);		handleBackupOffer(msg);    	break;
+    case "sync:backup_accept":        	markOnline(msg.from);		handleBackupAccept(msg);   	break;
+    case "sync:backup_push":          	markOnline(msg.from);		handleBackupPush(msg);     	break;
 
     default: mlog.debug(`SIG unknown type=${msg.type}`);
   }
@@ -1781,6 +1783,121 @@ async function handleMigrate(msg) {
     }
   }
 }
+/* ══════════════════════════════════════════
+   BURN NOTICE — receive side
+   Packet: { type: "app:burn", from, to, blob: encrypted{ts}, sig }
+   Decryption is identical to a regular message/migrate — always
+   state.encKey, symmetric scheme. Signature verification is NOT
+   optional here, same rule as app:migrate and the call:* group:
+   this packet drives an irreversible action, so an unsigned or
+   invalid one is dropped outright rather than flagged and shown.
+ 
+   Two branches:
+     - from self        → another of our own devices burned (or we
+       burned from elsewhere and this is reaching a second session).
+       Wipe THIS device too — no ceremony, no notify-back, just follow,
+       same "adopt silently" spirit as migrate's self branch.
+     - from a contact    → they burned; convert to block on our side.
+       Already-blocked contact → no-op, nothing left to do.
+══════════════════════════════════════════ */
+async function handleBurn(msg) {
+  if (!msg.from || !msg.blob) return;
+ 
+  const isSelf  = msg.from === state.publicId;
+  const contact = state.contacts[msg.from];
+  if (!isSelf && !contact) return;   // unknown sender, nothing to act on
+ 
+  let plain;
+  try {
+    plain = await decryptMessage(msg.blob);
+  } catch(e) {
+    mlog.warn(`← BURN         from ${pid(msg.from)} — decrypt failed`);
+    return;
+  }
+ 
+  const verifyKey = isSelf ? state.contacts[state.publicId]?.signPublicKey : contact.signPublicKey;
+  const sigValid  = msg.sig && verifyKey ? verifyBlob(msg.blob, msg.sig, verifyKey) : false;
+  if (!sigValid) {
+    mlog.warn(`← BURN         from ${pid(msg.from)} — signature invalid, dropped`);
+    return;
+  }
+ 
+  if (isSelf) {
+    mlog.warn(`← BURN         from self — self-destruct triggered`);
+    selfDestruct();
+    return;
+  }
+ 
+  if (contact.blocked) {
+    mlog.debug(`← BURN         from ${pid(msg.from)} — already blocked, no-op`);
+    return;
+  }
+ 
+  mlog.warn(`← BURN         from ${pid(msg.from)} — converting to block`);
+  burnBlockContact(msg.from);
+}
+ 
+/* Burn→block conversion. Reuses the existing manual-block wipe
+   (messages, peerBackups) but additionally drops any stored peer
+   token — deliberately NOT done on a manual block (see contactAction
+   "block" below), since manual block is a softer, reversible-in-spirit
+   action while burn is explicitly saying "treat this identity as gone
+   for good." blockReason is local-only UI metadata, same trust tier as
+   contact.type — never a security boundary, just lets the edit-contact
+   pane say WHY something is blocked instead of a bare yes/no. */
+async function burnBlockContact(id) {
+  const contact = state.contacts[id];
+  if (!contact) return;
+  contact.blocked         = true;
+  contact.blockReason     = "burned";
+  contact.lastStateChange = Date.now();
+  contact.messages        = [];
+  if (state.peerBackups[id]) {
+    delete state.peerBackups[id];
+    savePeerBackups();
+  }
+  if (state.peerTokens[id]) {
+    delete state.peerTokens[id];
+    savePeerTokens();
+  }
+  await saveContacts();
+  mlog.info(`BURN       wiped messages/backup/token, blocked  id=${pid(id)}`);
+  renderContactList();
+  if (state.currentChat === id) {
+    document.getElementById("blockToggleBtn").textContent = "UNBLOCK";
+  }
+}
+ 
+/* ══════════════════════════════════════════
+   SELF-DESTRUCT
+   Not cryptographic revocation — can't be. Identity is deterministic
+   from (username, passphrase); anyone who still knows the credentials
+   can log back in and re-derive the exact same keys. This is purely a
+   local wipe + social signal (the burn notices already sent to
+   contacts convert them to block on their end). Said plainly here and
+   in protocol.md rather than implying otherwise.
+ 
+   Clears every identity-scoped storage key — contacts, peer backups,
+   peer tokens, device registry, AND the device seed itself, so this
+   device can't quietly re-announce its old deviceId if the same
+   credentials are ever used here again. Nothing is kept anywhere
+   (deliberately — see chat discussion: a "this identity was burned
+   here" notice was considered and dropped, since credentials are
+   credentials and we can't actually stop a re-login anyway, only
+   pretend to).
+══════════════════════════════════════════ */
+function selfDestruct() {
+  const suffix = "_" + state.publicId;
+  [STORAGE_KEY, PEER_BACKUP_KEY, PEER_TOKEN_KEY, DEVICE_REGISTRY_KEY, DEVICE_KEY_STORAGE]
+    .forEach(key => localStorage.removeItem(key + suffix));
+ 
+  mlog.warn("BURN       self-destruct — all local identity data wiped, reloading");
+  try { state.ws?.close(1000, "burned"); } catch(e) {}
+ 
+  // hard reset — reload lands back on the login screen with nothing to
+  // restore from, same as a genuinely fresh browser profile.
+  setTimeout(() => location.reload(), 300);
+}
 
 /* ══════════════════════════════════════════
    MIGRATE — send side
@@ -1827,6 +1944,68 @@ async function notifyMigration(newRelay, ts, oldRelay) {
       mlog.warn(`→ MIGRATE      to self @ old relay — encrypt failed: ${e.message}`);
     }
   }
+}
+
+/* ══════════════════════════════════════════
+   BURN NOTICE — send side
+   Two kinds of recipients, same split as notifyMigration:
+     - every non-self, non-blocked contact — normal sendToRelay/
+       sendSignal routing, no different from any other message.
+     - ourselves — but unlike migrate there's no "old relay" to also
+       reach; this isn't a routing change, so a single sendSignal
+       (same pattern pushMiniBackup already uses for self-targeted
+       packets) is sufficient. It lands on whatever relay our "me"
+       contact currently points to, live-delivered to any other
+       connected session of ours and durably buffered there for
+       offline ones. A self-device parked at a genuinely different/
+       stale relay won't see it until it next syncs there — same
+       known limitation migrate already has, not solved here either.
+══════════════════════════════════════════ */
+async function notifyBurn(ts) {
+  const payload = { ts };
+ 
+  for (const id of Object.keys(state.contacts)) {
+    if (id === state.publicId) continue;
+    const contact = state.contacts[id];
+    if (!contact?.encKey || contact.blocked) continue;
+    try {
+      const blob = await encryptMessage(contact.encKey, payload);
+      const sig  = await signBlob(blob);
+      const burnMsgObj = { type: "app:burn", from: state.publicId, to: id, blob, sig };
+      const viaRelay    = sendToRelay(id, burnMsgObj, true);
+      if (!viaRelay) sendSignal(burnMsgObj);
+      mlog.info(`→ BURN         to   ${pid(id)}  via=${viaRelay ? "relay" : "signal(fallback)"}`);
+    } catch(e) {
+      mlog.warn(`→ BURN         to   ${pid(id)} — encrypt failed: ${e.message}`);
+    }
+  }
+ 
+  const me = state.contacts[state.publicId];
+  try {
+    const blob = await encryptMessage(me.encKey, payload);
+    const sig  = await signBlob(blob);
+    const selfBurnObj = { type: "app:burn", from: state.publicId, to: state.publicId, blob, sig };
+    sendSignal(selfBurnObj);
+    mlog.info(`→ BURN         to self`);
+  } catch(e) {
+    mlog.warn(`→ BURN         to self — encrypt failed: ${e.message}`);
+  }
+}
+ 
+/* Called from the confirm modal (see GUI section below), after the
+   type-to-confirm + "ARE YOU SURE?!" gates have both been cleared.
+   Notifies everyone FIRST, then wipes ourselves — same ordering
+   principle as commitMigration (announce, then act locally) so
+   contacts/other-devices are told before the identity that's
+   telling them ceases to exist. */
+async function commitBurn() {
+  const ts = Date.now();
+  mlog.warn(`BURN       committing — notifying contacts and self, then wiping this device`);
+  await notifyBurn(ts);
+  // brief pause so the outbound sends above have a chance to leave the
+  // socket before selfDestruct() closes it out from under them.
+  await new Promise(r => setTimeout(r, 400));
+  selfDestruct();
 }
 
 async function pushMiniBackup(contactId) {
@@ -3150,6 +3329,22 @@ function openChat(id) {
   } else if (migrateBtn) {
     migrateBtn.style.display = "none";
   }
+  
+  let burnBtn = document.getElementById("burnBtn");
+  if (isMe) {
+    if (!burnBtn) {
+      burnBtn = document.createElement("button");
+      burnBtn.id = "burnBtn";
+      burnBtn.textContent = "BURN";
+      burnBtn.style.color = "var(--danger)";
+      burnBtn.onclick = () => contactAction("burn");
+      document.getElementById("contactDropdown").appendChild(burnBtn);
+    }
+    burnBtn.style.display = "";
+  } else if (burnBtn) {
+    burnBtn.style.display = "none";
+  } 
+  
   document.getElementById("contactDropdown").classList.remove("open");
   renderContactList();
   renderMessages();
@@ -3283,7 +3478,7 @@ function contactAction(action) {
   const btns  = document.getElementById("contactActionBtns");
   body.innerHTML = btns.innerHTML = "";
 
-  if(action==="edit"){
+  if(action === "edit"){
     title.textContent="EDIT CONTACT";
     const isMe = c.publicId === state.publicId;
 
@@ -3295,7 +3490,7 @@ function contactAction(action) {
       `<strong style="color:var(--dim)">key</strong> ${esc(c.shareableKey)}<br>` +
       `<strong style="color:var(--dim)">relay</strong> ${esc(c.lastRelay || "—")}<br>` +
       `<strong style="color:var(--dim)">msgs</strong> ${c.messages?.length || 0}<br>` +
-      `<strong style="color:var(--dim)">blocked</strong> ${c.blocked ? "yes" : "no"}`;
+      `<strong style="color:var(--dim)">blocked</strong> ${c.blocked ? "yes" + (c.blockReason ? ` (${esc(c.blockReason)})` : "") : "no"}`;
     body.appendChild(info);
 
     // Wrapping in a <form> helps Firefox honour autocomplete="off" outright.
@@ -3626,6 +3821,8 @@ function contactAction(action) {
 
     btns.innerHTML = '<button class="btn-cancel" onclick="closeContactAction()">CLOSE</button>';
     document.getElementById("contactActionOverlay").classList.add("open");
+  } else if (action === "burn") {
+    buildBurnPanel();
   }
 }
 
@@ -3686,6 +3883,87 @@ function showMigrateWarning(url) {
   btns.appendChild(confirmBtn);
 }
 
+function buildBurnPanel() {
+  const title = document.getElementById("contactActionTitle");
+  const body  = document.getElementById("contactActionBody");
+  const btns  = document.getElementById("contactActionBtns");
+  body.innerHTML = btns.innerHTML = "";
+ 
+  title.textContent = "BURN IDENTITY";
+ 
+  const hint = document.createElement("div");
+  hint.className = "hint";
+  hint.style.cssText = "line-height:1.6";
+  hint.innerHTML =
+    "This notifies every contact and any other device of yours, then wipes " +
+    "<strong style='color:var(--text)'>all local data on this device</strong> — contacts, messages, backups, device identity — " +
+    "and returns you to the login screen.<br><br>" +
+    "<strong style='color:var(--danger)'>This is not real revocation.</strong> " +
+    "Your identity is derived from your username and passphrase — anyone who still knows them " +
+    "(including you) can log back in and it will work exactly as before. Burn only wipes what's local here " +
+    "and asks contacts to stop trusting it; it cannot force that anywhere else.";
+  body.appendChild(hint);
+ 
+  const confirmInput = document.createElement("input");
+  confirmInput.placeholder  = 'type BURN to continue';
+  confirmInput.name         = "mc-burn-confirm";
+  confirmInput.autocomplete = "off";
+  confirmInput.spellcheck   = false;
+  body.appendChild(confirmInput);
+ 
+  const proceedBtn = document.createElement("button");
+  proceedBtn.className   = "btn-confirm";
+  proceedBtn.style.cssText = "background:var(--danger);border-color:var(--danger)";
+  proceedBtn.textContent = "CONTINUE";
+  proceedBtn.disabled    = true;
+ 
+  confirmInput.addEventListener("input", () => {
+    proceedBtn.disabled = confirmInput.value.trim() !== "BURN";
+  });
+ 
+  const cancelBtn = document.createElement("button");
+  cancelBtn.className   = "btn-cancel";
+  cancelBtn.textContent = "CANCEL";
+  cancelBtn.onclick     = closeContactAction;
+ 
+  proceedBtn.onclick = () => showBurnWarning();
+ 
+  btns.appendChild(cancelBtn);
+  btns.appendChild(proceedBtn);
+  document.getElementById("contactActionOverlay").classList.add("open");
+  confirmInput.focus();
+}
+ 
+function showBurnWarning() {
+  const title = document.getElementById("contactActionTitle");
+  const body  = document.getElementById("contactActionBody");
+  const btns  = document.getElementById("contactActionBtns");
+  body.innerHTML = btns.innerHTML = "";
+ 
+  title.textContent = "ARE YOU SURE?!";
+ 
+  const warn = document.createElement("div");
+  warn.className = "hint";
+  warn.style.cssText = "color:var(--danger);line-height:1.6";
+  warn.textContent =
+    "Last chance to back out. Once you continue, contacts are notified immediately, " +
+    "this device is wiped, and you are logged out. There is no undo.";
+  body.appendChild(warn);
+ 
+  const cancelBtn = document.createElement("button");
+  cancelBtn.className   = "btn-cancel";
+  cancelBtn.textContent = "WAIT, NO!";
+  cancelBtn.onclick     = buildBurnPanel;   // back to the type-to-confirm step, fresh
+ 
+  const confirmBtn = document.createElement("button");
+  confirmBtn.className   = "btn-confirm";
+  confirmBtn.style.cssText = "background:var(--danger);border-color:var(--danger)";
+  confirmBtn.textContent = "BURN IT DOWN";
+  confirmBtn.onclick     = () => { closeContactAction(); commitBurn(); };
+ 
+  btns.appendChild(cancelBtn);
+  btns.appendChild(confirmBtn);
+}
 /* ══════════════════════════════════════════
    LOGIN
 ══════════════════════════════════════════ */

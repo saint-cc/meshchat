@@ -36,7 +36,7 @@ RELAY_WSS_URL = os.environ.get("RELAY_WSS_URL", "")   # e.g. wss://yourrelay.exa
 # Protocol version — informational only for now, surfaced in sig:relay_info
 # so client/server version drift shows up in both logs. Not enforced yet;
 # room to add real backwards-compat handling once this is actually needed.
-PROTOCOL_VERSION = os.environ.get("PROTOCOL_VERSION", "0.3.6")
+PROTOCOL_VERSION = os.environ.get("PROTOCOL_VERSION", "0.3.7")
 
 # Connection limits
 MAX_CONNECTIONS        = int(os.environ.get("MAX_CONNECTIONS",        100))   # total WS sessions
@@ -68,6 +68,14 @@ BUF_EXPIRE_INTERVAL = 300                                    # seconds between e
 # while testing; production target is closer to a year.
 BUF_MAX_AGE_MIGRATE = int(os.environ.get("BUF_MAX_AGE_MIGRATE", 7 * 86400))
 MIGRATE_SUFFIX       = "_migrate.json"   # filename tag — lets buf_expire pick the TTL bucket without opening the file
+
+# app:burn packets get their own long TTL, same reasoning as app:migrate —
+# these are "make sure this is eventually seen" packets, not conversation.
+# Separate from BUF_MAX_AGE_MIGRATE (and its own suffix) so a stray/late
+# migrate can never overwrite a pending burn notice in the buffer, or vice
+# versa — they don't share a slot.
+BUF_MAX_AGE_BURN = int(os.environ.get("BUF_MAX_AGE_BURN", 7 * 86400))
+BURN_SUFFIX       = "_burn.json"   # filename tag — same role as MIGRATE_SUFFIX
 
 # Logging
 LOG_FORMAT   = "%(asctime)s  %(levelname)-8s  %(message)s"
@@ -210,14 +218,21 @@ async def route_or_buffer(kind, frm, to, msg, ws):
     ours and never make it into the buffer at all — exactly the case
     this packet type exists to survive. The overwrite-per-sender,
     long-TTL semantics in buf_write already make this free when nobody
-    ends up needing the buffered copy."""
+    ends up needing the buffered copy.
+    
+    app:burn follows the identical exception as app:migrate, for the
+    identical reason: it must survive being "reached" by a stale session
+    of the same identity that's mid-disconnect. Kept as its own kind
+    throughout — never merged into the migrate buffer slot — so a routing
+    update can't clobber a pending burn notice or vice versa."""
     reached = await deliver(to, msg, exclude=ws)
     if reached:
         log.info("%-10s from=%s  to=%s  reached=%d", kind.upper(), short(frm), short(to), reached)
-    if not reached or kind == "app:migrate":
+    if not reached or kind in ("app:migrate", "app:burn"):
         await buf_write(to, msg)
         if reached:
-            log.info("BUF Q      from=%s  to=%s  (also buffered — migrate, durability required)  type=%s", short(frm), short(to), kind)
+            log.info("BUF Q      from=%s  to=%s  (also buffered — %s, durability required)  type=%s",
+                      short(frm), short(to), "migrate" if kind == "app:migrate" else "burn", kind)
         else:
             log.info("BUF Q      from=%s  to=%s  (offline)  type=%s", short(frm), short(to), kind)
 
@@ -323,7 +338,13 @@ def _buf_write_sync(to_id, msg):
     app:migrate packets use overwrite semantics: only the most recent
     packet from a given sender is kept (any older buffered migrate from
     that same sender is dropped first), and they're tagged with
-    MIGRATE_SUFFIX so buf_expire applies the longer TTL bucket."""
+    MIGRATE_SUFFIX so buf_expire applies the longer TTL bucket.
+    
+    app:burn uses the same overwrite-per-sender + own-suffix treatment as
+    app:migrate, kept as a fully separate bucket — the overwrite scan below
+    only ever drops files carrying the SAME suffix as the incoming packet,
+    so a migrate can never evict a buffered burn notice and a burn can
+    never evict a buffered migrate breadcrumb."""
     try:
         d = buf_dir(to_id)
     except ValueError as e:
@@ -335,18 +356,18 @@ def _buf_write_sync(to_id, msg):
         log.warning("BUF        mkdir failed  to=%s  err=%s", short(to_id), e)
         return
 
-    is_migrate = msg.get("type") == "app:migrate"
+    kind       = msg.get("type")
+    is_migrate = kind == "app:migrate"
+    is_burn    = kind == "app:burn"
     frm        = msg.get("from")
 
     files = buf_files(to_id)
 
-    if is_migrate and frm:
-        # overwrite — drop any existing buffered migrate packet(s) from this
-        # sender. Mutate `files` in place instead of re-calling buf_files()
-        # (avoids a second glob+sort on the hot path).
+    if (is_migrate or is_burn) and frm:
+        own_suffix = MIGRATE_SUFFIX if is_migrate else BURN_SUFFIX
         kept = []
         for fpath in files:
-            if not fpath.endswith(MIGRATE_SUFFIX):
+            if not fpath.endswith(own_suffix):
                 kept.append(fpath)
                 continue
             try:
@@ -358,9 +379,10 @@ def _buf_write_sync(to_id, msg):
             if old.get("from") == frm:
                 try:
                     os.remove(fpath)
-                    log.info("BUF        migrate overwrite  to=%s  from=%s", short(to_id), short(frm))
+                    log.info("BUF        %s overwrite  to=%s  from=%s",
+                              "migrate" if is_migrate else "burn", short(to_id), short(frm))
                 except Exception:
-                    kept.append(fpath)  # couldn't delete, keep in list
+                    kept.append(fpath)
             else:
                 kept.append(fpath)
         files = kept
@@ -380,14 +402,14 @@ def _buf_write_sync(to_id, msg):
         log.warning("BUF        size limit reached  to=%s  dropping", short(to_id))
         return
 
-    suffix = MIGRATE_SUFFIX if is_migrate else ".json"
+    suffix = MIGRATE_SUFFIX if is_migrate else (BURN_SUFFIX if is_burn else ".json")
     fname  = os.path.join(d, f"{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}{suffix}")
     try:
         with open(fname, "w") as f:
             json.dump(msg, f)
         stats["buf_in"] += 1
         log.info("BUF        write  to=%s  file=%s%s", short(to_id), os.path.basename(fname),
-                  "  [migrate]" if is_migrate else "")
+                  "  [migrate]" if is_migrate else ("  [burn]" if is_burn else ""))
     except Exception as e:
         log.warning("BUF        write failed  to=%s  err=%s", short(to_id), e)
 
@@ -491,7 +513,12 @@ async def buf_expire():
                 for entry in os.scandir(rec_dir.path):
                     if not entry.name.endswith(".json"):
                         continue
-                    max_age = BUF_MAX_AGE_MIGRATE if entry.name.endswith(MIGRATE_SUFFIX) else BUF_MAX_AGE
+                    if entry.name.endswith(MIGRATE_SUFFIX):
+                        max_age = BUF_MAX_AGE_MIGRATE
+                    elif entry.name.endswith(BURN_SUFFIX):
+                        max_age = BUF_MAX_AGE_BURN
+                    else:
+                        max_age = BUF_MAX_AGE
                     if now - entry.stat().st_mtime > max_age:
                         try:
                             os.remove(entry.path)
@@ -621,7 +648,7 @@ async def handler(ws):
                 await send_to(ws, {"type": "sig:auth_fail", "reason": "not_authenticated"})
 
             # ── message / migrate: from must match an authed identity on this socket ──
-            elif kind in ("app:message", "app:migrate"):
+            elif kind in ("app:message", "app:migrate", "app:burn"):
                 frm = msg.get("from", "?")
                 to  = msg.get("to")
                 if not valid_id(to):
@@ -719,8 +746,8 @@ async def run_signal_server():
     log.info("=" * 50)
     log.info("MeshChat signal server")
     log.info("Listening on %s:%d", WS_HOST, WS_PORT)
-    log.info("Buffer dir: %s  max_msgs=%d  max_age=%ds  migrate_age=%ds  max_mb=%.1f",
-             BUF_DIR, BUF_MAX_MSGS, BUF_MAX_AGE, BUF_MAX_AGE_MIGRATE, BUF_MAX_MB)
+    log.info("Buffer dir: %s  max_msgs=%d  max_age=%ds  migrate_age=%ds  burn_age=%ds  max_mb=%.1f",
+             BUF_DIR, BUF_MAX_MSGS, BUF_MAX_AGE, BUF_MAX_AGE_MIGRATE, BUF_MAX_AGE_BURN, BUF_MAX_MB)
     log.info("=" * 50)
     async with websockets.serve(handler, WS_HOST, WS_PORT, max_size=WS_MAX_SIZE):
         asyncio.create_task(log_stats())
