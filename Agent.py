@@ -20,7 +20,11 @@ Requirements:
     pip install websockets cryptography
 
 Run:
-    python3 agent.py
+    ./startagent.sh
+    (sets the AGENT_* env vars below, then runs this file — see that
+    script for the config format. Running `python3 agent.py` directly
+    without those env vars set falls back to the placeholder defaults.)
+
 The shareable key is printed on boot — exchange it with the contact(s)
 listed in CONTACTS below (out of band, same as any MeshChat address).
 """
@@ -64,17 +68,68 @@ except ImportError:
     AIORTC_AVAILABLE = False
 
 # ══════════════════════════════════════════
-#   CONFIG — edit before running
+#   LOGGING
+#   Moved ahead of CONFIG (below) so env-var parsing can log warnings
+#   on malformed AGENT_CONTACTS/AGENT_SHELL_CONTACTS entries instead of
+#   silently dropping them or needing a bare print().
 # ══════════════════════════════════════════
 
-USERNAME   = "agent-bot"                            # this agent's MeshChat username
-PASSPHRASE = "change-this-passphrase"                # this agent's MeshChat passphrase
-RELAY_WSS  = "wss://yourrelay.example.com/ws/"       # relay this agent connects to
+LOG_LEVEL = logging.INFO
+logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s  %(levelname)-7s  %(message)s", datefmt="%H:%M:%S")
+log = logging.getLogger("agent")
+
+
+def pid(s):
+    return (s or "?")[:8] + "…"
+
+
+# ══════════════════════════════════════════
+#   CONFIG — loaded from AGENT_* environment variables, set by
+#   startagent.sh. Falls back to the placeholder values below if a
+#   given env var isn't set, so `python3 agent.py` run bare still boots
+#   (and still warns about the placeholder key, same as before).
+#
+#   AGENT_CONTACTS format:      name=shareable_key,name2=shareable_key2
+#   AGENT_SHELL_CONTACTS format: name,name2   (subset of the names above)
+#   Shareable keys are base64url segments joined by '.' — they never
+#   contain '=' or ',' themselves, so splitting on those characters is
+#   unambiguous and needs no escaping/quoting.
+# ══════════════════════════════════════════
+
+def _parse_contacts(raw: str) -> dict:
+    contacts = {}
+    if not raw:
+        return contacts
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        if "=" not in entry:
+            log.warning("CONFIG     AGENT_CONTACTS entry missing '=': %r — skipped", entry)
+            continue
+        name, key = entry.split("=", 1)
+        name, key = name.strip(), key.strip()
+        if not name or not key:
+            log.warning("CONFIG     AGENT_CONTACTS entry has empty name/key: %r — skipped", entry)
+            continue
+        contacts[name] = key
+    return contacts
+
+
+def _parse_shell_contacts(raw: str) -> set:
+    if not raw:
+        return set()
+    return {n.strip() for n in raw.split(",") if n.strip()}
+
+
+USERNAME   = os.environ.get("AGENT_USERNAME", "agent-bot")                          # this agent's MeshChat username
+PASSPHRASE = os.environ.get("AGENT_PASSPHRASE", "change-this-passphrase")           # this agent's MeshChat passphrase
+RELAY_WSS  = os.environ.get("AGENT_RELAY_WSS", "wss://yourrelay.example.com/ws/")   # relay this agent connects to
 
 # Who is allowed to send it commands. name -> shareable key
 # ("encKey_b64url.signPubKey_b64url" or with a third ".relay_b64" segment —
 # the relay segment is ignored here; see NOTE below).
-CONTACTS = {
+CONTACTS = _parse_contacts(os.environ.get("AGENT_CONTACTS", "")) or {
     "admin": "PASTE_SHAREABLE_KEY_HERE",
 }
 
@@ -110,7 +165,6 @@ COMMAND_TIMEOUT  = 10             # seconds, per command — also the cap on a
                                    # cousin slipping through some other way;
                                    # see the TimeoutExpired handling below
 RECONNECT_DELAY  = 5              # seconds, on disconnect
-LOG_LEVEL        = logging.INFO
 
 # NOTE — single-relay assumption: replies are sent back over this agent's
 # own authenticated socket to RELAY_WSS (the same fallback path script.js
@@ -121,22 +175,8 @@ LOG_LEVEL        = logging.INFO
 # same-relay PoC; extend later if that stops being true.
 
 # ══════════════════════════════════════════
-#   SHELL ESCALATION (WebRTC) — PREP ONLY
+#   SHELL ESCALATION (WebRTC)
 #   ---------------------------------------
-#   This half of the file is not reachable yet. server.py doesn't route
-#   shell:* packet types (they'd currently hit the "UNKNOWN, dropped"
-#   branch), and script.js doesn't send them. Everything below is written
-#   against the shape we agreed on so nothing here needs to change again
-#   once those two catch up — it's just dead code until then. The pty and
-#   session-lifecycle pieces (ShellSession, spawn_pty_shell, idle timeout)
-#   have no WebRTC dependency and can be sanity-tested standalone today.
-#
-#   Agreed shape:
-#     shell:invite / shell:cancel / shell:end   — signed only, no blob
-#                                                  (mirrors call:invite/cancel/end)
-#     shell:offer  / shell:answer / shell:ice   — blob+sig, ciphertext
-#                                                  inside the signature
-#                                                  (mirrors call:offer/answer/ice)
 #   Two data channels, opened by the human side (the offerer):
 #     "shell-data" — raw pty bytes, ordered+reliable
 #     "shell-ctrl" — JSON control messages, currently just
@@ -150,9 +190,10 @@ LOG_LEVEL        = logging.INFO
 #   in SHELL_CONTACTS can ever get a full pty.
 # ══════════════════════════════════════════
 
-SHELL_CONTACTS        = set()     # subset of CONTACTS names allowed to request a full shell — empty = disabled
-SHELL_IDLE_TIMEOUT_S  = 300       # ssh-style — no bytes either direction for this long, session dies
-SHELL_IDLE_CHECK_S    = 5         # how often the watchdog checks
+# subset of CONTACTS names allowed to request a full shell — empty = disabled
+SHELL_CONTACTS       = _parse_shell_contacts(os.environ.get("AGENT_SHELL_CONTACTS", ""))
+SHELL_IDLE_TIMEOUT_S = 300       # ssh-style — no bytes either direction for this long, session dies
+SHELL_IDLE_CHECK_S   = 5         # how often the watchdog checks
 
 RTC_ICE_SERVERS = [
     RTCIceServer(urls="stun:stun.l.google.com:19302"),
@@ -164,18 +205,6 @@ RTC_ICE_SERVERS = [
 # in handle_shell_invite. A second invite while one is already live is ignored,
 # same rule as contact.call in script.js's state machine.
 SHELL_SESSIONS = {}
-
-# ══════════════════════════════════════════
-#   LOGGING
-# ══════════════════════════════════════════
-
-logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s  %(levelname)-7s  %(message)s", datefmt="%H:%M:%S")
-log = logging.getLogger("agent")
-
-
-def pid(s):
-    return (s or "?")[:8] + "…"
-
 
 # ══════════════════════════════════════════
 #   CRYPTO — mirrors script.js exactly
@@ -577,7 +606,19 @@ async def handle_shell_offer(ws, identity: "Identity", contacts_by_id: dict, msg
             @channel.on("open")
             def on_data_open():
                 asyncio.ensure_future(session.start_pty())
-                
+
+            # RACE FIX — aiortc can deliver the datachannel event after the
+            # channel has already transitioned to "open" (this happens
+            # whenever the remote description is applied late enough that
+            # the DCEP open handshake completes before Python gets around
+            # to registering the "open" listener above). In that case the
+            # "open" event has already fired with nobody listening, and
+            # start_pty() would otherwise never run — pty never spawns,
+            # nothing is ever written to the channel, and the client sees
+            # a connected data channel with a permanently blank terminal.
+            # start_pty() is idempotent (guards on self.master_fd), so
+            # calling it here is always safe even if "open" also fires
+            # normally right after this runs.
             if channel.readyState == "open":
                 asyncio.ensure_future(session.start_pty())
 
@@ -716,7 +757,7 @@ async def run():
     contacts_by_id = {}
     for name, key in CONTACTS.items():
         if key == "PASTE_SHAREABLE_KEY_HERE":
-            log.warning("CONTACT    '%s' still has a placeholder key — edit CONTACTS in the config", name)
+            log.warning("CONTACT    '%s' still has a placeholder key — set AGENT_CONTACTS (see startagent.sh)", name)
             continue
         c = parse_contact(name, key)
         contacts_by_id[c["public_id"]] = c
@@ -725,12 +766,11 @@ async def run():
     if SHELL_CONTACTS:
         unknown = SHELL_CONTACTS - set(CONTACTS)
         if unknown:
-            log.warning("SHELL      SHELL_CONTACTS references unknown name(s): %s", ", ".join(sorted(unknown)))
+            log.warning("SHELL      AGENT_SHELL_CONTACTS references unknown name(s): %s", ", ".join(sorted(unknown)))
         if not AIORTC_AVAILABLE:
-            log.warning("SHELL      SHELL_CONTACTS is set but aiortc isn't installed — shell escalation disabled")
+            log.warning("SHELL      AGENT_SHELL_CONTACTS is set but aiortc isn't installed — shell escalation disabled")
         else:
-            log.info("SHELL      escalation enabled for: %s  (still inert — see SHELL ESCALATION section)",
-                      ", ".join(sorted(SHELL_CONTACTS)))
+            log.info("SHELL      escalation enabled for: %s", ", ".join(sorted(SHELL_CONTACTS)))
 
     cwd_holder = {"cwd": os.path.expanduser("~")}
 
@@ -749,9 +789,6 @@ async def run():
                         await handle_message(ws, identity, contacts_by_id, cwd_holder, msg)
                     elif kind == "sig:auth_fail":
                         log.warning("relay rejected traffic: %s", msg.get("reason"))
-                    # shell:* — inert today, see SHELL ESCALATION section above;
-                    # server.py doesn't route these types yet, so in practice
-                    # this branch is currently unreachable.
                     elif kind == "shell:invite":
                         await handle_shell_invite(ws, identity, contacts_by_id, msg)
                     elif kind == "shell:offer":

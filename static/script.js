@@ -2744,14 +2744,13 @@ function shellRtcClose(id) {
 // yet client-side because the human is always the offerer; this is here
 // purely for the human's own local channels.
 function wireShellDataChannel(id, ch) {
-  ch.binaryType = "arraybuffer"; 
+  ch.binaryType = "arraybuffer";
   ch.onopen = () => mlog.info(`SHELL RTC  data channel open  ${pid(id)}`);
   ch.onclose = () => mlog.debug(`SHELL RTC  data channel closed  ${pid(id)}`);
   ch.onmessage = (e) => {
-    // raw pty bytes from the agent — terminal wiring (step 4) consumes this.
-    // Left as a visible hook rather than a silent drop so step 4 has an
-    // obvious place to attach.
-    if (typeof onShellDataReceived === "function") onShellDataReceived(id, e.data);
+    console.log("SHELL DATA raw", typeof e.data, e.data instanceof ArrayBuffer, e.data?.byteLength ?? e.data?.size);   // ← temporary debug line
+    const bytes = e.data instanceof ArrayBuffer ? new Uint8Array(e.data) : e.data;
+    if (typeof onShellDataReceived === "function") onShellDataReceived(id, bytes);
   };
 }
  
