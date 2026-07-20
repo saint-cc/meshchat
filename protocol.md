@@ -2,7 +2,7 @@
 
 A decentralised, encrypted messaging protocol built on WebSocket relay servers. No accounts, no central authority, no plaintext.
 
-Current client/server implementation version: `0.3.4`, surfaced informationally via the `version` field on `sig:relay_info` for drift visibility (not yet enforced).
+Current client/server implementation version: `0.3.7`, surfaced informationally via the `version` field on `sig:relay_info` for drift visibility (not yet enforced). `0.3.6` added WebRTC data-channel shell escalation for agent contacts; `0.3.7` added the burn notice.
 
 ---
 
@@ -265,6 +265,54 @@ The encrypted payload is `{ newRelay, ts }` — same encryption scheme as a regu
 
 ---
 
+## Burn Notice
+
+A deliberate, irreversible local action — "stop trusting this identity" — announced via its own dedicated packet type. Structurally identical to `app:migrate` in every way that matters (mandatory signature, always-durable buffering, overwrite-per-sender, long TTL) but kept on a completely separate wire type and buffer bucket, so a routing update can never clobber a pending burn notice, or vice versa — they never share a slot.
+
+```json
+{
+  "type": "app:burn",
+  "from": "<publicId>",
+  "to":   "<publicId>",
+  "blob": { "v": 1, "iv": [...], "data": [...] },
+  "sig":  [...]
+}
+```
+
+The encrypted payload is `{ ts }` — deliberately thin. Unlike `app:migrate` there is no value to timestamp-guard and adopt; burn is a one-shot action, not a routing fact to compare against what's already stored. `ts` exists only so the signed blob carries some content and for an audit trail. Encryption/signing is otherwise identical to `app:migrate` — sender's own `encKey`, same symmetric-by-address scheme.
+
+**Signature is mandatory.** Same rule as `app:migrate` and the `call:*`/`shell:*` groups: this packet drives an irreversible action, so an unsigned or invalid one is dropped outright rather than flagged and displayed.
+
+**Self vs. contact — the packet means something different depending on sender:**
+
+- **From self** — another of the user's own devices burned (or this is a second live session catching the same burn). Adopted silently, no ceremony, no notify-back — the receiving device wipes itself too. See [Self-Destruct](#self-destruct) below.
+- **From a contact** — they burned; the receiving side converts the contact to `blocked`, recording `blockReason: "burned"` (local-only UI metadata — never on the wire, never a security boundary, just lets the edit-contact pane say *why* something is blocked rather than a bare yes/no). This also drops any stored peer token for that contact, in addition to the message/backup wipe an ordinary manual block already performs — burn is explicitly saying "treat this identity as gone for good," a stronger and less reversible intent than a manual block, so nothing usable for a future restore is left behind. An already-blocked contact is a no-op.
+
+**On commit**, the burning client:
+1. Notifies every non-blocked contact via `sendToRelay` (their last-known relay), falling back to `sendSignal` — identical routing to a regular message or `app:migrate`.
+2. Sends a copy to *itself* via plain `sendSignal` (same pattern `pushMiniBackup` already uses for self-targeted packets) — no `sendViaRelayUrl`/old-relay dance the way `app:migrate` needs, since burn isn't a routing change. It only needs to reach whatever relay the "me" contact currently points to. A self-device parked at a genuinely different or stale relay won't see it until it next syncs there — the same known limitation `app:migrate` already has.
+3. After a brief pause to let the outbound sends leave the socket, wipes itself (see below).
+
+**Server-side buffering** mirrors `app:migrate`'s exception exactly, on its own bucket:
+- **Always durably buffered**, even when a live recipient session is reached — same stale-session race `app:migrate` protects against.
+- **Overwrite-per-sender**, but only within its *own* suffix (`_burn.json`) — a buffered `app:migrate` breadcrumb can never be evicted by an incoming burn, and vice versa.
+- **Long TTL** (`BUF_MAX_AGE_BURN`, default 7 days — independent of, and identical in spirit to, `BUF_MAX_AGE_MIGRATE`).
+
+### Self-Destruct
+
+Not cryptographic revocation — it can't be. Identity is deterministic from `(username, passphrase)`; anyone who still knows the credentials (including the user themselves) can log back in and re-derive the exact same keys at any time. Burn is purely a **local wipe plus a social signal** — the notices sent to contacts are what actually change anything outside the wiping device, by asking them to stop trusting it.
+
+On receiving a self-targeted burn — whether the network packet above, or triggering it locally — the client:
+1. Clears every identity-scoped storage key: contact store, peer backups, peer tokens, device registry, and the device seed itself, so this device can't quietly re-announce its old `deviceId` if the same credentials are ever used here again.
+2. Closes the signal socket.
+3. Reloads to the login screen — equivalent to a genuinely fresh browser profile for this identity.
+
+No trace is deliberately kept anywhere, on this device or otherwise, that the burn happened — consistent with the "not real revocation" framing above. A device that re-derives the same identity later has no way to know it was ever burned; that limitation is stated plainly here rather than implied otherwise.
+
+**Not yet implemented:** any UI indication — on this device or another — that a contact blocked via burn was burned specifically, versus manually blocked, beyond the receiving side's own `blockReason`.
+
+---
+
 ## Device Awareness
 
 ### Device Registry
@@ -378,6 +426,46 @@ The device that actually claimed the call ignores its own echo by comparing `dev
 
 ---
 
+## Agent Contacts & Shell Escalation
+
+A `type` field on a contact record — local-only, never on the wire, never included in `serialiseContacts()`/backups — marks a contact as an *agent*: a headless MeshChat identity (see `Agent.py`) running unattended and able to act on requests from trusted contacts. It only ever decides which header button the UI shows (call vs. shell); it carries no security meaning by itself. Real access control lives entirely on the agent's own side, in two independent, deliberately separate allowlists — being permitted one does not imply the other.
+
+### Bounded command whitelist
+
+The lighter-weight capability: ordinary encrypted `app:message` text, no new packet types. A contact the agent has whitelisted sends a short command (`ls`, `cd`, `pwd`, `cat`, `head`, `tail`, `file`, `df`, `du`, `whoami`, `hostname`, `uptime`); the agent executes it (`argv` list, never `shell=True`, `stdin=/dev/null`, per-command timeout, output capped and truncated on overflow) and replies with the output as a normal signed/encrypted text message. Single request/response per command — no pty, no session, no interactivity.
+
+### Shell escalation
+
+A full interactive pty, gated behind a **second, stricter allowlist** — being whitelisted for bounded commands does not imply shell eligibility; only contacts also explicitly named for shell access can ever get one. Reuses the `call:*` signaling shape and the same shared state machine (`transition()` in `statemachine.js`, `kind: "shell"` instead of `"call"` — identical phase/role logic, forked side effects) under its own wire prefix, with no audio/video involved at all:
+
+```json
+{
+  "type":      "shell:invite",
+  "from":      "<publicId>",
+  "to":        "<publicId>",
+  "sessionId": "<uuid>",
+  "ts":        1234567890123,
+  "deviceId":  "<deviceId>",
+  "sig":       [...]
+}
+```
+
+Seven types, mirroring the `call:*` group exactly: `shell:invite` / `shell:claim` / `shell:cancel` / `shell:end` (signed only, no `blob`); `shell:offer` / `shell:answer` / `shell:ice` (signed with an encrypted `blob` — SDP or one ICE candidate — inside the signature, same anti-swap protection as `call:offer`/`app:migrate`). `sessionId` plays `callId`'s role, generated once by the initiator. Signature is mandatory on every type in this group, same rule as `call:*` — an unsigned or invalid packet is dropped outright.
+
+**Asymmetry is hardcoded, not negotiated:** the human client is always the offerer, the agent is always the callee. `agent.py` auto-claims any `shell:invite` from a contact on its shell allowlist the instant it verifies the signature (there's no human on that end to click answer), then waits for the human's `shell:offer`. One session per contact is enforced on both sides — a second invite while one is already active is ignored.
+
+**Two data channels**, opened by the human/offerer once the peer connection is up:
+- `shell-data` — raw pty bytes, ordered and reliable. Keystrokes flow one way, pty output the other; rendered client-side via `xterm.js`.
+- `shell-ctrl` — JSON control messages, currently just `{"type":"resize","cols":N,"rows":N}`.
+
+The agent spawns the pty (`pty.fork()`, attached to the user's `$SHELL -i`) on the data channel's `open` event and tears it down on `shell:end`/`shell:cancel`, ICE failure, the pty process exiting on its own, or `SHELL_IDLE_TIMEOUT_S` (default 300s) of silence in both directions — ssh-style idle, not tab-focus-based.
+
+**No TURN** — same permanent architectural decision as voice calls, same STUN-only ICE config, same acceptance that some NAT pairings simply won't connect. If ICE fails, there is no escalation; the bounded command whitelist above needs no WebRTC and remains available regardless.
+
+**Not yet implemented:** human-to-human shell sharing (the `ringing` phase exists in the shared state machine for parity but is unreachable against `agent.py` today, since it always auto-claims); the same ICE diagnostics/restart gaps noted under [Voice Calling](#voice-calling) apply here too.
+
+---
+
 ## Signal Server Protocol
 
 ### Client → Server
@@ -389,6 +477,7 @@ The device that actually claimed the call ignores its own echo by comparing `dev
 | `sig:announce`      | `ids[]`                                   | yes  | Check local presence of up to 10 IDs |
 | `app:message`       | `from`, `to`, `blob`, `sig`, `deviceId?`  | yes | Deliver message — `from` must match authed identity on this socket |
 | `app:migrate`       | `from`, `to`, `blob`, `sig`               | yes | Notify of a relay migration — always durably buffered in addition to live delivery |
+| `app:burn`          | `from`, `to`, `blob`, `sig`               | yes | Notify of a burn (self-destruct / stop-trusting) — always durably buffered in addition to live delivery, own overwrite bucket |
 | `app:sync`          | `from`, `to`, `msgs[]`, `reply`           | yes  | Manual sync exchange |
 | `sync:backup_offer` | `from`, `to`, `size`                      | yes  | Offer backup blob to peer |
 | `sync:backup_accept`| `from`, `to`, `deviceId?`, `fingerprint?` | yes  | Accept a backup offer. With `deviceId`/`fingerprint`: device-freshness ack on the self-sync path |
@@ -405,6 +494,13 @@ The device that actually claimed the call ignores its own echo by comparing `dev
 | `call:offer`        | `from`, `to`, `callId`, `ts`, `deviceId?`, `blob`, `sig` | yes | WebRTC SDP offer — `blob` encrypted with recipient's `encKey`, signed with `blob` included |
 | `call:answer`       | `from`, `to`, `callId`, `ts`, `deviceId?`, `blob`, `sig` | yes | WebRTC SDP answer — same encryption/signing as `call:offer` |
 | `call:ice`          | `from`, `to`, `callId`, `ts`, `deviceId?`, `blob`, `sig` | yes | One ICE candidate — same encryption/signing as `call:offer` |
+| `shell:invite`      | `from`, `to`, `sessionId`, `ts`, `deviceId?`, `sig` | yes | Invite a contact to shell escalation — mandatory signature |
+| `shell:claim`       | `from`, `to`, `sessionId`, `ts`, `deviceId?`, `sig` | yes | Accept a shell invite (agent auto-claims if allowlisted) |
+| `shell:cancel`      | `from`, `to`, `sessionId`, `ts`, `deviceId?`, `sig` | yes | Cancel/decline before connection |
+| `shell:end`         | `from`, `to`, `sessionId`, `ts`, `deviceId?`, `sig` | yes | End an active or negotiating shell session |
+| `shell:offer`       | `from`, `to`, `sessionId`, `ts`, `deviceId?`, `blob`, `sig` | yes | WebRTC SDP offer — human is always the offerer |
+| `shell:answer`      | `from`, `to`, `sessionId`, `ts`, `deviceId?`, `blob`, `sig` | yes | WebRTC SDP answer — agent is always the answerer |
+| `shell:ice`         | `from`, `to`, `sessionId`, `ts`, `deviceId?`, `blob`, `sig` | yes | One ICE candidate — same encryption/signing as `shell:offer` |
 | `sig:relay_req`     | —                                         | yes | Request relay's own WSS URL |
 | `sig:ping`          | —                                         | yes | Keepalive |
 
@@ -423,11 +519,11 @@ The device that actually claimed the call ignores its own echo by comparing `dev
 ### Notes
 
 - `app:message`, `app:migrate`, `app:sync`, and all `sync:*` types require auth AND validate `from` ∈ `client_ids` on the socket. `sig:relay_req` and `sig:ping` only require the socket to be authed (no `from` field to check). `sig:announce` has no `from` field at all — its response targets the socket's own authed identity via `last_id()`.
-- `app:migrate` is always written to the durable buffer in addition to any live delivery.
+- `app:migrate` and `app:burn` are always written to the durable buffer in addition to any live delivery — each to its own overwrite bucket, keyed by its own filename suffix, so one can never evict the other.
 - `sync:backup_accept` and `sync:backup_push` carry optional `deviceId`/`fingerprint` fields used exclusively on the self-sync path. These fields are never set on the contact backup path. Old clients that omit them are handled gracefully.
 - Sync and backup types are e2e encrypted and routed by the server without inspection of contents — but the socket itself must be authed before any of these are accepted. This closes a prior gap where an unauthenticated connection could reach these branches before completing the challenge-response.
-- All seven `call:*` types are delivered live-only via the same `deliver()`/`from`-validation path as `app:sync` and the `sync:*` types; unlike `app:message`/`app:migrate` they are never durably buffered, so a callee who is offline simply never rings.
-- `call:invite`/`call:claim`/`call:cancel`/`call:end` carry no `blob` — signed only, nothing to encrypt. `call:offer`/`call:answer`/`call:ice` carry an encrypted `blob` (SDP or one ICE candidate) and sign the ciphertext along with the envelope, same protection principle as `app:migrate`.
+- All seven `call:*` types and all seven `shell:*` types are delivered live-only via the same `deliver()`/`from`-validation path as `app:sync` and the `sync:*` types; unlike `app:message`/`app:migrate`/`app:burn` they are never durably buffered, so an offline callee/agent simply never rings.
+- `call:invite`/`call:claim`/`call:cancel`/`call:end` and `shell:invite`/`shell:claim`/`shell:cancel`/`shell:end` carry no `blob` — signed only, nothing to encrypt. `call:offer`/`call:answer`/`call:ice` and `shell:offer`/`shell:answer`/`shell:ice` carry an encrypted `blob` (SDP or one ICE candidate) and sign the ciphertext along with the envelope, same protection principle as `app:migrate`/`app:burn`.
 
 ---
 
@@ -531,10 +627,11 @@ The relay itself is untrusted infrastructure. Cryptographic proof — signatures
 | `BUF_MAX_MSGS`        | `100`         | Max buffered messages per recipient |
 | `BUF_MAX_AGE`         | `86400`       | Buffer expiry in seconds (24h) — regular packets |
 | `BUF_MAX_AGE_MIGRATE` | `604800`      | Buffer expiry in seconds (7d) — `app:migrate` packets only |
+| `BUF_MAX_AGE_BURN`    | `604800`      | Buffer expiry in seconds (7d) — `app:burn` packets only, independent bucket |
 | `BUF_MAX_MB`          | `10`          | Max buffer size per recipient in MB |
 | `AUTH_TIMEOUT`        | `15`          | Seconds to complete challenge-response before disconnect |
 
 ---
 
 *MeshChat Protocol v1 — experimental, subject to change*  
-*Last updated: June 2026*
+*Last updated: July 2026*
