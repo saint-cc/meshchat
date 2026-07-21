@@ -2,6 +2,7 @@ import asyncio
 import base64
 import glob
 import hashlib
+import ipaddress
 import json
 import logging
 import multiprocessing
@@ -36,11 +37,64 @@ RELAY_WSS_URL = os.environ.get("RELAY_WSS_URL", "")   # e.g. wss://yourrelay.exa
 # Protocol version — informational only for now, surfaced in sig:relay_info
 # so client/server version drift shows up in both logs. Not enforced yet;
 # room to add real backwards-compat handling once this is actually needed.
-PROTOCOL_VERSION = os.environ.get("PROTOCOL_VERSION", "0.3.7")
+PROTOCOL_VERSION = os.environ.get("PROTOCOL_VERSION", "0.3.8")
 
 # Connection limits
 MAX_CONNECTIONS        = int(os.environ.get("MAX_CONNECTIONS",        100))   # total WS sessions
 MAX_CONNECTIONS_PER_IP = int(os.environ.get("MAX_CONNECTIONS_PER_IP", 15))   # per source IP
+
+# Trusted proxy addresses/ranges — X-Real-IP / X-Forwarded-For are only
+# honoured when the actual TCP peer falls inside one of these. Without
+# this, anyone who can reach WS_PORT directly (not just through nginx) can
+# set an arbitrary X-Real-IP per connection and make MAX_CONNECTIONS_PER_IP
+# (and per-IP rate limiting below) a no-op — every "different IP" they
+# claim gets its own fresh allowance.
+# Accepts a mix of bare IPs and CIDR ranges, e.g.
+# "127.0.0.1,::1,192.168.1.20,172.20.0.0/16" — a bare IP is treated as its
+# own /32 (or /128) network. CIDR support matters for anyone running nginx
+# in a container: the peer address the relay actually sees there is nginx's
+# address on the docker network (or the bridge gateway), which can drift
+# across redeploys even when the subnet itself stays fixed — a range
+# survives that, an exact single-IP match doesn't.
+# Default assumes nginx runs on the same host as this process (matches the
+# README's reverse-proxy setup); add whatever else applies to your topology.
+_TRUSTED_PROXIES_INVALID = []   # entries that failed to parse — logged once the logger exists, below
+
+def _parse_trusted_proxies(raw):
+    networks = []
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        try:
+            networks.append(ipaddress.ip_network(entry, strict=False))
+        except ValueError:
+            _TRUSTED_PROXIES_INVALID.append(entry)
+    return networks
+
+TRUSTED_PROXIES = _parse_trusted_proxies(os.environ.get("TRUSTED_PROXIES", "127.0.0.1,::1"))
+
+def is_trusted_proxy(addr):
+    """True if addr (a plain IP string) falls inside any TRUSTED_PROXIES
+    network — exact match or CIDR range, either way."""
+    if not addr:
+        return False
+    try:
+        ip = ipaddress.ip_address(addr)
+    except ValueError:
+        return False
+    return any(ip in net for net in TRUSTED_PROXIES)
+
+# Buffer — cap on total distinct recipient directories under BUF_DIR.
+# BUF_MAX_MSGS/BUF_MAX_MB already bound each recipient's own footprint, but
+# `to` only has to satisfy valid_id() — it never has to correspond to an
+# identity that has ever authenticated. Without this, an authed sender can
+# fan a single app:migrate/app:burn (long TTL, always durably buffered
+# regardless of delivery) out to an unbounded number of fabricated
+# recipient IDs, each getting its own small-but-persistent directory.
+# Existing recipients are never affected — this only stops NEW directories
+# from being created once the ceiling is hit.
+MAX_BUF_RECIPIENTS = int(os.environ.get("MAX_BUF_RECIPIENTS", 10000))
 
 # Rate limiter
 RATE_LIMIT_RATE  = 10   # tokens refilled per second
@@ -103,13 +157,17 @@ logging.getLogger("websockets.asyncio.server").addFilter(_HandshakeFilter())
 
 log = logging.getLogger("signal")
 
+for _bad_entry in _TRUSTED_PROXIES_INVALID:
+    log.warning("CONFIG     TRUSTED_PROXIES invalid entry skipped: %r", _bad_entry)
+
 # ══════════════════════════════════════════
 #   SIGNAL SERVER STATE
 # ══════════════════════════════════════════
 
 connected: dict[str, set] = {}   # publicId → set of websockets
-pending_auth: dict = {}          # ws → { enc_key, nonce, ts, bits }
+pending_auth: dict = {}          # ws → { enc_key, nonce, ts, bits, ws }
 ip_conns: dict[str, int] = {}    # ip → active connection count
+ip_limiters: dict = {}           # ip → RateLimiter shared across all that IP's sockets
 ws_to_ids: dict = {}             # ws → set of publicIds (reverse of connected; O(1) cleanup)
 buf_locks: dict = {}             # to_id → asyncio.Lock (serializes per-recipient buffer writes)
 
@@ -117,6 +175,7 @@ stats = {
     "bytes_in":  0, "bytes_out": 0,
     "msgs_in":   0, "msgs_out":  0,
     "buf_in":    0, "buf_out":   0,
+    "buf_cap_rejected": 0,   # writes dropped for hitting MAX_BUF_RECIPIENTS
 }
 
 # ══════════════════════════════════════════
@@ -134,14 +193,25 @@ def short(id_str):
 
 def peer_info(ws):
     try:
+        raw_addr = ws.remote_address[0]
+    except Exception:
+        raw_addr = None
+
+    # Only honour forwarded-for headers if the actual TCP peer is a known
+    # proxy — otherwise a direct connection to WS_PORT can claim to be any
+    # IP it likes, defeating MAX_CONNECTIONS_PER_IP and per-IP rate limiting
+    # outright. See TRUSTED_PROXIES comment above.
+    if not is_trusted_proxy(raw_addr):
+        return raw_addr or "unknown"
+
+    try:
         headers = ws.request.headers
         ip = (headers.get("X-Real-IP")
               or headers.get("X-Forwarded-For", "").split(",")[0].strip()
-              or ws.remote_address[0])
+              or raw_addr)
         return ip
     except Exception:
-        try:    return str(ws.remote_address)
-        except Exception: return "unknown"
+        return raw_addr or "unknown"
 
 def unique_keys():
     """Number of distinct registered public IDs."""
@@ -265,6 +335,7 @@ async def auth_challenge(ws, enc_key_bytes: bytes, bits: int, no_receive: bool =
         "ts":          time.monotonic(),
         "bits":        bits,
         "no_receive":  no_receive,
+        "ws":          ws,   # so sweep_pending_auth() can actively close stale entries
     }
     await send_to(ws, {
         "type": "sig:auth_challenge",
@@ -350,6 +421,23 @@ def _buf_write_sync(to_id, msg):
     except ValueError as e:
         log.warning("BUF        rejected  to=%s  reason=%s", short(to_id), e)
         return
+
+    # Recipient cap — only matters for a NEW recipient directory. An
+    # existing recipient (one that already has a dir, real or previously
+    # allowed) is never turned away by this; it's purely a brake on an
+    # attacker fanning out to unlimited fabricated recipient IDs. See
+    # MAX_BUF_RECIPIENTS comment near its definition.
+    if not os.path.isdir(d):
+        try:
+            existing = sum(1 for e in os.scandir(BUF_DIR) if e.is_dir()) if os.path.isdir(BUF_DIR) else 0
+        except Exception:
+            existing = 0
+        if existing >= MAX_BUF_RECIPIENTS:
+            stats["buf_cap_rejected"] += 1
+            log.warning("BUF        recipient cap reached (%d) — rejecting new recipient  to=%s",
+                        MAX_BUF_RECIPIENTS, short(to_id))
+            return
+
     try:
         os.makedirs(d, exist_ok=True)
     except Exception as e:
@@ -542,11 +630,42 @@ async def log_stats():
     while True:
         await asyncio.sleep(STATS_INTERVAL)
         log.info("STATS      keys=%d  sessions=%d  in=%s(%d msgs)  out=%s(%d msgs)  "
-                 "buf_in=%d  buf_out=%d",
+                 "buf_in=%d  buf_out=%d  buf_cap_rejected=%d",
                  unique_keys(), session_count(),
                  fmt_bytes(stats["bytes_in"]),  stats["msgs_in"],
                  fmt_bytes(stats["bytes_out"]), stats["msgs_out"],
-                 stats["buf_in"], stats["buf_out"])
+                 stats["buf_in"], stats["buf_out"], stats["buf_cap_rejected"])
+
+# ══════════════════════════════════════════
+#   PENDING AUTH SWEEP
+#   AUTH_TIMEOUT was previously only enforced reactively — checked inside
+#   auth_verify() when a client finally sent sig:auth_proof. A client that
+#   sends sig:auth_init and then simply never sends proof (and never closes
+#   the socket) was never kicked: the connection sat in pending_auth and
+#   held a connection slot — one of MAX_CONNECTIONS_PER_IP — indefinitely.
+#   This sweep actively closes anything that's been mid-challenge longer
+#   than AUTH_TIMEOUT, same interval-based pattern as buf_expire/log_stats.
+# ══════════════════════════════════════════
+
+PENDING_AUTH_SWEEP_INTERVAL = 5   # seconds between sweeps — independent of AUTH_TIMEOUT itself
+
+async def sweep_pending_auth():
+    while True:
+        await asyncio.sleep(PENDING_AUTH_SWEEP_INTERVAL)
+        now   = time.monotonic()
+        stale = [key for key, entry in pending_auth.items() if now - entry["ts"] > AUTH_TIMEOUT]
+        for key in stale:
+            entry = pending_auth.pop(key, None)
+            if not entry:
+                continue
+            ws = entry.get("ws")
+            if ws is not None:
+                try:
+                    await ws.close(1013, "auth timeout")
+                except Exception:
+                    pass
+        if stale:
+            log.info("AUTH       swept %d stale half-authed connection(s)", len(stale))
 
 # ══════════════════════════════════════════
 #   WEBSOCKET HANDLER
@@ -570,6 +689,16 @@ async def handler(ws):
         await ws.close(1013, "too many connections from your address")
         return
 
+    # Shared across every socket this IP currently has open — without this,
+    # MAX_CONNECTIONS_PER_IP sockets each got their own independent 10/s
+    # budget, so an IP's effective throughput scaled with how many
+    # connections it opened rather than staying capped at one connection's
+    # worth. get-or-create rather than always-new so it persists (and its
+    # token bucket state carries over) across this IP's concurrent sockets.
+    if addr not in ip_limiters:
+        ip_limiters[addr] = RateLimiter()
+    ip_limiter = ip_limiters[addr]
+
     log.info("CONNECT    peer=%s  sessions=%d/%d  from_ip=%d/%d",
              addr, session_count(), MAX_CONNECTIONS,
              ip_conns[addr], MAX_CONNECTIONS_PER_IP)
@@ -585,6 +714,12 @@ async def handler(ws):
 
             if not limiter.allow():
                 log.warning("RATELIMIT  peer=%s  ids=%s", addr, client_ids)
+                await send_to(ws, {"type": "error", "reason": "rate_limited"})
+                continue
+
+            if not ip_limiter.allow():
+                log.warning("RATELIMIT(ip)  peer=%s  ids=%s  sockets_from_ip=%d",
+                            addr, client_ids, ip_conns.get(addr, 0))
                 await send_to(ws, {"type": "error", "reason": "rate_limited"})
                 continue
 
@@ -715,11 +850,14 @@ async def handler(ws):
     except Exception as e:
         log.error("HANDLER EX peer=%s  ids=%s  error=%s", addr, client_ids, e)
     finally:
-        # release per-IP slot
+        # release per-IP slot — and the shared limiter along with it, once
+        # this IP has no sockets left (otherwise ip_limiters grows forever
+        # under normal IP churn, one entry per address ever seen).
         if addr in ip_conns:
             ip_conns[addr] -= 1
             if ip_conns[addr] <= 0:
                 del ip_conns[addr]
+                ip_limiters.pop(addr, None)
         # clean up any pending challenge if socket dropped mid-auth
         pending_auth.pop(id(ws), None)
         # unregister all authed identities on this socket
@@ -746,12 +884,14 @@ async def run_signal_server():
     log.info("=" * 50)
     log.info("MeshChat signal server")
     log.info("Listening on %s:%d", WS_HOST, WS_PORT)
-    log.info("Buffer dir: %s  max_msgs=%d  max_age=%ds  migrate_age=%ds  burn_age=%ds  max_mb=%.1f",
-             BUF_DIR, BUF_MAX_MSGS, BUF_MAX_AGE, BUF_MAX_AGE_MIGRATE, BUF_MAX_AGE_BURN, BUF_MAX_MB)
+    log.info("Buffer dir: %s  max_msgs=%d  max_age=%ds  migrate_age=%ds  burn_age=%ds  max_mb=%.1f  max_recipients=%d",
+             BUF_DIR, BUF_MAX_MSGS, BUF_MAX_AGE, BUF_MAX_AGE_MIGRATE, BUF_MAX_AGE_BURN, BUF_MAX_MB, MAX_BUF_RECIPIENTS)
+    log.info("Trusted proxies: %s", ", ".join(str(n) for n in TRUSTED_PROXIES) or "(none)")
     log.info("=" * 50)
     async with websockets.serve(handler, WS_HOST, WS_PORT, max_size=WS_MAX_SIZE):
         asyncio.create_task(log_stats())
         asyncio.create_task(buf_expire())
+        asyncio.create_task(sweep_pending_auth())
         await asyncio.Future()
 
 # ══════════════════════════════════════════
