@@ -8,6 +8,9 @@
 :: Relay identity (what this server tells clients it is)
 set RELAY_WSS_URL=wss://yourdomain.com/ws/
 
+:: Your nginx machine ip or local network range
+set TRUSTED_PROXIES=127.0.0.1
+
 :: local file buffer
 set BUF_DIR=/Path/to/relay_buf
 set BUF_MAX_MSGS=100

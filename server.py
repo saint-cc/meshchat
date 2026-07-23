@@ -37,7 +37,7 @@ RELAY_WSS_URL = os.environ.get("RELAY_WSS_URL", "")   # e.g. wss://yourrelay.exa
 # Protocol version — informational only for now, surfaced in sig:relay_info
 # so client/server version drift shows up in both logs. Not enforced yet;
 # room to add real backwards-compat handling once this is actually needed.
-PROTOCOL_VERSION = os.environ.get("PROTOCOL_VERSION", "0.3.8")
+PROTOCOL_VERSION = os.environ.get("PROTOCOL_VERSION", "0.3.9")
 
 # Connection limits
 MAX_CONNECTIONS        = int(os.environ.get("MAX_CONNECTIONS",        100))   # total WS sessions
@@ -99,6 +99,41 @@ MAX_BUF_RECIPIENTS = int(os.environ.get("MAX_BUF_RECIPIENTS", 10000))
 # Rate limiter
 RATE_LIMIT_RATE  = 10   # tokens refilled per second
 RATE_LIMIT_BURST = 20   # max burst size
+
+# Global auth admission limiter — shared across ALL connections regardless
+# of source IP. Per-IP limiting (rate limiter + MAX_CONNECTIONS_PER_IP)
+# does nothing against a genuinely distributed flood (many real, distinct
+# IPs — a botnet/proxy pool, not spoofed packets, since WS/TCP can't
+# complete a handshake with a forged source address). Since identity here
+# has zero creation cost by design (no registration, no stake), the only
+# lever that still works independent of source diversity is capping how
+# fast NEW auth completions can happen server-wide, full stop. Blunt on
+# purpose — it will also throttle a legitimate burst (e.g. many real users
+# reconnecting after this relay restarts), so defaults have headroom.
+GLOBAL_AUTH_RATE  = float(os.environ.get("GLOBAL_AUTH_RATE",  50))    # new auth completions/sec, server-wide
+GLOBAL_AUTH_BURST = float(os.environ.get("GLOBAL_AUTH_BURST", 100))   # burst allowance
+
+# Per-recipient buffer write-rate limit — separate from BUF_MAX_MSGS/MB,
+# which cap total stored, not the RATE of new arrivals. Without this, a
+# distributed flood of one-shot senders (many distinct identities/IPs, one
+# message each) targeting one specific real, existing recipient can blow
+# through BUF_MAX_MSGS in well under a second, evicting genuine buffered
+# messages from that person's real contacts before they ever reconnect to
+# read them. Deliberately independent of sender identity — the whole
+# premise of this attack is many different senders, so nothing keyed by
+# sender would help. Only gates the OFFLINE buffering path (buf_write is
+# only reached when live delivery failed, or for app:migrate/app:burn's
+# durability exception) — has zero effect on live delivery between two
+# people who are both online.
+BUF_WRITE_RATE_LIMIT = float(os.environ.get("BUF_WRITE_RATE_LIMIT",  2))   # new buffered msgs/sec allowed, per recipient
+BUF_WRITE_RATE_BURST = float(os.environ.get("BUF_WRITE_RATE_BURST", 20))   # burst allowance, per recipient
+# How long a recipient's write-rate limiter sits idle before being pruned.
+# MAX_BUF_RECIPIENTS only bounds directories that exist AT ONCE — over a
+# server's lifetime, directories get created, flushed/expired, and later
+# recreated for different fabricated IDs, so the total distinct recipient
+# IDs ever seen isn't bounded the same way. Without pruning, this dict
+# would grow slowly forever under a patient, rotating attacker.
+BUF_RATE_LIMITER_IDLE_S = 600
 
 # WebSocket
 WS_MAX_SIZE = int(os.environ.get("WS_MAX_SIZE", 2 * 1024 * 1024))   # 2 MB per frame
@@ -170,12 +205,15 @@ ip_conns: dict[str, int] = {}    # ip → active connection count
 ip_limiters: dict = {}           # ip → RateLimiter shared across all that IP's sockets
 ws_to_ids: dict = {}             # ws → set of publicIds (reverse of connected; O(1) cleanup)
 buf_locks: dict = {}             # to_id → asyncio.Lock (serializes per-recipient buffer writes)
+buf_recipient_limiters: dict = {}   # to_id → RateLimiter, governs rate of NEW buffer writes for that recipient
 
 stats = {
     "bytes_in":  0, "bytes_out": 0,
     "msgs_in":   0, "msgs_out":  0,
     "buf_in":    0, "buf_out":   0,
-    "buf_cap_rejected": 0,   # writes dropped for hitting MAX_BUF_RECIPIENTS
+    "buf_cap_rejected":  0,   # writes dropped for hitting MAX_BUF_RECIPIENTS
+    "buf_rate_rejected": 0,   # writes dropped for hitting a recipient's write-rate limit
+    "auth_admission_rejected": 0,   # auth completions dropped by the global admission limiter
 }
 
 # ══════════════════════════════════════════
@@ -239,6 +277,11 @@ class RateLimiter:
             self.tokens -= 1
             return True
         return False
+
+# Single shared instance — deliberately NOT one-per-IP or one-per-socket.
+# See GLOBAL_AUTH_RATE comment near its definition for why this needs to
+# be global to be effective at all.
+global_auth_limiter = RateLimiter(rate=GLOBAL_AUTH_RATE, burst=GLOBAL_AUTH_BURST)
 
 # ══════════════════════════════════════════
 #   ROUTING HELPERS
@@ -359,6 +402,18 @@ async def auth_verify(ws, nonce_back: list, addr: str) -> str | None:
     if bytes(nonce_back) != entry["nonce"]:
         log.warning("AUTH       proof mismatch  peer=%s", addr)
         await send_to(ws, {"type": "sig:auth_fail", "reason": "proof_invalid"})
+        return None
+
+    # Global admission gate — checked only after the proof is confirmed
+    # valid, so a flood of garbage/incorrect proofs doesn't spend from the
+    # shared budget, only completions that would actually have succeeded.
+    # Deliberately independent of source IP (see GLOBAL_AUTH_RATE comment)
+    # — this is the one lever that still works when the flood is genuinely
+    # distributed across many real, distinct addresses rather than one.
+    if not global_auth_limiter.allow():
+        log.warning("AUTH       global admission limit reached  peer=%s", addr)
+        stats["auth_admission_rejected"] += 1
+        await send_to(ws, {"type": "sig:auth_fail", "reason": "server_busy"})
         return None
 
     public_id = derive_public_id(entry["enc_key"])
@@ -544,7 +599,23 @@ async def buf_write(to_id, msg):
     is evicted once unreferenced — otherwise any syntactically-valid `to`
     (it need not correspond to a real identity — see valid_id) leaves a
     permanent Lock object behind, an unbounded memory leak an authenticated
-    client could trigger at will simply by sending to junk recipient ids."""
+    client could trigger at will simply by sending to junk recipient ids.
+
+    Write-rate limited per recipient BEFORE any of that — see
+    BUF_WRITE_RATE_LIMIT comment near its definition. This is what actually
+    stops a distributed flood of one-shot senders from blowing through a
+    specific real recipient's BUF_MAX_MSGS cap fast enough to evict their
+    genuine buffered messages; the lock/thread machinery below only cares
+    about serializing writes that get past this gate."""
+    limiter = buf_recipient_limiters.get(to_id)
+    if limiter is None:
+        limiter = RateLimiter(rate=BUF_WRITE_RATE_LIMIT, burst=BUF_WRITE_RATE_BURST)
+        buf_recipient_limiters[to_id] = limiter
+    if not limiter.allow():
+        stats["buf_rate_rejected"] += 1
+        log.warning("BUF        write-rate limit reached  to=%s — dropped", short(to_id))
+        return
+
     lock = await _acquire_buf_lock(to_id)
     try:
         await asyncio.to_thread(_buf_write_sync, to_id, msg)
@@ -594,33 +665,48 @@ async def buf_expire():
         now     = time.time()
         dropped = 0
         try:
-            if not os.path.isdir(BUF_DIR): continue
-            for rec_dir in os.scandir(BUF_DIR):
-                if not rec_dir.is_dir():
-                    continue
-                for entry in os.scandir(rec_dir.path):
-                    if not entry.name.endswith(".json"):
+            if os.path.isdir(BUF_DIR):
+                for rec_dir in os.scandir(BUF_DIR):
+                    if not rec_dir.is_dir():
                         continue
-                    if entry.name.endswith(MIGRATE_SUFFIX):
-                        max_age = BUF_MAX_AGE_MIGRATE
-                    elif entry.name.endswith(BURN_SUFFIX):
-                        max_age = BUF_MAX_AGE_BURN
-                    else:
-                        max_age = BUF_MAX_AGE
-                    if now - entry.stat().st_mtime > max_age:
-                        try:
-                            os.remove(entry.path)
-                            dropped += 1
-                        except Exception:
-                            pass
-                # clean up empty recipient dirs
-                if not os.listdir(rec_dir.path):
-                    try: os.rmdir(rec_dir.path)
-                    except Exception: pass
+                    for entry in os.scandir(rec_dir.path):
+                        if not entry.name.endswith(".json"):
+                            continue
+                        if entry.name.endswith(MIGRATE_SUFFIX):
+                            max_age = BUF_MAX_AGE_MIGRATE
+                        elif entry.name.endswith(BURN_SUFFIX):
+                            max_age = BUF_MAX_AGE_BURN
+                        else:
+                            max_age = BUF_MAX_AGE
+                        if now - entry.stat().st_mtime > max_age:
+                            try:
+                                os.remove(entry.path)
+                                dropped += 1
+                            except Exception:
+                                pass
+                    # clean up empty recipient dirs
+                    if not os.listdir(rec_dir.path):
+                        try: os.rmdir(rec_dir.path)
+                        except Exception: pass
         except Exception as e:
             log.warning("BUF        expire sweep error: %s", e)
         if dropped:
             log.info("BUF        expired %d file(s)", dropped)
+
+        # Prune idle per-recipient write-rate limiters. MAX_BUF_RECIPIENTS
+        # bounds directories that exist AT ONCE; it does NOT bound the total
+        # distinct recipient IDs ever seen across create/expire/recreate
+        # cycles over the server's lifetime — a patient, rotating attacker
+        # could otherwise grow buf_recipient_limiters slowly forever. Same
+        # cadence as the file-expiry sweep above, piggybacked on the same
+        # loop rather than a separate task.
+        now_mono  = time.monotonic()
+        idle_keys = [k for k, lim in buf_recipient_limiters.items()
+                     if now_mono - lim.last_time > BUF_RATE_LIMITER_IDLE_S]
+        for k in idle_keys:
+            buf_recipient_limiters.pop(k, None)
+        if idle_keys:
+            log.info("BUF        pruned %d idle write-rate limiter(s)", len(idle_keys))
 
 # ══════════════════════════════════════════
 #   STATS
@@ -630,11 +716,12 @@ async def log_stats():
     while True:
         await asyncio.sleep(STATS_INTERVAL)
         log.info("STATS      keys=%d  sessions=%d  in=%s(%d msgs)  out=%s(%d msgs)  "
-                 "buf_in=%d  buf_out=%d  buf_cap_rejected=%d",
+                 "buf_in=%d  buf_out=%d  buf_cap_rejected=%d  buf_rate_rejected=%d  auth_admission_rejected=%d",
                  unique_keys(), session_count(),
                  fmt_bytes(stats["bytes_in"]),  stats["msgs_in"],
                  fmt_bytes(stats["bytes_out"]), stats["msgs_out"],
-                 stats["buf_in"], stats["buf_out"], stats["buf_cap_rejected"])
+                 stats["buf_in"], stats["buf_out"], stats["buf_cap_rejected"],
+                 stats["buf_rate_rejected"], stats["auth_admission_rejected"])
 
 # ══════════════════════════════════════════
 #   PENDING AUTH SWEEP
@@ -886,6 +973,9 @@ async def run_signal_server():
     log.info("Listening on %s:%d", WS_HOST, WS_PORT)
     log.info("Buffer dir: %s  max_msgs=%d  max_age=%ds  migrate_age=%ds  burn_age=%ds  max_mb=%.1f  max_recipients=%d",
              BUF_DIR, BUF_MAX_MSGS, BUF_MAX_AGE, BUF_MAX_AGE_MIGRATE, BUF_MAX_AGE_BURN, BUF_MAX_MB, MAX_BUF_RECIPIENTS)
+    log.info("Buffer write-rate: %.1f/s per recipient  burst=%.0f  idle_prune=%ds",
+             BUF_WRITE_RATE_LIMIT, BUF_WRITE_RATE_BURST, BUF_RATE_LIMITER_IDLE_S)
+    log.info("Global auth admission: %.1f/s  burst=%.0f", GLOBAL_AUTH_RATE, GLOBAL_AUTH_BURST)
     log.info("Trusted proxies: %s", ", ".join(str(n) for n in TRUSTED_PROXIES) or "(none)")
     log.info("=" * 50)
     async with websockets.serve(handler, WS_HOST, WS_PORT, max_size=WS_MAX_SIZE):

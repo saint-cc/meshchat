@@ -13,7 +13,7 @@
 // Protocol version — informational only for now, surfaced via sig:relay_info
 // so client/server drift shows up in both logs. Not enforced yet; room to
 // add real backwards-compat handling once that's actually needed.
-const CLIENT_VERSION = "0.3.8";
+const CLIENT_VERSION = "0.3.9";
 
 const LOG_MAX_LINES      = 20;
 const LOG_CLEAR_INTERVAL = 5 * 60 * 1000;
@@ -1555,7 +1555,7 @@ async function sendImageMessage(file) {
       const me       = state.contacts[state.publicId];
       const relay    = me?.lastRelay ? { wss: me.lastRelay } : undefined;
 
-      const payload   = { id, type: "image", data: base64, mimeType, ts, ...(relay ? { relay } : {}) };
+      const payload   = { id, type: "image", data: base64, mimeType, ts, deviceId: state.deviceId, ...(relay ? { relay } : {}) };
       const encrypted = await encryptMessage(contact.encKey, payload);
       const sig       = await signBlob(encrypted);
 
@@ -1563,7 +1563,7 @@ async function sendImageMessage(file) {
       imageCache[id] = { encBlob, mimeType };
 
 	  const imgMsgObj  = { type: "app:message", from: state.publicId,
-				 to: state.currentChat, blob: encrypted, sig, deviceId: state.deviceId };
+				 to: state.currentChat, blob: encrypted, sig };
       const viaRelayImg = sendToRelay(state.currentChat, imgMsgObj, true);
       if (!viaRelayImg) sendSignal(imgMsgObj);
 
@@ -1592,7 +1592,7 @@ async function sendAudioMessage(blob) {
     const relay    = me?.lastRelay ? { wss: me.lastRelay } : undefined;
 
     // encrypt for transit
-    const payload   = { id, type: "audio", data: base64, mimeType, ts, ...(relay ? { relay } : {}) };
+    const payload   = { id, type: "audio", data: base64, mimeType, ts, deviceId: state.deviceId, ...(relay ? { relay } : {}) };
     const encrypted = await encryptMessage(contact.encKey, payload);
     const sig       = await signBlob(encrypted);
 
@@ -1602,7 +1602,7 @@ async function sendAudioMessage(blob) {
 
 
 	const audioMsgObj = { type: "app:message", from: state.publicId,
-             to: state.currentChat, blob: encrypted, sig, deviceId: state.deviceId };    const viaRelayAud  = sendToRelay(state.currentChat, audioMsgObj, true);
+             to: state.currentChat, blob: encrypted, sig };    const viaRelayAud  = sendToRelay(state.currentChat, audioMsgObj, true);
     if (!viaRelayAud) sendSignal(audioMsgObj);
 
     // stub in messages — data stays in audioCache only
@@ -1640,13 +1640,20 @@ async function receiveMessage(msg) {
   const contact = state.contacts[msg.from];
   if (!contact || contact.blocked) return;
   markOnline(msg.from);
-  if (msg.deviceId) recordKnownDevice(msg.from, msg.deviceId);
   try {
     let plain, valid;
     plain = await decryptMessage(msg.blob);
     valid = msg.sig && contact.signPublicKey
       ? verifyBlob(msg.blob, msg.sig, contact.signPublicKey)
       : false;
+    // deviceId now travels inside the encrypted+signed payload rather than
+    // the outer envelope (see notifyMigration-style payloads / protocol.md) —
+    // only recorded once the signature is confirmed valid, so a message that
+    // fails to decrypt, or one that decrypts but isn't validly signed, can't
+    // poison the device registry. This was previously firing unconditionally
+    // before decrypt/verify even ran — left over from debugging signature
+    // failures early on; tightened now that it's a real trust boundary.
+    if (valid && plain.deviceId) recordKnownDevice(msg.from, plain.deviceId);
     if (plain.relay?.wss) {
       updateRelay(contact, plain.relay.wss, plain.ts || Date.now());
       if (state.currentChat === msg.from) updateChatRelayInfo(msg.from);
@@ -2028,10 +2035,10 @@ async function sendMessage() {
   const fromId = state.publicId;
   const me     = state.contacts[state.publicId];
   const relay  = me?.lastRelay ? { wss: me.lastRelay } : undefined;
-  const blob   = await encryptMessage(contact.encKey, { id, text, ts, ...(relay ? { relay } : {}) });
+  const blob   = await encryptMessage(contact.encKey, { id, text, ts, deviceId: state.deviceId, ...(relay ? { relay } : {}) });
   const sig    = await signBlob(blob);
 
-  const msgObj = { type: "app:message", from: fromId, to: contact.publicId, blob, deviceId: state.deviceId, ...(sig ? { sig } : {}) };
+  const msgObj = { type: "app:message", from: fromId, to: contact.publicId, blob, ...(sig ? { sig } : {}) };
   const viaRelay = sendToRelay(state.currentChat, msgObj, true);
   if (!viaRelay) sendSignal(msgObj);
   contact.messages = mergeMessages(contact.messages, [{ id, from: fromId, text, ts, valid: true }]);
@@ -2058,11 +2065,11 @@ async function sendReaction(targetMsgId, emoji) {
   const ts  = Date.now();
   const me    = state.contacts[state.publicId];
   const relay = me?.lastRelay ? { wss: me.lastRelay } : undefined;
-  const payload  = { id, type: "reaction", targetId: targetMsgId, emoji, ts, ...(relay ? { relay } : {}) };
+  const payload  = { id, type: "reaction", targetId: targetMsgId, emoji, ts, deviceId: state.deviceId, ...(relay ? { relay } : {}) };
   const blob     = await encryptMessage(contact.encKey, payload);
   const sig      = await signBlob(blob);
 
-  const reactMsgObj = { type: "app:message", from: state.publicId, to: state.currentChat, blob, sig, deviceId: state.deviceId };
+  const reactMsgObj = { type: "app:message", from: state.publicId, to: state.currentChat, blob, sig };
   const viaRelayReact = sendToRelay(state.currentChat, reactMsgObj, true);
   if (!viaRelayReact) sendSignal(reactMsgObj);
   const msgObj = { id, from: state.publicId, type: "reaction", targetId: targetMsgId, emoji, ts, valid: true };

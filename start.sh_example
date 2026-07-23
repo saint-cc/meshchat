@@ -1,6 +1,7 @@
 #!/bin/bash
 
 export RELAY_WSS_URL="wss://yourdomain.com/ws/"
+set TRUSTED_PROXIES = "127.0.0.1"
 export BUF_DIR="./relay_buf"
 export BUF_MAX_MSGS=100
 export BUF_MAX_AGE=86400

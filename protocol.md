@@ -2,7 +2,7 @@
 
 A decentralised, encrypted messaging protocol built on WebSocket relay servers. No accounts, no central authority, no plaintext.
 
-Current client/server implementation version: `0.3.7`, surfaced informationally via the `version` field on `sig:relay_info` for drift visibility (not yet enforced). `0.3.6` added WebRTC data-channel shell escalation for agent contacts; `0.3.7` added the burn notice.
+Current client/server implementation version: `0.3.8`, surfaced informationally via the `version` field on `sig:relay_info` for drift visibility (not yet enforced). `0.3.6` added WebRTC data-channel shell escalation for agent contacts; `0.3.7` added the burn notice; `0.3.8` moved `app:message`'s `deviceId` into the encrypted payload (previously unsigned envelope metadata) and gated device-registry recording on signature validity.
 
 ---
 
@@ -56,7 +56,7 @@ Each device generates a random 32-byte seed on first run, stored in localStorage
 deviceId = base64url( SHA-256( Ed25519.getPublicKey(seed) )[0:12] )
 ```
 
-`deviceId` is strictly local — it never appears inside any encrypted backup blob or `serialiseContacts()` output, so it is never included in backups, exports, or restore payloads. It rides only as plaintext envelope metadata on specific wire packets where device distinction is meaningful (currently `app:message` and the self-sync backup path). The underlying seed is architecturally prepared for a future X25519 DH key via the standard Ed25519↔X25519 birational conversion — no re-keying needed when that work happens.
+`deviceId` is strictly local — it never appears inside any encrypted backup blob or `serialiseContacts()` output, so it is never included in backups, exports, or restore payloads. On `app:message` it travels inside the encrypted, signed payload rather than the outer envelope (see [Outer envelope](#outer-envelope-appmessage) below) — the relay never sees it, and the receiving side only records it once the signature has verified. It still rides as plaintext envelope metadata on the self-sync backup path (`sync:backup_push`/`sync:backup_accept`), where both ends already share a secret scoped to the user's own devices. The underlying seed is architecturally prepared for a future X25519 DH key via the standard Ed25519↔X25519 birational conversion — no re-keying needed when that work happens.
 
 ---
 
@@ -152,11 +152,12 @@ The plaintext payload (before encryption) for a text message:
 
 ```json
 {
-  "id":    "<uuid>",
-  "type":  "text",
-  "text":  "hello",
-  "ts":    1234567890123,
-  "relay": { "wss": "wss://sender.example.com/ws/" }
+  "id":       "<uuid>",
+  "type":     "text",
+  "text":     "hello",
+  "ts":       1234567890123,
+  "deviceId": "<deviceId>",
+  "relay":    { "wss": "wss://sender.example.com/ws/" }
 }
 ```
 
@@ -170,16 +171,17 @@ The wire packet wrapping the encrypted blob:
 
 ```json
 {
-  "type":     "app:message",
-  "from":     "<publicId>",
-  "to":       "<publicId>",
-  "blob":     { "v": 1, "iv": [...], "data": [...] },
-  "sig":      [...],
-  "deviceId": "<deviceId>"
+  "type": "app:message",
+  "from": "<publicId>",
+  "to":   "<publicId>",
+  "blob": { "v": 1, "iv": [...], "data": [...] },
+  "sig":  [...]
 }
 ```
 
-`deviceId` is the sender's device identity (see [Device Identity](#device-identity)). It is plaintext — not inside the encrypted blob — so the relay and recipient can read it without decryption. Recipients record it in the local device registry to build passive knowledge of which devices a given identity runs. It is optional; old clients that omit it are handled gracefully (the contact's device list stays at the "unknown" placeholder).
+`deviceId` (see [Device Identity](#device-identity)) lives *inside* the encrypted payload, not the outer envelope. Prior to `0.3.8` it rode here as plaintext envelope metadata and — unlike `call:*`/`shell:*` deviceId, which is part of the signed payload — was outside what `sig` covered, since `sig` on `app:message` only ever signed `blob`. That meant a relay (explicitly untrusted infrastructure in this design) could rewrite the field in transit without invalidating anything. Moving it inside the encrypted payload closes both problems in one change: the relay no longer sees which device sent a message, and a rewritten value would fail the AES-GCM auth tag before the application layer ever saw it.
+
+Recipients record it in the local device registry to build passive knowledge of which devices a given identity runs — but only once the outer `sig` has verified against the sender's signing key. A message that fails to decrypt, or one that decrypts but carries an invalid or missing signature, does not get its `deviceId` recorded, regardless of what the field says. `deviceId` remains optional on send; a client that omits it is handled gracefully (the contact's device list stays at the "unknown" placeholder).
 
 ---
 
@@ -330,7 +332,7 @@ Each client maintains a local device registry (`meshchat_known_devices_v1_<publi
 
 This is local-only, never included in backup blobs or `serialiseContacts()`. It is populated passively from two sources:
 
-1. **`app:message` receipt** — the outer `deviceId` field records which device a contact sent from.
+1. **`app:message` receipt** — the `deviceId` carried inside the decrypted payload records which device a contact sent from, once the packet's signature has verified.
 2. **Self-sync backup path** — `deviceId`/`fingerprint` fields on `sync:backup_push` and `sync:backup_accept` teach each of the user's own devices about the others (see [Peer Backup Protocol](#peer-backup-protocol)).
 
 The registry is displayed in a per-contact device popover in the UI. Contacts with no recorded devices show an "unknown" placeholder. The data accumulates passively through normal traffic — no dedicated discovery handshake.
@@ -475,7 +477,7 @@ The agent spawns the pty (`pty.fork()`, attached to the user's `$SHELL -i`) on t
 | `sig:auth_init`     | `enc_key`, `bits`, `no_receive?`          | yes  | Begin challenge-response. `no_receive: true` skips registration and buffer flush (used by probes) |
 | `sig:auth_proof`    | `nonce`                                   | yes  | Return decrypted nonce |
 | `sig:announce`      | `ids[]`                                   | yes  | Check local presence of up to 10 IDs |
-| `app:message`       | `from`, `to`, `blob`, `sig`, `deviceId?`  | yes | Deliver message — `from` must match authed identity on this socket |
+| `app:message`       | `from`, `to`, `blob`, `sig`  | yes | Deliver message — `from` must match authed identity on this socket. `deviceId` (optional) rides inside the encrypted `blob`, not as an outer field |
 | `app:migrate`       | `from`, `to`, `blob`, `sig`               | yes | Notify of a relay migration — always durably buffered in addition to live delivery |
 | `app:burn`          | `from`, `to`, `blob`, `sig`               | yes | Notify of a burn (self-destruct / stop-trusting) — always durably buffered in addition to live delivery, own overwrite bucket |
 | `app:sync`          | `from`, `to`, `msgs[]`, `reply`           | yes  | Manual sync exchange |
