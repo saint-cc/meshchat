@@ -1,5 +1,5 @@
 /* ═════════════════════════════════════════════════════════════
-   MESHCHAT — gui.js
+   MESHCHAT — meshchat-gui.js
    All DOM rendering, modals, event wiring, and the in-page log
    console. Depends on lib.js (pure helpers) but not on
    meshchat.js at *load* time — cross-file calls into meshchat.js
@@ -8,7 +8,7 @@
    script on the page has finished loading, so the forward
    reference is safe.
 
-   Load order: lib.js → gui.js → meshchat.js → statemachine.js
+   Load order: meshchat-lib.js → meshchat-gui.js → meshchat.js → statemachine.js
 ═══════════════════════════════════════════════════════════════ */
 
 /* ══════════════════════════════════════════
@@ -1313,14 +1313,14 @@ document.getElementById("importConfirm").onclick = () => {
   input.click();
 };
 
-document.getElementById("sendButton").onclick  = sendMessage;
+document.getElementById("sendButton").onclick  = () => sendMessage();
 document.getElementById("chatInput").onkeydown = (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMessage(); } };
 
 // audio button — push to talk
 const audioBtn = document.getElementById("audioBtn");
 if (audioBtn) {
-  audioBtn.addEventListener("mousedown",  startAudioRecord);
-  audioBtn.addEventListener("mouseup",    stopAudioRecord);
+  audioBtn.addEventListener("mousedown",  () => startAudioRecord());
+  audioBtn.addEventListener("mouseup",    () => stopAudioRecord());
   audioBtn.addEventListener("touchstart", e => { e.preventDefault(); startAudioRecord(); });
   audioBtn.addEventListener("touchend",   e => { e.preventDefault(); stopAudioRecord(); });
 }
