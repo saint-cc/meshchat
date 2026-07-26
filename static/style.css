@@ -127,7 +127,17 @@
 }
   .message.theirs  { background: var(--theirs); align-self: flex-start; border: 1px solid var(--border); }
   .message.invalid { border-color: var(--danger) !important; opacity: 0.6; }
-  .msgMeta { font-size: 10px; color: var(--muted); margin-top: 3px; }
+  .msgMeta { font-size: 10px; color: var(--muted); margin-top: 3px; display: flex; align-items: center; gap: 6px; }
+  .packetInfoBtn {
+    background: none; border: none; color: var(--muted); font-size: 11px;
+    cursor: pointer; padding: 0; line-height: 1; opacity: 0.5; transition: opacity 0.15s, color 0.15s;
+  }
+  .packetInfoBtn:hover { opacity: 1; color: var(--accent); }
+  .packetInfoPre {
+    margin-top: 4px; padding: 8px 10px; background: var(--bg); border: 1px solid var(--border);
+    color: var(--dim); font-size: 10px; line-height: 1.5; white-space: pre-wrap; word-break: break-all;
+    max-width: min(480px, 100%);
+  }
   #chatInputContainer { display: flex; border-top: 1px solid var(--border); }
   #chatInput {
     flex: 1; background: var(--surface); border: none; color: var(--text);

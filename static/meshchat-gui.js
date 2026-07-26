@@ -469,12 +469,12 @@ function toggleDevicePopover(id, li) {
   document.querySelectorAll(".devicePopover.open").forEach(p => p.classList.remove("open"));
   if (isOpen) return;
   const devices = Object.entries(state.knownDevices[id] || {})
-    .sort(([, a], [, b]) => b - a);   // most recent first
+    .sort(([, a], [, b]) => b.lastSeen - a.lastSeen);   // most recent first
   pop.innerHTML = devices.length
-    ? devices.map(([devId, ts]) =>
+    ? devices.map(([devId, info]) =>
         `<div class="devicePopoverRow">` +
           `<span>${esc(pid(devId))}</span>` +
-          `<span class="devicePopoverDate">${relativeDate(ts)}</span>` +
+          `<span class="devicePopoverDate">${relativeDate(info.lastSeen)}${info.lastN ? " · n:" + info.lastN : ""}</span>` +
         `</div>`
       ).join("")
     : '<div class="devicePopoverRow unknown">unknown</div>';
@@ -700,17 +700,64 @@ function renderMessages() {
 
     const meta   = document.createElement("div");
     meta.className   = "msgMeta";
+
+    const infoBtn = document.createElement("button");
+    infoBtn.className   = "packetInfoBtn";
+    infoBtn.title       = "show raw packet";
+    infoBtn.textContent = "ⓘ";
+    infoBtn.onclick = (e) => { e.stopPropagation(); togglePacketInfo(m.id, wrap); };
+    meta.appendChild(infoBtn);
+
+    const metaText = document.createElement("span");
     const d      = new Date(m.ts);
-    meta.textContent = d.toLocaleDateString([], { month:"short", day:"numeric" }) + " "
+    metaText.textContent = d.toLocaleDateString([], { month:"short", day:"numeric" }) + " "
                      + d.toLocaleTimeString([], { hour:"2-digit", minute:"2-digit" })
                      + (m.valid === false ? " · ⚠ unverified" : "");
+    meta.appendChild(metaText);
+
+    const infoPre = document.createElement("pre");
+    infoPre.className = "packetInfoPre";
+    infoPre.style.display = "none";
 
     if (!isAgentChat) bubble.appendChild(buildReactionRow(m.id, msgs, mine));
     wrap.appendChild(bubble);
     wrap.appendChild(meta);
+    wrap.appendChild(infoPre);
     container.appendChild(wrap);
   });
   container.scrollTop = container.scrollHeight;
+}
+
+// Packet inspector (ⓘ) — shows the wire envelope with the decrypted
+// payload spliced in where the ciphertext blob was, i.e. "everything
+// except the blob". Pulls from packetCache (meshchat.js), populated at
+// the same point each send/receive function already has both pieces in
+// hand. A message from before this session (reload, or arrived via
+// restore/backup/sync rather than a live send/receive) has no cache
+// entry — shown as unavailable rather than guessed at.
+function formatPacketInfo(msgId) {
+  const cached = packetCache[msgId];
+  if (!cached) return "packet info unavailable — not cached this session";
+  const { envelope, payload } = cached;
+  const display = { ...envelope };
+  delete display.blob;
+  if (Array.isArray(display.sig)) {
+    display.sig = bytesToHex(display.sig);
+  }
+  const payloadDisplay = { ...payload };
+  if (payloadDisplay.data) {
+    payloadDisplay.data = `<${payloadDisplay.data.length} chars omitted>`;
+  }
+  display.payload = payloadDisplay;
+  return JSON.stringify(display, null, 2);
+}
+
+function togglePacketInfo(msgId, wrap) {
+  const pre = wrap.querySelector(".packetInfoPre");
+  if (!pre) return;
+  const opening = pre.style.display === "none";
+  if (opening) pre.textContent = formatPacketInfo(msgId);
+  pre.style.display = opening ? "block" : "none";
 }
 
 function openModal() {
@@ -1252,6 +1299,7 @@ document.getElementById("loginButton").onclick = async (e) => {
     loadPeerBackups();
     loadPeerTokens();
 	loadDeviceRegistry();
+	loadSendCounters();
 	recordKnownDevice(state.publicId, state.deviceId);
 	
     document.getElementById("loginScreen").style.display  = "none";

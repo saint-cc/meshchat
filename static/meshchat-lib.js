@@ -1,12 +1,12 @@
 /* ═════════════════════════════════════════════════════════════
-   MESHCHAT — lib.js
+   MESHCHAT — meshchat-lib.js
    Pure helper functions only: no DOM access, no `state` access,
    no network. Everything here takes its inputs as parameters and
    returns a value (or mutates an object passed in, e.g.
    updateRelay/mergeContactMeta). Loads first — gui.js and
    meshchat.js both depend on it existing.
 
-   Load order: lib.js → gui.js → meshchat.js → statemachine.js
+   Load order: meshchat-lib.js → meshchat-gui.js → meshchat.js → statemachine.js
 ═══════════════════════════════════════════════════════════════ */
 
 /* ── passphrase entropy model (login screen strength meter) ── */
@@ -150,6 +150,14 @@ async function deriveReactionId(myPublicId, targetMsgId) {
 
 function rawToBase64(raw) { return btoa(String.fromCharCode(...raw)).replace(/\+/g,'-').replace(/\//g,'_').replace(/=/g,''); }
 function base64ToRaw(b64) { return Uint8Array.from(atob(b64.replace(/-/g,'+').replace(/_/g,'/')), c => c.charCodeAt(0)); }
+
+// Plain byte-array -> hex string. Display-only helper (currently used by
+// the packet inspector to render `sig` as a compact string instead of one
+// JSON.stringify(..., null, 2) line per byte); doesn't touch any stored
+// data, purely a rendering convenience.
+function bytesToHex(arr) {
+  return Array.from(arr).map(b => b.toString(16).padStart(2, "0")).join("");
+}
 
 async function importEncKey(raw)  { return crypto.subtle.importKey("raw", raw, { name: "AES-GCM" }, false, ["encrypt","decrypt"]); }
 async function importSignKey(raw) { return crypto.subtle.importKey("raw", raw, { name: "HMAC", hash: "SHA-256" }, false, ["sign","verify"]); }

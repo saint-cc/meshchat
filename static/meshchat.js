@@ -11,7 +11,7 @@
    NOTE: deliberately NOT named short() to avoid collision with
          the url-truncation var in lib.js's linkify().
 
-   Load order: lib.js → gui.js → meshchat.js → statemachine.js
+   Load order: meshchat-lib.js → meshchat-gui.js → meshchat.js → statemachine.js
 ═══════════════════════════════════════════════════════════════ */
 const CLIENT_VERSION = "0.3.9";
 
@@ -33,7 +33,7 @@ const RELAY_IDLE_MS  			= 30_000;
 const state = {
   user: null, publicId: null, shareableKey: null,
   keys: null, cryptoKey: null, encKey: null,
-  contacts: {}, peerBackups: {}, peerTokens: {}, knownDevices: {},
+  contacts: {}, peerBackups: {}, peerTokens: {}, knownDevices: {}, sendCounters: {},
   currentChat: null, ws: null, online: new Set(),
   unread: {}, knownDeviceFingerprints: {}
 };
@@ -44,6 +44,7 @@ const PEER_BACKUP_KEY	= "meshchat_peer_backups_v1";
 const PEER_TOKEN_KEY	= "meshchat_peer_tokens_v1";
 const DEVICE_REGISTRY_KEY = "meshchat_known_devices_v1";
 const DEVICE_KEY_STORAGE = "meshchat_device_seed_v1";
+const SEND_COUNTER_KEY = "meshchat_send_counters_v1";
 const EXCHANGE_COUNT	= 10;
 
 /* ══════════════════════════════════════════
@@ -257,9 +258,16 @@ function loadDeviceRegistry() {
     const cutoff = Date.now() - 90 * 24 * 60 * 60 * 1000;
     for (const identityId of Object.keys(state.knownDevices)) {
       const devs = state.knownDevices[identityId];
-      let entries = Object.entries(devs).filter(([, ts]) => ts > cutoff);
+      // migrate pre-n entries: a bare lastSeen timestamp becomes
+      // { lastSeen, lastN: 0 } — old data never had a counter to recover,
+      // so it starts at 0 and gets corrected the next time this device
+      // is actually seen sending something with an n on it.
+      for (const devId of Object.keys(devs)) {
+        if (typeof devs[devId] === "number") devs[devId] = { lastSeen: devs[devId], lastN: 0 };
+      }
+      let entries = Object.entries(devs).filter(([, v]) => v.lastSeen > cutoff);
       if (entries.length > 20) {
-        entries = entries.sort(([, a], [, b]) => b - a).slice(0, 20);
+        entries = entries.sort(([, a], [, b]) => b.lastSeen - a.lastSeen).slice(0, 20);
       }
       state.knownDevices[identityId] = Object.fromEntries(entries);
     }
@@ -275,11 +283,56 @@ function saveDeviceRegistry() {
 
 // shared by app:message receipt and the existing self-sync fingerprint
 // tagging — local-only knowledge, never part of serialiseContacts()/backup.
-function recordKnownDevice(identityId, deviceId) {
+// `n`, when provided, is the sender's per-(their device, us) send counter —
+// see nextSendCounter() below for the mirror-image local-send side. This
+// is bookkeeping only for now: a gap, dupe, or reorder is logged and
+// `lastN` is updated to whatever's highest seen, but nothing is dropped or
+// enforced yet. Callers that don't have an `n` (restore/backup/self-sync
+// paths) simply omit it — lastSeen still updates, lastN is left alone.
+function recordKnownDevice(identityId, deviceId, n) {
   if (!identityId || !deviceId) return;
   if (!state.knownDevices[identityId]) state.knownDevices[identityId] = {};
-  state.knownDevices[identityId][deviceId] = Date.now();
+  const existing = state.knownDevices[identityId][deviceId];
+  const prevLastN = (existing && typeof existing === "object") ? (existing.lastN || 0) : 0;
+  let lastN = prevLastN;
+  if (typeof n === "number") {
+    if (n !== prevLastN + 1) {
+      mlog.debug(`DEVICE     n gap/reorder  id=${pid(identityId)}  device=${pid(deviceId)}  expected=${prevLastN + 1}  got=${n}`);
+    }
+    lastN = Math.max(prevLastN, n);
+  }
+  state.knownDevices[identityId][deviceId] = { lastSeen: Date.now(), lastN };
   saveDeviceRegistry();
+}
+
+function loadSendCounters() {
+  try {
+    state.sendCounters = JSON.parse(localStorage.getItem(SEND_COUNTER_KEY + "_" + state.publicId) || "{}");
+    mlog.debug(`STORAGE    send counters loaded: ${Object.keys(state.sendCounters).length}`);
+  } catch(e) { state.sendCounters = {}; }
+}
+
+function saveSendCounters() {
+  try { localStorage.setItem(SEND_COUNTER_KEY + "_" + state.publicId, JSON.stringify(state.sendCounters)); }
+  catch(e) {}
+}
+
+// Local-only, per (THIS device, contact) outbound sequence — never
+// included in serialiseContacts()/backups, same tier as the device seed
+// itself. Deliberately not synced: two devices sharing one identity each
+// keep their own independent counter, since there is no live, authoritative
+// shared crypto state to arbitrate "whose turn" it is between them (see
+// chat — this is the fork double-ratchet readiness has to respect here).
+// Counts every outbound app:message payload (text/audio/image) to this
+// contact regardless of relay-vs-signal delivery path — it tracks logical
+// send order, not delivery success. Reactions are deliberately excluded.
+// Bookkeeping only for now: nothing yet consumes `n` as a real chain
+// position.
+function nextSendCounter(contactId) {
+  const n = (state.sendCounters[contactId] || 0) + 1;
+  state.sendCounters[contactId] = n;
+  saveSendCounters();
+  return n;
 }
 
 /* ══════════════════════════════════════════
@@ -1252,6 +1305,13 @@ function sendViaRelayUrl(url, obj) {
 ══════════════════════════════════════════ */
 const audioCache = {};
 const imageCache = {};
+// msgId → { envelope, payload } — feeds the packet-info (ⓘ) inspector on
+// each message bubble (meshchat-gui.js). In-memory only, same tier as
+// audioCache/imageCache above: a message from before this session (page
+// reload, or restored via backup/sync rather than sent/received live)
+// simply has no entry, and the inspector says so rather than fabricating
+// one.
+const packetCache = {};
 
 let mediaRecorder = null;
 let audioChunks   = [];
@@ -1308,7 +1368,7 @@ async function sendImageMessage(file) {
       const me       = state.contacts[state.publicId];
       const relay    = me?.lastRelay ? { wss: me.lastRelay } : undefined;
 
-      const payload   = { id, type: "image", data: base64, mimeType, ts, deviceId: state.deviceId, ...(relay ? { relay } : {}) };
+      const payload   = { id, type: "image", data: base64, mimeType, ts, deviceId: state.deviceId, n: nextSendCounter(state.currentChat), ...(relay ? { relay } : {}) };
       const encrypted = await encryptMessage(contact.encKey, payload);
       const sig       = await signBlob(encrypted);
 
@@ -1317,6 +1377,7 @@ async function sendImageMessage(file) {
 
 	  const imgMsgObj  = { type: "app:message", from: state.publicId,
 				 to: state.currentChat, blob: encrypted, sig };
+      packetCache[id] = { envelope: imgMsgObj, payload };
       const viaRelayImg = sendToRelay(state.currentChat, imgMsgObj, true);
       if (!viaRelayImg) sendSignal(imgMsgObj);
 
@@ -1345,7 +1406,7 @@ async function sendAudioMessage(blob) {
     const relay    = me?.lastRelay ? { wss: me.lastRelay } : undefined;
 
     // encrypt for transit
-    const payload   = { id, type: "audio", data: base64, mimeType, ts, deviceId: state.deviceId, ...(relay ? { relay } : {}) };
+    const payload   = { id, type: "audio", data: base64, mimeType, ts, deviceId: state.deviceId, n: nextSendCounter(state.currentChat), ...(relay ? { relay } : {}) };
     const encrypted = await encryptMessage(contact.encKey, payload);
     const sig       = await signBlob(encrypted);
 
@@ -1355,7 +1416,9 @@ async function sendAudioMessage(blob) {
 
 
 	const audioMsgObj = { type: "app:message", from: state.publicId,
-             to: state.currentChat, blob: encrypted, sig };    const viaRelayAud  = sendToRelay(state.currentChat, audioMsgObj, true);
+             to: state.currentChat, blob: encrypted, sig };
+    packetCache[id] = { envelope: audioMsgObj, payload };
+    const viaRelayAud  = sendToRelay(state.currentChat, audioMsgObj, true);
     if (!viaRelayAud) sendSignal(audioMsgObj);
 
     // stub in messages — data stays in audioCache only
@@ -1406,7 +1469,8 @@ async function receiveMessage(msg) {
     // poison the device registry. This was previously firing unconditionally
     // before decrypt/verify even ran — left over from debugging signature
     // failures early on; tightened now that it's a real trust boundary.
-    if (valid && plain.deviceId) recordKnownDevice(msg.from, plain.deviceId);
+    if (valid && plain.deviceId) recordKnownDevice(msg.from, plain.deviceId, plain.n);
+    if (plain.id) packetCache[plain.id] = { envelope: msg, payload: plain };
     if (plain.relay?.wss) {
       updateRelay(contact, plain.relay.wss, plain.ts || Date.now());
       if (state.currentChat === msg.from) updateChatRelayInfo(msg.from);
@@ -1788,10 +1852,12 @@ async function sendMessage() {
   const fromId = state.publicId;
   const me     = state.contacts[state.publicId];
   const relay  = me?.lastRelay ? { wss: me.lastRelay } : undefined;
-  const blob   = await encryptMessage(contact.encKey, { id, text, ts, deviceId: state.deviceId, ...(relay ? { relay } : {}) });
+  const payload = { id, text, ts, deviceId: state.deviceId, n: nextSendCounter(state.currentChat), ...(relay ? { relay } : {}) };
+  const blob   = await encryptMessage(contact.encKey, payload);
   const sig    = await signBlob(blob);
 
   const msgObj = { type: "app:message", from: fromId, to: contact.publicId, blob, ...(sig ? { sig } : {}) };
+  packetCache[id] = { envelope: msgObj, payload };
   const viaRelay = sendToRelay(state.currentChat, msgObj, true);
   if (!viaRelay) sendSignal(msgObj);
   contact.messages = mergeMessages(contact.messages, [{ id, from: fromId, text, ts, valid: true }]);
