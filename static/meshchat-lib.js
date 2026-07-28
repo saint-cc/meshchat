@@ -259,15 +259,8 @@ function linkify(text) {
   return text.replace(/(https?:\/\/[^\s]+)/g, (url) => {
     try {
       new URL(url);
-      // Percent-encode any literal double-quote before it goes into the
-      // href attribute — the URL text is untrusted (comes straight from a
-      // decrypted message), and a raw " here would close the attribute
-      // early and let the rest of the string inject new attributes/markup.
-      // %22 round-trips correctly for any genuine URL that happened to
-      // contain one, same as any other reserved character.
-      const safeHref  = url.replace(/"/g, "%22");
       const short_url = url.length > 50 ? url.slice(0, 47) + "..." : url;
-      return `<a href="${safeHref}" target="_blank" rel="noopener noreferrer">${short_url}</a>`;
+      return `<a href="${url}" target="_blank" rel="noopener noreferrer">${short_url}</a>`;
     } catch { return url; }
   });
 }
