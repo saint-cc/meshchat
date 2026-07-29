@@ -695,7 +695,15 @@ function renderMessages() {
         bubble.appendChild(img);
       }
     } else {
-      bubble.innerHTML = linkify(m.text || "");
+      // esc() first — m.text is untrusted (a decrypted message body from a
+      // contact), and was previously handed straight to linkify() and then
+      // innerHTML with no escaping at all. Any contact could send literal
+      // markup (e.g. an <img onerror=...>) and have it execute in this
+      // page — the same context holding state.contacts, sendMessage(),
+      // addContact(), exportBackup(), etc. esc() neutralises &/</>, and
+      // linkify's own URL regex still matches fine afterwards since a URL
+      // never legitimately contains a literal < or > to begin with.
+      bubble.innerHTML = linkify(esc(m.text || ""));
     }
 
     const meta   = document.createElement("div");
