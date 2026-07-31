@@ -11,8 +11,9 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
 <script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
 <script type="module">
-  import { ed25519 } from 'https://esm.sh/@noble/curves@1.4.0/ed25519';
+  import { ed25519, x25519 } from 'https://esm.sh/@noble/curves@1.4.0/ed25519';
   window.ed25519 = ed25519;
+  window.x25519 = x25519;
 </script>
 <link rel="stylesheet" href="./style.css">
 <link rel="manifest" href="./manifest.json">

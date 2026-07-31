@@ -12,7 +12,7 @@ import secrets
 import time
 import uuid
 
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 import websockets
 from flask import Flask, send_from_directory
 from werkzeug.middleware.proxy_fix import ProxyFix
@@ -37,7 +37,7 @@ RELAY_WSS_URL = os.environ.get("RELAY_WSS_URL", "")   # e.g. wss://yourrelay.exa
 # Protocol version — informational only for now, surfaced in sig:relay_info
 # so client/server version drift shows up in both logs. Not enforced yet;
 # room to add real backwards-compat handling once this is actually needed.
-PROTOCOL_VERSION = os.environ.get("PROTOCOL_VERSION", "0.3.9")
+PROTOCOL_VERSION = os.environ.get("PROTOCOL_VERSION", "0.4.0")
 
 # Connection limits
 MAX_CONNECTIONS        = int(os.environ.get("MAX_CONNECTIONS",        100))   # total WS sessions
@@ -200,7 +200,7 @@ for _bad_entry in _TRUSTED_PROXIES_INVALID:
 # ══════════════════════════════════════════
 
 connected: dict[str, set] = {}   # publicId → set of websockets
-pending_auth: dict = {}          # ws → { enc_key, nonce, ts, bits, ws }
+pending_auth: dict = {}          # ws → { x25519_pub, ed25519_pub, nonce, ts, bits, ws }
 ip_conns: dict[str, int] = {}    # ip → active connection count
 ip_limiters: dict = {}           # ip → RateLimiter shared across all that IP's sockets
 ws_to_ids: dict = {}             # ws → set of publicIds (reverse of connected; O(1) cleanup)
@@ -356,24 +356,35 @@ async def route_or_buffer(kind, frm, to, msg, ws):
 #   auth_verify       — check proof, register, flush buffer
 # ══════════════════════════════════════════
 
-def derive_public_id(enc_key_bytes: bytes) -> str:
-    """SHA-256(enc_key)[0..12] encoded as base64url — mirrors client derivePublicId()."""
-    digest = hashlib.sha256(enc_key_bytes).digest()[:12]
+def derive_public_id(x25519_pub: bytes, ed25519_pub: bytes) -> str:
+    """SHA-256(x25519_pub || ed25519_pub)[0..12] encoded as base64url — mirrors
+    client deriveIdentityPublicId(). Deliberately hashes BOTH keys together,
+    not just the X25519 one: if publicId only depended on the X25519 key,
+    someone could present a victim's real (public) x25519_pub alongside
+    their OWN ed25519_pub, sign the challenge with their own private key,
+    and get registered under the victim's publicId — never able to decrypt
+    anything routed to it, but able to silently swallow it. Binding both
+    keys means a valid publicId can only come from one specific pair."""
+    digest = hashlib.sha256(x25519_pub + ed25519_pub).digest()[:12]
     return base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
 
-async def auth_challenge(ws, enc_key_bytes: bytes, bits: int, no_receive: bool = False):
-    """Generate a random nonce, encrypt it to the client's enc key, send challenge.
+async def auth_challenge(ws, x25519_pub: bytes, ed25519_pub: bytes, bits: int, no_receive: bool = False):
+    """Generate a random nonce and send it in the clear — there is no
+    longer a shared secret to encrypt it with (that was the whole bug:
+    the old scheme's "auth" was decrypting a nonce with the same AES key
+    the client had just handed the server in plaintext one message
+    earlier, which proved nothing). The nonce here exists purely as
+    something for the client to SIGN with its Ed25519 private key in
+    auth_verify — that signature is the actual possession proof.
 
     no_receive: caller is a disposable probe (e.g. testRelayConnection) that
     has no business being treated as a reachable recipient — it intends to
     close itself the moment auth_ok arrives. Carried through to auth_verify
     so registration and buffer flush can be skipped for it specifically."""
     nonce_plain = secrets.token_bytes(32)
-    iv          = secrets.token_bytes(12)
-    aesgcm      = AESGCM(enc_key_bytes)
-    ciphertext  = aesgcm.encrypt(iv, nonce_plain, None)
     pending_auth[id(ws)] = {
-        "enc_key":     enc_key_bytes,
+        "x25519_pub":  x25519_pub,
+        "ed25519_pub": ed25519_pub,
         "nonce":       nonce_plain,
         "ts":          time.monotonic(),
         "bits":        bits,
@@ -381,16 +392,15 @@ async def auth_challenge(ws, enc_key_bytes: bytes, bits: int, no_receive: bool =
         "ws":          ws,   # so sweep_pending_auth() can actively close stale entries
     }
     await send_to(ws, {
-        "type": "sig:auth_challenge",
-        "bits": bits,
-        "iv":   list(iv),
-        "data": list(ciphertext),
+        "type":  "sig:auth_challenge",
+        "nonce": list(nonce_plain),
     })
     log.info("AUTH       challenge sent  bits=%d  peer=%s%s", bits, peer_info(ws),
               "  [no_receive]" if no_receive else "")
 
-async def auth_verify(ws, nonce_back: list, addr: str) -> str | None:
-    """Verify proof, register identity, flush buffer. Returns public_id or None on failure."""
+async def auth_verify(ws, sig_bytes: list, addr: str) -> str | None:
+    """Verify the Ed25519 signature over the nonce, register identity, flush
+    buffer. Returns public_id or None on failure."""
     entry = pending_auth.pop(id(ws), None)
     if not entry:
         log.warning("AUTH       proof with no pending challenge  peer=%s", addr)
@@ -399,8 +409,10 @@ async def auth_verify(ws, nonce_back: list, addr: str) -> str | None:
         log.warning("AUTH       challenge expired  peer=%s", addr)
         await send_to(ws, {"type": "sig:auth_fail", "reason": "timeout"})
         return None
-    if bytes(nonce_back) != entry["nonce"]:
-        log.warning("AUTH       proof mismatch  peer=%s", addr)
+    try:
+        Ed25519PublicKey.from_public_bytes(entry["ed25519_pub"]).verify(bytes(sig_bytes), entry["nonce"])
+    except Exception:
+        log.warning("AUTH       proof invalid  peer=%s", addr)
         await send_to(ws, {"type": "sig:auth_fail", "reason": "proof_invalid"})
         return None
 
@@ -416,7 +428,7 @@ async def auth_verify(ws, nonce_back: list, addr: str) -> str | None:
         await send_to(ws, {"type": "sig:auth_fail", "reason": "server_busy"})
         return None
 
-    public_id = derive_public_id(entry["enc_key"])
+    public_id = derive_public_id(entry["x25519_pub"], entry["ed25519_pub"])
     no_receive = entry.get("no_receive", False)
     if not no_receive:
         if public_id not in connected:
@@ -830,30 +842,32 @@ async def handler(ws):
             #         fmt_bytes(stats["bytes_in"]),
             #         fmt_bytes(stats["bytes_out"]))
 
-            # ── auth_init: client presents enc key, server sends challenge ──
+            # ── auth_init: client presents both public keys, server sends challenge ──
             if kind == "sig:auth_init":
-                enc_key_list = msg.get("enc_key")
+                x25519_list  = msg.get("x25519_pub")
+                ed25519_list = msg.get("ed25519_pub")
                 bits         = 256
                 no_receive   = bool(msg.get("no_receive", False))
-                if not enc_key_list:
+                if not x25519_list or not ed25519_list:
                     log.warning("AUTH       bad auth_init  peer=%s", addr)
                     await send_to(ws, {"type": "sig:auth_fail", "reason": "bad_init"})
                     continue
-                enc_key_bytes = bytes(enc_key_list)
-                if len(enc_key_bytes) != 32:
-                    log.warning("AUTH       wrong key length  bits=%d  got=%d  peer=%s",
-                                bits, len(enc_key_bytes), addr)
+                x25519_pub  = bytes(x25519_list)
+                ed25519_pub = bytes(ed25519_list)
+                if len(x25519_pub) != 32 or len(ed25519_pub) != 32:
+                    log.warning("AUTH       wrong key length  bits=%d  x25519=%d  ed25519=%d  peer=%s",
+                                bits, len(x25519_pub), len(ed25519_pub), addr)
                     await send_to(ws, {"type": "sig:auth_fail", "reason": "bad_key_length"})
                     continue
-                await auth_challenge(ws, enc_key_bytes, bits, no_receive)
+                await auth_challenge(ws, x25519_pub, ed25519_pub, bits, no_receive)
 
-            # ── auth_proof: client returns decrypted nonce ──
+            # ── auth_proof: client returns a signature over the nonce ──
             elif kind == "sig:auth_proof":
-                nonce_back = msg.get("nonce")
-                if not nonce_back:
+                sig_back = msg.get("sig")
+                if not sig_back:
                     log.warning("AUTH       empty proof  peer=%s", addr)
                     continue
-                public_id = await auth_verify(ws, nonce_back, addr)
+                public_id = await auth_verify(ws, sig_back, addr)
                 if public_id:
                     if not client_ids:
                         client_ids.append(public_id)

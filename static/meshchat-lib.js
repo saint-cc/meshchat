@@ -129,14 +129,44 @@ async function deriveMasterSecret(name, passphrase) {
 async function hkdfExpand(master){
   const key=await crypto.subtle.importKey("raw",master,{name:"HKDF"},false,["deriveBits"]);
   const derive=async(label)=>new Uint8Array(await crypto.subtle.deriveBits({name:"HKDF",hash:"SHA-256",salt:new Uint8Array(32),info:new TextEncoder().encode("meshchat-v1:"+label)},key,256));
-  const encryptionKey=await derive("encryption");
+  // x25519Seed replaces the old raw AES "encryptionKey" — this is now a DH
+  // private scalar, never handed to anyone. What goes in the shareable
+  // address is x25519.getPublicKey(x25519Seed), a genuine public key, not
+  // a secret. See deriveSharedAesKey() below for what actually produces
+  // the AES key now (ECDH output, per-contact, not this seed directly).
+  const x25519Seed=await derive("x25519");
   const backupKey=await derive("backup");
   const signingKeySeed=await derive("signing");  // raw bytes now, not imported as HMAC
-  return{signingKeySeed,encryptionKey,backupKey};
+  return{signingKeySeed,x25519Seed,backupKey};
 }
 
+// Single-key hash — used for DEVICE identity only (getOrCreateDeviceId），
+// which derives a device id from a lone Ed25519 device pubkey with no
+// paired X25519 key involved. NOT used for identity publicId anymore —
+// see deriveIdentityPublicId() below, which binds two keys together and
+// is what auth/contacts actually use.
 async function derivePublicId(rawKey) {
   const hash = await crypto.subtle.digest("SHA-256", rawKey);
+  return btoa(String.fromCharCode(...new Uint8Array(hash).slice(0, 12))).replace(/\+/g,'-').replace(/\//g,'_').replace(/=/g,'');
+}
+
+// Identity publicId — binds BOTH the X25519 and Ed25519 public keys into
+// one hash. This is deliberate, not cosmetic: if publicId were derived
+// from the X25519 key alone, someone could present a victim's real
+// (public, no secret needed) x25519_pub alongside their OWN ed25519_pub,
+// sign the server's auth challenge with their own Ed25519 private key,
+// and the server would register their socket under the victim's
+// publicId — they'd never be able to decrypt anything, but they could
+// silently swallow everything routed to that identity. Hashing both
+// keys together means the server can only derive one specific publicId
+// from one specific (x25519, ed25519) pair, so there's no way to mix a
+// stolen public key from one identity with a private key from another
+// and land on someone else's publicId.
+async function deriveIdentityPublicId(x25519PublicKey, ed25519PublicKey) {
+  const combined = new Uint8Array(x25519PublicKey.length + ed25519PublicKey.length);
+  combined.set(x25519PublicKey, 0);
+  combined.set(ed25519PublicKey, x25519PublicKey.length);
+  const hash = await crypto.subtle.digest("SHA-256", combined);
   return btoa(String.fromCharCode(...new Uint8Array(hash).slice(0, 12))).replace(/\+/g,'-').replace(/\//g,'_').replace(/=/g,'');
 }
 
@@ -196,6 +226,33 @@ async function encryptMessage(recipientEncKey, payload) {
   const iv     = crypto.getRandomValues(new Uint8Array(12));
   const cipher = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, recipientEncKey, new TextEncoder().encode(JSON.stringify(payload)));
   return { v: 1, iv: Array.from(iv), data: Array.from(new Uint8Array(cipher)) };
+}
+
+// THE fix — replaces "AES key handed out in the QR code" with a real
+// X25519 static-static ECDH: two identities each combine their OWN
+// private scalar with the OTHER's public key and land on the same
+// shared secret, which nobody who only has one side's public key can
+// compute. HKDF over the raw ECDH output (never used directly as key
+// material) yields the actual AES-256-GCM key.
+//
+// Self-case (talking to your own identity, e.g. multi-device sync) is
+// not special-cased: X25519(myPriv, myPub) is a well-defined DH
+// operation and every device holding the same identity seed derives the
+// identical result, so state.encKey is produced by this same function.
+//
+// Static-static means this same key is reused for every message between
+// this pair, forever (barring a passphrase change) — this fixes the
+// pairwise-separation bug (every contact no longer shares one AES key),
+// it does NOT add forward secrecy. That's a separate, later piece of
+// work (Double Ratchet), not something this function claims to solve.
+async function deriveSharedAesKey(myX25519Seed, theirX25519PublicKey) {
+  const shared = x25519.getSharedSecret(myX25519Seed, theirX25519PublicKey);
+  const hkdfKey = await crypto.subtle.importKey("raw", shared, { name: "HKDF" }, false, ["deriveBits"]);
+  const bits = await crypto.subtle.deriveBits(
+    { name: "HKDF", hash: "SHA-256", salt: new Uint8Array(32), info: new TextEncoder().encode("meshchat-v1:pairwise") },
+    hkdfKey, 256
+  );
+  return importEncKey(new Uint8Array(bits));
 }
 
 function verifyBlob(blob,sig,contactSignPublicKey){

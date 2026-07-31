@@ -912,12 +912,13 @@ function contactAction(action) {
         try {
           const parts = newKey.split(".");
           if (parts.length < 2 || parts.length > 3) throw new Error("invalid key format");
-          const encKeyBytes   = base64ToRaw(parts[0]);
-          const signPublicKey = base64ToRaw(parts[1]);
-          if (encKeyBytes.length !== 32 || signPublicKey.length !== 32) throw new Error("invalid key length");
-          c.shareableKey  = newKey;
-          c.encKey        = await importEncKey(encKeyBytes);
-          c.signPublicKey = signPublicKey;
+          const x25519PublicKey = base64ToRaw(parts[0]);
+          const signPublicKey   = base64ToRaw(parts[1]);
+          if (x25519PublicKey.length !== 32 || signPublicKey.length !== 32) throw new Error("invalid key length");
+          c.shareableKey    = newKey;
+          c.encKey          = await deriveSharedAesKey(state.x25519Seed, x25519PublicKey);
+          c.x25519PublicKey = x25519PublicKey;
+          c.signPublicKey   = signPublicKey;
           if (parts.length === 3 && parts[2] && !relayVal) c.lastRelay = atob(parts[2]);
           mlog.info(`CONTACT    key updated  ${pid(c.publicId)}`);
         } catch(e) {
@@ -1284,11 +1285,24 @@ document.getElementById("loginButton").onclick = async (e) => {
     const keys   = await hkdfExpand(master);
 	state.user=name;
 	state.keys=keys;
-	state.publicId=await derivePublicId(keys.encryptionKey);
+	// X25519 identity keypair — keys.x25519Seed is the private scalar,
+	// NEVER shared. Only x25519PublicKey goes in the shareable address.
+	// This is the actual fix: the address used to carry a raw AES key
+	// (a secret every contact shared identically); now it carries a
+	// genuine public key, and each pairwise AES key is derived fresh via
+	// ECDH (deriveSharedAesKey, lib.js) — see addContact/deserialiseContacts.
+	state.x25519Seed=keys.x25519Seed;
+	const x25519PublicKey=x25519.getPublicKey(keys.x25519Seed);
 	const signPublicKey=ed25519.getPublicKey(keys.signingKeySeed);
-	state.shareableKey=rawToBase64(keys.encryptionKey)+"."+rawToBase64(signPublicKey);
+	// publicId binds BOTH keys (deriveIdentityPublicId, lib.js) — see the
+	// comment there for why hashing only the X25519 key would be exploitable.
+	state.publicId=await deriveIdentityPublicId(x25519PublicKey,signPublicKey);
+	state.shareableKey=rawToBase64(x25519PublicKey)+"."+rawToBase64(signPublicKey);
 	state.cryptoKey=await importEncKey(keys.backupKey);
-	state.encKey=await importEncKey(keys.encryptionKey);
+	// "our own" AES key, for self-targeted traffic (multi-device sync,
+	// mini-backups, etc.) — ECDH against our own public key. Deterministic,
+	// same result on every device that logs into this identity.
+	state.encKey=await deriveSharedAesKey(keys.x25519Seed,x25519PublicKey);
 	// device identity — local-only, never backed up, never synced. Get-or-create
 	// every boot: same device + same identity always yields the same id.
 	state.deviceId = await getOrCreateDeviceId();
@@ -1296,13 +1310,13 @@ document.getElementById("loginButton").onclick = async (e) => {
 	
     await loadContacts();
 	if(!state.contacts[state.publicId]){
-	  const parts=state.shareableKey.split(".");
-	  const encKeyBytes=base64ToRaw(parts[0]);
-	  state.contacts[state.publicId]={name:state.user+" (me)",publicId:state.publicId,shareableKey:state.shareableKey,encKey:await importEncKey(encKeyBytes),signPublicKey,messages:[]};
+	  state.contacts[state.publicId]={name:state.user+" (me)",publicId:state.publicId,shareableKey:state.shareableKey,encKey:state.encKey,x25519PublicKey,signPublicKey,messages:[]};
 	}else{
 	  // patch existing me contact with fresh 2-part key (wss segment appended later via relay_info)
 	  state.contacts[state.publicId].shareableKey=state.shareableKey;
 	  state.contacts[state.publicId].signPublicKey=signPublicKey;
+	  state.contacts[state.publicId].x25519PublicKey=x25519PublicKey;
+	  state.contacts[state.publicId].encKey=state.encKey;
 	}
     loadPeerBackups();
     loadPeerTokens();

@@ -2,7 +2,7 @@
 
 A decentralised, encrypted messaging protocol built on WebSocket relay servers. No accounts, no central authority, no plaintext.
 
-Current client/server implementation version: `0.3.8`, surfaced informationally via the `version` field on `sig:relay_info` for drift visibility (not yet enforced). `0.3.6` added WebRTC data-channel shell escalation for agent contacts; `0.3.7` added the burn notice; `0.3.8` moved `app:message`'s `deviceId` into the encrypted payload (previously unsigned envelope metadata) and gated device-registry recording on signature validity.
+Current client/server implementation version: `0.4.0`, surfaced informationally via the `version` field on `sig:relay_info` for drift visibility (not yet enforced). `0.3.6` added WebRTC data-channel shell escalation for agent contacts; `0.3.7` added the burn notice. `0.4.0` replaces the identity encryption key with an X25519 keypair — see [Identity and Key Derivation](#identity-and-key-derivation) and [Encryption](#encryption) below; this is a breaking protocol change with no backward compatibility, consistent with the project's pre-1.0 stance.
 
 ---
 
@@ -36,17 +36,21 @@ Three keys are expanded from the master secret via HKDF-SHA-256:
 
 | Label | Use |
 |---|---|
-| `meshchat-v1:encryption` | AES-256-GCM message encryption |
+| `meshchat-v1:x25519`     | X25519 private scalar — message encryption key agreement (see below) |
 | `meshchat-v1:backup`     | AES-256-GCM backup file encryption |
 | `meshchat-v1:signing`    | Ed25519 signing seed |
+
+**`meshchat-v1:x25519` replaces the old `meshchat-v1:encryption` label.** Prior versions derived a raw AES-256 key directly and distributed it as-is inside the shareable address — meaning every contact who held that address held the literal key used to encrypt everything sent to that identity, with no separation between senders. `meshchat-v1:x25519` instead derives an X25519 private scalar, which never leaves the device. The corresponding public key (`X25519.getPublicKey(seed)`) is what goes in the shareable address; the actual AES key used per-conversation is computed fresh via ECDH — see [Encryption](#encryption).
 
 ### PublicId
 
 ```
-publicId = base64url( SHA-256(encryptionKey)[0:12] )
+publicId = base64url( SHA-256(x25519PublicKey || ed25519PublicKey)[0:12] )
 ```
 
-The server derives publicId from the presented enc key during auth and never trusts a client-supplied ID claim.
+PublicId is deliberately derived from **both** public keys concatenated, not the X25519 key alone. If it depended only on the X25519 key, an attacker could present a victim's real (public, no secret required) X25519 public key alongside an Ed25519 public key of their own choosing, sign the relay's auth challenge with their own Ed25519 private key, and have the relay register their socket under the victim's publicId — unable to decrypt anything routed there, but able to silently swallow it or otherwise squat on the identity's routing. Hashing both keys together means a given publicId can only be produced by one specific (X25519, Ed25519) pair; a stolen public key from one identity can't be combined with a private key from another to land on the same publicId.
+
+The server derives publicId from the two presented public keys during auth (see [Relay Authentication](#relay-authentication)) and never trusts a client-supplied ID claim.
 
 ### Device Identity
 
@@ -56,7 +60,7 @@ Each device generates a random 32-byte seed on first run, stored in localStorage
 deviceId = base64url( SHA-256( Ed25519.getPublicKey(seed) )[0:12] )
 ```
 
-`deviceId` is strictly local — it never appears inside any encrypted backup blob or `serialiseContacts()` output, so it is never included in backups, exports, or restore payloads. On `app:message` it travels inside the encrypted, signed payload rather than the outer envelope (see [Outer envelope](#outer-envelope-appmessage) below) — the relay never sees it, and the receiving side only records it once the signature has verified. It still rides as plaintext envelope metadata on the self-sync backup path (`sync:backup_push`/`sync:backup_accept`), where both ends already share a secret scoped to the user's own devices. The underlying seed is architecturally prepared for a future X25519 DH key via the standard Ed25519↔X25519 birational conversion — no re-keying needed when that work happens.
+`deviceId` is strictly local — it never appears inside any encrypted backup blob or `serialiseContacts()` output, so it is never included in backups, exports, or restore payloads. It rides only as plaintext envelope metadata on specific wire packets where device distinction is meaningful (currently `app:message` and the self-sync backup path). The underlying seed is architecturally prepared for a future X25519 DH key via the standard Ed25519↔X25519 birational conversion — no re-keying needed when that work happens. (This is a *separate* X25519 use from the identity-level agreement key above — device-level forward secrecy is future Double Ratchet work, not part of this pass.)
 
 ---
 
@@ -65,10 +69,12 @@ deviceId = base64url( SHA-256( Ed25519.getPublicKey(seed) )[0:12] )
 Everything needed to reach someone, encoded as a single dot-separated string:
 
 ```
-<encKey_b64>.<signPublicKey_b64>.<relayWss_b64>
+<x25519PublicKey_b64>.<signPublicKey_b64>.<relayWss_b64>
 ```
 
-All three segments are base64url encoded. The third segment is `btoa(wssUrl)` — standard base64 of the relay WebSocket URL. It is optional but included when sharing via QR code or copy-paste, bootstrapping direct relay connectivity on first contact.
+All three segments are base64url encoded. **Both the first and second segments are public keys — there is no secret material anywhere in this address.** It is meant to be shared as freely as a phone number: printed on a sticker, posted publicly, handed to a stranger. Holding someone's address lets you *reach* and *encrypt to* them; it does not let you read anyone else's traffic with them, and does not let you impersonate them, since neither public key on its own is sufficient to derive the other side's private material.
+
+The third segment is `btoa(wssUrl)` — standard base64 of the relay WebSocket URL. It is optional but included when sharing via QR code or copy-paste, bootstrapping direct relay connectivity on first contact.
 
 Implementations must decode the third segment with `atob()` before use. Segments beyond the third must be ignored for forward compatibility.
 
@@ -76,25 +82,27 @@ Implementations must decode the third segment with `atob()` before use. Segments
 
 ## Relay Authentication
 
-Authentication happens on connect, before routing or buffer delivery. The protocol is a simple challenge-response proving possession of the enc key.
+Authentication happens on connect, before routing or buffer delivery. The protocol proves possession of the identity's Ed25519 private key via a sign-the-nonce challenge.
 
 ### Sequence
 
 ```
-client → server:  auth_init      { enc_key: [...bytes], bits: 256 }
-server → client:  auth_challenge { bits: 256, iv: [...], data: [...] }
-client → server:  auth_proof     { nonce: [...bytes] }
+client → server:  auth_init      { x25519_pub: [...bytes], ed25519_pub: [...bytes] }
+server → client:  auth_challenge { nonce: [...bytes] }
+client → server:  auth_proof     { sig: [...bytes] }
 server → client:  auth_ok        { public_id: "..." }
              or:  auth_fail      { reason: "..." }
 ```
 
-1. Client sends enc key bytes
-2. Server encrypts a random 32-byte nonce with the presented key (AES-GCM) and sends it back
-3. Client decrypts and returns the nonce plaintext
-4. Server verifies, derives publicId from the enc key, registers the socket, flushes buffer
+1. Client sends both its X25519 and Ed25519 public key bytes
+2. Server generates a random 32-byte nonce and sends it back in the clear — there is no shared secret between client and server to encrypt it with, and nothing about the nonce itself is worth hiding
+3. Client signs the nonce with its Ed25519 private signing key and returns the signature
+4. Server verifies the signature against the presented Ed25519 public key, derives publicId from **both** presented public keys (see [PublicId](#publicid)), registers the socket, flushes buffer
 5. Client proceeds with `sig:relay_req`, presence polling, and normal operation
 
-The server never trusts the client's claimed publicId — it derives it authoritatively from the presented enc key.
+**This replaces a prior scheme (protocol versions before `0.4.0`) that proved possession by having the client decrypt an AES-GCM-encrypted nonce using the same raw AES key it had just presented in `auth_init` moments earlier.** That scheme proved nothing: the server already held the "secret" in plaintext from the immediately preceding message, so successfully decrypting it demonstrated only that the client could run AES-GCM, not that it possessed anything the server didn't already have. The sign-the-nonce scheme is a genuine possession proof — only the holder of the Ed25519 private key can produce a valid signature, and the server can verify it using only the public key the client just presented.
+
+The server never trusts the client's claimed publicId — it derives it authoritatively from the two presented public keys.
 
 An optional `no_receive: true` flag on `sig:auth_init` completes the challenge-response without registering the socket as a recipient and without triggering a buffer flush. Used by disposable connectivity probes (e.g. the migrate panel's TEST function) that must not silently consume buffered packets.
 
@@ -110,27 +118,44 @@ On `auth_fail` the client does not retry immediately — the socket `onclose` ha
 
 ### Security properties
 
-- Proves possession of the enc key without revealing any secret
-- The enc key is already public by design (shared in the shareable address) — presenting it to the server is not a privacy concern
-- Replay attacks are prevented by the random nonce
+- Proves possession of the Ed25519 private signing key via a genuine cryptographic signature, not a decrypt-what-you-just-sent round-trip
+- Both public keys presented in `auth_init` are already public by design (shared in the shareable address) — presenting them to the server is not a privacy concern
+- Replay attacks are prevented by the random nonce — a captured signature is only valid for that specific nonce, and each connection gets a fresh one
+- publicId binds both public keys together (see [PublicId](#publicid)), closing the swap attack where someone presents a victim's X25519 public key alongside their own Ed25519 public key
 - Buffer hijacking, ID spoofing, and fake presence are all closed by this mechanism
 
 ---
 
 ## Encryption
 
-**Message encryption** uses the recipient's encryption key (AES-256-GCM):
+**Message encryption** uses a pairwise AES-256-GCM key derived fresh via X25519 Diffie-Hellman, not a raw key transmitted in the shareable address:
 
 ```
+sharedSecret = X25519(
+  privateKey = sender's own X25519 private scalar,
+  publicKey  = recipient's X25519 public key
+)
+aesKey = HKDF-SHA-256(
+  key  = sharedSecret,
+  salt = 32 zero bytes,
+  info = "meshchat-v1:pairwise",
+  bits = 256
+)
 ciphertext = AES-GCM(
-  key  = recipient.encryptionKey,
+  key  = aesKey,
   iv   = random 12 bytes,
   data = JSON(payload)
 )
 wire = { v: 1, iv: [...], data: [...] }
 ```
 
-**Message signing** uses the sender's Ed25519 signing key:
+Static-static ECDH is symmetric — `X25519(alicePriv, bobPub)` and `X25519(bobPriv, alicePub)` yield the identical value — so both sides independently derive the same `aesKey` without ever transmitting it. Because the key depends on *both* parties' private material, it is unique to that specific pair: Alice's key for talking to Bob is different from her key for talking to Carol, even though Alice has only one identity. This is what closes the vulnerability present in protocol versions before `0.4.0`, where every one of an identity's contacts held the literal same AES key used to encrypt everything sent to that identity — meaning any two contacts of the same person could decrypt each other's traffic with that person. Under the current scheme, only the two parties to a given pairwise secret can compute it.
+
+Self-targeted traffic (an identity's own multi-device sync, mini-backups, etc.) uses the same derivation against the identity's own public key — `X25519(myPriv, myPub)` is a well-defined DH operation and every device holding the same identity seed derives the identical result, so no special-casing is needed for the self case.
+
+**This is static-static ECDH, not a ratchet.** The same pairwise key is reused for every message between a given pair indefinitely (until a passphrase change produces new identity keys). It provides real separation between contacts — the actual bug being fixed — but it does **not** provide forward secrecy: if either party's X25519 private key is later compromised, previously recorded ciphertext between that pair becomes decryptable in hindsight, same as the prior scheme's forward-secrecy limitation, just now correctly scoped to the pair rather than the whole network. See `known-limitations.md`. Forward secrecy (Double Ratchet, evolving the key per message/turn) is separate, later work that builds on top of this pairwise foundation — it is not part of what `0.4.0` changes.
+
+**Message signing** uses the sender's Ed25519 signing key, unchanged from prior versions:
 
 ```
 sig = Ed25519.sign(JSON(wire), sender.signingKeySeed)
@@ -138,7 +163,7 @@ sig = Ed25519.sign(JSON(wire), sender.signingKeySeed)
 
 The recipient verifies the signature against the sender's signing public key (known from the shareable address). Invalid signatures are flagged but not dropped — the message is displayed with a warning.
 
-**Backup encryption** uses the backup key (separate from the message encryption key):
+**Backup encryption** uses the backup key (separate from the message encryption key, unaffected by the X25519 change — it was never derived from or shared as part of the vulnerable scheme):
 
 ```
 ciphertext = AES-256-GCM(key = backupKey, iv = random, data = gzip(JSON(contacts)))
@@ -152,12 +177,11 @@ The plaintext payload (before encryption) for a text message:
 
 ```json
 {
-  "id":       "<uuid>",
-  "type":     "text",
-  "text":     "hello",
-  "ts":       1234567890123,
-  "deviceId": "<deviceId>",
-  "relay":    { "wss": "wss://sender.example.com/ws/" }
+  "id":    "<uuid>",
+  "type":  "text",
+  "text":  "hello",
+  "ts":    1234567890123,
+  "relay": { "wss": "wss://sender.example.com/ws/" }
 }
 ```
 
@@ -171,17 +195,16 @@ The wire packet wrapping the encrypted blob:
 
 ```json
 {
-  "type": "app:message",
-  "from": "<publicId>",
-  "to":   "<publicId>",
-  "blob": { "v": 1, "iv": [...], "data": [...] },
-  "sig":  [...]
+  "type":     "app:message",
+  "from":     "<publicId>",
+  "to":       "<publicId>",
+  "blob":     { "v": 1, "iv": [...], "data": [...] },
+  "sig":      [...],
+  "deviceId": "<deviceId>"
 }
 ```
 
-`deviceId` (see [Device Identity](#device-identity)) lives *inside* the encrypted payload, not the outer envelope. Prior to `0.3.8` it rode here as plaintext envelope metadata and — unlike `call:*`/`shell:*` deviceId, which is part of the signed payload — was outside what `sig` covered, since `sig` on `app:message` only ever signed `blob`. That meant a relay (explicitly untrusted infrastructure in this design) could rewrite the field in transit without invalidating anything. Moving it inside the encrypted payload closes both problems in one change: the relay no longer sees which device sent a message, and a rewritten value would fail the AES-GCM auth tag before the application layer ever saw it.
-
-Recipients record it in the local device registry to build passive knowledge of which devices a given identity runs — but only once the outer `sig` has verified against the sender's signing key. A message that fails to decrypt, or one that decrypts but carries an invalid or missing signature, does not get its `deviceId` recorded, regardless of what the field says. `deviceId` remains optional on send; a client that omits it is handled gracefully (the contact's device list stays at the "unknown" placeholder).
+`deviceId` is the sender's device identity (see [Device Identity](#device-identity)). It is plaintext — not inside the encrypted blob — so the relay and recipient can read it without decryption. Recipients record it in the local device registry to build passive knowledge of which devices a given identity runs. It is optional; old clients that omit it are handled gracefully (the contact's device list stays at the "unknown" placeholder).
 
 ---
 
@@ -245,7 +268,7 @@ A deliberate relay change is announced via a dedicated packet type so contacts (
 }
 ```
 
-The encrypted payload is `{ newRelay, ts }` — same encryption scheme as a regular message (`encryptMessage`), decrypted with the receiver's own `encKey`. This scheme is symmetric — a contact who already holds your shareable address holds the same key you decrypt with.
+The encrypted payload is `{ newRelay, ts }` — same encryption scheme as a regular message (`encryptMessage`), using the same pairwise X25519-derived key as any other traffic between the two parties (see [Encryption](#encryption)). For the self-targeted case (a migration breadcrumb left for one's own other devices), this is the identity's own self-ECDH key, computed identically on every device holding the same identity.
 
 **Signature is mandatory.** An `app:migrate` packet with a missing or invalid signature is dropped outright — unlike a regular message where a bad signature is flagged but displayed. This packet redirects routing and must not be trusted on decryption success alone.
 
@@ -281,7 +304,7 @@ A deliberate, irreversible local action — "stop trusting this identity" — an
 }
 ```
 
-The encrypted payload is `{ ts }` — deliberately thin. Unlike `app:migrate` there is no value to timestamp-guard and adopt; burn is a one-shot action, not a routing fact to compare against what's already stored. `ts` exists only so the signed blob carries some content and for an audit trail. Encryption/signing is otherwise identical to `app:migrate` — sender's own `encKey`, same symmetric-by-address scheme.
+The encrypted payload is `{ ts }` — deliberately thin. Unlike `app:migrate` there is no value to timestamp-guard and adopt; burn is a one-shot action, not a routing fact to compare against what's already stored. `ts` exists only so the signed blob carries some content and for an audit trail. Encryption/signing is otherwise identical to `app:migrate` — the same pairwise X25519-derived key as any other traffic between the two parties.
 
 **Signature is mandatory.** Same rule as `app:migrate` and the `call:*`/`shell:*` groups: this packet drives an irreversible action, so an unsigned or invalid one is dropped outright rather than flagged and displayed.
 
@@ -332,7 +355,7 @@ Each client maintains a local device registry (`meshchat_known_devices_v1_<publi
 
 This is local-only, never included in backup blobs or `serialiseContacts()`. It is populated passively from two sources:
 
-1. **`app:message` receipt** — the `deviceId` carried inside the decrypted payload records which device a contact sent from, once the packet's signature has verified.
+1. **`app:message` receipt** — the outer `deviceId` field records which device a contact sent from.
 2. **Self-sync backup path** — `deviceId`/`fingerprint` fields on `sync:backup_push` and `sync:backup_accept` teach each of the user's own devices about the others (see [Peer Backup Protocol](#peer-backup-protocol)).
 
 The registry is displayed in a per-contact device popover in the UI. Contacts with no recorded devices show an "unknown" placeholder. The data accumulates passively through normal traffic — no dedicated discovery handshake.
@@ -384,7 +407,7 @@ Routing follows the normal contact-relay priority (`sendToRelay` → `sendSignal
 }
 ```
 
-Three types: `call:offer`, `call:answer`, `call:ice`. Unlike the invite/claim/cancel/end group, these carry a `blob` — the SDP (`{ sdp }`) or one ICE candidate (`candidate.toJSON()`) — encrypted with the recipient's `encKey` via the same `encryptMessage` scheme as a regular message. The signed payload is `{ type, from, to, callId, deviceId, ts, blob }` — **the ciphertext itself is inside the signature**, the same protection `app:migrate` relies on, so the relay can't swap the encrypted SDP/ICE payload for another without invalidating the signature.
+Three types: `call:offer`, `call:answer`, `call:ice`. Unlike the invite/claim/cancel/end group, these carry a `blob` — the SDP (`{ sdp }`) or one ICE candidate (`candidate.toJSON()`) — encrypted with the pairwise X25519-derived key shared between the two parties (see [Encryption](#encryption)), via the same `encryptMessage` scheme as a regular message. The signed payload is `{ type, from, to, callId, deviceId, ts, blob }` — **the ciphertext itself is inside the signature**, the same protection `app:migrate` relies on, so the relay can't swap the encrypted SDP/ICE payload for another without invalidating the signature.
 
 Only accepted while `contact.call.callId` matches and the local role is the expected one for that packet (`call:offer` only while `role === "callee"`, `call:answer` only while `role === "caller"`). `call:ice` candidates arriving before the remote description is set are queued (`iceQueue`) and flushed once it's applied, since trickle ICE races the SDP exchange.
 
@@ -474,10 +497,10 @@ The agent spawns the pty (`pty.fork()`, attached to the user's `$SHELL -i`) on t
 
 | Type | Fields | Auth required | Description |
 |---|---|---|---|
-| `sig:auth_init`     | `enc_key`, `bits`, `no_receive?`          | yes  | Begin challenge-response. `no_receive: true` skips registration and buffer flush (used by probes) |
-| `sig:auth_proof`    | `nonce`                                   | yes  | Return decrypted nonce |
+| `sig:auth_init`     | `x25519_pub`, `ed25519_pub`, `no_receive?` | no  | Begin challenge-response, presenting both public keys. `no_receive: true` skips registration and buffer flush (used by probes) |
+| `sig:auth_proof`    | `sig`                                     | no  | Return Ed25519 signature over the server's nonce |
 | `sig:announce`      | `ids[]`                                   | yes  | Check local presence of up to 10 IDs |
-| `app:message`       | `from`, `to`, `blob`, `sig`  | yes | Deliver message — `from` must match authed identity on this socket. `deviceId` (optional) rides inside the encrypted `blob`, not as an outer field |
+| `app:message`       | `from`, `to`, `blob`, `sig`, `deviceId?`  | yes | Deliver message — `from` must match authed identity on this socket |
 | `app:migrate`       | `from`, `to`, `blob`, `sig`               | yes | Notify of a relay migration — always durably buffered in addition to live delivery |
 | `app:burn`          | `from`, `to`, `blob`, `sig`               | yes | Notify of a burn (self-destruct / stop-trusting) — always durably buffered in addition to live delivery, own overwrite bucket |
 | `app:sync`          | `from`, `to`, `msgs[]`, `reply`           | yes  | Manual sync exchange |
@@ -493,7 +516,7 @@ The agent spawns the pty (`pty.fork()`, attached to the user's `$SHELL -i`) on t
 | `call:claim`        | `from`, `to`, `callId`, `ts`, `deviceId?`, `sig` | yes | Answer a call — also sent self-targeted for multi-device dedup |
 | `call:cancel`       | `from`, `to`, `callId`, `ts`, `deviceId?`, `sig` | yes | Cancel/decline before connection |
 | `call:end`          | `from`, `to`, `callId`, `ts`, `deviceId?`, `sig` | yes | Hang up an active or negotiating call |
-| `call:offer`        | `from`, `to`, `callId`, `ts`, `deviceId?`, `blob`, `sig` | yes | WebRTC SDP offer — `blob` encrypted with recipient's `encKey`, signed with `blob` included |
+| `call:offer`        | `from`, `to`, `callId`, `ts`, `deviceId?`, `blob`, `sig` | yes | WebRTC SDP offer — `blob` encrypted with the pairwise X25519-derived key, signed with `blob` included |
 | `call:answer`       | `from`, `to`, `callId`, `ts`, `deviceId?`, `blob`, `sig` | yes | WebRTC SDP answer — same encryption/signing as `call:offer` |
 | `call:ice`          | `from`, `to`, `callId`, `ts`, `deviceId?`, `blob`, `sig` | yes | One ICE candidate — same encryption/signing as `call:offer` |
 | `shell:invite`      | `from`, `to`, `sessionId`, `ts`, `deviceId?`, `sig` | yes | Invite a contact to shell escalation — mandatory signature |

@@ -13,7 +13,7 @@
 
    Load order: meshchat-lib.js → meshchat-gui.js → meshchat.js → statemachine.js
 ═══════════════════════════════════════════════════════════════ */
-const CLIENT_VERSION = "0.3.9";
+const CLIENT_VERSION = "0.4.0";
 
 const POLL_INTERVAL_MS        	= 30_000;			// base interval between presence polls
 const POLL_JITTER_MS          	= 10_000;			// ± random jitter added to poll interval
@@ -118,10 +118,18 @@ async function computeBackupFingerprint() {
   const hash = await crypto.subtle.digest("SHA-256", enc.encode(JSON.stringify(serialiseContacts())));
   return btoa(String.fromCharCode(...new Uint8Array(hash).slice(0, 12))).replace(/\+/g,'-').replace(/\//g,'_').replace(/=/g,'');
 }
-async function decryptMessage(blob) {
+// key MUST be the caller's ECDH-derived key for the specific sender
+// (contact.encKey) — never state.encKey used blindly. Under the old
+// symmetric-by-address scheme every sender encrypted with the recipient's
+// own raw AES key, so decrypting with state.encKey always happened to
+// work regardless of who sent it. That's no longer true: each pairwise
+// ECDH secret is DIFFERENT per contact, so the caller must resolve which
+// contact.encKey applies (self-targeted packets still work uniformly here,
+// since state.contacts[state.publicId].encKey IS state.encKey — self-ECDH).
+async function decryptMessage(blob, key) {
   // v missing = v0 (legacy unversioned), v:1 = AES-256-GCM explicit
   if (blob.v !== undefined && blob.v > 1) throw new Error(`unsupported message version v${blob.v}`);
-  const plain = await crypto.subtle.decrypt({ name: "AES-GCM", iv: new Uint8Array(blob.iv) }, state.encKey, new Uint8Array(blob.data));
+  const plain = await crypto.subtle.decrypt({ name: "AES-GCM", iv: new Uint8Array(blob.iv) }, key, new Uint8Array(blob.data));
   return JSON.parse(new TextDecoder().decode(plain));
 }
 function signBlob(blob){
@@ -174,10 +182,15 @@ async function deserialiseContacts(raw){
   const out={};
   for(const[id,c]of Object.entries(raw)){
     const parts=c.shareableKey.split(".");
-    const encKeyBytes=base64ToRaw(parts[0]);
+    const x25519PublicKey=base64ToRaw(parts[0]);
     const signPublicKey=parts.length>=2?base64ToRaw(parts[1]):null;
     // parts[2] is base64-encoded relay WSS — preserved as-is in shareableKey
-    out[id]={...c,encKey:await importEncKey(encKeyBytes),signPublicKey};
+    // encKey is no longer imported raw off the wire — it's derived fresh via
+    // ECDH(ourX25519Seed, theirX25519PublicKey) every load. Works identically
+    // for the self entry (id === state.publicId): X25519 against our own
+    // public key is a well-defined DH operation, same result every device.
+    const encKey=await deriveSharedAesKey(state.x25519Seed,x25519PublicKey);
+    out[id]={...c,encKey,x25519PublicKey,signPublicKey};
   }
   return out;
 }
@@ -549,9 +562,22 @@ async function sendRestoreRequest(id) {
 
 async function handleRestoreRequest(msg) {
   if (!msg.from || !msg.blob) return;
+  const contact = state.contacts[msg.from];
+  if (!contact) {
+    // Under the old symmetric-by-address scheme, ANY sender could produce
+    // a blob decryptable with our own key — no need to have added them
+    // back. That was exactly the bug this whole pass fixed. With real
+    // ECDH, decrypting genuinely requires their X25519 public key on
+    // file, i.e. we must already have them as a contact. sendRestoreRequest
+    // is only ever invoked for ids already in state.contacts on the
+    // sending side, so this isn't a new practical limitation — just
+    // enforced by the crypto now instead of a policy check after decrypt.
+    mlog.warn(`← RESTORE_REQ  from ${pid(msg.from)} — unknown contact, can't decrypt, dropped`);
+    return;
+  }
   let plain;
   try {
-    plain = await decryptObject(state.encKey, msg.blob);
+    plain = await decryptObject(contact.encKey, msg.blob);
     if (plain.publicId_A !== msg.from) {
       mlog.warn(`← RESTORE_REQ  from ${pid(msg.from)} — ID_A mismatch, dropped`);
       return;
@@ -565,12 +591,12 @@ async function handleRestoreRequest(msg) {
     return;
   }
 
-  if (state.contacts[msg.from]?.blocked) {
+  if (contact.blocked) {
     mlog.info(`← RESTORE_REQ  from ${pid(msg.from)} — blocked, ignored`);
     return;
   }
   
-  if (plain.deviceId && state.contacts[msg.from]) recordKnownDevice(msg.from, plain.deviceId);
+  if (plain.deviceId) recordKnownDevice(msg.from, plain.deviceId);
 
   if (!canRestore(msg.from)) {
     mlog.info(`← RESTORE_REQ  from ${pid(msg.from)} — cooldown, no ack`);
@@ -788,23 +814,29 @@ function rebootSignal() {
 
 function startAuth() {
   authState.step = "await_challenge";
+  const parts = state.shareableKey.split(".");
   state.ws.send(JSON.stringify({
-    type:    "sig:auth_init",
-    enc_key: Array.from(base64ToRaw(state.shareableKey.split(".")[0])),
+    type:        "sig:auth_init",
+    x25519_pub:  Array.from(base64ToRaw(parts[0])),
+    ed25519_pub: Array.from(base64ToRaw(parts[1])),
   }));
   mlog.info("AUTH       init");
 }
 
-async function handleAuthChallenge(msg) {
+// Possession proof is now "sign the nonce with your Ed25519 private key,"
+// not "decrypt the nonce with the same AES key you just handed the server
+// in auth_init" (which proved nothing — the server already had that key
+// in plaintext from the message immediately before). The nonce itself
+// travels in the clear now too; there's nothing about it worth hiding,
+// only something worth proving you can sign.
+function handleAuthChallenge(msg) {
   try {
-    const iv         = new Uint8Array(msg.iv);
-    const data       = new Uint8Array(msg.data);
-    const plainBytes = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, state.encKey, data);
-    const nonce      = Array.from(new Uint8Array(plainBytes));
-    state.ws.send(JSON.stringify({ type: "sig:auth_proof", nonce }));
+    const nonce = new Uint8Array(msg.nonce);
+    const sig   = Array.from(ed25519.sign(nonce, state.keys.signingKeySeed));
+    state.ws.send(JSON.stringify({ type: "sig:auth_proof", sig }));
     mlog.info("AUTH       proof sent");
   } catch(e) {
-    mlog.err(`AUTH       decrypt failed: ${e.message}`);
+    mlog.err(`AUTH       sign failed: ${e.message}`);
   }
 }
 
@@ -1007,14 +1039,19 @@ function testRelayConnection(url) {
 
     ws.onopen = () => {
       step = "await_challenge";
-      const encKey = Array.from(base64ToRaw(state.shareableKey.split(".")[0]));
+      const parts = state.shareableKey.split(".");
       // no_receive: this probe closes itself the instant auth_ok arrives — it
       // must never be registered as a recipient server-side, or a buffer
       // flush racing the deliberate close can either warn harmlessly (the
       // common case) or, in the unlucky ordering, have the server delete a
       // buffered packet (e.g. a migrate breadcrumb) it believes was delivered
       // to a socket that was actually already gone or about to discard it.
-      ws.send(JSON.stringify({ type: "sig:auth_init", enc_key: encKey, no_receive: true }));
+      ws.send(JSON.stringify({
+        type: "sig:auth_init",
+        x25519_pub:  Array.from(base64ToRaw(parts[0])),
+        ed25519_pub: Array.from(base64ToRaw(parts[1])),
+        no_receive: true,
+      }));
     };
 
     ws.onmessage = async (evt) => {
@@ -1022,10 +1059,9 @@ function testRelayConnection(url) {
         const msg = JSON.parse(evt.data);
 
         if (step === "await_challenge" && msg.type === "sig:auth_challenge") {
-          const iv         = new Uint8Array(msg.iv);
-          const data       = new Uint8Array(msg.data);
-          const plainBytes = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, state.encKey, data);
-          ws.send(JSON.stringify({ type: "sig:auth_proof", nonce: Array.from(new Uint8Array(plainBytes)) }));
+          const nonce = new Uint8Array(msg.nonce);
+          const sig   = Array.from(ed25519.sign(nonce, state.keys.signingKeySeed));
+          ws.send(JSON.stringify({ type: "sig:auth_proof", sig }));
           step = "await_ok";
           return;
         }
@@ -1092,8 +1128,12 @@ function getOrOpenRelayConn(url, messageOnly) {
     ws.onopen = () => {
       clearTimeout(connectTimeout);
       entry.authStep = "await_challenge";
-      const encKey = Array.from(base64ToRaw(state.shareableKey.split(".")[0]));
-      ws.send(JSON.stringify({ type: "sig:auth_init", enc_key: encKey }));
+      const parts = state.shareableKey.split(".");
+      ws.send(JSON.stringify({
+        type: "sig:auth_init",
+        x25519_pub:  Array.from(base64ToRaw(parts[0])),
+        ed25519_pub: Array.from(base64ToRaw(parts[1])),
+      }));
       mlog.info(`RELAY      open, authing  host=${hostname}`);
     };
 
@@ -1103,11 +1143,9 @@ function getOrOpenRelayConn(url, messageOnly) {
 
         // ── challenge ──
         if (entry.authStep === "await_challenge" && msg.type === "sig:auth_challenge") {
-          const iv         = new Uint8Array(msg.iv);
-          const data       = new Uint8Array(msg.data);
-          const plainBytes = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, state.encKey, data);
-          const nonce      = Array.from(new Uint8Array(plainBytes));
-          ws.send(JSON.stringify({ type: "sig:auth_proof", nonce }));
+          const nonce = new Uint8Array(msg.nonce);
+          const sig   = Array.from(ed25519.sign(nonce, state.keys.signingKeySeed));
+          ws.send(JSON.stringify({ type: "sig:auth_proof", sig }));
           entry.authStep = "await_ok";
           mlog.info(`RELAY      auth proof sent  host=${hostname}`);
           return;
@@ -1178,16 +1216,20 @@ function drainOldRelay(url) {
 
   ws.onopen = () => {
     step = "await_challenge";
-    const encKey = Array.from(base64ToRaw(state.shareableKey.split(".")[0]));
-    ws.send(JSON.stringify({ type: "sig:auth_init", enc_key: encKey }));
+    const parts = state.shareableKey.split(".");
+    ws.send(JSON.stringify({
+      type: "sig:auth_init",
+      x25519_pub:  Array.from(base64ToRaw(parts[0])),
+      ed25519_pub: Array.from(base64ToRaw(parts[1])),
+    }));
   };
 
   ws.onmessage = async (evt) => {
     const msg = JSON.parse(evt.data);
     if (step === "await_challenge" && msg.type === "sig:auth_challenge") {
-      const iv = new Uint8Array(msg.iv), data = new Uint8Array(msg.data);
-      const plain = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, state.encKey, data);
-      ws.send(JSON.stringify({ type: "sig:auth_proof", nonce: Array.from(new Uint8Array(plain)) }));
+      const nonce = new Uint8Array(msg.nonce);
+      const sig   = Array.from(ed25519.sign(nonce, state.keys.signingKeySeed));
+      ws.send(JSON.stringify({ type: "sig:auth_proof", sig }));
       step = "await_ok";
       return;
     }
@@ -1458,7 +1500,7 @@ async function receiveMessage(msg) {
   markOnline(msg.from);
   try {
     let plain, valid;
-    plain = await decryptMessage(msg.blob);
+    plain = await decryptMessage(msg.blob, contact.encKey);
     valid = msg.sig && contact.signPublicKey
       ? verifyBlob(msg.blob, msg.sig, contact.signPublicKey)
       : false;
@@ -1541,7 +1583,7 @@ async function handleMigrate(msg) {
 
   let plain;
   try {
-    plain = await decryptMessage(msg.blob);
+    plain = await decryptMessage(msg.blob, contact.encKey);
   } catch(e) {
     mlog.warn(`← MIGRATE      from ${pid(msg.from)} — decrypt failed`);
     return;
@@ -1633,7 +1675,7 @@ async function handleBurn(msg) {
  
   let plain;
   try {
-    plain = await decryptMessage(msg.blob);
+    plain = await decryptMessage(msg.blob, contact.encKey);
   } catch(e) {
     mlog.warn(`← BURN         from ${pid(msg.from)} — decrypt failed`);
     return;
@@ -2147,7 +2189,7 @@ async function handleShellAnswer(msg) {
   const entry = shellConns[msg.from];
   if (!entry) { mlog.warn(`← SHELL ANSWER from ${pid(msg.from)} — no pc, dropped`); return; }
   try {
-    const plain = await decryptMessage(msg.blob);
+    const plain = await decryptMessage(msg.blob, contact.encKey);
     await entry.pc.setRemoteDescription({ type: "answer", sdp: plain.sdp });
     await flushShellIceQueue(msg.from);
     mlog.info(`← SHELL ANSWER from ${pid(msg.from)} — remote set`);
@@ -2168,7 +2210,7 @@ async function handleShellIce(msg) {
   if (contact.shell?.sessionId !== msg.sessionId) return; // stale/unrelated session
  
   let plain;
-  try { plain = await decryptMessage(msg.blob); }
+  try { plain = await decryptMessage(msg.blob, contact.encKey); }
   catch(e) { mlog.warn(`← SHELL ICE    from ${pid(msg.from)} — decrypt failed`); return; }
  
   const entry = shellConns[msg.from];
@@ -2218,7 +2260,7 @@ async function handleCallOffer(msg) {
   }
   markOnline(msg.from);
   let plain;
-  try { plain = await decryptMessage(msg.blob); }
+  try { plain = await decryptMessage(msg.blob, contact.encKey); }
   catch(e) { mlog.warn(`← CALL OFFER   from ${pid(msg.from)} — decrypt failed`); return; }
 
   try {
@@ -2253,7 +2295,7 @@ async function handleCallAnswer(msg) {
   const entry = rtcConns[msg.from];
   if (!entry) { mlog.warn(`← CALL ANSWER  from ${pid(msg.from)} — no pc, dropped`); return; }
   try {
-    const plain = await decryptMessage(msg.blob);
+    const plain = await decryptMessage(msg.blob, contact.encKey);
     await entry.pc.setRemoteDescription({ type: "answer", sdp: plain.sdp });
     await flushIceQueue(msg.from);
     mlog.info(`← CALL ANSWER  from ${pid(msg.from)} — remote set`);
@@ -2274,7 +2316,7 @@ async function handleCallIce(msg) {
   if (contact.call?.callId !== msg.callId) return; // stale/unrelated call
 
   let plain;
-  try { plain = await decryptMessage(msg.blob); }
+  try { plain = await decryptMessage(msg.blob, contact.encKey); }
   catch(e) { mlog.warn(`← CALL ICE     from ${pid(msg.from)} — decrypt failed`); return; }
 
   const entry = rtcConns[msg.from];
@@ -2602,23 +2644,28 @@ function sendShellResize(id, cols, rows) {
 ══════════════════════════════════════════ */
 async function addContact(name,shareableKey,save=true,type="human"){
   if(!name||!shareableKey)return false;
-  let encKeyBytes,signPublicKey,relayWss=null;
+  let x25519PublicKey,signPublicKey,relayWss=null;
   try{
     const parts=shareableKey.split(".");
     if(parts.length<2||parts.length>3)throw new Error();
-    encKeyBytes=base64ToRaw(parts[0]);
+    x25519PublicKey=base64ToRaw(parts[0]);
     signPublicKey=base64ToRaw(parts[1]);
-    if(encKeyBytes.length!==32||signPublicKey.length!==32)throw new Error();
+    if(x25519PublicKey.length!==32||signPublicKey.length!==32)throw new Error();
     if(parts.length===3&&parts[2])relayWss=atob(parts[2]);
   }
   catch(e){return false;}
-  const publicId=await derivePublicId(encKeyBytes);
+  const publicId=await deriveIdentityPublicId(x25519PublicKey,signPublicKey);
   if(publicId===state.publicId||state.contacts[publicId])return!!state.contacts[publicId];
   // type is local-only UI metadata — never on the wire, never trusted as a
   // security boundary. It just decides which button (call vs shell) shows
   // in the header. Real enforcement of shell access lives entirely in the
   // agent's own SHELL_CONTACTS allowlist. Anything but "agent" is "human".
-  state.contacts[publicId]={name,publicId,shareableKey,encKey:await importEncKey(encKeyBytes),signPublicKey,messages:[],
+  // encKey is derived via ECDH, not imported off the wire — this contact's
+  // x25519PublicKey is public by design (it's what's in the QR code), but
+  // the AES key it produces is the shared secret only WE and THEY can
+  // compute, not anyone else holding this same shareable address.
+  const encKey=await deriveSharedAesKey(state.x25519Seed,x25519PublicKey);
+  state.contacts[publicId]={name,publicId,shareableKey,encKey,x25519PublicKey,signPublicKey,messages:[],
     lastRelay:relayWss||null, type: type==="agent"?"agent":"human"};
   if(save)await saveContacts();
   mlog.info(`CONTACT    added ${name}  ${pid(publicId)}${relayWss?" wss="+relayWss:""}${type==="agent"?"  [agent]":""}`);
