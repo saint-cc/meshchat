@@ -871,6 +871,26 @@ function contactAction(action) {
     relayInput.addEventListener("focus", () => { relayInput.readOnly = false; }, { once: true });
     editForm.appendChild(relayInput);
 
+    // Agent toggle — mirrors the add-contact modal's agentToggleRow.
+    // Not applicable to self, same reasoning as the key field above:
+    // contact.type only ever decides which header button (call vs shell)
+    // shows for THIS contact, and self gets neither.
+    let agentCheckbox = null;
+    if (!isMe) {
+      const agentRow = document.createElement("div");
+      agentRow.style.cssText = "display:flex;align-items:center;gap:8px;font-size:11px;color:var(--muted)";
+      agentCheckbox = document.createElement("input");
+      agentCheckbox.type = "checkbox";
+      agentCheckbox.id = "editContactIsAgent";
+      agentCheckbox.checked = c.type === "agent";
+      const agentLabel = document.createElement("label");
+      agentLabel.htmlFor = "editContactIsAgent";
+      agentLabel.textContent = "this is an agent (enables shell access, not just chat)";
+      agentRow.appendChild(agentCheckbox);
+      agentRow.appendChild(agentLabel);
+      editForm.appendChild(agentRow);
+    }
+
     // datalist — unique WSS values collected from all contacts
     const datalist = document.createElement("datalist");
     datalist.id = "relayDatalist";
@@ -894,6 +914,7 @@ function contactAction(action) {
       const val = nameInput.value.trim();
       if (!val) return;
       c.name = val;
+      if (agentCheckbox) c.type = agentCheckbox.checked ? "agent" : "human";
       c.lastStateChange = Date.now();
 
       // relay override
@@ -930,6 +951,11 @@ function contactAction(action) {
       await saveContacts();
       document.getElementById("chatHeaderName").textContent = val;
       updateChatRelayInfo(state.currentChat);
+      // type may have just changed via agentCheckbox — call/shell button
+      // visibility depends on it, same gate startShell()/the header render
+      // already use elsewhere.
+      updateCallHeaderBtn(state.currentChat);
+      updateShellHeaderBtn(state.currentChat);
       renderContactList();
       closeContactAction();
       if (ownRelayChanged) rebootSignal();

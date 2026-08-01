@@ -2,7 +2,7 @@
 
 A decentralised, encrypted messaging protocol built on WebSocket relay servers. No accounts, no central authority, no plaintext.
 
-Current client/server implementation version: `0.4.0`, surfaced informationally via the `version` field on `sig:relay_info` for drift visibility (not yet enforced). `0.3.6` added WebRTC data-channel shell escalation for agent contacts; `0.3.7` added the burn notice; `0.4.0` replaced the identity encryption key with an X25519 keypair (breaking, no backward compatibility).
+Current client/server implementation version: `0.4.0`, surfaced informationally via the `version` field on `sig:relay_info` for drift visibility (not yet enforced). `0.3.6` added WebRTC data-channel shell escalation for agent contacts; `0.3.7` added the burn notice; `0.4.0` replaced the identity encryption key with an X25519 keypair (breaking, no backward compatibility) and added Double Ratchet Phase 1 groundwork — per-contact send counters, richer device registry entries, and a client-side packet inspector (see [Device Awareness](#device-awareness)).
 
 ---
 
@@ -177,15 +177,19 @@ The plaintext payload (before encryption) for a text message:
 
 ```json
 {
-  "id":    "<uuid>",
-  "type":  "text",
-  "text":  "hello",
-  "ts":    1234567890123,
-  "relay": { "wss": "wss://sender.example.com/ws/" }
+  "id":       "<uuid>",
+  "type":     "text",
+  "text":     "hello",
+  "ts":       1234567890123,
+  "deviceId": "<deviceId>",
+  "n":        42,
+  "relay":    { "wss": "wss://sender.example.com/ws/" }
 }
 ```
 
 The `relay` field carries the sender's current relay WSS URL. Recipients update their routing table for the sender on every message received. This is how relay information propagates passively through the network.
+
+`deviceId` and `n` are Double Ratchet Phase 1 groundwork (see [Device Awareness](#device-awareness) for the full picture) — `deviceId` identifies which of the sender's devices produced this message, and `n` is that device's per-contact send sequence number. Both live **inside** the encrypted, signed payload, not the outer envelope — see the security note under [Outer envelope](#outer-envelope-appmessage) below for why. `n` is omitted on `reaction` payloads; every other type (`text`, `audio`, `image`) carries it.
 
 **Other payload types:** `audio`, `image`, `reaction`. Audio and image carry `data` (base64) and `mimeType`. Reactions carry `targetId` and `emoji`.
 
@@ -195,16 +199,15 @@ The wire packet wrapping the encrypted blob:
 
 ```json
 {
-  "type":     "app:message",
-  "from":     "<publicId>",
-  "to":       "<publicId>",
-  "blob":     { "v": 1, "iv": [...], "data": [...] },
-  "sig":      [...],
-  "deviceId": "<deviceId>"
+  "type": "app:message",
+  "from": "<publicId>",
+  "to":   "<publicId>",
+  "blob": { "v": 1, "iv": [...], "data": [...] },
+  "sig":  [...]
 }
 ```
 
-`deviceId` is the sender's device identity (see [Device Identity](#device-identity)). It is plaintext — not inside the encrypted blob — so the relay and recipient can read it without decryption. Recipients record it in the local device registry to build passive knowledge of which devices a given identity runs. It is optional; old clients that omit it are handled gracefully (the contact's device list stays at the "unknown" placeholder).
+**`deviceId` is deliberately not here.** It used to ride as plaintext outer-envelope metadata, but that left it outside `sig`'s coverage — a relay could rewrite it in transit and the recipient would have no way to detect the tampering, since the signature only ever covered `blob`. It now travels inside the encrypted+signed payload (see above) instead, and — same trust-boundary tightening — a recipient only records it in the local device registry once the signature has verified as valid; a message that fails to decrypt, or decrypts but doesn't verify, can't poison the registry. It is optional; old clients that omit it are handled gracefully (the contact's device list stays at the "unknown" placeholder).
 
 ---
 
@@ -347,18 +350,38 @@ Each client maintains a local device registry (`meshchat_known_devices_v1_<publi
 ```json
 {
   "<identityId>": {
-    "<deviceId>": <lastSeenTimestamp>,
-    "<deviceId>": <lastSeenTimestamp>
+    "<deviceId>": { "lastSeen": <timestamp>, "lastN": <int> },
+    "<deviceId>": { "lastSeen": <timestamp>, "lastN": <int> }
   }
 }
 ```
 
 This is local-only, never included in backup blobs or `serialiseContacts()`. It is populated passively from two sources:
 
-1. **`app:message` receipt** — the outer `deviceId` field records which device a contact sent from.
-2. **Self-sync backup path** — `deviceId`/`fingerprint` fields on `sync:backup_push` and `sync:backup_accept` teach each of the user's own devices about the others (see [Peer Backup Protocol](#peer-backup-protocol)).
+1. **`app:message` receipt** — the payload's `deviceId` and `n` fields (see [Message Payload](#message-payload)) record which device a contact sent from and that device's send sequence number, once the signature has verified.
+2. **Self-sync backup path** — `deviceId`/`fingerprint` fields on `sync:backup_push` and `sync:backup_accept` teach each of the user's own devices about the others (see [Peer Backup Protocol](#peer-backup-protocol)). This path has no `n` to offer, so `lastN` is left untouched.
 
-The registry is displayed in a per-contact device popover in the UI. Contacts with no recorded devices show an "unknown" placeholder. The data accumulates passively through normal traffic — no dedicated discovery handshake.
+**Migration from the pre-`lastN` shape:** older stored entries are bare `lastSeen` timestamps rather than `{ lastSeen, lastN }` objects. `loadDeviceRegistry()` migrates these in place on load — a bare number becomes `{ lastSeen: <that number>, lastN: 0 }`, since there was never a counter to recover for that history; it corrects itself the next time that device is actually seen sending something with an `n` on it.
+
+**`lastN` is bookkeeping, not enforcement — for now.** `recordKnownDevice(identityId, deviceId, n)` updates `lastN` to the highest `n` seen from that device, and if an incoming `n` isn't exactly `prevLastN + 1`, logs a gap/reorder at `mlog.debug` (console-only, not surfaced to the person). Nothing is currently dropped, buffered, or reordered based on this — it exists so the registry already carries the sequence information a future ordering/ratcheting pass can build on, without needing another storage migration when that happens.
+
+The registry is displayed in a per-contact device popover in the UI, showing each known device's relative last-seen date and its `lastN` (e.g. `2d ago · n:14`). Contacts with no recorded devices show an "unknown" placeholder. The data accumulates passively through normal traffic — no dedicated discovery handshake.
+
+### Send Counters
+
+Alongside the device registry, each client maintains a local, per-(this device, contact) outbound counter (`meshchat_send_counters_v1_<publicId>` in localStorage):
+
+```json
+{ "<contactPublicId>": <n> }
+```
+
+`nextSendCounter(contactId)` increments and persists this before every outbound `text`/`audio`/`image` payload, and the result is what's placed in that payload's `n` field. **Reactions are deliberately excluded** — they aren't part of the conversational sequence the counter is meant to track.
+
+This is local-only and never included in `serialiseContacts()` or any backup — same tier as the device seed itself. It is **not** synced or reconciled between a person's own devices: each device sharing one identity keeps its own independent counter, since (as of Phase 1) there is no live, authoritative shared crypto state to arbitrate whose turn it is between two devices of the same identity sending concurrently. `Agent.py` mirrors this exactly, backed by a small JSON file (`agent_send_counters.json`) instead of localStorage.
+
+### Packet Inspector
+
+A client-side debugging aid, not a wire-protocol feature: each message bubble carries an "ⓘ" button that, on click, displays the full outer envelope for that message with the encrypted `blob` field removed and the decrypted payload spliced in its place (audio/image `data` is replaced with a size placeholder rather than shown in full). This is sourced from an in-memory `packetCache` (`msgId → { envelope, payload }`) populated at the same point each send/receive path already has both pieces in hand, and is **not** persisted — a message from before the current session (page reload, or one that arrived via restore/backup/sync rather than a live send/receive) has no cache entry and the inspector says so rather than reconstructing one.
 
 ### Planned propagation
 
@@ -636,7 +659,8 @@ The relay itself is untrusted infrastructure. Cryptographic proof — signatures
 | `meshchat_contacts_<publicId>`         | per identity | Encrypted contact store (backup key) |
 | `meshchat_peer_backups_v1_<publicId>`  | per identity | Peer-supplied encrypted backup blobs |
 | `meshchat_peer_tokens_v1_<publicId>`   | per identity | Contact tokens for restore gating |
-| `meshchat_known_devices_v1_<publicId>` | per identity | Device registry — `{ identityId: { deviceId: lastSeenTs } }` |
+| `meshchat_known_devices_v1_<publicId>` | per identity | Device registry — `{ identityId: { deviceId: { lastSeen, lastN } } }` |
+| `meshchat_send_counters_v1_<publicId>` | per device   | Outbound send counters — `{ contactPublicId: n }`. Never shared, never backed up |
 | `meshchat_device_seed_v1_<publicId>`   | per device   | Raw 32-byte device seed (base64). Never shared, never backed up |
 
 ---
