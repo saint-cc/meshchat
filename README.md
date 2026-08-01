@@ -4,32 +4,38 @@ Decentralised, end-to-end encrypted messaging built around cryptographic identit
 
 No registration. No central identity provider. No plaintext.
 
-Messages are encrypted in the browser before they leave your device. Relay servers transport and 
+Messages are encrypted in the browser before they leave your device. Relay servers transport and
 temporarily buffer ciphertext, but never possess your private keys or message contents.
 
 ---
 
 ## How it works
 
-Your identity is derived locally from your username and passphrase using PBKDF2 + HKDF. The same 
+Your identity is derived locally from your username and passphrase using PBKDF2 + HKDF. The same
 credentials always produce the same cryptographic identity.
 
 There are no accounts to create and no passwords stored on any server. Your passphrase **is** your identity.
 
-Contacts are added by exchanging a shareable address (QR code or copy-paste). This contains your encryption 
-public key, signing public key and current relay address. No registration or central directory is required.
+Contacts are added by exchanging a shareable address (QR code or copy-paste). This contains your X25519
+public key, Ed25519 signing public key, and current relay address. No registration or central directory
+is required.
 
-Messages are encrypted with AES-256-GCM for the recipient and signed with Ed25519 before leaving your device.
+Each pairwise conversation uses its own AES-256-GCM key, derived fresh via X25519 Diffie-Hellman between
+the two parties — not a raw key transmitted in the address. Messages are signed with Ed25519 before
+leaving your device.
+
+This is static-static ECDH, not a ratchet: the same pairwise key is reused for every message between a
+given pair. It separates conversations from each other but does **not** provide forward secrecy — that's
+what Double Ratchet support is being built toward next (see `known-limitations.md`).
 
 ---
 
 ## Features
 
-- End-to-end encrypted text, image and audio messages
-- Peer-to-peer voice calling (WebRTC, audio-only — video is deliberately deferred)
+- End-to-end encrypted text, image and audio messages, plus lightweight reactions
 - Message signing and verification
 - No accounts, email addresses or phone numbers
-- Roaming identities — move freely between relay servers
+- Roaming identities — move freely between relay servers, with a tested migration flow
 - No central directory or identity provider
 - Direct client-to-relay delivery across different relays
 - Offline delivery through temporary encrypted relay buffers
@@ -37,9 +43,10 @@ Messages are encrypted with AES-256-GCM for the recipient and signed with Ed2551
 - Peer backup of encrypted data
 - QR code contact exchange
 - Encrypted backup export / import
-- Burn notice — local wipe of this device plus a signal to contacts to stop trusting a compromised or 
-  abandoned identity (see Important limitations — this is not cryptographic revocation)
-- Installable as a Progressive Web App
+- Agent contacts — bounded remote-command whitelist, plus optional full interactive shell (WebRTC) for explicitly trusted contacts
+- Burn notice — local wipe + "stop trusting me" signal to contacts (not cryptographic revocation — see `known-limitations.md`)
+- Progressive Web App (PWA)
+- Installable and offline-capable for reading conversations
 
 ---
 
@@ -146,23 +153,17 @@ server {
 
 ### Static files
 
-The client files (`index.html`, `style.css`, `script.js`, `statemachine.js`, `manifest.json`, `sw.js`) are 
-inside a `static/` directory next to `server.py`.
-
-`index.html` also pulls in a handful of third-party scripts from public CDNs — xterm.js and its fit addon 
-(shell terminal UI), html5-qrcode and qrcodejs (QR scan/generate), and `@noble/curves` via esm.sh 
-(Ed25519). If you're self-hosting behind a restrictive firewall or CSP, these need to stay reachable too — 
-nothing is vendored locally yet.
+The client files (`index.html`, `style.css`, `meshchat-lib.js`, `meshchat-gui.js`, `meshchat.js`,
+`statemachine.js`, `manifest.json`, `sw.js`) are inside a `static/` directory next to `server.py`.
 
 ---
 
 ## Relay authentication
 
-When a client connects, the relay authenticates the session by verifying ownership of the presented public 
-key through 
-a challenge-response exchange.
+When a client connects, the relay authenticates the session by verifying ownership of the presented
+Ed25519 signing key through a sign-the-nonce challenge-response exchange.
 
-This allows the relay to associate active connections and offline message buffers with authenticated 
+This allows the relay to associate active connections and offline message buffers with authenticated
 identities without ever learning private keys or passphrases.
 
 Relay authentication protects against identity spoofing while preserving end-to-end encryption.
@@ -173,13 +174,13 @@ Relay authentication protects against identity spoofing while preserving end-to-
 
 MeshChat separates **transport** from **trust**.
 
-Relay servers are intentionally simple transport nodes. They forward ciphertext, temporarily buffer encrypted 
+Relay servers are intentionally simple transport nodes. They forward ciphertext, temporarily buffer encrypted
 messages for offline users, and authenticate ownership of public identities during connection.
 
 Trust resides entirely in cryptographic identities generated locally by each client.
 
-There is no global directory, no relay-to-relay communication and no central authority coordinating the network. 
-Contacts learn each other's current relay location directly, allowing identities to migrate between relays 
+There is no global directory, no relay-to-relay communication and no central authority coordinating the network.
+Contacts learn each other's current relay location directly, allowing identities to migrate between relays
 while remaining reachable.
 
 ---
@@ -202,21 +203,14 @@ while remaining reachable.
 * passphrases
 * contact names
 * encrypted backups
-* call/shell audio or terminal content (voice calls and shell sessions are peer-to-peer WebRTC; the relay only 
-  ever sees small signed signaling packets to set them up)
 
 ### Important limitations
 
 * Passphrase security is everything.
-* Static identities mean there is currently **no forward secrecy**.
+* Pairwise keys are static — there is currently **no forward secrecy** (Double Ratchet work is in progress to address this).
 * Relay operators can observe IP addresses.
-* No TURN server — voice calls and shell escalation are peer-to-peer over STUN only. Some NAT pairings will 
-  never be able to connect; this is a permanent architectural decision, not a bug to be fixed later.
-* The burn notice is **not cryptographic revocation**. Identity is deterministic from your username and 
-  passphrase — anyone who still knows both (including you) can log back in and it will work exactly as 
-  before. Burn only wipes local data on the device it's run from and asks contacts to stop trusting that 
-  identity; it cannot force that anywhere else.
 * MeshChat is **not** an anonymity network and is not a replacement for Tor.
+* Burn notice is a local wipe and social signal, not cryptographic revocation — anyone who still knows your credentials can still log back in.
 
 See `known-limitations.md` for a complete discussion.
 
@@ -257,4 +251,5 @@ See `protocol.md` for the complete protocol specification, packet formats, routi
 
 MeshChat is an experimental research project exploring decentralised, roaming, end-to-end encrypted messaging.
 
-The protocol is still evolving and should not yet be considered stable.
+The protocol is still evolving and should not yet be considered stable. Forward secrecy via Double Ratchet
+is currently in development.

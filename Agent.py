@@ -4,17 +4,44 @@ agent.py — MeshChat command agent (PoC)
 
 A headless MeshChat identity that lives on a box, takes whitelisted shell
 commands (ls / cd) from trusted contacts, and replies with the output —
-same protocol, same crypto as script.js. Add its shareable key to your
-real MeshChat client like any other contact.
+same protocol, same crypto as meshchat.js / meshchat-lib.js. Add its
+shareable key to your real MeshChat client like any other contact.
 
-Crypto is a line-for-line mirror of script.js:
-  masterSecret = PBKDF2(passphrase, salt=SHA256("meshchat-v1:"+username), 100000, SHA-256, 32B)
-  encKey / signSeed = HKDF-SHA256(master, salt=32 zero bytes, info="meshchat-v1:<label>", 32B)
-  publicId = base64url( SHA256(encKey)[0:12] )
-  message envelope: AES-256-GCM keyed on the RECIPIENT's encKey, Ed25519-signed
-  own incoming messages are decrypted with OUR OWN encKey (symmetric-by-address design)
+Crypto is a line-for-line mirror of meshchat-lib.js as of protocol 0.4.0
+(X25519 ECDH pairwise encryption — the earlier "shared AES key baked into
+the address" scheme is gone):
 
-Auth handshake with the relay is identical to server.py's challenge-response.
+  masterSecret   = PBKDF2(passphrase, salt=SHA256("meshchat-v1:"+username), 100000, SHA-256, 32B)
+  x25519Seed     = HKDF-SHA256(master, salt=32 zero bytes, info="meshchat-v1:x25519",  32B)  — private scalar, NEVER shared
+  signingKeySeed = HKDF-SHA256(master, salt=32 zero bytes, info="meshchat-v1:signing", 32B)  — Ed25519 seed
+  backupKey      = HKDF-SHA256(master, salt=32 zero bytes, info="meshchat-v1:backup",  32B)  — unused here, derived for parity only
+
+  publicId = base64url( SHA256(x25519PublicKey || ed25519PublicKey)[0:12] )
+             — binds BOTH public keys together (deriveIdentityPublicId), so a
+             stolen public key from one identity can't be paired with a
+             private key from another to land on someone else's publicId.
+
+  deviceId = base64url( SHA256(Ed25519.getPublicKey(deviceSeed))[0:12] ) — same derivation
+             as meshchat.js's getOrCreateDeviceId(), just backed by a small local JSON file
+             (agent_device_seed.json) instead of localStorage, since this is headless.
+             Rides only inside the encrypted+signed message payload now (never as
+             plaintext envelope metadata) — mirrors the client's fix that stopped
+             deviceId from being unsigned/outer-envelope data.
+
+  Per-pair message key: static-static X25519 ECDH between OUR private scalar and
+  the CONTACT's public key, then HKDF-SHA256(sharedSecret, salt=32 zero bytes,
+  info="meshchat-v1:pairwise", 32B) -> AES-256-GCM key. This is symmetric — the
+  same key is used to both encrypt outbound replies to a contact AND decrypt
+  their inbound messages to us — so each contact gets exactly one AESGCM
+  instance (contact["aesgcm"]), not a separate encrypt/decrypt pair.
+
+  message envelope: AES-256-GCM keyed on the pairwise ECDH secret, Ed25519-signed.
+
+Auth handshake with the relay is a genuine possession proof, not a
+decrypt-what-you-just-sent round trip: the client presents both public keys
+in auth_init, the relay sends a random nonce IN THE CLEAR, and the client
+signs it with its Ed25519 private key and returns the signature. Identical
+to server.py's challenge-response.
 
 Requirements:
     pip install websockets cryptography
@@ -49,6 +76,7 @@ import uuid
 import websockets
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
+from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
@@ -127,7 +155,7 @@ PASSPHRASE = os.environ.get("AGENT_PASSPHRASE", "change-this-passphrase")       
 RELAY_WSS  = os.environ.get("AGENT_RELAY_WSS", "wss://yourrelay.example.com/ws/")   # relay this agent connects to
 
 # Who is allowed to send it commands. name -> shareable key
-# ("encKey_b64url.signPubKey_b64url" or with a third ".relay_b64" segment —
+# ("x25519Pub_b64url.signPubKey_b64url" or with a third ".relay_b64" segment —
 # the relay segment is ignored here; see NOTE below).
 CONTACTS = _parse_contacts(os.environ.get("AGENT_CONTACTS", "")) or {
     "admin": "PASTE_SHAREABLE_KEY_HERE",
@@ -167,12 +195,28 @@ COMMAND_TIMEOUT  = 10             # seconds, per command — also the cap on a
 RECONNECT_DELAY  = 5              # seconds, on disconnect
 
 # NOTE — single-relay assumption: replies are sent back over this agent's
-# own authenticated socket to RELAY_WSS (the same fallback path script.js
+# own authenticated socket to RELAY_WSS (the same fallback path meshchat.js
 # calls sendSignal). If a contact lives on a different relay than this
 # agent, delivery depends on them also being reachable there (live or via
 # that relay's offline buffer) — there's no outbound cross-relay connection
-# here the way script.js's sendToRelay/getOrOpenRelayConn does. Fine for a
+# here the way meshchat.js's sendToRelay/getOrOpenRelayConn does. Fine for a
 # same-relay PoC; extend later if that stops being true.
+
+# ══════════════════════════════════════════
+#   DEVICE IDENTITY & SEND COUNTERS — STATE FILES
+#   Local-only, persistent, never transmitted or included in any payload —
+#   mirrors meshchat.js's meshchat_device_seed_v1_<publicId> and
+#   meshchat_send_counters_v1_<publicId> localStorage entries, just backed
+#   by small JSON files since this is headless (no browser storage here).
+#   AGENT_STATE_DIR defaults to the directory this file lives in, but is
+#   overridable for deployments that want state kept elsewhere (e.g.
+#   outside a container's ephemeral layer) — same override pattern as the
+#   other AGENT_* config.
+# ══════════════════════════════════════════
+
+AGENT_STATE_DIR   = os.environ.get("AGENT_STATE_DIR", os.path.dirname(os.path.abspath(__file__)))
+DEVICE_SEED_FILE  = os.path.join(AGENT_STATE_DIR, "agent_device_seed.json")
+SEND_COUNTER_FILE = os.path.join(AGENT_STATE_DIR, "agent_send_counters.json")
 
 # ══════════════════════════════════════════
 #   SHELL ESCALATION (WebRTC)
@@ -203,11 +247,11 @@ RTC_ICE_SERVERS = [
 
 # contact public_id -> ShellSession — one active session per contact, enforced
 # in handle_shell_invite. A second invite while one is already live is ignored,
-# same rule as contact.call in script.js's state machine.
+# same rule as contact.call in meshchat.js's state machine.
 SHELL_SESSIONS = {}
 
 # ══════════════════════════════════════════
-#   CRYPTO — mirrors script.js exactly
+#   CRYPTO — mirrors meshchat-lib.js exactly
 # ══════════════════════════════════════════
 
 def derive_master_secret(username: str, passphrase: str) -> bytes:
@@ -224,8 +268,37 @@ def hkdf_expand(master: bytes, label: str) -> bytes:
 
 
 def derive_public_id(raw_key: bytes) -> str:
+    """Single-key hash — DEVICE identity only (mirrors derivePublicId in
+    meshchat-lib.js). NOT used for identity publicId — see
+    derive_identity_public_id() below, which binds two keys together."""
     digest = hashlib.sha256(raw_key).digest()[:12]
     return base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
+
+
+def derive_identity_public_id(x25519_pub: bytes, ed25519_pub: bytes) -> str:
+    """Identity publicId — binds BOTH the X25519 and Ed25519 public keys
+    into one hash (mirrors deriveIdentityPublicId in meshchat-lib.js). This
+    is deliberate: if publicId depended on the X25519 key alone, someone
+    could present a victim's real (public) x25519_pub alongside their OWN
+    ed25519_pub, sign the relay's auth challenge with their own Ed25519
+    private key, and get registered under the victim's publicId — unable to
+    decrypt anything, but able to silently swallow traffic routed to it."""
+    digest = hashlib.sha256(x25519_pub + ed25519_pub).digest()[:12]
+    return base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
+
+
+def derive_shared_aes_key(my_x25519_priv: X25519PrivateKey, their_x25519_pub_bytes: bytes) -> AESGCM:
+    """Static-static X25519 ECDH + HKDF -> AES-256-GCM key, mirrors
+    deriveSharedAesKey() in meshchat-lib.js. Symmetric: the same key results
+    whichever side computes it, so it serves as both the encrypt key for
+    OUR outbound traffic to this peer and the decrypt key for THEIR inbound
+    traffic to us — one AESGCM instance per contact, not a pair."""
+    shared = my_x25519_priv.exchange(X25519PublicKey.from_public_bytes(their_x25519_pub_bytes))
+    aes_key_bytes = HKDF(
+        algorithm=SHA256(), length=32, salt=b"\x00" * 32,
+        info=b"meshchat-v1:pairwise",
+    ).derive(shared)
+    return AESGCM(aes_key_bytes)
 
 
 def raw_to_b64url(raw: bytes) -> str:
@@ -244,11 +317,11 @@ def encrypt_message(recipient_aesgcm: AESGCM, payload: dict) -> dict:
     return {"v": 1, "iv": list(iv), "data": list(ct)}
 
 
-def decrypt_message(own_aesgcm: AESGCM, blob: dict) -> dict:
+def decrypt_message(aesgcm: AESGCM, blob: dict) -> dict:
     if blob.get("v", 1) > 1:
         raise ValueError(f"unsupported message version v{blob.get('v')}")
     iv, data = bytes(blob["iv"]), bytes(blob["data"])
-    pt = own_aesgcm.decrypt(iv, data, None)
+    pt = aesgcm.decrypt(iv, data, None)
     return json.loads(pt.decode())
 
 
@@ -267,37 +340,129 @@ def verify_blob(blob: dict, sig: list, pubkey: Ed25519PublicKey) -> bool:
 
 
 # ══════════════════════════════════════════
+#   DEVICE IDENTITY & SEND COUNTERS — persistence
+#   load_or_create_device_seed() mirrors meshchat.js's getOrCreateDeviceId():
+#   same seed-then-derive shape (raw 32-byte seed, deviceId = derived
+#   public form via the same SHA-256[0:12]/base64url derive_public_id()
+#   used for publicId), just backed by a small JSON file instead of
+#   localStorage. Only the derived deviceId ever leaves this process —
+#   the seed itself is never transmitted, same boundary the browser
+#   client draws around meshchat_device_seed_v1_<publicId>.
+# ══════════════════════════════════════════
+
+def load_or_create_device_seed() -> bytes:
+    if os.path.exists(DEVICE_SEED_FILE):
+        try:
+            with open(DEVICE_SEED_FILE) as f:
+                data = json.load(f)
+            return b64url_to_raw(data["seed"])
+        except Exception as e:
+            log.warning("DEVICE     seed file unreadable (%s) — generating a new one", e)
+    seed = os.urandom(32)
+    try:
+        os.makedirs(os.path.dirname(DEVICE_SEED_FILE) or ".", exist_ok=True)
+        with open(DEVICE_SEED_FILE, "w") as f:
+            json.dump({"seed": raw_to_b64url(seed)}, f)
+        log.info("DEVICE     new device identity generated  file=%s", DEVICE_SEED_FILE)
+    except Exception as e:
+        log.warning("DEVICE     couldn't persist seed (%s) — a new one will be generated next boot", e)
+    return seed
+
+
+# Per-contact outbound sequence, local-only — mirrors meshchat.js's
+# nextSendCounter()/meshchat_send_counters_v1_<publicId>. Same shape:
+# {contactPublicId: n}. Loaded once at import time; every reply increments
+# and persists immediately, same as the client does on every send.
+def _load_send_counters() -> dict:
+    if not os.path.exists(SEND_COUNTER_FILE):
+        return {}
+    try:
+        with open(SEND_COUNTER_FILE) as f:
+            return json.load(f)
+    except Exception as e:
+        log.warning("DEVICE     send-counter file unreadable (%s) — starting fresh", e)
+        return {}
+
+
+def _save_send_counters(counters: dict):
+    try:
+        with open(SEND_COUNTER_FILE, "w") as f:
+            json.dump(counters, f)
+    except Exception as e:
+        log.warning("DEVICE     send-counter file write failed: %s", e)
+
+
+SEND_COUNTERS = _load_send_counters()
+
+
+def next_send_counter(contact_public_id: str) -> int:
+    n = SEND_COUNTERS.get(contact_public_id, 0) + 1
+    SEND_COUNTERS[contact_public_id] = n
+    _save_send_counters(SEND_COUNTERS)
+    return n
+
+
+# ══════════════════════════════════════════
 #   IDENTITY
 # ══════════════════════════════════════════
 
 class Identity:
-    def __init__(self, username, passphrase, relay_wss):
+    def __init__(self, username, passphrase, relay_wss, device_seed):
         master = derive_master_secret(username, passphrase)
-        self.enc_key_bytes = hkdf_expand(master, "encryption")
-        self.sign_seed     = hkdf_expand(master, "signing")
-        self.sign_key      = Ed25519PrivateKey.from_private_bytes(self.sign_seed)
 
-        sign_pub_bytes = self.sign_key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+        # x25519Seed is the private DH scalar — NEVER shared. Only its
+        # public key goes in the shareable address. backupKey is derived
+        # for parity with the client's hkdfExpand() but isn't used by this
+        # agent today (no backup/export flow here).
+        self.x25519_seed = hkdf_expand(master, "x25519")
+        self.sign_seed    = hkdf_expand(master, "signing")
+        self.backup_key   = hkdf_expand(master, "backup")
 
-        self.aesgcm        = AESGCM(self.enc_key_bytes)
-        self.public_id     = derive_public_id(self.enc_key_bytes)
+        self.x25519_priv = X25519PrivateKey.from_private_bytes(self.x25519_seed)
+        self.x25519_pub_bytes = self.x25519_priv.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+
+        self.sign_key = Ed25519PrivateKey.from_private_bytes(self.sign_seed)
+        self.sign_pub_bytes = self.sign_key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+
+        # publicId binds BOTH keys (derive_identity_public_id) — see its
+        # docstring for why hashing only the X25519 key would be exploitable.
+        self.public_id = derive_identity_public_id(self.x25519_pub_bytes, self.sign_pub_bytes)
         self.shareable_key = (
-            raw_to_b64url(self.enc_key_bytes) + "." +
-            raw_to_b64url(sign_pub_bytes) + "." +
+            raw_to_b64url(self.x25519_pub_bytes) + "." +
+            raw_to_b64url(self.sign_pub_bytes) + "." +
             base64.b64encode(relay_wss.encode()).decode()
         )
 
+        # Self-ECDH — X25519(myPriv, myPub) is a well-defined DH operation,
+        # same result every time. Not currently exercised (this agent has
+        # no self-sync/backup path), kept for parity with the client and
+        # in case self-targeted traffic is ever needed here.
+        self.self_aesgcm = derive_shared_aes_key(self.x25519_priv, self.x25519_pub_bytes)
 
-def parse_contact(name: str, shareable_key: str) -> dict:
+        # Device identity — separate from the (username, passphrase)-derived
+        # identity above, same split meshchat.js draws between publicId and
+        # deviceId. Derived from the persistent local seed via the same
+        # Ed25519.getPublicKey → SHA-256[0:12] → base64url path as the
+        # browser client's getOrCreateDeviceId().
+        device_priv_key    = Ed25519PrivateKey.from_private_bytes(device_seed)
+        device_pub_bytes   = device_priv_key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+        self.device_id     = derive_public_id(device_pub_bytes)
+
+
+def parse_contact(name: str, shareable_key: str, identity: Identity) -> dict:
     parts = shareable_key.split(".")
     if len(parts) < 2:
         raise ValueError(f"contact '{name}' has an invalid shareable key")
-    enc_key_bytes  = b64url_to_raw(parts[0])
-    sign_pub_bytes = b64url_to_raw(parts[1])
+    x25519_pub_bytes = b64url_to_raw(parts[0])
+    sign_pub_bytes   = b64url_to_raw(parts[1])
+    if len(x25519_pub_bytes) != 32 or len(sign_pub_bytes) != 32:
+        raise ValueError(f"contact '{name}' has a malformed key (wrong length)")
     return {
         "name":      name,
-        "public_id": derive_public_id(enc_key_bytes),
-        "aesgcm":    AESGCM(enc_key_bytes),      # used to encrypt OUR replies to them
+        "public_id": derive_identity_public_id(x25519_pub_bytes, sign_pub_bytes),
+        # Pairwise ECDH key — symmetric, used for BOTH encrypting our
+        # replies to this contact and decrypting their messages to us.
+        "aesgcm":    derive_shared_aes_key(identity.x25519_priv, x25519_pub_bytes),
         "sign_pub":  Ed25519PublicKey.from_public_bytes(sign_pub_bytes),
     }
 
@@ -407,7 +572,7 @@ class ShellSession:
 
     aiortc's DataChannel API mirrors the browser's (on("message"),
     on("open"), .send()), so the channel-facing half of this class reads
-    the same as script.js's RTC code once that side exists.
+    the same as meshchat.js's RTC code once that side exists.
     """
 
     def __init__(self, contact: dict, session_id: str, loop: asyncio.AbstractEventLoop):
@@ -517,7 +682,7 @@ class ShellSession:
 
 
 # ══════════════════════════════════════════
-#   SHELL SIGNALING — signed packets, mirrors signCallPacket/verifyCallPacket
+#   SHELL SIGNALING — signed packets, mirrors signShellPacket/verifyShellPacket
 # ══════════════════════════════════════════
 
 def sign_shell_packet(identity: "Identity", obj: dict) -> list:
@@ -565,7 +730,7 @@ async def handle_shell_invite(ws, identity: "Identity", contacts_by_id: dict, ms
     SHELL_SESSIONS[contact["public_id"]] = session
 
     claim = {"type": "shell:claim", "from": identity.public_id, "to": frm,
-             "sessionId": session_id, "ts": int(time.time() * 1000)}
+             "sessionId": session_id, "deviceId": identity.device_id, "ts": int(time.time() * 1000)}
     claim["sig"] = sign_shell_packet(identity, claim)
     await ws.send(json.dumps(claim))
     log.info("SHELL      invite accepted  contact=%s  session=%s", contact["name"], pid(session_id))
@@ -586,7 +751,7 @@ async def handle_shell_offer(ws, identity: "Identity", contacts_by_id: dict, msg
         return
 
     try:
-        plain = decrypt_message(identity.aesgcm, msg["blob"])
+        plain = decrypt_message(contact["aesgcm"], msg["blob"])
     except Exception as e:
         log.warning("SHELL      offer from %s — decrypt failed: %s", contact["name"], e)
         return
@@ -645,7 +810,8 @@ async def handle_shell_offer(ws, identity: "Identity", contacts_by_id: dict, msg
 
     blob = encrypt_message(contact["aesgcm"], {"sdp": pc.localDescription.sdp})
     obj = {"type": "shell:answer", "from": identity.public_id, "to": frm,
-           "sessionId": session.session_id, "ts": int(time.time() * 1000), "blob": blob}
+           "sessionId": session.session_id, "deviceId": identity.device_id,
+           "ts": int(time.time() * 1000), "blob": blob}
     obj["sig"] = sign_shell_packet(identity, obj)
     await ws.send(json.dumps(obj))
     log.info("SHELL      answer sent  contact=%s", contact["name"])
@@ -662,7 +828,7 @@ async def handle_shell_ice(identity: "Identity", contacts_by_id: dict, msg: dict
     if not verify_shell_packet(msg, contact["sign_pub"]):
         return
     try:
-        plain = decrypt_message(identity.aesgcm, msg["blob"])
+        plain = decrypt_message(contact["aesgcm"], msg["blob"])
         if not plain.get("candidate"):
             return
         cand = candidate_from_sdp(plain["candidate"].split(":", 1)[1])
@@ -686,14 +852,23 @@ async def handle_shell_end(contacts_by_id: dict, msg: dict):
 # ══════════════════════════════════════════
 
 async def do_auth(ws, identity: Identity):
-    await ws.send(json.dumps({"type": "sig:auth_init", "enc_key": list(identity.enc_key_bytes)}))
+    """Sign-the-nonce handshake (0.4.0+): present both public keys, receive
+    a random nonce IN THE CLEAR (nothing about it is worth hiding — there is
+    no shared secret with the relay to encrypt it with), sign the nonce with
+    our Ed25519 private key, and return the signature as possession proof.
+    Mirrors meshchat.js's startAuth()/handleAuthChallenge()."""
+    await ws.send(json.dumps({
+        "type":        "sig:auth_init",
+        "x25519_pub":  list(identity.x25519_pub_bytes),
+        "ed25519_pub": list(identity.sign_pub_bytes),
+    }))
     while True:
         msg = json.loads(await ws.recv())
         kind = msg.get("type")
         if kind == "sig:auth_challenge":
-            iv, data = bytes(msg["iv"]), bytes(msg["data"])
-            nonce = identity.aesgcm.decrypt(iv, data, None)
-            await ws.send(json.dumps({"type": "sig:auth_proof", "nonce": list(nonce)}))
+            nonce = bytes(msg["nonce"])
+            sig   = list(identity.sign_key.sign(nonce))
+            await ws.send(json.dumps({"type": "sig:auth_proof", "sig": sig}))
         elif kind == "sig:auth_ok":
             log.info("AUTH OK    id=%s", pid(msg.get("public_id")))
             return
@@ -704,15 +879,22 @@ async def do_auth(ws, identity: Identity):
 
 async def send_reply(ws, identity: Identity, contact: dict, text: str):
     await asyncio.sleep(0.5)
-    payload = {"id": str(uuid.uuid4()), "type": "text", "text": text, "ts": int(time.time() * 1000)}
-    blob    = encrypt_message(contact["aesgcm"], payload)
-    sig     = sign_blob(identity.sign_key, blob)
+    payload = {
+        "id": str(uuid.uuid4()), "type": "text", "text": text, "ts": int(time.time() * 1000),
+        # deviceId rides INSIDE the encrypted+signed payload, not the outer
+        # envelope — mirrors the client-side fix that closed the window
+        # where deviceId used to be unsigned, outer-envelope metadata a
+        # relay could rewrite silently.
+        "deviceId": identity.device_id, "n": next_send_counter(contact["public_id"]),
+    }
+    blob = encrypt_message(contact["aesgcm"], payload)
+    sig  = sign_blob(identity.sign_key, blob)
     obj = {
         "type": "app:message", "from": identity.public_id, "to": contact["public_id"],
         "blob": blob, "sig": sig,
     }
     await ws.send(json.dumps(obj))
-    log.info("→ REPLY    to=%s  (%d chars)", contact["name"], len(text))
+    log.info("→ REPLY    to=%s  (%d chars)  n=%d", contact["name"], len(text), payload["n"])
 
 
 async def handle_message(ws, identity: Identity, contacts_by_id: dict, cwd_holder: dict, msg: dict):
@@ -725,8 +907,12 @@ async def handle_message(ws, identity: Identity, contacts_by_id: dict, cwd_holde
         log.debug("MSG        from unknown id=%s — ignored", pid(frm))
         return
 
+    # Pairwise ECDH key (contact["aesgcm"]) decrypts THEIR message to us —
+    # under 0.4.0 this is no longer "decrypt with our own key" (that only
+    # worked under the old symmetric-by-address scheme); the shared secret
+    # is specific to this (us, them) pair.
     try:
-        plain = decrypt_message(identity.aesgcm, blob)
+        plain = decrypt_message(contact["aesgcm"], blob)
     except Exception as e:
         log.warning("MSG        from %s — decrypt failed: %s", contact["name"], e)
         return
@@ -746,11 +932,12 @@ async def handle_message(ws, identity: Identity, contacts_by_id: dict, cwd_holde
 
 
 async def run():
-    identity = Identity(USERNAME, PASSPHRASE, RELAY_WSS)
+    identity = Identity(USERNAME, PASSPHRASE, RELAY_WSS, load_or_create_device_seed())
 
     print("=" * 60)
     print(f" MeshChat Agent — {USERNAME}")
     print(f" publicId  : {identity.public_id}")
+    print(f" deviceId  : {identity.device_id}")
     print(f" shareable : {identity.shareable_key}")
     print("=" * 60)
 
@@ -759,7 +946,11 @@ async def run():
         if key == "PASTE_SHAREABLE_KEY_HERE":
             log.warning("CONTACT    '%s' still has a placeholder key — set AGENT_CONTACTS (see startagent.sh)", name)
             continue
-        c = parse_contact(name, key)
+        try:
+            c = parse_contact(name, key, identity)
+        except ValueError as e:
+            log.warning("CONTACT    '%s' skipped — %s", name, e)
+            continue
         contacts_by_id[c["public_id"]] = c
         log.info("CONTACT    %-12s → %s", name, pid(c["public_id"]))
 

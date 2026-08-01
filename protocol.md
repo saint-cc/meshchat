@@ -2,7 +2,7 @@
 
 A decentralised, encrypted messaging protocol built on WebSocket relay servers. No accounts, no central authority, no plaintext.
 
-Current client/server implementation version: `0.4.0`, surfaced informationally via the `version` field on `sig:relay_info` for drift visibility (not yet enforced). `0.3.6` added WebRTC data-channel shell escalation for agent contacts; `0.3.7` added the burn notice. `0.4.0` replaces the identity encryption key with an X25519 keypair — see [Identity and Key Derivation](#identity-and-key-derivation) and [Encryption](#encryption) below; this is a breaking protocol change with no backward compatibility, consistent with the project's pre-1.0 stance.
+Current client/server implementation version: `0.4.0`, surfaced informationally via the `version` field on `sig:relay_info` for drift visibility (not yet enforced). `0.3.6` added WebRTC data-channel shell escalation for agent contacts; `0.3.7` added the burn notice; `0.4.0` replaced the identity encryption key with an X25519 keypair (breaking, no backward compatibility).
 
 ---
 
@@ -40,7 +40,7 @@ Three keys are expanded from the master secret via HKDF-SHA-256:
 | `meshchat-v1:backup`     | AES-256-GCM backup file encryption |
 | `meshchat-v1:signing`    | Ed25519 signing seed |
 
-**`meshchat-v1:x25519` replaces the old `meshchat-v1:encryption` label.** Prior versions derived a raw AES-256 key directly and distributed it as-is inside the shareable address — meaning every contact who held that address held the literal key used to encrypt everything sent to that identity, with no separation between senders. `meshchat-v1:x25519` instead derives an X25519 private scalar, which never leaves the device. The corresponding public key (`X25519.getPublicKey(seed)`) is what goes in the shareable address; the actual AES key used per-conversation is computed fresh via ECDH — see [Encryption](#encryption).
+`meshchat-v1:x25519` derives an X25519 private scalar, which never leaves the device. The corresponding public key (`X25519.getPublicKey(seed)`) is what goes in the shareable address; the actual AES key used per-conversation is computed fresh via ECDH — see [Encryption](#encryption).
 
 ### PublicId
 
@@ -100,7 +100,7 @@ server → client:  auth_ok        { public_id: "..." }
 4. Server verifies the signature against the presented Ed25519 public key, derives publicId from **both** presented public keys (see [PublicId](#publicid)), registers the socket, flushes buffer
 5. Client proceeds with `sig:relay_req`, presence polling, and normal operation
 
-**This replaces a prior scheme (protocol versions before `0.4.0`) that proved possession by having the client decrypt an AES-GCM-encrypted nonce using the same raw AES key it had just presented in `auth_init` moments earlier.** That scheme proved nothing: the server already held the "secret" in plaintext from the immediately preceding message, so successfully decrypting it demonstrated only that the client could run AES-GCM, not that it possessed anything the server didn't already have. The sign-the-nonce scheme is a genuine possession proof — only the holder of the Ed25519 private key can produce a valid signature, and the server can verify it using only the public key the client just presented.
+The sign-the-nonce scheme is a genuine possession proof — only the holder of the Ed25519 private key can produce a valid signature, and the server can verify it using only the public key the client just presented.
 
 The server never trusts the client's claimed publicId — it derives it authoritatively from the two presented public keys.
 
@@ -149,11 +149,11 @@ ciphertext = AES-GCM(
 wire = { v: 1, iv: [...], data: [...] }
 ```
 
-Static-static ECDH is symmetric — `X25519(alicePriv, bobPub)` and `X25519(bobPriv, alicePub)` yield the identical value — so both sides independently derive the same `aesKey` without ever transmitting it. Because the key depends on *both* parties' private material, it is unique to that specific pair: Alice's key for talking to Bob is different from her key for talking to Carol, even though Alice has only one identity. This is what closes the vulnerability present in protocol versions before `0.4.0`, where every one of an identity's contacts held the literal same AES key used to encrypt everything sent to that identity — meaning any two contacts of the same person could decrypt each other's traffic with that person. Under the current scheme, only the two parties to a given pairwise secret can compute it.
+Static-static ECDH is symmetric — `X25519(alicePriv, bobPub)` and `X25519(bobPriv, alicePub)` yield the identical value — so both sides independently derive the same `aesKey` without ever transmitting it. Because the key depends on *both* parties' private material, it is unique to that specific pair: Alice's key for talking to Bob is different from her key for talking to Carol, even though Alice has only one identity. Only the two parties to a given pairwise secret can compute it.
 
 Self-targeted traffic (an identity's own multi-device sync, mini-backups, etc.) uses the same derivation against the identity's own public key — `X25519(myPriv, myPub)` is a well-defined DH operation and every device holding the same identity seed derives the identical result, so no special-casing is needed for the self case.
 
-**This is static-static ECDH, not a ratchet.** The same pairwise key is reused for every message between a given pair indefinitely (until a passphrase change produces new identity keys). It provides real separation between contacts — the actual bug being fixed — but it does **not** provide forward secrecy: if either party's X25519 private key is later compromised, previously recorded ciphertext between that pair becomes decryptable in hindsight, same as the prior scheme's forward-secrecy limitation, just now correctly scoped to the pair rather than the whole network. See `known-limitations.md`. Forward secrecy (Double Ratchet, evolving the key per message/turn) is separate, later work that builds on top of this pairwise foundation — it is not part of what `0.4.0` changes.
+**This is static-static ECDH, not a ratchet.** The same pairwise key is reused for every message between a given pair indefinitely (until a passphrase change produces new identity keys). It provides real separation between contacts, but it does **not** provide forward secrecy: if either party's X25519 private key is later compromised, previously recorded ciphertext between that pair becomes decryptable in hindsight. See `known-limitations.md`. Forward secrecy (Double Ratchet, evolving the key per message/turn) is separate, later work that builds on top of this pairwise foundation.
 
 **Message signing** uses the sender's Ed25519 signing key, unchanged from prior versions:
 
