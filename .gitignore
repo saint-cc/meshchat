@@ -3,15 +3,16 @@ __pycache__/
 *.pyc
 *.pyo
 *.log
+*.pem
 start.bat
 start.sh
 minimizer.py
-vapid_key.pem
+
  
 # local dev folders
 relay_buf/
 project/
 push_subs/
 static/FA6E31B89/
-vapid_key.pem
-*.pem
+
+/push_subs
