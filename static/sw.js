@@ -9,3 +9,36 @@ self.addEventListener("activate", (event) => {
 self.addEventListener("fetch", event => {
   event.respondWith(fetch(event.request));
 });
+
+/* ══════════════════════════════════════════
+   PUSH NOTIFICATIONS
+   Every push MeshChat sends is deliberately bodyless — no message
+   content, sender identity, or any other metadata, ever (see
+   protocol.md's Push Notifications section). event.data is expected to
+   be null; this is a wake-up ping, not a payload delivery, so there is
+   nothing to decrypt or parse here. userVisibleOnly:true (required by
+   the browser at subscribe time — see ensurePushSubscription in
+   meshchat.js) obligates showing a notification for every push received,
+   which is exactly what this does.
+══════════════════════════════════════════ */
+self.addEventListener("push", (event) => {
+  event.waitUntil(
+    self.registration.showNotification("MeshChat", {
+      body: "tap to check",
+      tag: "meshchat-push",   // collapses multiple pending pushes into one visible notification
+      renotify: false,
+    })
+  );
+});
+
+self.addEventListener("notificationclick", (event) => {
+  event.notification.close();
+  event.waitUntil(
+    clients.matchAll({ type: "window", includeUncontrolled: true }).then((clientList) => {
+      for (const client of clientList) {
+        if ("focus" in client) return client.focus();
+      }
+      if (clients.openWindow) return clients.openWindow("./");
+    })
+  );
+});

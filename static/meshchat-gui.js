@@ -859,7 +859,7 @@ function contactAction(action) {
     const relayInput = document.createElement("input");
     relayInput.type          = "url";
     relayInput.placeholder   = "relay wss override (optional)";
-    relayInput.value         = "wss://";
+    relayInput.value         = c.lastRelay || "wss://";
     relayInput.name          = "mc-edit-relay-wss-" + Math.random().toString(36).slice(2, 8);
     relayInput.autocomplete  = "off";
     relayInput.spellcheck    = false;
@@ -871,24 +871,26 @@ function contactAction(action) {
     relayInput.addEventListener("focus", () => { relayInput.readOnly = false; }, { once: true });
     editForm.appendChild(relayInput);
 
-    // Agent toggle — mirrors the add-contact modal's agentToggleRow.
-    // Not applicable to self, same reasoning as the key field above:
-    // contact.type only ever decides which header button (call vs shell)
-    // shows for THIS contact, and self gets neither.
-    let agentCheckbox = null;
-    if (!isMe) {
-      const agentRow = document.createElement("div");
-      agentRow.style.cssText = "display:flex;align-items:center;gap:8px;font-size:11px;color:var(--muted)";
-      agentCheckbox = document.createElement("input");
-      agentCheckbox.type = "checkbox";
-      agentCheckbox.id = "editContactIsAgent";
-      agentCheckbox.checked = c.type === "agent";
-      const agentLabel = document.createElement("label");
-      agentLabel.htmlFor = "editContactIsAgent";
-      agentLabel.textContent = "this is an agent (enables shell access, not just chat)";
-      agentRow.appendChild(agentCheckbox);
-      agentRow.appendChild(agentLabel);
-      editForm.appendChild(agentRow);
+    // push notification opt-in — self only, mirrors the agent-type
+    // checkbox pattern (self-excluded there, self-only here). Per-device:
+    // this reflects/controls THIS browser's subscription, not a global
+    // setting for the identity — see meshchat.js's loadPushPref/
+    // togglePushPref for why that's the deliberate scope.
+    let pushCheckbox = null;
+    const initialPushPref = isMe ? loadPushPref() : false;
+    if (isMe) {
+      const pushRow = document.createElement("label");
+      pushRow.style.cssText = "display:flex;align-items:center;gap:8px;font-size:11px;color:var(--muted)";
+      pushCheckbox = document.createElement("input");
+      pushCheckbox.type = "checkbox";
+      pushCheckbox.checked = initialPushPref;
+      const supported = pushSupported();
+      pushCheckbox.disabled = !supported;
+      pushRow.appendChild(pushCheckbox);
+      pushRow.appendChild(document.createTextNode(
+        supported ? "push notifications on this device" : "push notifications — not supported in this browser"
+      ));
+      editForm.appendChild(pushRow);
     }
 
     // datalist — unique WSS values collected from all contacts
@@ -914,7 +916,6 @@ function contactAction(action) {
       const val = nameInput.value.trim();
       if (!val) return;
       c.name = val;
-      if (agentCheckbox) c.type = agentCheckbox.checked ? "agent" : "human";
       c.lastStateChange = Date.now();
 
       // relay override
@@ -948,14 +949,13 @@ function contactAction(action) {
         }
       }
 
+      if (pushCheckbox && pushCheckbox.checked !== initialPushPref) {
+        await togglePushPref(pushCheckbox.checked);
+      }
+
       await saveContacts();
       document.getElementById("chatHeaderName").textContent = val;
       updateChatRelayInfo(state.currentChat);
-      // type may have just changed via agentCheckbox — call/shell button
-      // visibility depends on it, same gate startShell()/the header render
-      // already use elsewhere.
-      updateCallHeaderBtn(state.currentChat);
-      updateShellHeaderBtn(state.currentChat);
       renderContactList();
       closeContactAction();
       if (ownRelayChanged) rebootSignal();

@@ -10,9 +10,18 @@ import os
 import re
 import secrets
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 import uuid
 
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
+from cryptography.hazmat.primitives.serialization import (
+    Encoding, NoEncryption, PrivateFormat, PublicFormat, load_pem_private_key,
+)
 import websockets
 from flask import Flask, send_from_directory
 from werkzeug.middleware.proxy_fix import ProxyFix
@@ -37,7 +46,7 @@ RELAY_WSS_URL = os.environ.get("RELAY_WSS_URL", "")   # e.g. wss://yourrelay.exa
 # Protocol version — informational only for now, surfaced in sig:relay_info
 # so client/server version drift shows up in both logs. Not enforced yet;
 # room to add real backwards-compat handling once this is actually needed.
-PROTOCOL_VERSION = os.environ.get("PROTOCOL_VERSION", "0.4.0")
+PROTOCOL_VERSION = os.environ.get("PROTOCOL_VERSION", "0.4.1")
 
 # Connection limits
 MAX_CONNECTIONS        = int(os.environ.get("MAX_CONNECTIONS",        100))   # total WS sessions
@@ -166,6 +175,29 @@ MIGRATE_SUFFIX       = "_migrate.json"   # filename tag — lets buf_expire pick
 BUF_MAX_AGE_BURN = int(os.environ.get("BUF_MAX_AGE_BURN", 7 * 86400))
 BURN_SUFFIX       = "_burn.json"   # filename tag — same role as MIGRATE_SUFFIX
 
+# ══════════════════════════════════════════
+#   VAPID / WEB PUSH — configuration
+#   Push is opt-in per-device (client-side checkbox) and deliberately
+#   payload-less — a push here only ever means "wake up and check", never
+#   carries message content. That's what lets this whole feature skip
+#   pywebpush/aes128gcm payload encryption entirely: an empty-body push
+#   only needs a VAPID keypair and a signed JWT per request, both doable
+#   with `cryptography` (already a dependency) — see the VAPID section
+#   below. Only fired for genuinely-offline app:message deliveries;
+#   app:migrate/app:burn are not user-facing and never trigger one.
+#
+#   VAPID_KEY_FILE/PUSH_SUBS_DIR default to sitting next to BUF_DIR rather
+#   than under it — same "fresh relay boots with sane defaults" spirit as
+#   BUF_DIR's own default, just its own sibling directory rather than a
+#   subdirectory, since a push subscription isn't a buffered packet.
+# ══════════════════════════════════════════
+VAPID_SUBJECT    = os.environ.get("VAPID_SUBJECT", "mailto:admin@example.com")
+VAPID_KEY_FILE   = os.environ.get("VAPID_KEY_FILE",
+                                   os.path.join(os.path.dirname(os.path.abspath(BUF_DIR)), "vapid_key.pem"))
+PUSH_SUBS_DIR    = os.environ.get("PUSH_SUBS_DIR",
+                                   os.path.join(os.path.dirname(os.path.abspath(BUF_DIR)), "push_subs"))
+PUSH_TTL_SECONDS = int(os.environ.get("PUSH_TTL_SECONDS", 60))   # how long the push service should hold this if the device is unreachable
+
 # Logging
 LOG_FORMAT   = "%(asctime)s  %(levelname)-8s  %(message)s"
 LOG_DATE_FMT = "%H:%M:%S"
@@ -214,6 +246,9 @@ stats = {
     "buf_cap_rejected":  0,   # writes dropped for hitting MAX_BUF_RECIPIENTS
     "buf_rate_rejected": 0,   # writes dropped for hitting a recipient's write-rate limit
     "auth_admission_rejected": 0,   # auth completions dropped by the global admission limiter
+    "push_sent":    0,   # pushes that got a non-error response from the push service
+    "push_pruned":  0,   # subscriptions removed after a permanent failure (404/410)
+    "push_failed":  0,   # transient push failures (network error, 5xx, etc.) — left on file, no retry
 }
 
 # ══════════════════════════════════════════
@@ -284,6 +319,182 @@ class RateLimiter:
 global_auth_limiter = RateLimiter(rate=GLOBAL_AUTH_RATE, burst=GLOBAL_AUTH_BURST)
 
 # ══════════════════════════════════════════
+#   VAPID / WEB PUSH
+#   Hand-rolled rather than pulling in pywebpush — see the config comment
+#   above for why an empty-payload push doesn't need a full webpush
+#   library. What's actually needed: an EC P-256 keypair (VAPID mandates
+#   this curve), a signed ES256 JWT per push, and a bodyless POST. All of
+#   that is `cryptography` (already a dependency) plus stdlib urllib.
+# ══════════════════════════════════════════
+
+def _b64url(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+
+def _load_or_create_vapid_key():
+    if os.path.exists(VAPID_KEY_FILE):
+        try:
+            with open(VAPID_KEY_FILE, "rb") as f:
+                return load_pem_private_key(f.read(), password=None)
+        except Exception as e:
+            log.warning("VAPID      key file unreadable (%s) — generating a new one", e)
+    key = ec.generate_private_key(ec.SECP256R1())
+    try:
+        os.makedirs(os.path.dirname(VAPID_KEY_FILE) or ".", exist_ok=True)
+        with open(VAPID_KEY_FILE, "wb") as f:
+            f.write(key.private_bytes(Encoding.PEM, PrivateFormat.PKCS8, NoEncryption()))
+        log.info("VAPID      new keypair generated  file=%s", VAPID_KEY_FILE)
+    except Exception as e:
+        log.warning("VAPID      couldn't persist key (%s) — a new one will be generated next boot", e)
+    return key
+
+VAPID_PRIVATE_KEY = _load_or_create_vapid_key()
+# Uncompressed EC point (0x04 || X || Y, 65 bytes) — this is the exact
+# format applicationServerKey expects client-side (pushManager.subscribe),
+# and what goes in the Authorization header's k= parameter server-side.
+VAPID_PUBLIC_KEY_B64 = _b64url(
+    VAPID_PRIVATE_KEY.public_key().public_bytes(Encoding.X962, PublicFormat.UncompressedPoint)
+)
+
+def _vapid_jwt(aud: str) -> str:
+    """Signed ES256 JWT — the possession proof a push service checks
+    against the public key presented alongside it. `aud` must be the
+    scheme+host (origin) of the specific push endpoint being called, not
+    a fixed value — each push service (FCM, Mozilla's, etc.) checks its
+    own origin against this claim."""
+    header = _b64url(json.dumps({"typ": "JWT", "alg": "ES256"}, separators=(",", ":")).encode())
+    claims = _b64url(json.dumps({
+        "aud": aud,
+        "exp": int(time.time()) + 12 * 3600,   # spec allows up to 24h; 12h is plenty for a "wake up" ping
+        "sub": VAPID_SUBJECT,
+    }, separators=(",", ":")).encode())
+    signing_input = f"{header}.{claims}".encode()
+    # cryptography's ECDSA sign() returns a DER-encoded signature; JWS ES256
+    # wants raw r||s (32 bytes each, big-endian, concatenated) — this is the
+    # one non-obvious conversion step in hand-rolling VAPID.
+    der_sig = VAPID_PRIVATE_KEY.sign(signing_input, ec.ECDSA(hashes.SHA256()))
+    r, s = decode_dss_signature(der_sig)
+    raw_sig = r.to_bytes(32, "big") + s.to_bytes(32, "big")
+    return f"{header}.{claims}.{_b64url(raw_sig)}"
+
+def _send_web_push_sync(endpoint: str) -> tuple[bool, int | None]:
+    """Sync body — runs in a worker thread (urllib is blocking). Sends an
+    empty-body push: no content, no aes128gcm encryption layer, purely a
+    wake-up. Returns (permanent_failure, http_status). permanent_failure
+    is True only on 404/410 — the push service telling us the subscription
+    itself is dead, not just that this one attempt failed."""
+    try:
+        parsed = urllib.parse.urlparse(endpoint)
+        aud = f"{parsed.scheme}://{parsed.netloc}"
+        jwt = _vapid_jwt(aud)
+        req = urllib.request.Request(
+            endpoint, data=b"", method="POST",
+            headers={
+                "TTL": str(PUSH_TTL_SECONDS),
+                "Authorization": f"vapid t={jwt}, k={VAPID_PUBLIC_KEY_B64}",
+                "Content-Length": "0",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return False, resp.status
+    except urllib.error.HTTPError as e:
+        return e.code in (404, 410), e.code
+    except Exception as e:
+        log.debug("PUSH       send error  endpoint=%s…  err=%s", endpoint[:40], e)
+        return False, None
+
+# ══════════════════════════════════════════
+#   PUSH SUBSCRIPTION STORAGE
+#   Layout: PUSH_SUBS_DIR/<publicId>/<deviceId>.json — one file per
+#   (identity, device) pair, mirrors BUF_DIR's per-recipient directory
+#   shape. No locking: writes are whole-file replacements keyed by a
+#   caller-controlled deviceId, so concurrent writes to the SAME file
+#   would only ever be the same device re-subscribing — last-write-wins
+#   is fine, same tier of concern as localStorage overwrites client-side.
+# ══════════════════════════════════════════
+
+def push_sub_dir(to_id):
+    path = os.path.realpath(os.path.join(PUSH_SUBS_DIR, to_id))
+    if not path.startswith(os.path.realpath(PUSH_SUBS_DIR) + os.sep):
+        raise ValueError(f"path traversal attempt: {to_id!r}")
+    return path
+
+def _push_sub_write_sync(to_id, device_id, subscription):
+    try:
+        d = push_sub_dir(to_id)
+    except ValueError as e:
+        log.warning("PUSH_SUB   rejected  to=%s  reason=%s", short(to_id), e)
+        return
+    try:
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, f"{device_id}.json"), "w") as f:
+            json.dump(subscription, f)
+        log.info("PUSH_SUB   subscribed  id=%s  device=%s", short(to_id), short(device_id))
+    except Exception as e:
+        log.warning("PUSH_SUB   write failed  to=%s  err=%s", short(to_id), e)
+
+def _push_sub_delete_sync(to_id, device_id):
+    try:
+        d = push_sub_dir(to_id)
+    except ValueError:
+        return
+    try:
+        os.remove(os.path.join(d, f"{device_id}.json"))
+        log.info("PUSH_SUB   unsubscribed  id=%s  device=%s", short(to_id), short(device_id))
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        log.warning("PUSH_SUB   unsubscribe failed  to=%s  err=%s", short(to_id), e)
+
+def _push_subs_list_sync(to_id):
+    """Returns [(deviceId, subscriptionDict), ...] for every subscription
+    on file for to_id. Corrupt/unreadable entries are skipped rather than
+    aborting the whole read — one bad file shouldn't silence pushes to a
+    recipient's other devices."""
+    try:
+        d = push_sub_dir(to_id)
+    except ValueError:
+        return []
+    if not os.path.isdir(d):
+        return []
+    out = []
+    for fpath in glob.glob(os.path.join(d, "*.json")):
+        try:
+            with open(fpath) as f:
+                sub = json.load(f)
+            device_id = os.path.basename(fpath)[:-len(".json")]
+            out.append((device_id, sub))
+        except Exception:
+            continue
+    return out
+
+async def push_notify(to_id):
+    """Fire a best-effort, empty-payload push to every subscription on
+    file for to_id. Only called from route_or_buffer for a genuinely-
+    offline app:message delivery — never for app:migrate/app:burn (not
+    user-facing) and never when a live session was already reached.
+    Pushes are inherently best-effort: no retry on transient failure,
+    same as everything else in this protocol that isn't durably buffered."""
+    subs = await asyncio.to_thread(_push_subs_list_sync, to_id)
+    if not subs:
+        return
+    for device_id, sub in subs:
+        endpoint = sub.get("endpoint")
+        if not endpoint:
+            continue
+        dead, status = await asyncio.to_thread(_send_web_push_sync, endpoint)
+        if dead:
+            await asyncio.to_thread(_push_sub_delete_sync, to_id, device_id)
+            stats["push_pruned"] += 1
+            log.info("PUSH       subscription dead (status=%s) — pruned  id=%s  device=%s",
+                      status, short(to_id), short(device_id))
+        elif status is not None and 200 <= status < 300:
+            stats["push_sent"] += 1
+            log.debug("PUSH       sent  id=%s  device=%s  status=%s", short(to_id), short(device_id), status)
+        else:
+            stats["push_failed"] += 1
+            log.debug("PUSH       transient failure  id=%s  device=%s  status=%s", short(to_id), short(device_id), status)
+
+# ══════════════════════════════════════════
 #   ROUTING HELPERS
 # ══════════════════════════════════════════
 
@@ -337,7 +548,13 @@ async def route_or_buffer(kind, frm, to, msg, ws):
     identical reason: it must survive being "reached" by a stale session
     of the same identity that's mid-disconnect. Kept as its own kind
     throughout — never merged into the migrate buffer slot — so a routing
-    update can't clobber a pending burn notice or vice versa."""
+    update can't clobber a pending burn notice or vice versa.
+
+    Push (app:message only): fired only when live delivery genuinely
+    failed — a push exists to tell someone to open the app and check,
+    which is meaningless if they're already connected and about to
+    receive the message live. app:migrate/app:burn never push — neither
+    is something a human needs to be woken up for."""
     reached = await deliver(to, msg, exclude=ws)
     if reached:
         log.info("%-10s from=%s  to=%s  reached=%d", kind.upper(), short(frm), short(to), reached)
@@ -348,6 +565,8 @@ async def route_or_buffer(kind, frm, to, msg, ws):
                       short(frm), short(to), "migrate" if kind == "app:migrate" else "burn", kind)
         else:
             log.info("BUF Q      from=%s  to=%s  (offline)  type=%s", short(frm), short(to), kind)
+    if not reached and kind == "app:message":
+        await push_notify(to)
 
 # ══════════════════════════════════════════
 #   AUTH HELPERS
@@ -728,12 +947,14 @@ async def log_stats():
     while True:
         await asyncio.sleep(STATS_INTERVAL)
         log.info("STATS      keys=%d  sessions=%d  in=%s(%d msgs)  out=%s(%d msgs)  "
-                 "buf_in=%d  buf_out=%d  buf_cap_rejected=%d  buf_rate_rejected=%d  auth_admission_rejected=%d",
+                 "buf_in=%d  buf_out=%d  buf_cap_rejected=%d  buf_rate_rejected=%d  auth_admission_rejected=%d  "
+                 "push_sent=%d  push_failed=%d  push_pruned=%d",
                  unique_keys(), session_count(),
                  fmt_bytes(stats["bytes_in"]),  stats["msgs_in"],
                  fmt_bytes(stats["bytes_out"]), stats["msgs_out"],
                  stats["buf_in"], stats["buf_out"], stats["buf_cap_rejected"],
-                 stats["buf_rate_rejected"], stats["auth_admission_rejected"])
+                 stats["buf_rate_rejected"], stats["auth_admission_rejected"],
+                 stats["push_sent"], stats["push_failed"], stats["push_pruned"])
 
 # ══════════════════════════════════════════
 #   PENDING AUTH SWEEP
@@ -896,6 +1117,56 @@ async def handler(ws):
                     continue
                 await route_or_buffer(kind, frm, to, msg, ws)
 
+            # ── push subscribe/unsubscribe: from must match an authed
+            #    identity on this socket, same rule as app:message et al.
+            #    No mandatory signature — this doesn't redirect routing or
+            #    drive an irreversible action the way app:migrate/app:burn
+            #    do, it's "start/stop sending pushes to this endpoint",
+            #    same trust tier as the sync:* group. ──
+            elif kind == "sig:push_subscribe":
+                frm       = msg.get("from", "?")
+                device_id = msg.get("deviceId")
+                sub       = msg.get("subscription")
+                if frm not in client_ids:
+                    log.warning("PUSH_SUB   from=%s  not authed  peer=%s  dropped", short(frm), addr)
+                    await send_to(ws, {"type": "error", "reason": "not_authenticated"})
+                    continue
+                if not valid_id(device_id):
+                    log.warning("PUSH_SUB   from=%s  bad deviceId, dropped", short(frm))
+                    continue
+                if not isinstance(sub, dict):
+                    log.warning("PUSH_SUB   from=%s  bad subscription shape, dropped", short(frm))
+                    continue
+                endpoint = sub.get("endpoint")
+                keys     = sub.get("keys") if isinstance(sub.get("keys"), dict) else {}
+                # https-only — a ws://, http://, or garbage endpoint has no
+                # business being POSTed to later; WS_MAX_SIZE already caps
+                # the overall frame this arrives in, so no separate size
+                # check is needed on top of that for now.
+                if not isinstance(endpoint, str) or not endpoint.startswith("https://"):
+                    log.warning("PUSH_SUB   from=%s  endpoint not https, dropped", short(frm))
+                    continue
+                if not keys.get("p256dh") or not keys.get("auth"):
+                    log.warning("PUSH_SUB   from=%s  missing keys.p256dh/auth, dropped", short(frm))
+                    continue
+                await asyncio.to_thread(_push_sub_write_sync, frm, device_id, {
+                    "endpoint": endpoint,
+                    "p256dh":   keys["p256dh"],
+                    "auth":     keys["auth"],
+                })
+
+            elif kind == "sig:push_unsubscribe":
+                frm       = msg.get("from", "?")
+                device_id = msg.get("deviceId")
+                if frm not in client_ids:
+                    log.warning("PUSH_UNSUB from=%s  not authed  peer=%s  dropped", short(frm), addr)
+                    await send_to(ws, {"type": "error", "reason": "not_authenticated"})
+                    continue
+                if not valid_id(device_id):
+                    log.warning("PUSH_UNSUB from=%s  bad deviceId, dropped", short(frm))
+                    continue
+                await asyncio.to_thread(_push_sub_delete_sync, frm, device_id)
+
             elif kind == "sig:announce":
                 ids = msg.get("ids", [])
                 if not isinstance(ids, list):
@@ -934,7 +1205,12 @@ async def handler(ws):
                          kind.upper()[:16], short(frm), short(to), reached)
 
             elif kind == "sig:relay_req":
-                await send_to(ws, {"type": "sig:relay_info", "wss": RELAY_WSS_URL or None, "version": PROTOCOL_VERSION})
+                await send_to(ws, {
+                    "type":           "sig:relay_info",
+                    "wss":            RELAY_WSS_URL or None,
+                    "version":        PROTOCOL_VERSION,
+                    "vapidPublicKey": VAPID_PUBLIC_KEY_B64,
+                })
                 log.info("RELAY_INFO sent to %s  wss=%s  version=%s",
                          short(last_id()), RELAY_WSS_URL or "—", PROTOCOL_VERSION)
 
@@ -991,6 +1267,8 @@ async def run_signal_server():
              BUF_WRITE_RATE_LIMIT, BUF_WRITE_RATE_BURST, BUF_RATE_LIMITER_IDLE_S)
     log.info("Global auth admission: %.1f/s  burst=%.0f", GLOBAL_AUTH_RATE, GLOBAL_AUTH_BURST)
     log.info("Trusted proxies: %s", ", ".join(str(n) for n in TRUSTED_PROXIES) or "(none)")
+    log.info("Push: subs_dir=%s  vapid_key=%s  vapid_pub=%s…  ttl=%ds  subject=%s",
+             PUSH_SUBS_DIR, VAPID_KEY_FILE, VAPID_PUBLIC_KEY_B64[:16], PUSH_TTL_SECONDS, VAPID_SUBJECT)
     log.info("=" * 50)
     async with websockets.serve(handler, WS_HOST, WS_PORT, max_size=WS_MAX_SIZE):
         asyncio.create_task(log_stats())

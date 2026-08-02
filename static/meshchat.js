@@ -13,7 +13,7 @@
 
    Load order: meshchat-lib.js → meshchat-gui.js → meshchat.js → statemachine.js
 ═══════════════════════════════════════════════════════════════ */
-const CLIENT_VERSION = "0.4.0";
+const CLIENT_VERSION = "0.4.1";
 
 const POLL_INTERVAL_MS        	= 30_000;			// base interval between presence polls
 const POLL_JITTER_MS          	= 10_000;			// ± random jitter added to poll interval
@@ -35,7 +35,14 @@ const state = {
   keys: null, cryptoKey: null, encKey: null,
   contacts: {}, peerBackups: {}, peerTokens: {}, knownDevices: {}, sendCounters: {},
   currentChat: null, ws: null, online: new Set(),
-  unread: {}, knownDeviceFingerprints: {}
+  unread: {}, knownDeviceFingerprints: {},
+  // vapidPublicKey — this relay's VAPID public key, from the most recent
+  // sig:relay_info. pushSyncedRelayWss — the wss URL we've already sent
+  // sig:push_subscribe to THIS session; lets ensurePushSubscription()
+  // skip resending on every ordinary reconnect to the same relay, while
+  // still firing again automatically after a migration (new relay = new
+  // key = mismatch against this).
+  vapidPublicKey: null, pushSyncedRelayWss: null
 };
 
 const SIGNAL_URL		=`wss://${window.location.hostname}/ws/`;
@@ -45,6 +52,7 @@ const PEER_TOKEN_KEY	= "meshchat_peer_tokens_v1";
 const DEVICE_REGISTRY_KEY = "meshchat_known_devices_v1";
 const DEVICE_KEY_STORAGE = "meshchat_device_seed_v1";
 const SEND_COUNTER_KEY = "meshchat_send_counters_v1";
+const PUSH_PREF_KEY = "meshchat_push_pref_v1";   // per-device opt-in preference, local-only
 const EXCHANGE_COUNT	= 10;
 
 /* ══════════════════════════════════════════
@@ -928,6 +936,14 @@ function handleSignal(msg) {
         }
         saveContacts();
       }
+      // vapidPublicKey is per-relay, not per-identity — every relay_info
+      // (fresh login, ordinary reconnect, or post-migration reconnect)
+      // carries whichever relay we're CURRENTLY connected to's key.
+      // ensurePushSubscription() is itself the guard against redundant
+      // resubscribes on an ordinary reconnect to the same relay — see its
+      // pushSyncedRelayWss check.
+      state.vapidPublicKey = msg.vapidPublicKey || null;
+      ensurePushSubscription();
       break;
 
     case "sig:seen":
@@ -1491,6 +1507,112 @@ async function getAudioUrl(msgId) {
 }
 
 /* ══════════════════════════════════════════
+   PUSH NOTIFICATIONS
+   Opt-in, per-device (see server.py/protocol.md for the wire side).
+   Preference is a local-only on/off flag (loadPushPref/savePushPref) —
+   the actual PushSubscription object lives in the browser, obtained via
+   the service worker's PushManager, keyed to whichever relay's VAPID
+   public key was current at subscribe time.
+
+   ensurePushSubscription() is the single entry point that keeps browser
+   subscription + relay registration in sync with the current relay. It's
+   deliberately safe to call often (relay_info fires on every connect,
+   including ordinary reconnects) — pushSyncedRelayWss short-circuits the
+   common case, and the key-mismatch check handles the one case that
+   actually needs work: a migration having moved us to a relay whose
+   VAPID key differs from whatever the browser is currently subscribed
+   under. No special-cased "migration path" is needed for the subscribe
+   side as a result — see commitMigration()/notifyMigration() for the
+   one thing that IS migration-specific: proactively telling the OLD
+   relay to drop our subscription rather than leaving it to go silently
+   stale there.
+══════════════════════════════════════════ */
+function loadPushPref() {
+  try { return localStorage.getItem(PUSH_PREF_KEY + "_" + state.publicId) === "1"; }
+  catch(e) { return false; }
+}
+function savePushPref(enabled) {
+  try { localStorage.setItem(PUSH_PREF_KEY + "_" + state.publicId, enabled ? "1" : "0"); }
+  catch(e) {}
+}
+
+function pushSupported() {
+  return "serviceWorker" in navigator && "PushManager" in window;
+}
+
+async function ensurePushSubscription() {
+  if (!loadPushPref()) return;
+  if (!state.vapidPublicKey) return;   // no relay_info received yet this connection
+  if (!pushSupported()) {
+    mlog.warn("PUSH       not supported in this browser — leaving preference as-is");
+    return;
+  }
+  const wss = getSignalUrl();
+  if (state.pushSyncedRelayWss === wss) return;   // already synced with this relay this session
+
+  try {
+    const reg = await navigator.serviceWorker.ready;
+    let sub = await reg.pushManager.getSubscription();
+
+    // desiredKey/currentKey comparison — a subscription created against a
+    // DIFFERENT relay's VAPID key (this only ever happens right after a
+    // migration) is cryptographically dead weight; the push service will
+    // never accept a JWT signed by a key other than the one presented at
+    // subscribe time. Detecting the mismatch here is what lets migration
+    // "just work" through this same function rather than needing its own
+    // resubscribe call.
+    const desiredKey = base64ToRaw(state.vapidPublicKey);
+    const currentKey = sub?.options?.applicationServerKey
+      ? new Uint8Array(sub.options.applicationServerKey) : null;
+    const keyMatches = currentKey && currentKey.length === desiredKey.length
+      && currentKey.every((b, i) => b === desiredKey[i]);
+
+    if (sub && !keyMatches) {
+      await sub.unsubscribe();
+      mlog.info("PUSH       dropped subscription tied to a different relay's key");
+      sub = null;
+    }
+    if (!sub) {
+      sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: desiredKey });
+      mlog.info("PUSH       browser subscription created");
+    }
+
+    const json = sub.toJSON();
+    sendSignal({
+      type: "sig:push_subscribe", from: state.publicId, deviceId: state.deviceId,
+      subscription: { endpoint: json.endpoint, keys: json.keys },
+    });
+    state.pushSyncedRelayWss = wss;
+    mlog.info(`PUSH       registered with relay  ${wss}`);
+  } catch(e) {
+    mlog.warn("PUSH       subscribe failed: " + e.message);
+  }
+}
+
+// user-facing: called from the edit-contact (self) checkbox. Turning OFF
+// unsubscribes both the browser (so it stops waking this tab/SW for
+// nothing) and the current relay. Does NOT touch any OTHER relay this
+// identity may have subscriptions parked at from a past migration — same
+// "best-effort, not a durable guarantee" tier as the rest of this feature.
+async function togglePushPref(enabled) {
+  if (enabled) {
+    savePushPref(true);
+    state.pushSyncedRelayWss = null;   // force ensurePushSubscription to actually run
+    await ensurePushSubscription();
+  } else {
+    savePushPref(false);
+    try {
+      const reg = await navigator.serviceWorker.ready;
+      const sub = await reg.pushManager.getSubscription();
+      if (sub) await sub.unsubscribe();
+    } catch(e) {}
+    sendSignal({ type: "sig:push_unsubscribe", from: state.publicId, deviceId: state.deviceId });
+    state.pushSyncedRelayWss = null;
+    mlog.info("PUSH       unsubscribed");
+  }
+}
+
+/* ══════════════════════════════════════════
    MESSAGING
 ══════════════════════════════════════════ */
 async function receiveMessage(msg) {
@@ -1808,6 +1930,21 @@ async function notifyMigration(newRelay, ts, oldRelay) {
       mlog.info(`→ MIGRATE      to self @ old relay ${oldRelay}  sent=${sent}`);
     } catch(e) {
       mlog.warn(`→ MIGRATE      to self @ old relay — encrypt failed: ${e.message}`);
+    }
+
+    // Best-effort push cleanup at the relay being left behind. A
+    // subscription registered under the OLD relay's VAPID key is already
+    // cryptographically dead the moment we leave — no push sent through
+    // it will ever verify — but nothing removes the file there on its
+    // own, so this proactively asks. No encryption/signing needed, same
+    // trust tier as sync:* — reuses the same connection queued for the
+    // app:migrate breadcrumb just above (getOrOpenRelayConn dedups by
+    // hostname), so this either flushes alongside it or not at all.
+    if (loadPushPref()) {
+      const sentUnsub = sendViaRelayUrl(oldRelay, {
+        type: "sig:push_unsubscribe", from: state.publicId, deviceId: state.deviceId,
+      });
+      mlog.info(`→ PUSH_UNSUB   old relay ${oldRelay}  sent=${sentUnsub}`);
     }
   }
 }

@@ -116,7 +116,11 @@ before implementation starts, not just during it.
     forward secrecy
 - **Agreed: full per-device fanout is the likely direction.** This gets
   its own dedicated deep-dive conversation before any of it starts —
-  too large and too foundational to fold into general cleanup
+  too large and too foundational to fold into general cleanup. Next
+  session opens with competitive research first (Signal Sesame, Matrix
+  Olm/Megolm, Session, SimpleX — current specifics pulled fresh rather
+  than from memory) to feed that conversation rather than run parallel
+  to it.
 
 ### Sync / backup device-smartness (for later, no urgency)
 - Sync: when syncing a conversation, also check other-self devices, not
@@ -125,6 +129,40 @@ before implementation starts, not just during it.
   go out as just "identity," with no contact-device specificity needed —
   worth revisiting once the device-layer routing question above is
   settled, since it changes what's possible here
+
+---
+
+## Ideas — not yet scoped
+
+Lower-fidelity than "Planned" above — captured so they're not lost, not
+because there's a plan yet.
+
+### General plugin architecture (shell escalation as the worked example)
+- Shell today is threaded through four places: `meshchat.js` (signaling,
+  `shellConns`), `meshchat-gui.js` (terminal DOM), `statemachine.js` (the
+  `kind: "shell"` fork), and `index.html` markup (button, panel). None of
+  that is plugin-shaped yet — it's just the first agent-capable feature,
+  hardcoded.
+- A real plugin API needs hook points for at least: header-button
+  registration (gated on `contact.type`), a state-machine "kind"
+  registration instead of the hardcoded `call`/`shell` fork, and a
+  message-render override (agent chats already render left-aligned with
+  reactions suppressed — that's already a de facto per-type override,
+  just not a general one).
+- **Sub-question already sketched:** lazy-loading third-party plugin
+  assets (xterm.js/xterm-addon-fit/xterm.css today are unconditional
+  `<head>` tags everyone pays for, whether or not they ever touch shell).
+  Answer sketched out: a small `assetLoader` (dedupes concurrent loads,
+  ordered script loading, promise-based) triggered from the *action* that
+  needs it (`startShell()`), not from app boot or even from adding an
+  agent contact. Leaning self-hosted under `static/vendor/` over CDN —
+  same lazy-load benefit either way, but avoids leaking "this identity
+  uses shell" to a third party's request logs, which matters more here
+  than it would in a typical app.
+- Open: whether to scope a first pass as just the asset-loading slice
+  (prove the lazy-load pattern against shell as-is), or go straight for
+  the fuller manifest/hook-point design with shell as the reference
+  implementation. Undecided — flagged in chat, not yet a decision.
 
 ---
 
