@@ -26,7 +26,7 @@ self.addEventListener("push", (event) => {
     self.registration.showNotification("MeshChat", {
       body: "tap to check",
       tag: "meshchat-push",   // collapses multiple pending pushes into one visible notification
-      renotify: false,
+      renotify: true,        // …but still re-alert (banner/sound) each time, even if the prior one is unread
     })
   );
 });
