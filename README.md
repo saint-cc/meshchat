@@ -1,41 +1,35 @@
+````markdown
 # MeshChat
 
 Decentralised, end-to-end encrypted messaging built around cryptographic identities rather than accounts.
 
 No registration. No central identity provider. No plaintext.
 
-Messages are encrypted in the browser before they leave your device. Relay servers transport and
+Messages are encrypted in the browser before they leave your device. Relay servers transport and 
 temporarily buffer ciphertext, but never possess your private keys or message contents.
 
 ---
 
 ## How it works
 
-Your identity is derived locally from your username and passphrase using PBKDF2 + HKDF. The same
+Your identity is derived locally from your username and passphrase using PBKDF2 + HKDF. The same 
 credentials always produce the same cryptographic identity.
 
 There are no accounts to create and no passwords stored on any server. Your passphrase **is** your identity.
 
-Contacts are added by exchanging a shareable address (QR code or copy-paste). This contains your X25519
-public key, Ed25519 signing public key, and current relay address. No registration or central directory
-is required.
+Contacts are added by exchanging a shareable address (QR code or copy-paste). This contains your encryption 
+public key, signing public key and current relay address. No registration or central directory is required.
 
-Each pairwise conversation uses its own AES-256-GCM key, derived fresh via X25519 Diffie-Hellman between
-the two parties — not a raw key transmitted in the address. Messages are signed with Ed25519 before
-leaving your device.
-
-This is static-static ECDH, not a ratchet: the same pairwise key is reused for every message between a
-given pair. It separates conversations from each other but does **not** provide forward secrecy — that's
-what Double Ratchet support is being built toward next (see `known-limitations.md`).
+Messages are encrypted with AES-256-GCM for the recipient and signed with Ed25519 before leaving your device.
 
 ---
 
 ## Features
 
-- End-to-end encrypted text, image and audio messages, plus lightweight reactions
+- End-to-end encrypted text, image and audio messages
 - Message signing and verification
 - No accounts, email addresses or phone numbers
-- Roaming identities — move freely between relay servers, with a tested migration flow
+- Roaming identities — move freely between relay servers
 - No central directory or identity provider
 - Direct client-to-relay delivery across different relays
 - Offline delivery through temporary encrypted relay buffers
@@ -43,10 +37,9 @@ what Double Ratchet support is being built toward next (see `known-limitations.m
 - Peer backup of encrypted data
 - QR code contact exchange
 - Encrypted backup export / import
-- Agent contacts — bounded remote-command whitelist, plus optional full interactive shell (WebRTC) for explicitly trusted contacts
-- Burn notice — local wipe + "stop trusting me" signal to contacts (not cryptographic revocation — see `known-limitations.md`)
 - Progressive Web App (PWA)
 - Installable and offline-capable for reading conversations
+- Opt-in push notifications (per device, content-free — a push only ever means "open the app and check")
 
 ---
 
@@ -57,7 +50,7 @@ what Double Ratchet support is being built toward next (see `known-limitations.m
 - Python 3.11+
 - `websockets`
 - `flask`
-- `cryptography`
+- `cryptograpy`
 
 ```bash
 pip install websockets flask cryptography
@@ -153,17 +146,18 @@ server {
 
 ### Static files
 
-The client files (`index.html`, `style.css`, `meshchat-lib.js`, `meshchat-gui.js`, `meshchat.js`,
-`statemachine.js`, `manifest.json`, `sw.js`) are inside a `static/` directory next to `server.py`.
+The client files (`index.html`, `style.css`, `script.js`, `manifest.json`, `sw.js`) are inside a `static/` 
+directory next to `server.py`.
 
 ---
 
 ## Relay authentication
 
-When a client connects, the relay authenticates the session by verifying ownership of the presented
-Ed25519 signing key through a sign-the-nonce challenge-response exchange.
+When a client connects, the relay authenticates the session by verifying ownership of the presented public 
+key through 
+a challenge-response exchange.
 
-This allows the relay to associate active connections and offline message buffers with authenticated
+This allows the relay to associate active connections and offline message buffers with authenticated 
 identities without ever learning private keys or passphrases.
 
 Relay authentication protects against identity spoofing while preserving end-to-end encryption.
@@ -174,13 +168,13 @@ Relay authentication protects against identity spoofing while preserving end-to-
 
 MeshChat separates **transport** from **trust**.
 
-Relay servers are intentionally simple transport nodes. They forward ciphertext, temporarily buffer encrypted
+Relay servers are intentionally simple transport nodes. They forward ciphertext, temporarily buffer encrypted 
 messages for offline users, and authenticate ownership of public identities during connection.
 
 Trust resides entirely in cryptographic identities generated locally by each client.
 
-There is no global directory, no relay-to-relay communication and no central authority coordinating the network.
-Contacts learn each other's current relay location directly, allowing identities to migrate between relays
+There is no global directory, no relay-to-relay communication and no central authority coordinating the network. 
+Contacts learn each other's current relay location directly, allowing identities to migrate between relays 
 while remaining reachable.
 
 ---
@@ -207,10 +201,9 @@ while remaining reachable.
 ### Important limitations
 
 * Passphrase security is everything.
-* Pairwise keys are static — there is currently **no forward secrecy** (Double Ratchet work is in progress to address this).
+* Static identities mean there is currently **no forward secrecy**.
 * Relay operators can observe IP addresses.
 * MeshChat is **not** an anonymity network and is not a replacement for Tor.
-* Burn notice is a local wipe and social signal, not cryptographic revocation — anyone who still knows your credentials can still log back in.
 
 See `known-limitations.md` for a complete discussion.
 
@@ -251,5 +244,7 @@ See `protocol.md` for the complete protocol specification, packet formats, routi
 
 MeshChat is an experimental research project exploring decentralised, roaming, end-to-end encrypted messaging.
 
-The protocol is still evolving and should not yet be considered stable. Forward secrecy via Double Ratchet
-is currently in development.
+The protocol is still evolving and should not yet be considered stable.
+
+```
+```

@@ -2,7 +2,7 @@
 
 A decentralised, encrypted messaging protocol built on WebSocket relay servers. No accounts, no central authority, no plaintext.
 
-Current client/server implementation version: `0.4.0`, surfaced informationally via the `version` field on `sig:relay_info` for drift visibility (not yet enforced). `0.3.6` added WebRTC data-channel shell escalation for agent contacts; `0.3.7` added the burn notice; `0.4.0` replaced the identity encryption key with an X25519 keypair (breaking, no backward compatibility) and added Double Ratchet Phase 1 groundwork — per-contact send counters, richer device registry entries, and a client-side packet inspector (see [Device Awareness](#device-awareness)).
+Current client/server implementation version: `0.4.1`, surfaced informationally via the `version` field on `sig:relay_info` for drift visibility (not yet enforced). `0.3.6` added WebRTC data-channel shell escalation for agent contacts; `0.3.7` added the burn notice; `0.4.0` replaced the identity encryption key with an X25519 keypair (breaking, no backward compatibility); `0.4.1` adds web push notifications end to end — VAPID keypair generation, `sig:push_subscribe`/`sig:push_unsubscribe`, best-effort empty-payload pushes on genuinely-offline `app:message` delivery, the per-device opt-in checkbox (edit-contact panel, self only), the browser subscribe/re-subscribe flow, and the service worker's `push`/`notificationclick` handling. See [Push Notifications](#push-notifications) for the full picture, including what's deliberately still out of scope.
 
 ---
 
@@ -177,19 +177,15 @@ The plaintext payload (before encryption) for a text message:
 
 ```json
 {
-  "id":       "<uuid>",
-  "type":     "text",
-  "text":     "hello",
-  "ts":       1234567890123,
-  "deviceId": "<deviceId>",
-  "n":        42,
-  "relay":    { "wss": "wss://sender.example.com/ws/" }
+  "id":    "<uuid>",
+  "type":  "text",
+  "text":  "hello",
+  "ts":    1234567890123,
+  "relay": { "wss": "wss://sender.example.com/ws/" }
 }
 ```
 
 The `relay` field carries the sender's current relay WSS URL. Recipients update their routing table for the sender on every message received. This is how relay information propagates passively through the network.
-
-`deviceId` and `n` are Double Ratchet Phase 1 groundwork (see [Device Awareness](#device-awareness) for the full picture) — `deviceId` identifies which of the sender's devices produced this message, and `n` is that device's per-contact send sequence number. Both live **inside** the encrypted, signed payload, not the outer envelope — see the security note under [Outer envelope](#outer-envelope-appmessage) below for why. `n` is omitted on `reaction` payloads; every other type (`text`, `audio`, `image`) carries it.
 
 **Other payload types:** `audio`, `image`, `reaction`. Audio and image carry `data` (base64) and `mimeType`. Reactions carry `targetId` and `emoji`.
 
@@ -199,15 +195,16 @@ The wire packet wrapping the encrypted blob:
 
 ```json
 {
-  "type": "app:message",
-  "from": "<publicId>",
-  "to":   "<publicId>",
-  "blob": { "v": 1, "iv": [...], "data": [...] },
-  "sig":  [...]
+  "type":     "app:message",
+  "from":     "<publicId>",
+  "to":       "<publicId>",
+  "blob":     { "v": 1, "iv": [...], "data": [...] },
+  "sig":      [...],
+  "deviceId": "<deviceId>"
 }
 ```
 
-**`deviceId` is deliberately not here.** It used to ride as plaintext outer-envelope metadata, but that left it outside `sig`'s coverage — a relay could rewrite it in transit and the recipient would have no way to detect the tampering, since the signature only ever covered `blob`. It now travels inside the encrypted+signed payload (see above) instead, and — same trust-boundary tightening — a recipient only records it in the local device registry once the signature has verified as valid; a message that fails to decrypt, or decrypts but doesn't verify, can't poison the registry. It is optional; old clients that omit it are handled gracefully (the contact's device list stays at the "unknown" placeholder).
+`deviceId` is the sender's device identity (see [Device Identity](#device-identity)). It is plaintext — not inside the encrypted blob — so the relay and recipient can read it without decryption. Recipients record it in the local device registry to build passive knowledge of which devices a given identity runs. It is optional; old clients that omit it are handled gracefully (the contact's device list stays at the "unknown" placeholder).
 
 ---
 
@@ -350,38 +347,18 @@ Each client maintains a local device registry (`meshchat_known_devices_v1_<publi
 ```json
 {
   "<identityId>": {
-    "<deviceId>": { "lastSeen": <timestamp>, "lastN": <int> },
-    "<deviceId>": { "lastSeen": <timestamp>, "lastN": <int> }
+    "<deviceId>": <lastSeenTimestamp>,
+    "<deviceId>": <lastSeenTimestamp>
   }
 }
 ```
 
 This is local-only, never included in backup blobs or `serialiseContacts()`. It is populated passively from two sources:
 
-1. **`app:message` receipt** — the payload's `deviceId` and `n` fields (see [Message Payload](#message-payload)) record which device a contact sent from and that device's send sequence number, once the signature has verified.
-2. **Self-sync backup path** — `deviceId`/`fingerprint` fields on `sync:backup_push` and `sync:backup_accept` teach each of the user's own devices about the others (see [Peer Backup Protocol](#peer-backup-protocol)). This path has no `n` to offer, so `lastN` is left untouched.
+1. **`app:message` receipt** — the outer `deviceId` field records which device a contact sent from.
+2. **Self-sync backup path** — `deviceId`/`fingerprint` fields on `sync:backup_push` and `sync:backup_accept` teach each of the user's own devices about the others (see [Peer Backup Protocol](#peer-backup-protocol)).
 
-**Migration from the pre-`lastN` shape:** older stored entries are bare `lastSeen` timestamps rather than `{ lastSeen, lastN }` objects. `loadDeviceRegistry()` migrates these in place on load — a bare number becomes `{ lastSeen: <that number>, lastN: 0 }`, since there was never a counter to recover for that history; it corrects itself the next time that device is actually seen sending something with an `n` on it.
-
-**`lastN` is bookkeeping, not enforcement — for now.** `recordKnownDevice(identityId, deviceId, n)` updates `lastN` to the highest `n` seen from that device, and if an incoming `n` isn't exactly `prevLastN + 1`, logs a gap/reorder at `mlog.debug` (console-only, not surfaced to the person). Nothing is currently dropped, buffered, or reordered based on this — it exists so the registry already carries the sequence information a future ordering/ratcheting pass can build on, without needing another storage migration when that happens.
-
-The registry is displayed in a per-contact device popover in the UI, showing each known device's relative last-seen date and its `lastN` (e.g. `2d ago · n:14`). Contacts with no recorded devices show an "unknown" placeholder. The data accumulates passively through normal traffic — no dedicated discovery handshake.
-
-### Send Counters
-
-Alongside the device registry, each client maintains a local, per-(this device, contact) outbound counter (`meshchat_send_counters_v1_<publicId>` in localStorage):
-
-```json
-{ "<contactPublicId>": <n> }
-```
-
-`nextSendCounter(contactId)` increments and persists this before every outbound `text`/`audio`/`image` payload, and the result is what's placed in that payload's `n` field. **Reactions are deliberately excluded** — they aren't part of the conversational sequence the counter is meant to track.
-
-This is local-only and never included in `serialiseContacts()` or any backup — same tier as the device seed itself. It is **not** synced or reconciled between a person's own devices: each device sharing one identity keeps its own independent counter, since (as of Phase 1) there is no live, authoritative shared crypto state to arbitrate whose turn it is between two devices of the same identity sending concurrently. `Agent.py` mirrors this exactly, backed by a small JSON file (`agent_send_counters.json`) instead of localStorage.
-
-### Packet Inspector
-
-A client-side debugging aid, not a wire-protocol feature: each message bubble carries an "ⓘ" button that, on click, displays the full outer envelope for that message with the encrypted `blob` field removed and the decrypted payload spliced in its place (audio/image `data` is replaced with a size placeholder rather than shown in full). This is sourced from an in-memory `packetCache` (`msgId → { envelope, payload }`) populated at the same point each send/receive path already has both pieces in hand, and is **not** persisted — a message from before the current session (page reload, or one that arrived via restore/backup/sync rather than a live send/receive) has no cache entry and the inspector says so rather than reconstructing one.
+The registry is displayed in a per-contact device popover in the UI. Contacts with no recorded devices show an "unknown" placeholder. The data accumulates passively through normal traffic — no dedicated discovery handshake.
 
 ### Planned propagation
 
@@ -514,6 +491,59 @@ The agent spawns the pty (`pty.fork()`, attached to the user's `$SHELL -i`) on t
 
 ---
 
+## Push Notifications
+
+**Status: implemented, client and server.** Opt-in per device, off by default.
+
+Push is opt-in per device and deliberately generic — a push here means only "something arrived, open the app and check." No message content, sender identity, or any other metadata is ever included in a push payload. This is what lets the relay skip the standard Web Push payload-encryption layer (`aes128gcm`) entirely: every push sent is a bodyless POST, authenticated only via a signed VAPID JWT, carrying nothing for anyone — including the push service operator (Google, Mozilla, etc.) — to read.
+
+### Browser support
+
+Standard Web Push (`PushManager` + service worker + VAPID) — not Chrome-specific. Chrome/Edge/Opera and Firefox (desktop and Android) work with no caveats; Safari desktop works since Safari 16. **Safari on iOS/iPadOS only delivers push to a PWA that has actually been added to the Home Screen** (iOS 16.4+) — a page merely open in a Safari tab cannot receive push at all, regardless of subscription state. This is an Apple platform restriction, not something client code can route around. Requires HTTPS (or `localhost` for local dev) unconditionally — no service worker registers at all over plain `http://`. The client's `pushSupported()` check gates the opt-in checkbox off (rather than letting it silently fail) wherever `serviceWorker`/`PushManager` aren't available.
+
+### VAPID keypair
+
+Each relay generates its own EC P-256 keypair on first boot and persists it (`VAPID_KEY_FILE`, default sitting next to `BUF_DIR` rather than inside it). The public key is exposed to clients as `vapidPublicKey` on `sig:relay_info` — base64url encoding of the uncompressed EC point (`0x04 || X || Y`, 65 bytes), the exact format `PushManager.subscribe()`'s `applicationServerKey` expects client-side.
+
+**This keypair is per-relay, not per-identity or global.** A subscription registered against one relay's VAPID key is cryptographically unusable at another relay — the push service binds a subscription to the specific public key presented at `subscribe()` time. This has a direct consequence for [relay migration](#relay-migration): a subscription doesn't automatically follow to a new relay. Handled without a dedicated "migration mode": the client's single `ensurePushSubscription()` entry point runs on every `sig:relay_info` (fresh login, ordinary reconnect, or the reconnect that follows a migration alike) and compares the browser's current subscription key against whichever relay it's presently talking to — a mismatch (only ever possible right after a migration) triggers an automatic unsubscribe-and-resubscribe against the new relay's key. Separately, `notifyMigration()` sends a best-effort `sig:push_unsubscribe` to the relay being left behind, piggybacked on the same connection as the self-targeted `app:migrate` breadcrumb, so the old relay isn't left holding a dead subscription indefinitely. The one accepted gap: a message that lands on the old relay from a contact who hasn't yet learned about the migration will not trigger a push (the message itself is still safely delivered/recovered via the existing migrate/drain mechanism) — a brief window, same spirit as the other timing windows already documented under [Relay Migration](#relay-migration).
+
+### Subscribing
+
+```json
+{
+  "type":         "sig:push_subscribe",
+  "from":         "<publicId>",
+  "deviceId":     "<deviceId>",
+  "subscription": { "endpoint": "https://...", "keys": { "p256dh": "...", "auth": "..." } }
+}
+```
+
+Stored at `PUSH_SUBS_DIR/<publicId>/<deviceId>.json` — one file per (identity, device) pair, mirroring `relay_buf`'s per-recipient layout. `sig:push_unsubscribe { from, deviceId }` removes it. Neither type requires a signature — unlike `app:migrate`/`app:burn`, this doesn't redirect routing or drive an irreversible action, so it sits at the same trust tier as the `sync:*` group: authed-socket only, `from` validated against `client_ids`.
+
+The relay rejects any subscription whose `endpoint` isn't `https://`, or that's missing `keys.p256dh`/`keys.auth` — no further validation beyond that and the existing `WS_MAX_SIZE` frame cap.
+
+### Firing a push
+
+Triggered only from inside the offline-buffering path (`buf_write`) for `app:message`, and only when live delivery genuinely failed — a push exists to prompt someone to open the app, which is meaningless if they're already connected and receiving the message live. `app:migrate` and `app:burn` never trigger a push; neither is something a human needs to be woken up for.
+
+Each subscription on file for the recipient gets its own push attempt: a bodyless HTTPS POST to `endpoint`, authenticated via `Authorization: vapid t=<jwt>, k=<vapidPublicKey>`, where the JWT (`ES256`, claims `{ aud, exp, sub }`) is signed fresh per push using the relay's VAPID private key. `aud` is the scheme+host of that specific `endpoint` (push services validate this). Pushes are best-effort — a transient failure (network error, 5xx) is logged and left alone, no retry, same as everything else in this protocol that isn't durably buffered. A `404`/`410` response means the push service has permanently invalidated the subscription; that subscription file is deleted immediately rather than left to fail forever.
+
+### Client-side opt-in and subscribe flow
+
+A checkbox in the edit-contact panel, self-entry only ("push notifications on this device"), controls a **per-device** local preference (`loadPushPref`/`savePushPref` — not part of `serialiseContacts()`/backups, same tier as the device seed itself: this is a statement about this browser, not the identity). Toggling it on calls `ensurePushSubscription()` immediately; toggling it off unsubscribes the browser's `PushSubscription` and sends `sig:push_unsubscribe` to the current relay.
+
+`ensurePushSubscription()` is the single function that keeps the browser subscription and the relay's registration in sync — it runs on every `sig:relay_info`, short-circuits via `pushSyncedRelayWss` when nothing's actually changed (ordinary reconnect to the same relay), and only does real work — unsubscribe/resubscribe against a new `vapidPublicKey`, or subscribe fresh — when something has. See [VAPID keypair](#vapid-keypair) above for why a relay change is the one case this needs to notice.
+
+The service worker (`sw.js`) handles the two events every push implies: `push` (show a generic "MeshChat — tap to check" notification; `event.data` is always null, there's nothing to parse) and `notificationclick` (focus an existing tab if one's open, otherwise open a new one).
+
+### Not yet implemented
+
+- WebRTC call/shell artifacts (a `"15:45 · WebRTC call · 2 min"` line, or a missed-call indicator, as a normal encrypted message type) — once that exists, it rides this same push trigger for free, no server changes needed
+- Any push trigger beyond `app:message` — `call:invite`/`shell:invite` are live-only and never buffered, so a push for a missed call/session would need its own trigger point at delivery-failure time, not `buf_write`
+- Any explicit messaging around the iOS "must be installed to Home Screen first" requirement — an iOS Safari tab user currently just sees the checkbox disabled with the generic "not supported in this browser" label
+
+---
+
 ## Signal Server Protocol
 
 ### Client → Server
@@ -549,6 +579,8 @@ The agent spawns the pty (`pty.fork()`, attached to the user's `$SHELL -i`) on t
 | `shell:offer`       | `from`, `to`, `sessionId`, `ts`, `deviceId?`, `blob`, `sig` | yes | WebRTC SDP offer — human is always the offerer |
 | `shell:answer`      | `from`, `to`, `sessionId`, `ts`, `deviceId?`, `blob`, `sig` | yes | WebRTC SDP answer — agent is always the answerer |
 | `shell:ice`         | `from`, `to`, `sessionId`, `ts`, `deviceId?`, `blob`, `sig` | yes | One ICE candidate — same encryption/signing as `shell:offer` |
+| `sig:push_subscribe`   | `from`, `deviceId`, `subscription: { endpoint, keys: { p256dh, auth } }` | yes | Register a per-device push subscription. No mandatory signature — doesn't redirect routing or drive an irreversible action, same trust tier as `sync:*`. `endpoint` must be `https://`, `keys.p256dh`/`keys.auth` required |
+| `sig:push_unsubscribe` | `from`, `deviceId`                        | yes | Remove a previously registered push subscription |
 | `sig:relay_req`     | —                                         | yes | Request relay's own WSS URL |
 | `sig:ping`          | —                                         | yes | Keepalive |
 
@@ -559,7 +591,7 @@ The agent spawns the pty (`pty.fork()`, attached to the user's `$SHELL -i`) on t
 | `sig:auth_challenge` | `bits`, `iv`, `data` | Encrypted nonce for client to decrypt |
 | `sig:auth_ok`        | `public_id`          | Auth succeeded, routing active |
 | `sig:auth_fail`      | `reason`             | Auth failed or unauthed packet dropped |
-| `sig:relay_info`     | `wss`, `version`     | Relay's own WSS URL and protocol version (informational, not yet enforced) |
+| `sig:relay_info`     | `wss`, `version`, `vapidPublicKey` | Relay's own WSS URL, protocol version (informational, not yet enforced), and its VAPID public key (base64url, uncompressed EC point) for push subscription |
 | `sig:seen`           | `id`                 | A queried ID is locally connected |
 | `sig:pong`           | —                    | Keepalive response |
 | `error`              | `reason`             | Protocol error (e.g. rate limited, not_authenticated) |
@@ -659,9 +691,9 @@ The relay itself is untrusted infrastructure. Cryptographic proof — signatures
 | `meshchat_contacts_<publicId>`         | per identity | Encrypted contact store (backup key) |
 | `meshchat_peer_backups_v1_<publicId>`  | per identity | Peer-supplied encrypted backup blobs |
 | `meshchat_peer_tokens_v1_<publicId>`   | per identity | Contact tokens for restore gating |
-| `meshchat_known_devices_v1_<publicId>` | per identity | Device registry — `{ identityId: { deviceId: { lastSeen, lastN } } }` |
-| `meshchat_send_counters_v1_<publicId>` | per device   | Outbound send counters — `{ contactPublicId: n }`. Never shared, never backed up |
+| `meshchat_known_devices_v1_<publicId>` | per identity | Device registry — `{ identityId: { deviceId: lastSeenTs } }` |
 | `meshchat_device_seed_v1_<publicId>`   | per device   | Raw 32-byte device seed (base64). Never shared, never backed up |
+| `meshchat_push_pref_v1_<publicId>`     | per device   | Push notification opt-in ("1"/"0"). Local-only preference — the actual `PushSubscription` lives in the browser's own PushManager storage, not here |
 
 ---
 
@@ -679,6 +711,10 @@ The relay itself is untrusted infrastructure. Cryptographic proof — signatures
 | `BUF_MAX_AGE_BURN`    | `604800`      | Buffer expiry in seconds (7d) — `app:burn` packets only, independent bucket |
 | `BUF_MAX_MB`          | `10`          | Max buffer size per recipient in MB |
 | `AUTH_TIMEOUT`        | `15`          | Seconds to complete challenge-response before disconnect |
+| `VAPID_SUBJECT`       | `mailto:admin@example.com` | Operator contact required by the VAPID spec, sent in every push JWT's `sub` claim |
+| `VAPID_KEY_FILE`      | next to `BUF_DIR` | Path to the persisted VAPID EC P-256 private key (PEM); generated on first boot if missing |
+| `PUSH_SUBS_DIR`       | next to `BUF_DIR` | Push subscription storage — `<dir>/<publicId>/<deviceId>.json` |
+| `PUSH_TTL_SECONDS`    | `60`          | `TTL` header sent with each push — how long the push service should hold it if the device is unreachable |
 
 ---
 
