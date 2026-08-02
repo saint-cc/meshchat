@@ -13,3 +13,5 @@ relay_buf/
 project/
 push_subs/
 static/FA6E31B89/
+vapid_key.pem
+*.pem
