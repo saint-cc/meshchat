@@ -36,7 +36,7 @@ const STATUS_TITLE = { sent: "sent", delivered: "delivered", failed: "failed to 
 const MAX_DOT_AGE   			= 300_000; 			// = PRUNE_INTERVAL_MS
 
 const mlog = (() => {
-  const ts    = () => new Date().toLocaleTimeString([], { hour:"2-digit", minute:"2-digit", second:"2-digit" });
+  const ts    = () => new Date().toLocaleTimeString([], { hour:"2-digit", minute:"2-digit", second:"2-digit", hour12:false });
   const lines = [];
   let visible = false;
 
