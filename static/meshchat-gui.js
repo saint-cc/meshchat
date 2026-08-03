@@ -25,6 +25,14 @@ const LOG_MAX_LINES      = 20;
 const LOG_CLEAR_INTERVAL = 5 * 60 * 1000;
 const MODAL_CLOSE_DELAY_MS    	= 1_200;			// brief pause before closing export/import modal
 
+// message status glyphs — sent: left this device (client-side optimism
+// only, no relay round-trip); delivered: the recipient's device decrypted
+// AND verified it (via the auto-ack reaction, see receiveMessage in
+// meshchat.js); failed: never left the device (no open socket / no relay
+// path). Only ever shown on our own ("mine") messages.
+const STATUS_GLYPH = { sent: "✔️", delivered: "✔️✔️", failed: "✗" };
+const STATUS_TITLE = { sent: "sent", delivered: "delivered", failed: "failed to send" };
+
 const MAX_DOT_AGE   			= 300_000; 			// = PRUNE_INTERVAL_MS
 
 const mlog = (() => {
@@ -722,6 +730,14 @@ function renderMessages() {
                      + d.toLocaleTimeString([], { hour:"2-digit", minute:"2-digit" })
                      + (m.valid === false ? " · ⚠ unverified" : "");
     meta.appendChild(metaText);
+
+    if (mine && m.type !== "reaction" && m.status) {
+      const statusEl = document.createElement("span");
+      statusEl.className   = "msgStatus" + (m.status === "failed" ? " failed" : "");
+      statusEl.title       = STATUS_TITLE[m.status] || "";
+      statusEl.textContent = STATUS_GLYPH[m.status] || "";
+      meta.appendChild(statusEl);
+    }
 
     const infoPre = document.createElement("pre");
     infoPre.className = "packetInfoPre";

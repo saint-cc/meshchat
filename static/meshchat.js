@@ -1423,26 +1423,34 @@ async function sendImageMessage(file) {
       const mimeType = "image/jpeg";
       const ts       = Date.now();
       const id       = crypto.randomUUID();
-      const me       = state.contacts[state.publicId];
-      const relay    = me?.lastRelay ? { wss: me.lastRelay } : undefined;
 
-      const payload   = { id, type: "image", data: base64, mimeType, ts, deviceId: state.deviceId, n: nextSendCounter(state.currentChat), ...(relay ? { relay } : {}) };
-      const encrypted = await encryptMessage(contact.encKey, payload);
-      const sig       = await signBlob(encrypted);
+      let status = "failed";
+      try {
+        const me       = state.contacts[state.publicId];
+        const relay    = me?.lastRelay ? { wss: me.lastRelay } : undefined;
 
-      const encBlob = await encryptObject(state.encKey, { data: base64, mimeType });
-      imageCache[id] = { encBlob, mimeType };
+        const payload   = { id, type: "image", data: base64, mimeType, ts, deviceId: state.deviceId, n: nextSendCounter(state.currentChat), ...(relay ? { relay } : {}) };
+        const encrypted = await encryptMessage(contact.encKey, payload);
+        const sig       = await signBlob(encrypted);
 
-	  const imgMsgObj  = { type: "app:message", from: state.publicId,
-				 to: state.currentChat, blob: encrypted, sig };
-      packetCache[id] = { envelope: imgMsgObj, payload };
-      const viaRelayImg = sendToRelay(state.currentChat, imgMsgObj, true);
-      if (!viaRelayImg) sendSignal(imgMsgObj);
+        const encBlob = await encryptObject(state.encKey, { data: base64, mimeType });
+        imageCache[id] = { encBlob, mimeType };
 
-      contact.messages = mergeMessages(contact.messages, [{ id, from: state.publicId, type: "image", mimeType, ts, valid: true }]);
+        const imgMsgObj  = { type: "app:message", from: state.publicId,
+                   to: state.currentChat, blob: encrypted, sig };
+        packetCache[id] = { envelope: imgMsgObj, payload };
+        const viaRelayImg = sendToRelay(state.currentChat, imgMsgObj, true);
+        const wsOpen      = state.ws?.readyState === WebSocket.OPEN;
+        if (!viaRelayImg) sendSignal(imgMsgObj);
+        status = (viaRelayImg || wsOpen) ? "sent" : "failed";
+        mlog.info(`→ IMAGE        to   ${pid(state.currentChat)}  ${w}×${h}  via=${viaRelayImg ? "relay" : (wsOpen ? "signal(fallback)" : "nowhere — no open socket")}`);
+      } catch(e) {
+        mlog.err(`→ IMAGE        to   ${pid(state.currentChat)} — send failed: ${e.message}`);
+      }
+
+      contact.messages = mergeMessages(contact.messages, [{ id, from: state.publicId, type: "image", mimeType, ts, valid: true, status }]);
       await saveContacts();
       renderMessages();
-      mlog.info(`→ IMAGE        to   ${pid(state.currentChat)}  ${w}×${h}  via=${viaRelayImg ? "relay" : "signal(fallback)"}`);
     };
     reader.readAsDataURL(blob);
   }, "image/jpeg", 0.85);
@@ -1460,30 +1468,37 @@ async function sendAudioMessage(blob) {
     const ts       = Date.now();
     const id       = crypto.randomUUID();
     const mimeType = blob.type;
-    const me       = state.contacts[state.publicId];
-    const relay    = me?.lastRelay ? { wss: me.lastRelay } : undefined;
 
-    // encrypt for transit
-    const payload   = { id, type: "audio", data: base64, mimeType, ts, deviceId: state.deviceId, n: nextSendCounter(state.currentChat), ...(relay ? { relay } : {}) };
-    const encrypted = await encryptMessage(contact.encKey, payload);
-    const sig       = await signBlob(encrypted);
+    let status = "failed";
+    try {
+      const me       = state.contacts[state.publicId];
+      const relay    = me?.lastRelay ? { wss: me.lastRelay } : undefined;
 
-    // store encrypted in memory cache — never raw
-    const encBlob = await encryptObject(state.encKey, { data: base64, mimeType });
-    audioCache[id] = { encBlob, mimeType };
+      // encrypt for transit
+      const payload   = { id, type: "audio", data: base64, mimeType, ts, deviceId: state.deviceId, n: nextSendCounter(state.currentChat), ...(relay ? { relay } : {}) };
+      const encrypted = await encryptMessage(contact.encKey, payload);
+      const sig       = await signBlob(encrypted);
 
+      // store encrypted in memory cache — never raw
+      const encBlob = await encryptObject(state.encKey, { data: base64, mimeType });
+      audioCache[id] = { encBlob, mimeType };
 
-	const audioMsgObj = { type: "app:message", from: state.publicId,
-             to: state.currentChat, blob: encrypted, sig };
-    packetCache[id] = { envelope: audioMsgObj, payload };
-    const viaRelayAud  = sendToRelay(state.currentChat, audioMsgObj, true);
-    if (!viaRelayAud) sendSignal(audioMsgObj);
+      const audioMsgObj = { type: "app:message", from: state.publicId,
+               to: state.currentChat, blob: encrypted, sig };
+      packetCache[id] = { envelope: audioMsgObj, payload };
+      const viaRelayAud = sendToRelay(state.currentChat, audioMsgObj, true);
+      const wsOpen      = state.ws?.readyState === WebSocket.OPEN;
+      if (!viaRelayAud) sendSignal(audioMsgObj);
+      status = (viaRelayAud || wsOpen) ? "sent" : "failed";
+      mlog.info(`→ AUDIO        to   ${pid(state.currentChat)}  size=${blob.size}b  via=${viaRelayAud ? "relay" : (wsOpen ? "signal(fallback)" : "nowhere — no open socket")}`);
+    } catch(e) {
+      mlog.err(`→ AUDIO        to   ${pid(state.currentChat)} — send failed: ${e.message}`);
+    }
 
     // stub in messages — data stays in audioCache only
-    contact.messages = mergeMessages(contact.messages, [{ id, from: state.publicId, type: "audio", mimeType, ts, valid: true }]);
+    contact.messages = mergeMessages(contact.messages, [{ id, from: state.publicId, type: "audio", mimeType, ts, valid: true, status }]);
     await saveContacts();
     renderMessages();
-    mlog.info(`→ AUDIO        to   ${pid(state.currentChat)}  size=${blob.size}b  via=${viaRelayAud ? "relay" : "signal(fallback)"}`);
   };
   reader.readAsDataURL(blob);
 }
@@ -1661,10 +1676,31 @@ async function receiveMessage(msg) {
 
     if (msgObj.type === "reaction") {
       contact.messages = mergeMessages(contact.messages, [msgObj]);
+      // Any reaction — including our own auto-ack below, which is itself
+      // a reaction with emoji:null — targeting a message WE sent proves
+      // the other side decrypted it. A genuine "they cleared their
+      // reaction" is indistinguishable on the wire and implies the exact
+      // same thing, so no special-casing is needed: just flip status
+      // once, on whichever reaction gets there first.
+      const target = contact.messages.find(m => m.id === msgObj.targetId);
+      if (target && target.from === state.publicId && target.status !== "delivered") {
+        target.status = "delivered";
+      }
     } else {
       contact.messages = mergeMessages(contact.messages, [msgObj]);
       if (state.currentChat !== msg.from) {
         state.unread[msg.from] = (state.unread[msg.from] || 0) + 1;
+      }
+      // Auto-ack — reuses the existing reaction channel (emoji:null)
+      // rather than a new packet type. Only for a message that both
+      // decrypted AND verified: an ack should mean "a real device
+      // confirmed this," not just "something decryptable arrived."
+      // Never fires on our own self-targeted traffic (msg.from ===
+      // state.publicId) — there's no delivery concept to signal to
+      // ourselves. Deliberately NOT gated on state.currentChat — this
+      // must go to msg.from regardless of which chat happens to be open.
+      if (valid && msg.from !== state.publicId) {
+        sendReaction(plain.id, null, msg.from);
       }
     }
     await saveContacts();
@@ -2027,21 +2063,34 @@ async function sendMessage() {
   const contact = state.contacts[state.currentChat];
   if (!contact?.encKey) return;
   const ts = Date.now(), id = crypto.randomUUID();
-
   const fromId = state.publicId;
-  const me     = state.contacts[state.publicId];
-  const relay  = me?.lastRelay ? { wss: me.lastRelay } : undefined;
-  const payload = { id, text, ts, deviceId: state.deviceId, n: nextSendCounter(state.currentChat), ...(relay ? { relay } : {}) };
-  const blob   = await encryptMessage(contact.encKey, payload);
-  const sig    = await signBlob(blob);
 
-  const msgObj = { type: "app:message", from: fromId, to: contact.publicId, blob, ...(sig ? { sig } : {}) };
-  packetCache[id] = { envelope: msgObj, payload };
-  const viaRelay = sendToRelay(state.currentChat, msgObj, true);
-  if (!viaRelay) sendSignal(msgObj);
-  contact.messages = mergeMessages(contact.messages, [{ id, from: fromId, text, ts, valid: true }]);
-  mlog.info(`→ MSG          to   ${pid(state.currentChat)}  via=${viaRelay ? "relay" : "signal(fallback)"}`);
-  mlog.debug(`MSG content: "${text.slice(0,40)}${text.length>40?"…":""}"  id=${id}`);
+  // status is purely client-side optimism — "did this packet genuinely
+  // leave the device" (a live relay connection, or the main signal socket
+  // being open), NOT a relay/recipient acknowledgement. There's no
+  // round-trip to the relay for this; see the delivered/✔️✔️ path below,
+  // which is the real recipient-confirmed signal (an auto-ack reaction).
+  let status = "failed";
+  try {
+    const me     = state.contacts[state.publicId];
+    const relay  = me?.lastRelay ? { wss: me.lastRelay } : undefined;
+    const payload = { id, text, ts, deviceId: state.deviceId, n: nextSendCounter(state.currentChat), ...(relay ? { relay } : {}) };
+    const blob   = await encryptMessage(contact.encKey, payload);
+    const sig    = await signBlob(blob);
+
+    const msgObj = { type: "app:message", from: fromId, to: contact.publicId, blob, ...(sig ? { sig } : {}) };
+    packetCache[id] = { envelope: msgObj, payload };
+    const viaRelay = sendToRelay(state.currentChat, msgObj, true);
+    const wsOpen   = state.ws?.readyState === WebSocket.OPEN;
+    if (!viaRelay) sendSignal(msgObj);
+    status = (viaRelay || wsOpen) ? "sent" : "failed";
+    mlog.info(`→ MSG          to   ${pid(state.currentChat)}  via=${viaRelay ? "relay" : (wsOpen ? "signal(fallback)" : "nowhere — no open socket")}`);
+    mlog.debug(`MSG content: "${text.slice(0,40)}${text.length>40?"…":""}"  id=${id}`);
+  } catch(e) {
+    mlog.err(`→ MSG          to   ${pid(state.currentChat)} — send failed: ${e.message}`);
+  }
+
+  contact.messages = mergeMessages(contact.messages, [{ id, from: fromId, text, ts, valid: true, status }]);
   await saveContacts();
   input.value = "";
   renderMessages();
@@ -2054,9 +2103,9 @@ async function sendMessage() {
    so mergeMessages naturally replaces, never duplicates.
    emoji: ":)" | ":(" | null  (null = cleared)
 ══════════════════════════════════════════ */
-async function sendReaction(targetMsgId, emoji) {
-  if (!state.currentChat) return;
-  const contact = state.contacts[state.currentChat];
+async function sendReaction(targetMsgId, emoji, contactId = state.currentChat) {
+  if (!contactId) return;
+  const contact = state.contacts[contactId];
   if (!contact?.encKey) return;
 
   const id  = await deriveReactionId(state.publicId, targetMsgId);
@@ -2067,14 +2116,16 @@ async function sendReaction(targetMsgId, emoji) {
   const blob     = await encryptMessage(contact.encKey, payload);
   const sig      = await signBlob(blob);
 
-  const reactMsgObj = { type: "app:message", from: state.publicId, to: state.currentChat, blob, sig };
-  const viaRelayReact = sendToRelay(state.currentChat, reactMsgObj, true);
+  const reactMsgObj = { type: "app:message", from: state.publicId, to: contactId, blob, sig };
+  const viaRelayReact = sendToRelay(contactId, reactMsgObj, true);
   if (!viaRelayReact) sendSignal(reactMsgObj);
   const msgObj = { id, from: state.publicId, type: "reaction", targetId: targetMsgId, emoji, ts, valid: true };
   contact.messages = mergeMessages(contact.messages, [msgObj]);
-  mlog.info(`→ REACTION     to   ${pid(state.currentChat)}  target=${pid(targetMsgId)}  emoji=${emoji || "nil"}  via=${viaRelayReact ? "relay" : "signal(fallback)"}`);
+  mlog.info(`→ REACTION     to   ${pid(contactId)}  target=${pid(targetMsgId)}  emoji=${emoji || "nil"}  via=${viaRelayReact ? "relay" : "signal(fallback)"}`);
   await saveContacts();
-  renderMessages();
+  // only the currently-open chat needs a re-render — an auto-ack fired
+  // for some other contact shouldn't repaint whatever chat is on screen
+  if (state.currentChat === contactId) renderMessages();
 }
 
 /* ══════════════════════════════════════════

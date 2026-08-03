@@ -128,6 +128,8 @@
   .message.theirs  { background: var(--theirs); align-self: flex-start; border: 1px solid var(--border); }
   .message.invalid { border-color: var(--danger) !important; opacity: 0.6; }
   .msgMeta { font-size: 10px; color: var(--muted); margin-top: 3px; display: flex; align-items: center; gap: 6px; }
+.msgStatus { font-size: 10px; opacity: 0.85; letter-spacing: -1px; }
+.msgStatus.failed { color: var(--danger); letter-spacing: normal; }
   .packetInfoBtn {
     background: none; border: none; color: var(--muted); font-size: 11px;
     cursor: pointer; padding: 0; line-height: 1; opacity: 0.5; transition: opacity 0.15s, color 0.15s;
