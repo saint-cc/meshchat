@@ -2203,7 +2203,7 @@ async function sendCallNotice(id) {
 
   const msgId = crypto.randomUUID();
   const ts    = Date.now();
-  const callerName = state.contacts[state.publicId]?.name || state.user || "Someone";
+  const callerName = state.user || "Someone";
   const text  = `${callerName} is attempting a WebRTC connection`;
 
   let status = "failed";
