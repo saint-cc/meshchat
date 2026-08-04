@@ -33,6 +33,12 @@ const MODAL_CLOSE_DELAY_MS    	= 1_200;			// brief pause before closing export/i
 const STATUS_GLYPH = { sent: "✔️", delivered: "✔️✔️", failed: "✗" };
 const STATUS_TITLE = { sent: "sent", delivered: "delivered", failed: "failed to send" };
 
+// icon per system-notice kind — keyed by payload.kind, not hardcoded to
+// calls. Add an entry here whenever a new system-notice kind is wired up
+// (migration confirmation, burn, etc.) rather than inventing a new
+// message type each time.
+const SYSTEM_ICON = { call: "📞" };
+
 const MAX_DOT_AGE   			= 300_000; 			// = PRUNE_INTERVAL_MS
 
 const mlog = (() => {
@@ -527,6 +533,8 @@ function renderContactList() {
         ? "🎤 audio message"
         : last.type === "image"
         ? "🖼 image"
+        : last.type === "system"
+        ? (SYSTEM_ICON[last.kind] || "•") + " " + (last.text || "").slice(0, 26) + ((last.text || "").length > 26 ? "…" : "")
         : (last.text || "").slice(0, 28) + (last.text?.length > 28 ? "…" : "")
       : "";
     const hasBackup = !!state.peerBackups[c.publicId];
@@ -656,6 +664,22 @@ function renderMessages() {
   const isAgentChat = state.contacts[state.currentChat]?.type === "agent";
 
   visible.forEach(m => {
+    if (m.type === "system") {
+      const sysWrap = document.createElement("div");
+      sysWrap.className = "systemMsgWrap";
+      const sysLine = document.createElement("div");
+      sysLine.className = "systemMsg" + (m.valid === false ? " invalid" : "");
+      const icon = SYSTEM_ICON[m.kind] || "•";
+      const d = new Date(m.ts);
+      const timeStr = d.toLocaleTimeString([], { hour:"2-digit", minute:"2-digit", hour12:false });
+      sysLine.textContent = `${icon}  ${m.text || ""}`
+        + (m.valid === false ? "  ·  ⚠ unverified" : "")
+        + `  ·  ${timeStr}`;
+      sysWrap.appendChild(sysLine);
+      container.appendChild(sysWrap);
+      return;
+    }
+
     const mine = m.from === state.publicId;
     const wrap = document.createElement("div");
     wrap.style.cssText = "display:flex;flex-direction:column;align-items:" + (isAgentChat ? "flex-start" : (mine ? "flex-end" : "flex-start"));

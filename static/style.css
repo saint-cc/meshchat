@@ -130,6 +130,17 @@
   .msgMeta { font-size: 10px; color: var(--muted); margin-top: 3px; display: flex; align-items: center; gap: 6px; }
 .msgStatus { font-size: 10px; opacity: 0.85; letter-spacing: -1px; }
 .msgStatus.failed { color: var(--danger); letter-spacing: normal; }
+.systemMsgWrap { display: flex; justify-content: center; }
+.systemMsg {
+  color: var(--muted);
+  font-size: 11px;
+  letter-spacing: 0.05em;
+  padding: 4px 12px;
+  margin: 4px 0;
+  text-align: center;
+  opacity: 0.85;
+}
+.systemMsg.invalid { color: var(--danger); opacity: 1; }
   .packetInfoBtn {
     background: none; border: none; color: var(--muted); font-size: 11px;
     cursor: pointer; padding: 0; line-height: 1; opacity: 0.5; transition: opacity 0.15s, color 0.15s;

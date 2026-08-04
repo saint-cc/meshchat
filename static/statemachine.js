@@ -127,6 +127,7 @@ function onStateEnter(id, oldPhase, newPhase, role) {
 
     case "calling":
       sendCallInvite(id);
+      sendCallNotice(id);
       break;
 
     case "ringing":

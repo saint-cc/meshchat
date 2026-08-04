@@ -13,7 +13,7 @@
 
    Load order: meshchat-lib.js → meshchat-gui.js → meshchat.js → statemachine.js
 ═══════════════════════════════════════════════════════════════ */
-const CLIENT_VERSION = "0.4.1";
+const CLIENT_VERSION = "0.4.2";
 
 const POLL_INTERVAL_MS        	= 30_000;			// base interval between presence polls
 const POLL_JITTER_MS          	= 10_000;			// ± random jitter added to poll interval
@@ -1669,6 +1669,9 @@ async function receiveMessage(msg) {
     } else if (plain.type === "reaction") {
       msgObj.type = "reaction"; msgObj.targetId = plain.targetId; msgObj.emoji = plain.emoji || null;
       mlog.info(`← REACTION     from ${pid(msg.from)}  target=${pid(plain.targetId)}  emoji=${plain.emoji || "nil"}`);
+    } else if (plain.type === "system") {
+      msgObj.type = "system"; msgObj.kind = plain.kind || null; msgObj.text = plain.text;
+      mlog.info(`← SYSTEM_MSG   from ${pid(msg.from)}  kind=${plain.kind || "?"}  "${(plain.text||"").slice(0,60)}"`);
     } else {
       msgObj.text = plain.text;
       mlog.debug(`MSG content: "${(plain.text||"").slice(0,40)}${(plain.text||"").length>40?"…":""}"  id=${plain.id}`);
@@ -2169,6 +2172,64 @@ function sendCallPacket(toId, type, callId) {
   const viaRelay = sendToRelay(toId, obj, false);
   if (!viaRelay) sendSignal(obj);
   mlog.info(`→ ${type.toUpperCase()}  to ${pid(toId)}  callId=${pid(callId)}  via=${viaRelay ? "relay" : "signal(fallback)"}`);
+}
+
+/* ── call notice — a real, encrypted app:message artifact left in the
+   chat at the moment a call is attempted. Unlike call:invite (signed
+   only, never buffered, live-only delivery), this rides the SAME channel
+   as a normal text message — same encryption, same auto-ack, same
+   offline-buffer + push-notify path server-side. That's the whole point:
+   a callee who's offline gets a push for this the same way they'd get
+   one for any other message, and both sides keep a visible record of the
+   attempt regardless of whether the call itself ever connects.
+
+   type: "system" / kind: "call" rather than a plain text message — see
+   the SYSTEM_ICON map + renderMessages' dedicated branch in
+   meshchat-gui.js. kind exists so future system notices (a relay
+   migration confirmation, a burn notice, etc.) can reuse this same
+   rendering with their own icon/text rather than needing their own type.
+
+   Text is a static placeholder for now — a later pass can make it
+   state-aware (e.g. update the same id's text as the call phase
+   advances) once that's actually wanted; no need to build that now.
+
+   Deliberately only wired for voice calls, never shell escalation — shell
+   targets are always agent contacts, and agent.py's handle_message
+   treats any incoming text as a command to execute. Sending this here
+   would just bounce back "command not allowed" on the agent's side. ── */
+async function sendCallNotice(id) {
+  const contact = state.contacts[id];
+  if (!contact || contact.blocked || !contact.encKey) return;
+
+  const msgId = crypto.randomUUID();
+  const ts    = Date.now();
+  const callerName = state.contacts[state.publicId]?.name || state.user || "Someone";
+  const text  = `${callerName} is attempting a WebRTC connection`;
+
+  let status = "failed";
+  try {
+    const me    = state.contacts[state.publicId];
+    const relay = me?.lastRelay ? { wss: me.lastRelay } : undefined;
+    const payload = { id: msgId, type: "system", kind: "call", text, ts,
+                       deviceId: state.deviceId, n: nextSendCounter(id), ...(relay ? { relay } : {}) };
+    const blob    = await encryptMessage(contact.encKey, payload);
+    const sig     = await signBlob(blob);
+
+    const noticeObj = { type: "app:message", from: state.publicId, to: id, blob, sig };
+    packetCache[msgId] = { envelope: noticeObj, payload };
+    const viaRelay = sendToRelay(id, noticeObj, true);
+    const wsOpen    = state.ws?.readyState === WebSocket.OPEN;
+    if (!viaRelay) sendSignal(noticeObj);
+    status = (viaRelay || wsOpen) ? "sent" : "failed";
+    mlog.info(`→ CALL_NOTICE  to   ${pid(id)}  via=${viaRelay ? "relay" : (wsOpen ? "signal(fallback)" : "nowhere — no open socket")}`);
+  } catch(e) {
+    mlog.err(`→ CALL_NOTICE  to   ${pid(id)} — send failed: ${e.message}`);
+  }
+
+  contact.messages = mergeMessages(contact.messages, [{ id: msgId, from: state.publicId, type: "system", kind: "call", text, ts, valid: true, status }]);
+  await saveContacts();
+  if (state.currentChat === id) renderMessages();
+  updateContactPreview();
 }
 
 /* ── send side — called from onStateEnter / user actions ── */
