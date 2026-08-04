@@ -50,7 +50,7 @@ Messages are encrypted with AES-256-GCM for the recipient and signed with Ed2551
 - Python 3.11+
 - `websockets`
 - `flask`
-- `cryptograpy`
+- `cryptography`
 
 ```bash
 pip install websockets flask cryptography

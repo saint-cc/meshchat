@@ -4,7 +4,7 @@ Working notes on what's done, what's next, and what still needs a real design
 conversation before it gets touched. Not a promise of order or timing — just
 so the list lives somewhere other than someone's head.
 
-Current version: `0.4.0`. See `protocol.md` for the authoritative wire spec
+Current version: `0.4.2`. See `protocol.md` for the authoritative wire spec
 and `known-limitations.md` for permanent, by-design tradeoffs (no TURN, no
 real revocation, etc.) — those aren't roadmap items, they're not going to
 change.
@@ -31,6 +31,23 @@ Recent, for context on where "next" picks up from:
 - `protocol.md` caught up to the above, plus a real drift fix: `deviceId`
   was documented as outer-envelope metadata but had already been moved
   inside the encrypted+signed payload in code — doc now matches reality
+- **Push notifications (`0.4.1`)** — end to end: per-relay VAPID keypair
+  generated on first boot, `sig:push_subscribe`/`sig:push_unsubscribe`,
+  best-effort empty-payload pushes fired only on genuinely-offline
+  `app:message` delivery, per-device opt-in checkbox (edit-contact panel,
+  self only), browser subscribe/resubscribe handled uniformly through
+  `ensurePushSubscription()` (including the post-migration VAPID-key
+  mismatch case), and the service worker's generic `push`/
+  `notificationclick` handling. Full detail lives in `protocol.md`'s
+  [Push Notifications](protocol.md#push-notifications) section — no open
+  design questions left on this one.
+- **Message status — SEND / RECEIVED.** SEND was already implicit; RECEIVED
+  is now live too, riding the existing reaction channel rather than a new
+  packet type — `receiveMessage()` fires an auto-ack (`emoji: null`) back
+  to the sender the moment a message both decrypts and verifies, and the
+  sender flips that message's status to `delivered` on receipt. Rendered
+  client-side as ✔️ (sent) / ✔️✔️ (delivered) / ✗ (failed). READ status is
+  explicitly **not** part of this — see below, still deferred on purpose.
 
 ---
 
@@ -58,33 +75,12 @@ Things with a rough shape already, not blocked on a bigger design call:
 Real feature work, but each has an open question that needs deciding
 before implementation starts, not just during it.
 
-### Push notifications
-- Checkbox, opt-in, not silent
-- Per-relay VAPID keypair, generated once on relay boot and persisted —
-  same pattern as the device seed. No manual coordination needed between
-  relay operators; each browser's push subscription is bound to whichever
-  relay's public key it subscribed with, so this is fully automatable
-- Payload content: relay can't decrypt, so no message content either way.
-  Open question is whether to distinguish packet *kind* (message vs.
-  incoming call) in the payload, or keep it fully generic ("tap to check")
-  and let the woken app handle the specifics through normal signaling.
-  Leaning toward generic-for-now — avoids committing to new wire metadata
-  before there's a proven need
-- New pieces needed: persistent subscription store server-side (separate
-  from the ephemeral offline buffer), resubscribe step on relay migration,
-  fanout across a person's multiple devices (subscriptions are
-  per-browser-instance; ties into the device-layer work below)
-
-### Message status (SEND / RECEIVED)
-- SEND is already implicit (message left the socket)
-- RECEIVED needs a small signed ack packet, mirrors the reaction/`call:*`
-  packet pattern already in place
-- Open question: does RECEIVED fire automatically on successful
-  decrypt+verify, or is there a reason to hold it back — and what
-  "received" even means once a message has landed on one of a person's
-  several devices but not the others (see device-layer routing below)
-- **READ status is explicitly deferred** — sensitive, opinions vary
-  widely, not worth deciding under the same pass as RECEIVED
+### READ status
+- Deferred on purpose, separate from the now-shipped SEND/RECEIVED pass
+  above — sensitive, opinions vary widely on whether/when it should even
+  exist, not worth deciding under the same pass as RECEIVED
+- Open question is as much product as protocol: per-conversation opt-out,
+  or not implemented at all
 
 ### Device-layer routing (`networkID::deviceID`)
 - Goal: routing addressed to a specific device, not just an identity,

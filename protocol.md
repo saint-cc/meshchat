@@ -2,7 +2,7 @@
 
 A decentralised, encrypted messaging protocol built on WebSocket relay servers. No accounts, no central authority, no plaintext.
 
-Current client/server implementation version: `0.4.1`, surfaced informationally via the `version` field on `sig:relay_info` for drift visibility (not yet enforced). `0.3.6` added WebRTC data-channel shell escalation for agent contacts; `0.3.7` added the burn notice; `0.4.0` replaced the identity encryption key with an X25519 keypair (breaking, no backward compatibility); `0.4.1` adds web push notifications end to end — VAPID keypair generation, `sig:push_subscribe`/`sig:push_unsubscribe`, best-effort empty-payload pushes on genuinely-offline `app:message` delivery, the per-device opt-in checkbox (edit-contact panel, self only), the browser subscribe/re-subscribe flow, and the service worker's `push`/`notificationclick` handling. See [Push Notifications](#push-notifications) for the full picture, including what's deliberately still out of scope.
+Current client/server implementation version: `0.4.2`, surfaced informationally via the `version` field on `sig:relay_info` for drift visibility (not yet enforced). `0.3.6` added WebRTC data-channel shell escalation for agent contacts; `0.3.7` added the burn notice; `0.4.0` replaced the identity encryption key with an X25519 keypair (breaking, no backward compatibility); `0.4.1` adds web push notifications end to end — VAPID keypair generation, `sig:push_subscribe`/`sig:push_unsubscribe`, best-effort empty-payload pushes on genuinely-offline `app:message` delivery, the per-device opt-in checkbox (edit-contact panel, self only), the browser subscribe/re-subscribe flow, and the service worker's `push`/`notificationclick` handling; `0.4.2` is a client-side bugfix only (the WebRTC call notice previously always labelled the caller `"<name> (me)"`, regardless of who was actually calling, because it read the caller's own locally-decorated self-contact label instead of their plain username — no wire format change). See [Push Notifications](#push-notifications) for the full picture, including what's deliberately still out of scope.
 
 ---
 
@@ -187,7 +187,25 @@ The plaintext payload (before encryption) for a text message:
 
 The `relay` field carries the sender's current relay WSS URL. Recipients update their routing table for the sender on every message received. This is how relay information propagates passively through the network.
 
-**Other payload types:** `audio`, `image`, `reaction`. Audio and image carry `data` (base64) and `mimeType`. Reactions carry `targetId` and `emoji`.
+**Other payload types:** `audio`, `image`, `reaction`, `system`. Audio and image carry `data` (base64) and `mimeType`. Reactions carry `targetId` and `emoji`. System notices carry `kind` and `text` — a real, encrypted `app:message` artifact (not a signaling-only packet) used today for the WebRTC call notice (`kind: "call"`), so an offline callee still gets it via the normal offline-buffer/push path and both sides keep a visible record of the attempt regardless of whether the call itself connects.
+
+### Delivery Acknowledgement (RECEIVED)
+
+There is no dedicated packet type for this — SEND and RECEIVED status both ride existing mechanisms rather than adding new wire surface.
+
+**SEND** is purely local optimism: it means the packet left the socket (an open outbound relay connection, or the main signal connection), nothing more. It is never confirmed by the relay or the recipient.
+
+**RECEIVED** reuses the reaction channel. The instant a recipient's client both decrypts an incoming `app:message` *and* successfully verifies its Ed25519 signature, it sends a `reaction` message back to the sender with `targetId` set to the original message's `id` and `emoji: null`:
+
+```json
+{ "id": "<derived-reaction-id>", "type": "reaction", "targetId": "<original msg id>", "emoji": null, "ts": ... }
+```
+
+This is the exact same shape and stable-ID derivation (`SHA-256("reaction:" + myPublicId + ":" + targetMsgId)`) used for an ordinary emoji reaction — see [Message Merging](#message-merging). The sender treats *any* reaction targeting one of its own outbound messages as proof a real device received and cryptographically verified it — the emoji value is irrelevant to this purpose, `null` is simply what an auto-ack carries. On receipt, the sender flips that message's local status from `sent` to `delivered`.
+
+This acknowledgement deliberately never fires for self-targeted traffic (`msg.from === state.publicId`) — there is no delivery concept to signal to oneself — and only fires once signature verification has actually passed, so a message that merely decrypts but fails verification does not get silently marked delivered.
+
+**READ status is explicitly deferred**, unlike RECEIVED — sensitive, opinions vary widely on whether it should exist at all, and it is not part of this mechanism. See `Roadmap.md`.
 
 ### Outer envelope (`app:message`)
 
@@ -392,6 +410,8 @@ Four types: `call:invite`, `call:claim`, `call:cancel`, `call:end`. All share th
 
 Routing follows the normal contact-relay priority (`sendToRelay` → `sendSignal` fallback) — no special-cased delivery path.
 
+**Call notice.** Entering the `calling` phase also sends a regular, encrypted `app:message` with `type: "system"`/`kind: "call"` (see [Message Payload](#message-payload)) — a visible, offline-deliverable record of the attempt on both sides, independent of whether the call itself connects. Its text is built from the caller's plain username (`state.user`), not any locally-decorated contact-list display name — see the `0.4.2` changelog note at the top of this document for the bug this fixed. This is deliberately only wired for voice calls, not shell escalation: shell targets are always agent contacts, and `agent.py`'s message handler treats any incoming text as a command to execute.
+
 ### Signaling packets — offer / answer / ice (WebRTC negotiation)
 
 ```json
@@ -538,7 +558,7 @@ The service worker (`sw.js`) handles the two events every push implies: `push` (
 
 ### Not yet implemented
 
-- WebRTC call/shell artifacts (a `"15:45 · WebRTC call · 2 min"` line, or a missed-call indicator, as a normal encrypted message type) — once that exists, it rides this same push trigger for free, no server changes needed
+- A distinct missed-call/session indicator — **partially covered as of `0.4.x`**: the call notice (`type: "system"`/`kind: "call"`, see [Voice Calling](#voice-calling)) already rides this same push trigger for free, no server changes needed, since it's a normal `app:message`. What's still missing is anything that distinguishes "you got a call notice" from "you got a text" in the (deliberately generic) push body itself — not a gap in mechanism, just in payload specificity, which is out of scope per the design note above.
 - Any push trigger beyond `app:message` — `call:invite`/`shell:invite` are live-only and never buffered, so a push for a missed call/session would need its own trigger point at delivery-failure time, not `buf_write`
 - Any explicit messaging around the iOS "must be installed to Home Screen first" requirement — an iOS Safari tab user currently just sees the checkbox disabled with the generic "not supported in this browser" label
 
@@ -604,6 +624,7 @@ The service worker (`sw.js`) handles the two events every push implies: `push` (
 - Sync and backup types are e2e encrypted and routed by the server without inspection of contents — but the socket itself must be authed before any of these are accepted. This closes a prior gap where an unauthenticated connection could reach these branches before completing the challenge-response.
 - All seven `call:*` types and all seven `shell:*` types are delivered live-only via the same `deliver()`/`from`-validation path as `app:sync` and the `sync:*` types; unlike `app:message`/`app:migrate`/`app:burn` they are never durably buffered, so an offline callee/agent simply never rings.
 - `call:invite`/`call:claim`/`call:cancel`/`call:end` and `shell:invite`/`shell:claim`/`shell:cancel`/`shell:end` carry no `blob` — signed only, nothing to encrypt. `call:offer`/`call:answer`/`call:ice` and `shell:offer`/`shell:answer`/`shell:ice` carry an encrypted `blob` (SDP or one ICE candidate) and sign the ciphertext along with the envelope, same protection principle as `app:migrate`/`app:burn`.
+- Delivery acknowledgement (RECEIVED) is not a distinct signal-server packet type — it is an ordinary `app:message` carrying a `reaction` payload with `emoji: null`, routed exactly like any other message. See [Delivery Acknowledgement](#delivery-acknowledgement-received).
 
 ---
 
@@ -654,7 +675,7 @@ function mergeMessages(a, b) {
 }
 ```
 
-Reactions use a stable derived ID (`SHA-256("reaction:" + myId + ":" + targetMsgId)`) so a user's reaction to a given message always has the same ID — naturally replacing rather than duplicating on merge.
+Reactions use a stable derived ID (`SHA-256("reaction:" + myId + ":" + targetMsgId)`) so a user's reaction to a given message always has the same ID — naturally replacing rather than duplicating on merge. The delivery-acknowledgement reaction (see [Delivery Acknowledgement](#delivery-acknowledgement-received)) uses this identical derivation, so it merges the same way.
 
 ---
 
@@ -719,4 +740,4 @@ The relay itself is untrusted infrastructure. Cryptographic proof — signatures
 ---
 
 *MeshChat Protocol v1 — experimental, subject to change*  
-*Last updated: July 2026*
+*Last updated: August 2026*
