@@ -33,6 +33,16 @@ Recovery requires creating a new identity and re-establishing trust with contact
 
 ---
 
+## Burn notice is not revocation
+
+The "burn" action (self-destruct) does not revoke a compromised identity — it can't. Identity is deterministic from your username and passphrase, so anyone who still knows them, including you, can log back in at any time and re-derive the exact same keys, exactly as before.
+
+Burn only does two things: wipes local data on the device you burned from, and sends a signal asking your contacts to stop trusting that identity. Contacts who receive it convert you to blocked on their end. It cannot force this anywhere else, cannot stop a future login with the same credentials, and leaves no trace — on this device or any other — that a burn ever happened.
+
+If your passphrase itself is compromised, burn does not help; see "Compromised identities cannot be revoked" above. Burn is for when *you* want to stop using an identity and tell others to stop trusting it, not for containing a stolen passphrase.
+
+---
+
 # Synchronisation
 
 ## Eventual completeness
@@ -108,6 +118,16 @@ If that relay is unavailable, new messages cannot be delivered until the recipie
 Relay authentication prevents identity spoofing, but it does not prevent a relay operator from refusing connections, delaying delivery or discarding buffered ciphertext.
 
 End-to-end encryption protects message contents, not service availability.
+
+---
+
+## No TURN server — some calls and shell sessions will not connect
+
+Voice calls and agent shell escalation negotiate directly between the two devices over WebRTC, using STUN only (three public STUN servers, for resilience). There is no TURN relay, and this is a permanent design decision rather than a gap awaiting a fix.
+
+Most NAT setups traverse fine with STUN alone. Some do not — certain symmetric-NAT and carrier-grade-NAT pairings cannot establish a direct peer-to-peer path, and no amount of retrying will change that outcome. When this happens, the call or shell session simply fails to connect; the bounded command whitelist (for agent contacts) needs no WebRTC and is unaffected.
+
+This trade-off avoids running or trusting a TURN relay server, which would otherwise see call/shell metadata and be able to observe (though not decrypt) the connection attempt. The cost is that a small fraction of NAT pairings are permanently unreachable for calls and shell sessions specifically — text messaging is unaffected, since it never uses WebRTC.
 
 ---
 
