@@ -1371,8 +1371,15 @@ document.getElementById("loginButton").onclick = async (e) => {
 	state.encKey=await deriveSharedAesKey(keys.x25519Seed,x25519PublicKey);
 	// device identity — local-only, never backed up, never synced. Get-or-create
 	// every boot: same device + same identity always yields the same id.
-	state.deviceId = await getOrCreateDeviceId();
-	mlog.info(`DEVICE     ${pid(state.deviceId)}`);
+	// deviceId and routingId are two SEPARATE derivations off this ONE seed —
+	// deliberately unlinkable from each other (see deriveDeviceRoutingId,
+	// lib.js). deviceId is what contacts learn; routingId is what the relay
+	// learns, for per-device addressing ("bob::laptop") without handing the
+	// relay something a contact would also recognise.
+	const deviceSeed = await getOrCreateDeviceSeed();
+	state.deviceId  = await getOrCreateDeviceId(deviceSeed);
+	state.routingId = await deriveDeviceRoutingId(deviceSeed);
+	mlog.info(`DEVICE     ${pid(state.deviceId)}  routing=${pid(state.routingId)}`);
 	
     await loadContacts();
 	if(!state.contacts[state.publicId]){

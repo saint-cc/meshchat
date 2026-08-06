@@ -28,6 +28,16 @@ the address" scheme is gone):
              plaintext envelope metadata) — mirrors the client's fix that stopped
              deviceId from being unsigned/outer-envelope data.
 
+  routingId = base64url( HKDF-SHA256(deviceSeed, salt=32 zero bytes,
+              info="meshchat-v1:device-routing", 32B)[0:12] ) — a SEPARATE derivation
+              off the SAME deviceSeed as deviceId above, deliberately unlinkable from it
+              (HKDF-SHA256 is a PRF; different info labels off one secret give
+              cryptographically independent outputs). Presented to the relay in the
+              clear at auth time (sig:auth_init's routing_id field) so it can target
+              this specific agent process without ever learning anything that would
+              let it correlate with deviceId — which only CONTACTS ever see, inside
+              the encrypted message payload, never the relay.
+
   Per-pair message key: static-static X25519 ECDH between OUR private scalar and
   the CONTACT's public key, then HKDF-SHA256(sharedSecret, salt=32 zero bytes,
   info="meshchat-v1:pairwise", 32B) -> AES-256-GCM key. This is symmetric — the
@@ -287,6 +297,21 @@ def derive_identity_public_id(x25519_pub: bytes, ed25519_pub: bytes) -> str:
     return base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
 
 
+def derive_device_routing_id(device_seed: bytes) -> str:
+    """Mirrors deriveDeviceRoutingId() in meshchat-lib.js — same device
+    seed as device_id, deliberately different HKDF info label so the two
+    are cryptographically unlinkable without the seed itself. Presented
+    to the relay at auth time (sig:auth_init's routing_id) so it can
+    target this specific agent process/box without the relay ever seeing
+    anything that would also let it correlate with device_id (which
+    contacts, not the relay, learn — see send_reply's payload below)."""
+    raw = HKDF(
+        algorithm=SHA256(), length=32, salt=b"\x00" * 32,
+        info=b"meshchat-v1:device-routing",
+    ).derive(device_seed)
+    return base64.urlsafe_b64encode(raw[:12]).rstrip(b"=").decode()
+
+
 def derive_shared_aes_key(my_x25519_priv: X25519PrivateKey, their_x25519_pub_bytes: bytes) -> AESGCM:
     """Static-static X25519 ECDH + HKDF -> AES-256-GCM key, mirrors
     deriveSharedAesKey() in meshchat-lib.js. Symmetric: the same key results
@@ -447,6 +472,11 @@ class Identity:
         device_priv_key    = Ed25519PrivateKey.from_private_bytes(device_seed)
         device_pub_bytes   = device_priv_key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
         self.device_id     = derive_public_id(device_pub_bytes)
+
+        # routing_id — SEPARATE derivation off the same device_seed, never
+        # derivable from device_id or vice versa without the seed. See
+        # derive_device_routing_id's docstring.
+        self.routing_id    = derive_device_routing_id(device_seed)
 
 
 def parse_contact(name: str, shareable_key: str, identity: Identity) -> dict:
@@ -861,6 +891,7 @@ async def do_auth(ws, identity: Identity):
         "type":        "sig:auth_init",
         "x25519_pub":  list(identity.x25519_pub_bytes),
         "ed25519_pub": list(identity.sign_pub_bytes),
+        "routing_id":  identity.routing_id,
     }))
     while True:
         msg = json.loads(await ws.recv())
@@ -885,7 +916,8 @@ async def send_reply(ws, identity: Identity, contact: dict, text: str):
         # envelope — mirrors the client-side fix that closed the window
         # where deviceId used to be unsigned, outer-envelope metadata a
         # relay could rewrite silently.
-        "deviceId": identity.device_id, "n": next_send_counter(contact["public_id"]),
+        "deviceId": identity.device_id, "routingId": identity.routing_id,
+        "n": next_send_counter(contact["public_id"]),
     }
     blob = encrypt_message(contact["aesgcm"], payload)
     sig  = sign_blob(identity.sign_key, blob)
@@ -938,6 +970,7 @@ async def run():
     print(f" MeshChat Agent — {USERNAME}")
     print(f" publicId  : {identity.public_id}")
     print(f" deviceId  : {identity.device_id}")
+    print(f" routingId : {identity.routing_id}")
     print(f" shareable : {identity.shareable_key}")
     print("=" * 60)
 

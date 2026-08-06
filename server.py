@@ -46,7 +46,7 @@ RELAY_WSS_URL = os.environ.get("RELAY_WSS_URL", "")   # e.g. wss://yourrelay.exa
 # Protocol version — informational only for now, surfaced in sig:relay_info
 # so client/server version drift shows up in both logs. Not enforced yet;
 # room to add real backwards-compat handling once this is actually needed.
-PROTOCOL_VERSION = os.environ.get("PROTOCOL_VERSION", "0.4.2")
+PROTOCOL_VERSION = os.environ.get("PROTOCOL_VERSION", "0.4.3")
 
 # Connection limits
 MAX_CONNECTIONS        = int(os.environ.get("MAX_CONNECTIONS",        100))   # total WS sessions
@@ -232,10 +232,21 @@ for _bad_entry in _TRUSTED_PROXIES_INVALID:
 # ══════════════════════════════════════════
 
 connected: dict[str, set] = {}   # publicId → set of websockets
-pending_auth: dict = {}          # ws → { x25519_pub, ed25519_pub, nonce, ts, bits, ws }
+# connected_by_routing — publicId → routingId → set of websockets. Additive,
+# NOT a replacement for `connected`: a socket that presents a routing_id at
+# auth ends up in both. routingId is a separate HKDF derivation off the same
+# device seed as deviceId, deliberately unlinkable from it (see
+# deriveDeviceRoutingId in meshchat-lib.js / derive_device_routing_id in
+# Agent.py) — this map is what lets route_or_buffer target one specific
+# device ("bob::laptop") instead of fanning an app:message out to every live
+# session under a publicId. A set (not a bare ws) per routingId in case a
+# device briefly holds two sockets across a reconnect race.
+connected_by_routing: dict[str, dict[str, set]] = {}
+pending_auth: dict = {}          # ws → { x25519_pub, ed25519_pub, nonce, ts, bits, routing_id, ws }
 ip_conns: dict[str, int] = {}    # ip → active connection count
 ip_limiters: dict = {}           # ip → RateLimiter shared across all that IP's sockets
 ws_to_ids: dict = {}             # ws → set of publicIds (reverse of connected; O(1) cleanup)
+ws_to_routing: dict = {}         # ws → list of (publicId, routingId) (reverse of connected_by_routing; O(1) cleanup)
 buf_locks: dict = {}             # to_id → asyncio.Lock (serializes per-recipient buffer writes)
 buf_recipient_limiters: dict = {}   # to_id → RateLimiter, governs rate of NEW buffer writes for that recipient
 
@@ -515,10 +526,37 @@ async def send_to(ws, obj):
                 sockets.discard(ws)
                 if not sockets:
                     del connected[cid]
+        # same pruning for the routing-id map, via its own reverse index
+        for (cid, rid) in ws_to_routing.pop(ws, []):
+            devmap = connected_by_routing.get(cid)
+            if devmap:
+                sockets = devmap.get(rid)
+                if sockets:
+                    sockets.discard(ws)
+                    if not sockets:
+                        del devmap[rid]
+                if not devmap:
+                    del connected_by_routing[cid]
         return False
 
 async def deliver(to_id, obj, exclude=None):
     sessions = connected.get(to_id, set())
+    reached  = 0
+    for ws in list(sessions):
+        if ws is exclude: continue
+        if await send_to(ws, obj): reached += 1
+    return reached
+
+async def deliver_to_device(to_id, routing_id, obj, exclude=None):
+    """Same shape as deliver(), scoped to the socket(s) registered under
+    this specific (identity, routingId) pair — see connected_by_routing.
+    Used when an app:message envelope carries an optional toDevice field.
+    Deliberately does NOT fall back to every session under to_id if the
+    named device isn't currently registered — a device-targeted send
+    reaching nobody is exactly the "offline" case route_or_buffer already
+    handles via the shared identity-level buffer; broadcasting instead
+    would silently defeat the whole point of asking for one device."""
+    sessions = connected_by_routing.get(to_id, {}).get(routing_id, set())
     reached  = 0
     for ws in list(sessions):
         if ws is exclude: continue
@@ -554,10 +592,24 @@ async def route_or_buffer(kind, frm, to, msg, ws):
     failed — a push exists to tell someone to open the app and check,
     which is meaningless if they're already connected and about to
     receive the message live. app:migrate/app:burn never push — neither
-    is something a human needs to be woken up for."""
-    reached = await deliver(to, msg, exclude=ws)
+    is something a human needs to be woken up for.
+
+    Device targeting (app:message only): an envelope carrying `toDevice`
+    (a routingId — see connected_by_routing) is delivered only to that
+    specific registered device via deliver_to_device(), not fanned out to
+    every live session under `to`. The offline buffer stays IDENTITY-level
+    regardless — a device-targeted send that misses live delivery still
+    falls into the same shared buffer as everything else and is flushed to
+    whichever device reconnects first. Making the buffer itself
+    device-aware is a separate, deliberately deferred piece of work."""
+    to_device = msg.get("toDevice") if kind == "app:message" else None
+    if to_device:
+        reached = await deliver_to_device(to, to_device, msg, exclude=ws)
+    else:
+        reached = await deliver(to, msg, exclude=ws)
     if reached:
-        log.info("%-10s from=%s  to=%s  reached=%d", kind.upper(), short(frm), short(to), reached)
+        log.info("%-10s from=%s  to=%s  reached=%d%s", kind.upper(), short(frm), short(to), reached,
+                  f"  device={short(to_device)}" if to_device else "")
     if not reached or kind in ("app:migrate", "app:burn"):
         await buf_write(to, msg)
         if reached:
@@ -587,7 +639,8 @@ def derive_public_id(x25519_pub: bytes, ed25519_pub: bytes) -> str:
     digest = hashlib.sha256(x25519_pub + ed25519_pub).digest()[:12]
     return base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
 
-async def auth_challenge(ws, x25519_pub: bytes, ed25519_pub: bytes, bits: int, no_receive: bool = False):
+async def auth_challenge(ws, x25519_pub: bytes, ed25519_pub: bytes, bits: int, no_receive: bool = False,
+                          routing_id: str | None = None):
     """Generate a random nonce and send it in the clear — there is no
     longer a shared secret to encrypt it with (that was the whole bug:
     the old scheme's "auth" was decrypting a nonce with the same AES key
@@ -599,7 +652,16 @@ async def auth_challenge(ws, x25519_pub: bytes, ed25519_pub: bytes, bits: int, n
     no_receive: caller is a disposable probe (e.g. testRelayConnection) that
     has no business being treated as a reachable recipient — it intends to
     close itself the moment auth_ok arrives. Carried through to auth_verify
-    so registration and buffer flush can be skipped for it specifically."""
+    so registration and buffer flush can be skipped for it specifically.
+
+    routing_id: optional per-device routing token (see connected_by_routing) —
+    already validated (valid_id) by the caller before this is reached. It's
+    presented in the clear here for the same reason x25519_pub/ed25519_pub
+    are: nothing about it is secret on its own (it's only unlinkable to
+    deviceId, not hidden from the relay it's addressed to), and possession
+    of the matching identity is still what auth_verify actually proves.
+    Carried through pending_auth so it's only ever registered once the
+    challenge is genuinely answered, same as everything else here."""
     nonce_plain = secrets.token_bytes(32)
     pending_auth[id(ws)] = {
         "x25519_pub":  x25519_pub,
@@ -608,6 +670,7 @@ async def auth_challenge(ws, x25519_pub: bytes, ed25519_pub: bytes, bits: int, n
         "ts":          time.monotonic(),
         "bits":        bits,
         "no_receive":  no_receive,
+        "routing_id":  routing_id,
         "ws":          ws,   # so sweep_pending_auth() can actively close stale entries
     }
     await send_to(ws, {
@@ -647,16 +710,21 @@ async def auth_verify(ws, sig_bytes: list, addr: str) -> str | None:
         await send_to(ws, {"type": "sig:auth_fail", "reason": "server_busy"})
         return None
 
-    public_id = derive_public_id(entry["x25519_pub"], entry["ed25519_pub"])
+    public_id  = derive_public_id(entry["x25519_pub"], entry["ed25519_pub"])
     no_receive = entry.get("no_receive", False)
+    routing_id = entry.get("routing_id")
     if not no_receive:
         if public_id not in connected:
             connected[public_id] = set()
         connected[public_id].add(ws)
         ws_to_ids.setdefault(ws, set()).add(public_id)
-    log.info("AUTH OK    id=%s  bits=%d  peer=%s  keys=%d  sessions=%d%s",
+        if routing_id:
+            connected_by_routing.setdefault(public_id, {}).setdefault(routing_id, set()).add(ws)
+            ws_to_routing.setdefault(ws, []).append((public_id, routing_id))
+    log.info("AUTH OK    id=%s  bits=%d  peer=%s  keys=%d  sessions=%d%s%s",
              short(public_id), entry["bits"], addr, unique_keys(), session_count(),
-             "  [no_receive — not registered]" if no_receive else "")
+             "  [no_receive — not registered]" if no_receive else "",
+             f"  routing={short(routing_id)}" if (routing_id and not no_receive) else "")
     await send_to(ws, {"type": "sig:auth_ok", "public_id": public_id})
     if not no_receive:
         await buf_deliver(public_id, ws)
@@ -1069,6 +1137,7 @@ async def handler(ws):
                 ed25519_list = msg.get("ed25519_pub")
                 bits         = 256
                 no_receive   = bool(msg.get("no_receive", False))
+                routing_id   = msg.get("routing_id")
                 if not x25519_list or not ed25519_list:
                     log.warning("AUTH       bad auth_init  peer=%s", addr)
                     await send_to(ws, {"type": "sig:auth_fail", "reason": "bad_init"})
@@ -1080,7 +1149,13 @@ async def handler(ws):
                                 bits, len(x25519_pub), len(ed25519_pub), addr)
                     await send_to(ws, {"type": "sig:auth_fail", "reason": "bad_key_length"})
                     continue
-                await auth_challenge(ws, x25519_pub, ed25519_pub, bits, no_receive)
+                # optional — old clients simply omit it, falling back to
+                # today's broadcast-to-every-session-under-publicId behavior
+                if routing_id is not None and not valid_id(routing_id):
+                    log.warning("AUTH       bad routing_id  peer=%s", addr)
+                    await send_to(ws, {"type": "sig:auth_fail", "reason": "bad_routing_id"})
+                    continue
+                await auth_challenge(ws, x25519_pub, ed25519_pub, bits, no_receive, routing_id)
 
             # ── auth_proof: client returns a signature over the nonce ──
             elif kind == "sig:auth_proof":
@@ -1251,6 +1326,19 @@ async def handler(ws):
                              short(cid), addr, remaining)
         # drop reverse-map entry (send_to's failure path may have popped it already)
         ws_to_ids.pop(ws, None)
+        # same for the routing-id map — a clean close reaches here without
+        # ever going through send_to's failure branch, so this path needs
+        # its own cleanup rather than relying on that one
+        for (cid, rid) in ws_to_routing.pop(ws, []):
+            devmap = connected_by_routing.get(cid)
+            if devmap:
+                sockets = devmap.get(rid)
+                if sockets:
+                    sockets.discard(ws)
+                    if not sockets:
+                        del devmap[rid]
+                if not devmap:
+                    del connected_by_routing[cid]
 
 # ══════════════════════════════════════════
 #   SIGNAL SERVER ENTRYPOINT (async)

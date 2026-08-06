@@ -13,7 +13,7 @@
 
    Load order: meshchat-lib.js → meshchat-gui.js → meshchat.js → statemachine.js
 ═══════════════════════════════════════════════════════════════ */
-const CLIENT_VERSION = "0.4.2";
+const CLIENT_VERSION = "0.4.3";
 
 const POLL_INTERVAL_MS        	= 30_000;			// base interval between presence polls
 const POLL_JITTER_MS          	= 10_000;			// ± random jitter added to poll interval
@@ -42,7 +42,14 @@ const state = {
   // skip resending on every ordinary reconnect to the same relay, while
   // still firing again automatically after a migration (new relay = new
   // key = mismatch against this).
-  vapidPublicKey: null, pushSyncedRelayWss: null
+  vapidPublicKey: null, pushSyncedRelayWss: null,
+  // routingId — separate HKDF derivation off the same device seed as
+  // deviceId, deliberately unlinkable from it. See deriveDeviceRoutingId
+  // (lib.js) and getOrCreateDeviceSeed below. Local-only until presented
+  // to the relay at auth time (sig:auth_init) and, passively, to contacts
+  // inside message payloads — never in serialiseContacts()/backups, same
+  // tier as deviceId itself.
+  routingId: null
 };
 
 const SIGNAL_URL		=`wss://${window.location.hostname}/ws/`;
@@ -106,17 +113,22 @@ setInterval(pruneOnline, PRUNE_INTERVAL_MS);
 // secrecy can be derived from this same seed later via the standard
 // birational Ed25519↔X25519 conversion — no re-keying, no redistribution,
 // no "deviceId v1 vs v2" when that work actually happens.
-async function getOrCreateDeviceId() {
+async function getOrCreateDeviceSeed() {
   const storageKey = DEVICE_KEY_STORAGE + "_" + state.publicId;
-  let seed;
   const existing = localStorage.getItem(storageKey);
-  if (existing) {
-    seed = base64ToRaw(existing);
-  } else {
-    seed = crypto.getRandomValues(new Uint8Array(32));
-    localStorage.setItem(storageKey, rawToBase64(seed));
-    mlog.info("DEVICE     new device identity generated");
-  }
+  if (existing) return base64ToRaw(existing);
+  const seed = crypto.getRandomValues(new Uint8Array(32));
+  localStorage.setItem(storageKey, rawToBase64(seed));
+  mlog.info("DEVICE     new device identity generated");
+  return seed;
+}
+
+// deviceId and routingId (lib.js) are two SEPARATE derivations off the
+// SAME seed — see deriveDeviceRoutingId's comment for why that separation
+// matters. Split out from the old getOrCreateDeviceId so login can derive
+// both from one seed fetch/generate rather than duplicating the
+// get-or-create logic per derivation.
+async function getOrCreateDeviceId(seed) {
   const publicKey = ed25519.getPublicKey(seed);
   return await derivePublicId(publicKey);
 }
@@ -310,7 +322,7 @@ function saveDeviceRegistry() {
 // `lastN` is updated to whatever's highest seen, but nothing is dropped or
 // enforced yet. Callers that don't have an `n` (restore/backup/self-sync
 // paths) simply omit it — lastSeen still updates, lastN is left alone.
-function recordKnownDevice(identityId, deviceId, n) {
+function recordKnownDevice(identityId, deviceId, n, routingId) {
   if (!identityId || !deviceId) return;
   if (!state.knownDevices[identityId]) state.knownDevices[identityId] = {};
   const existing = state.knownDevices[identityId][deviceId];
@@ -322,7 +334,13 @@ function recordKnownDevice(identityId, deviceId, n) {
     }
     lastN = Math.max(prevLastN, n);
   }
-  state.knownDevices[identityId][deviceId] = { lastSeen: Date.now(), lastN };
+  // routingId is learned passively, the same way deviceId itself is — only
+  // adopt an explicitly-provided value, same "don't let an omitted field
+  // silently blank out what's already known" rule mergeContactMeta uses
+  // for contact.type. Older/other callers that don't pass it (e.g. restore
+  // paths) leave whatever's already on file untouched.
+  const prevRoutingId = (existing && typeof existing === "object") ? existing.routingId : undefined;
+  state.knownDevices[identityId][deviceId] = { lastSeen: Date.now(), lastN, routingId: routingId || prevRoutingId || null };
   saveDeviceRegistry();
 }
 
@@ -827,6 +845,7 @@ function startAuth() {
     type:        "sig:auth_init",
     x25519_pub:  Array.from(base64ToRaw(parts[0])),
     ed25519_pub: Array.from(base64ToRaw(parts[1])),
+    routing_id:  state.routingId || undefined,
   }));
   mlog.info("AUTH       init");
 }
@@ -1149,6 +1168,7 @@ function getOrOpenRelayConn(url, messageOnly) {
         type: "sig:auth_init",
         x25519_pub:  Array.from(base64ToRaw(parts[0])),
         ed25519_pub: Array.from(base64ToRaw(parts[1])),
+        routing_id:  state.routingId || undefined,
       }));
       mlog.info(`RELAY      open, authing  host=${hostname}`);
     };
@@ -1429,7 +1449,7 @@ async function sendImageMessage(file) {
         const me       = state.contacts[state.publicId];
         const relay    = me?.lastRelay ? { wss: me.lastRelay } : undefined;
 
-        const payload   = { id, type: "image", data: base64, mimeType, ts, deviceId: state.deviceId, n: nextSendCounter(state.currentChat), ...(relay ? { relay } : {}) };
+        const payload   = { id, type: "image", data: base64, mimeType, ts, deviceId: state.deviceId, routingId: state.routingId, n: nextSendCounter(state.currentChat), ...(relay ? { relay } : {}) };
         const encrypted = await encryptMessage(contact.encKey, payload);
         const sig       = await signBlob(encrypted);
 
@@ -1475,7 +1495,7 @@ async function sendAudioMessage(blob) {
       const relay    = me?.lastRelay ? { wss: me.lastRelay } : undefined;
 
       // encrypt for transit
-      const payload   = { id, type: "audio", data: base64, mimeType, ts, deviceId: state.deviceId, n: nextSendCounter(state.currentChat), ...(relay ? { relay } : {}) };
+      const payload   = { id, type: "audio", data: base64, mimeType, ts, deviceId: state.deviceId, routingId: state.routingId, n: nextSendCounter(state.currentChat), ...(relay ? { relay } : {}) };
       const encrypted = await encryptMessage(contact.encKey, payload);
       const sig       = await signBlob(encrypted);
 
@@ -1648,7 +1668,7 @@ async function receiveMessage(msg) {
     // poison the device registry. This was previously firing unconditionally
     // before decrypt/verify even ran — left over from debugging signature
     // failures early on; tightened now that it's a real trust boundary.
-    if (valid && plain.deviceId) recordKnownDevice(msg.from, plain.deviceId, plain.n);
+    if (valid && plain.deviceId) recordKnownDevice(msg.from, plain.deviceId, plain.n, plain.routingId);
     if (plain.id) packetCache[plain.id] = { envelope: msg, payload: plain };
     if (plain.relay?.wss) {
       updateRelay(contact, plain.relay.wss, plain.ts || Date.now());
@@ -2077,7 +2097,7 @@ async function sendMessage() {
   try {
     const me     = state.contacts[state.publicId];
     const relay  = me?.lastRelay ? { wss: me.lastRelay } : undefined;
-    const payload = { id, text, ts, deviceId: state.deviceId, n: nextSendCounter(state.currentChat), ...(relay ? { relay } : {}) };
+    const payload = { id, text, ts, deviceId: state.deviceId, routingId: state.routingId, n: nextSendCounter(state.currentChat), ...(relay ? { relay } : {}) };
     const blob   = await encryptMessage(contact.encKey, payload);
     const sig    = await signBlob(blob);
 
@@ -2115,7 +2135,7 @@ async function sendReaction(targetMsgId, emoji, contactId = state.currentChat) {
   const ts  = Date.now();
   const me    = state.contacts[state.publicId];
   const relay = me?.lastRelay ? { wss: me.lastRelay } : undefined;
-  const payload  = { id, type: "reaction", targetId: targetMsgId, emoji, ts, deviceId: state.deviceId, ...(relay ? { relay } : {}) };
+  const payload  = { id, type: "reaction", targetId: targetMsgId, emoji, ts, deviceId: state.deviceId, routingId: state.routingId, ...(relay ? { relay } : {}) };
   const blob     = await encryptMessage(contact.encKey, payload);
   const sig      = await signBlob(blob);
 
@@ -2211,7 +2231,7 @@ async function sendCallNotice(id) {
     const me    = state.contacts[state.publicId];
     const relay = me?.lastRelay ? { wss: me.lastRelay } : undefined;
     const payload = { id: msgId, type: "system", kind: "call", text, ts,
-                       deviceId: state.deviceId, n: nextSendCounter(id), ...(relay ? { relay } : {}) };
+                       deviceId: state.deviceId, routingId: state.routingId, n: nextSendCounter(id), ...(relay ? { relay } : {}) };
     const blob    = await encryptMessage(contact.encKey, payload);
     const sig     = await signBlob(blob);
 
