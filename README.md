@@ -17,10 +17,10 @@ credentials always produce the same cryptographic identity.
 
 There are no accounts to create and no passwords stored on any server. Your passphrase **is** your identity.
 
-Contacts are added by exchanging a shareable address (QR code or copy-paste). This contains your encryption 
-public key, signing public key and current relay address. No registration or central directory is required.
+Contacts are added by exchanging a shareable address (QR code or copy-paste). This contains your X25519 
+public key (used for message encryption), your Ed25519 public key (used for signing), and your current relay address. No registration or central directory is required.
 
-Messages are encrypted with AES-256-GCM for the recipient and signed with Ed25519 before leaving your device.
+Messages are encrypted with AES-256-GCM using a per-contact key agreed via X25519 Diffie-Hellman, and signed with Ed25519 before leaving your device.
 
 ---
 

@@ -62,27 +62,27 @@ deviceId = base64url( SHA-256( Ed25519.getPublicKey(seed) )[0:12] )
 
 `deviceId` is strictly local — it never appears inside any encrypted backup blob or `serialiseContacts()` output, so it is never included in backups, exports, or restore payloads. It rides only as plaintext envelope metadata on specific wire packets where device distinction is meaningful (currently `app:message` and the self-sync backup path). The underlying seed is architecturally prepared for a future X25519 DH key via the standard Ed25519↔X25519 birational conversion — no re-keying needed when that work happens. (This is a *separate* X25519 use from the identity-level agreement key above — device-level forward secrecy is future Double Ratchet work, not part of this pass.)
 
-### Device Routing ID
+### Device Endpoint ID
 
 A second, deliberately *unlinkable* value derived from the same device seed as `deviceId`, presented to the relay instead of to contacts:
 
 ```
-routingId = base64url( HKDF-SHA256(
+endpointId = base64url( HKDF-SHA256(
   key  = deviceSeed,
   salt = 32 zero bytes,
-  info = "meshchat-v1:device-routing",
+  info = "meshchat-v1:device-endpoint",
   bits = 256
 )[0:12] )
 ```
 
-`deviceId` and `routingId` share one seed but are computed under different HKDF info labels. HKDF-SHA256 is a PRF: two outputs derived from the same key under different labels are computationally independent of one another — knowing one gives no leverage on the other without the seed itself. This closes a specific correlation gap that a single shared device identifier would otherwise open: a relay operator sees every `routingId` that ever authenticates, and a contact sees every `deviceId` a sender's messages carry, but neither party can link their view to the other's. Without this split, a single "device identifier" doing both jobs would hand the relay a value contacts also recognise from their own device popover — turning "which socket to route to" into "which physical device a given contact is using," a strictly larger disclosure than routing requires.
+`deviceId` and `endpointId` share one seed but are computed under different HKDF info labels. HKDF-SHA256 is a PRF: two outputs derived from the same key under different labels are computationally independent of one another — knowing one gives no leverage on the other without the seed itself. This closes a specific correlation gap that a single shared device identifier would otherwise open: a relay operator sees every `endpointId` that ever authenticates, and a contact sees every `deviceId` a sender's messages carry, but neither party can link their view to the other's. Without this split, a single "device identifier" doing both jobs would hand the relay a value contacts also recognise from their own device popover — turning "which socket to route to" into "which physical device a given contact is using," a strictly larger disclosure than routing requires.
 
-This is **not** anonymity from the relay in any broader sense — a relay that wants to correlate connections by IP, timing, or reconnect pattern can still do so under whatever identifier is presented, `routingId` included. What the split buys is narrower and specific: it prevents *joining* the relay's view with a contact's view through a shared identifier. Same tier of exposure as `publicId` already has at the identity level, one notch more granular, not a new category of leak.
+This is **not** anonymity from the relay in any broader sense — a relay that wants to correlate connections by IP, timing, or reconnect pattern can still do so under whatever identifier is presented, `endpointId` included. What the split buys is narrower and specific: it prevents *joining* the relay's view with a contact's view through a shared identifier. Same tier of exposure as `publicId` already has at the identity level, one notch more granular, not a new category of leak.
 
-`routingId` is:
+`endpointId` is:
 - **Presented to the relay** — optionally, in the clear, alongside the two public keys on `sig:auth_init` (see [Relay Authentication](#relay-authentication)). Optional for backward compatibility: a client that omits it simply gets no device-level routing, falling back to the existing broadcast-to-every-session behavior.
 - **Learned passively by contacts** — inside the encrypted message payload, alongside `deviceId` and `n` (see [Message Payload](#message-payload)), the same way `deviceId` itself is learned. Recorded in the device registry (see [Device Registry](#device-registry)) only after signature verification, same rule as `deviceId`.
-- **Never in the shareable address, never in backups** — it has no business in either. The shareable address is meant to be handed to strangers; `routingId` is meaningful only to the relay currently holding a live socket for it.
+- **Never in the shareable address, never in backups** — it has no business in either. The shareable address is meant to be handed to strangers; `endpointId` is meaningful only to the relay currently holding a live socket for it.
 - **Static per (device, identity)**, same tradeoff as everything else derived deterministically here — no rotation, no revocation.
 
 ---
@@ -110,17 +110,17 @@ Authentication happens on connect, before routing or buffer delivery. The protoc
 ### Sequence
 
 ```
-client → server:  auth_init      { x25519_pub: [...bytes], ed25519_pub: [...bytes], routing_id?: "..." }
+client → server:  auth_init      { x25519_pub: [...bytes], ed25519_pub: [...bytes], endpoint_id?: "..." }
 server → client:  auth_challenge { nonce: [...bytes] }
 client → server:  auth_proof     { sig: [...bytes] }
 server → client:  auth_ok        { public_id: "..." }
              or:  auth_fail      { reason: "..." }
 ```
 
-1. Client sends both its X25519 and Ed25519 public key bytes, plus an optional `routing_id` (see [Device Routing ID](#device-routing-id)) — presented in the clear, same as the two public keys, and validated (`valid_id`) before the challenge is even issued
+1. Client sends both its X25519 and Ed25519 public key bytes, plus an optional `endpoint_id` (see [Device Endpoint ID](#device-endpoint-id)) — presented in the clear, same as the two public keys, and validated (`valid_id`) before the challenge is even issued
 2. Server generates a random 32-byte nonce and sends it back in the clear — there is no shared secret between client and server to encrypt it with, and nothing about the nonce itself is worth hiding
 3. Client signs the nonce with its Ed25519 private signing key and returns the signature
-4. Server verifies the signature against the presented Ed25519 public key, derives publicId from **both** presented public keys (see [PublicId](#publicid)), registers the socket, flushes buffer. If a `routing_id` was presented, the socket is additionally registered into `connected_by_routing[publicId][routing_id]`, enabling device-targeted delivery for `app:message` (see [Device Routing ID](#device-routing-id) and [Transport and Routing](#transport-and-routing))
+4. Server verifies the signature against the presented Ed25519 public key, derives publicId from **both** presented public keys (see [PublicId](#publicid)), registers the socket, flushes buffer. If a `endpoint_id` was presented, the socket is additionally registered into `connected_by_endpoint[publicId][endpoint_id]`, enabling device-targeted delivery for `app:message` (see [Device Endpoint ID](#device-endpoint-id) and [Transport and Routing](#transport-and-routing))
 5. Client proceeds with `sig:relay_req`, presence polling, and normal operation
 
 The sign-the-nonce scheme is a genuine possession proof — only the holder of the Ed25519 private key can produce a valid signature, and the server can verify it using only the public key the client just presented.
@@ -137,7 +137,7 @@ The home relay is never targeted via this path. `getOrOpenRelayConn` checks the 
 
 ### Auth failure
 
-On `auth_fail` the client does not retry immediately — the socket `onclose` handler drives reconnect with the normal backoff. Reason codes: `bad_init`, `bad_key_length`, `bad_routing_id`, `timeout`, `proof_invalid`, `not_authenticated`.
+On `auth_fail` the client does not retry immediately — the socket `onclose` handler drives reconnect with the normal backoff. Reason codes: `bad_init`, `bad_key_length`, `bad_endpoint_id`, `timeout`, `proof_invalid`, `not_authenticated`.
 
 ### Security properties
 
@@ -205,14 +205,14 @@ The plaintext payload (before encryption) for a text message:
   "text":      "hello",
   "ts":        1234567890123,
   "deviceId":  "<deviceId>",
-  "routingId": "<routingId>",
+  "endpointId": "<endpointId>",
   "relay":     { "wss": "wss://sender.example.com/ws/" }
 }
 ```
 
 The `relay` field carries the sender's current relay WSS URL. Recipients update their routing table for the sender on every message received. This is how relay information propagates passively through the network.
 
-`routingId` (see [Device Routing ID](#device-routing-id)) travels alongside `deviceId` inside this same encrypted payload — it's how a contact passively *learns* a sender's routingId, the same way they learn `deviceId`, recorded into the device registry only once the envelope's signature has verified. Optional; older payloads that omit it leave whatever's already on file for that device untouched rather than being treated as a clear-it signal.
+`endpointId` (see [Device Endpoint ID](#device-endpoint-id)) travels alongside `deviceId` inside this same encrypted payload — it's how a contact passively *learns* a sender's endpointId, the same way they learn `deviceId`, recorded into the device registry only once the envelope's signature has verified. Optional; older payloads that omit it leave whatever's already on file for that device untouched rather than being treated as a clear-it signal.
 
 **Other payload types:** `audio`, `image`, `reaction`, `system`. Audio and image carry `data` (base64) and `mimeType`. Reactions carry `targetId` and `emoji`. System notices carry `kind` and `text` — a real, encrypted `app:message` artifact (not a signaling-only packet) used today for the WebRTC call notice (`kind: "call"`), so an offline callee still gets it via the normal offline-buffer/push path and both sides keep a visible record of the attempt regardless of whether the call itself connects.
 
@@ -246,13 +246,13 @@ The wire packet wrapping the encrypted blob:
   "blob":      { "v": 1, "iv": [...], "data": [...] },
   "sig":       [...],
   "deviceId":  "<deviceId>",
-  "toDevice":  "<recipient's routingId>"
+  "toEndpoint":  "<recipient's endpointId>"
 }
 ```
 
 `deviceId` is the sender's device identity (see [Device Identity](#device-identity)). It is plaintext — not inside the encrypted blob — so the relay and recipient can read it without decryption. Recipients record it in the local device registry to build passive knowledge of which devices a given identity runs. It is optional; old clients that omit it are handled gracefully (the contact's device list stays at the "unknown" placeholder).
 
-`toDevice`, when present, is the **recipient's** `routingId` (learned earlier via the mechanism above) — a request to route this specific message to one registered device rather than fanning it out to every live session under `to`. The relay honors this via `deliver_to_device`/`connected_by_routing` (see [Device Routing ID](#device-routing-id)); a `toDevice` value that isn't currently registered is treated as "that device is offline," not silently broadcast to every session. Optional and orthogonal to the sender's own `deviceId`/`routingId` fields above — a message can identify its sender's device, target the recipient's device, both, or neither.
+`toEndpoint`, when present, is the **recipient's** `endpointId` (learned earlier via the mechanism above) — a request to route this specific message to one registered device rather than fanning it out to every live session under `to`. The relay honors this via `deliver_to_endpoint`/`connected_by_endpoint` (see [Device Endpoint ID](#device-endpoint-id)); a `toEndpoint` value that isn't currently registered is treated as "that device is offline," not silently broadcast to every session. Optional and orthogonal to the sender's own `deviceId`/`endpointId` fields above — a message can identify its sender's device, target the recipient's device, both, or neither.
 
 ---
 
@@ -395,21 +395,21 @@ Each client maintains a local device registry (`meshchat_known_devices_v1_<publi
 ```json
 {
   "<identityId>": {
-    "<deviceId>": { "lastSeen": <timestamp>, "lastN": <int>, "routingId": "<routingId or null>" }
+    "<deviceId>": { "lastSeen": <timestamp>, "lastN": <int>, "endpointId": "<endpointId or null>" }
   }
 }
 ```
 
 This is local-only, never included in backup blobs or `serialiseContacts()`. It is populated passively from two sources:
 
-1. **`app:message` receipt** — the outer `deviceId` field records which device a contact sent from; the encrypted payload's `routingId` field (see [Device Routing ID](#device-routing-id)), once present, is recorded alongside it — only ever adopting an explicitly-provided value, so a payload that omits it (e.g. from an older client) leaves whatever's already on file untouched rather than clearing it.
-2. **Self-sync backup path** — `deviceId`/`fingerprint` fields on `sync:backup_push` and `sync:backup_accept` teach each of the user's own devices about the others (see [Peer Backup Protocol](#peer-backup-protocol)). This path does not currently carry `routingId`.
+1. **`app:message` receipt** — the outer `deviceId` field records which device a contact sent from; the encrypted payload's `endpointId` field (see [Device Endpoint ID](#device-endpoint-id)), once present, is recorded alongside it — only ever adopting an explicitly-provided value, so a payload that omits it (e.g. from an older client) leaves whatever's already on file untouched rather than clearing it.
+2. **Self-sync backup path** — `deviceId`/`fingerprint` fields on `sync:backup_push` and `sync:backup_accept` teach each of the user's own devices about the others (see [Peer Backup Protocol](#peer-backup-protocol)). This path does not currently carry `endpointId`.
 
 The registry is displayed in a per-contact device popover in the UI. Contacts with no recorded devices show an "unknown" placeholder. The data accumulates passively through normal traffic — no dedicated discovery handshake.
 
 ### Planned propagation
 
-`deviceId` will be extended to `app:migrate` and `app:sync` envelopes in future passes; `routingId` (see [Device Routing ID](#device-routing-id)) would follow the same path if device-targeted delivery is ever needed for those types. Per-device forward secrecy (X25519 DH) is architecturally prepared via the device seed but explicitly deferred.
+`deviceId` will be extended to `app:migrate` and `app:sync` envelopes in future passes; `endpointId` (see [Device Endpoint ID](#device-endpoint-id)) would follow the same path if device-targeted delivery is ever needed for those types. Per-device forward secrecy (X25519 DH) is architecturally prepared via the device seed but explicitly deferred.
 
 ---
 
@@ -599,10 +599,10 @@ The service worker (`sw.js`) handles the two events every push implies: `push` (
 
 | Type | Fields | Auth required | Description |
 |---|---|---|---|
-| `sig:auth_init`     | `x25519_pub`, `ed25519_pub`, `no_receive?`, `routing_id?` | no  | Begin challenge-response, presenting both public keys. `no_receive: true` skips registration and buffer flush (used by probes). `routing_id`, if present, additionally registers the socket into `connected_by_routing` for device-targeted delivery (see [Device Routing ID](#device-routing-id)) |
+| `sig:auth_init`     | `x25519_pub`, `ed25519_pub`, `no_receive?`, `endpoint_id?` | no  | Begin challenge-response, presenting both public keys. `no_receive: true` skips registration and buffer flush (used by probes). `endpoint_id`, if present, additionally registers the socket into `connected_by_endpoint` for device-targeted delivery (see [Device Endpoint ID](#device-endpoint-id)) |
 | `sig:auth_proof`    | `sig`                                     | no  | Return Ed25519 signature over the server's nonce |
 | `sig:announce`      | `ids[]`                                   | yes  | Check local presence of up to 10 IDs |
-| `app:message`       | `from`, `to`, `blob`, `sig`, `deviceId?`, `toDevice?` | yes | Deliver message — `from` must match authed identity on this socket. `toDevice`, if present, targets one specific registered device (the recipient's `routingId`) instead of every live session under `to` |
+| `app:message`       | `from`, `to`, `blob`, `sig`, `deviceId?`, `toEndpoint?` | yes | Deliver message — `from` must match authed identity on this socket. `toEndpoint`, if present, targets one specific registered device (the recipient's `endpointId`) instead of every live session under `to` |
 | `app:migrate`       | `from`, `to`, `blob`, `sig`               | yes | Notify of a relay migration — always durably buffered in addition to live delivery |
 | `app:burn`          | `from`, `to`, `blob`, `sig`               | yes | Notify of a burn (self-destruct / stop-trusting) — always durably buffered in addition to live delivery, own overwrite bucket |
 | `app:sync`          | `from`, `to`, `msgs[]`, `reply`           | yes  | Manual sync exchange |
@@ -654,7 +654,7 @@ The service worker (`sw.js`) handles the two events every push implies: `push` (
 - All seven `call:*` types and all seven `shell:*` types are delivered live-only via the same `deliver()`/`from`-validation path as `app:sync` and the `sync:*` types; unlike `app:message`/`app:migrate`/`app:burn` they are never durably buffered, so an offline callee/agent simply never rings.
 - `call:invite`/`call:claim`/`call:cancel`/`call:end` and `shell:invite`/`shell:claim`/`shell:cancel`/`shell:end` carry no `blob` — signed only, nothing to encrypt. `call:offer`/`call:answer`/`call:ice` and `shell:offer`/`shell:answer`/`shell:ice` carry an encrypted `blob` (SDP or one ICE candidate) and sign the ciphertext along with the envelope, same protection principle as `app:migrate`/`app:burn`.
 - Delivery acknowledgement (RECEIVED) is not a distinct signal-server packet type — it is an ordinary `app:message` carrying a `reaction` payload with `emoji: null`, routed exactly like any other message. See [Delivery Acknowledgement](#delivery-acknowledgement-received).
-- `toDevice`-targeted delivery is live-only in its device-scoping — the offline buffer (`buf_write`/`buf_deliver`) remains identity-level regardless of `toDevice`. A device-targeted message that misses live delivery still lands in the same shared per-`to`-identity buffer as any other message and is flushed to whichever device authenticates first, not held back for the named device specifically. Making the buffer itself device-aware is explicitly deferred — see `Roadmap.md`.
+- `toEndpoint`-targeted delivery is live-only in its device-scoping — the offline buffer (`buf_write`/`buf_deliver`) remains identity-level regardless of `toEndpoint`. A device-targeted message that misses live delivery still lands in the same shared per-`to`-identity buffer as any other message and is flushed to whichever device authenticates first, not held back for the named device specifically. Making the buffer itself device-aware is explicitly deferred — see `Roadmap.md`.
 
 ---
 
@@ -742,7 +742,7 @@ The relay itself is untrusted infrastructure. Cryptographic proof — signatures
 | `meshchat_contacts_<publicId>`         | per identity | Encrypted contact store (backup key) |
 | `meshchat_peer_backups_v1_<publicId>`  | per identity | Peer-supplied encrypted backup blobs |
 | `meshchat_peer_tokens_v1_<publicId>`   | per identity | Contact tokens for restore gating |
-| `meshchat_known_devices_v1_<publicId>` | per identity | Device registry — `{ identityId: { deviceId: { lastSeen, lastN, routingId } } }` |
+| `meshchat_known_devices_v1_<publicId>` | per identity | Device registry — `{ identityId: { deviceId: { lastSeen, lastN, endpointId } } }` |
 | `meshchat_device_seed_v1_<publicId>`   | per device   | Raw 32-byte device seed (base64). Never shared, never backed up |
 | `meshchat_push_pref_v1_<publicId>`     | per device   | Push notification opt-in ("1"/"0"). Local-only preference — the actual `PushSubscription` lives in the browser's own PushManager storage, not here |
 

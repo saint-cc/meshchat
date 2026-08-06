@@ -173,21 +173,21 @@ async function deriveIdentityPublicId(x25519PublicKey, ed25519PublicKey) {
 // Device routing ID — a SEPARATE derivation off the same device seed that
 // produces deviceId, deliberately unlinkable from it. deviceId hashes a
 // public Ed25519 key (something contacts see and use to build their device
-// popover); routingId is a raw HKDF output presented only to the relay,
+// popover); endpointId is a raw HKDF output presented only to the relay,
 // under its own info label. HKDF-SHA256 is a PRF, so knowing one output
 // gives no leverage on the other without the seed itself — a relay
-// operator who sees every routingId that ever connects can't link any of
+// operator who sees every endpointId that ever connects can't link any of
 // them to a deviceId a contact might know, and a contact who only ever
-// sees deviceId can't derive routingId. That separation is what makes
+// sees deviceId can't derive endpointId. That separation is what makes
 // per-device relay routing ("bob::laptop") possible without handing the
 // relay a durable identifier that doubles as a device fingerprint contacts
 // would also recognise. Same seed as getOrCreateDeviceId — get-or-created
 // together at login (see getOrCreateDeviceSeed in meshchat.js) since both
 // need it at the same moment.
-async function deriveDeviceRoutingId(deviceSeed) {
+async function deriveDeviceEndpointId(deviceSeed) {
   const key  = await crypto.subtle.importKey("raw", deviceSeed, { name: "HKDF" }, false, ["deriveBits"]);
   const bits = await crypto.subtle.deriveBits(
-    { name: "HKDF", hash: "SHA-256", salt: new Uint8Array(32), info: new TextEncoder().encode("meshchat-v1:device-routing") },
+    { name: "HKDF", hash: "SHA-256", salt: new Uint8Array(32), info: new TextEncoder().encode("meshchat-v1:device-endpoint") },
     key, 256
   );
   return btoa(String.fromCharCode(...new Uint8Array(bits).slice(0, 12))).replace(/\+/g,'-').replace(/\//g,'_').replace(/=/g,'');

@@ -116,7 +116,45 @@ before implementation starts, not just during it.
   session opens with competitive research first (Signal Sesame, Matrix
   Olm/Megolm, Session, SimpleX — current specifics pulled fresh rather
   than from memory) to feed that conversation rather than run parallel
-  to it.
+  to it. Signal's own model assumes a server willing to hold prekey
+  state, which the relay deliberately doesn't do — worth weighing
+  SimpleX/Session's server-holds-nothing constraints at least as
+  heavily as Signal's, rather than treating Signal as the default
+  answer to diverge from only where forced to.
+
+  **Two things carried forward from an earlier chat, not yet decided,
+  just flagged so they aren't lost before that session starts:**
+  - **The offline buffer must become device-keyed before fanout ships —
+    this is a hard blocker, not a nice-to-have.** `buf_dir`/`buf_write`/
+    `buf_deliver` in `server.py` are identity-level today, which is fine
+    under the current static pairwise key (any device sharing the seed
+    can decrypt whatever's buffered). It stops being fine under a real
+    ratchet: a fanned-out ciphertext is bound to one specific device's
+    chain, so a buffered packet handed to whichever device reconnects
+    first is either undecryptable by that device or never reaches the
+    one it was actually meant for. The `endpointId` plumbing (see
+    `protocol.md`'s [Device Endpoint ID](protocol.md#device-endpoint-id))
+    makes the mechanical part straightforward when it's time — keying
+    `BUF_DIR` by `(publicId, endpointId)` instead of just `publicId` —
+    but it needs to land as part of this work, not after.
+  - **Session bootstrap and session reset are likely the same
+    mechanism, not two.** Bootstrapping a never-before-seen device and
+    recovering a desynced/corrupted session with a known device both
+    reduce to "agree a fresh root key with this specific endpoint,
+    discarding whatever chain state exists" — bootstrap is just the
+    case where that state happens to be empty. Leaning toward one
+    signed "propose new root key" packet type for both, mandatory
+    signature (same trust tier as `app:migrate`/`app:burn` — this
+    drives crypto state, not just display), with the manual "accept
+    this device?" confirmation gating only the *never-seen-endpoint*
+    case — resetting an already-trusted endpoint's session likely
+    doesn't need the same friction, though it should still be visible
+    (log line / quiet system notice) rather than silent. Detection of
+    "this session needs a reset" (repeated AEAD failures, skipped-key
+    cache overflow) probably wants to surface a prompt rather than
+    auto-fire, at least until there's real usage data on false-positive
+    rate. Design bootstrap and reset together — don't build bootstrap
+    first and bolt reset on as an afterthought.
 
 ### Sync / backup device-smartness (for later, no urgency)
 - Sync: when syncing a conversation, also check other-self devices, not
