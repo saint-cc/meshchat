@@ -374,6 +374,34 @@ function nextSendCounter(contactId) {
   return n;
 }
 
+// Causal-ordering groundwork (see Roadmap.md's "Causal message ordering"
+// entry). Returns { deviceId, n } for the most recently active device
+// we've heard a REAL counted message from for this contact, or null if we
+// have nothing usable yet. Deliberately reads straight off the existing
+// device registry (state.knownDevices, maintained by recordKnownDevice())
+// rather than tracking any new per-contact pointer — the freshest entry
+// there already IS "the last (device, n) of theirs we've seen."
+//
+// lastN === 0 is skipped — that means every packet we've recorded from
+// that device so far was one with no `n` of its own (i.e. only ever a
+// reaction; see recordKnownDevice), which isn't a usable ack target. This
+// does NOT fully resolve which of several genuinely active devices is
+// most current — a device that's only reacted can still have the newest
+// lastSeen and get skipped correctly, but two devices that have both sent
+// real messages are disambiguated by lastSeen alone, which is a coarser
+// signal than a real per-device fanout would give. That's the harder,
+// deliberately-deferred multi-device work (see Roadmap.md), not this pass.
+function getAckPointer(contactId) {
+  const devices = state.knownDevices[contactId];
+  if (!devices) return null;
+  let best = null;
+  for (const [deviceId, info] of Object.entries(devices)) {
+    if (!info || typeof info.lastN !== "number" || info.lastN <= 0) continue;
+    if (!best || info.lastSeen > best.lastSeen) best = { deviceId, n: info.lastN, lastSeen: info.lastSeen };
+  }
+  return best ? { deviceId: best.deviceId, n: best.n } : null;
+}
+
 /* ══════════════════════════════════════════
    PEER BACKUP DISTRIBUTION
    Protocol (non-self peers):
@@ -1445,11 +1473,15 @@ async function sendImageMessage(file) {
       const id       = crypto.randomUUID();
 
       let status = "failed";
+      let n = null, ack = null;   // see sendMessage()'s comment on why these are hoisted
       try {
         const me       = state.contacts[state.publicId];
         const relay    = me?.lastRelay ? { wss: me.lastRelay } : undefined;
 
-        const payload   = { id, type: "image", data: base64, mimeType, ts, deviceId: state.deviceId, endpointId: state.endpointId, n: nextSendCounter(state.currentChat), ...(relay ? { relay } : {}) };
+        ack = getAckPointer(state.currentChat);
+        n   = nextSendCounter(state.currentChat);
+        const payload   = { id, type: "image", data: base64, mimeType, ts, deviceId: state.deviceId, endpointId: state.endpointId, n,
+                             ...(ack ? { ackDeviceId: ack.deviceId, ackN: ack.n } : {}), ...(relay ? { relay } : {}) };
         const encrypted = await encryptMessage(contact.encKey, payload);
         const sig       = await signBlob(encrypted);
 
@@ -1468,7 +1500,8 @@ async function sendImageMessage(file) {
         mlog.err(`→ IMAGE        to   ${pid(state.currentChat)} — send failed: ${e.message}`);
       }
 
-      contact.messages = mergeMessages(contact.messages, [{ id, from: state.publicId, type: "image", mimeType, ts, valid: true, status }]);
+      contact.messages = mergeMessages(contact.messages, [{ id, from: state.publicId, type: "image", mimeType, ts, valid: true, status,
+        ...(n !== null ? { deviceId: state.deviceId, n } : {}), ...(ack ? { ackDeviceId: ack.deviceId, ackN: ack.n } : {}) }]);
       await saveContacts();
       renderMessages();
     };
@@ -1490,12 +1523,16 @@ async function sendAudioMessage(blob) {
     const mimeType = blob.type;
 
     let status = "failed";
+    let n = null, ack = null;   // see sendMessage()'s comment on why these are hoisted
     try {
       const me       = state.contacts[state.publicId];
       const relay    = me?.lastRelay ? { wss: me.lastRelay } : undefined;
 
       // encrypt for transit
-      const payload   = { id, type: "audio", data: base64, mimeType, ts, deviceId: state.deviceId, endpointId: state.endpointId, n: nextSendCounter(state.currentChat), ...(relay ? { relay } : {}) };
+      ack = getAckPointer(state.currentChat);
+      n   = nextSendCounter(state.currentChat);
+      const payload   = { id, type: "audio", data: base64, mimeType, ts, deviceId: state.deviceId, endpointId: state.endpointId, n,
+                           ...(ack ? { ackDeviceId: ack.deviceId, ackN: ack.n } : {}), ...(relay ? { relay } : {}) };
       const encrypted = await encryptMessage(contact.encKey, payload);
       const sig       = await signBlob(encrypted);
 
@@ -1516,7 +1553,8 @@ async function sendAudioMessage(blob) {
     }
 
     // stub in messages — data stays in audioCache only
-    contact.messages = mergeMessages(contact.messages, [{ id, from: state.publicId, type: "audio", mimeType, ts, valid: true, status }]);
+    contact.messages = mergeMessages(contact.messages, [{ id, from: state.publicId, type: "audio", mimeType, ts, valid: true, status,
+      ...(n !== null ? { deviceId: state.deviceId, n } : {}), ...(ack ? { ackDeviceId: ack.deviceId, ackN: ack.n } : {}) }]);
     await saveContacts();
     renderMessages();
   };
@@ -1677,6 +1715,15 @@ async function receiveMessage(msg) {
     mlog.info(`← MSG          from ${pid(msg.from)}  sig:${valid ? "✓" : "✗"}`);
 
     const msgObj = { id: plain.id, from: msg.from, ts: plain.ts || Date.now(), valid };
+    // Causal-ordering groundwork (see Roadmap.md) — persist the sender's
+    // device/counter and, when present, their ack-back reference to OUR
+    // last-seen (device, n) of ours. Only ever present on payload types
+    // that carry `n` in the first place (text/audio/image/system) — a
+    // reaction's payload has neither field, so this is naturally a no-op
+    // there rather than needing its own type check.
+    if (plain.deviceId) msgObj.deviceId = plain.deviceId;
+    if (typeof plain.n === "number") msgObj.n = plain.n;
+    if (plain.ackDeviceId && typeof plain.ackN === "number") { msgObj.ackDeviceId = plain.ackDeviceId; msgObj.ackN = plain.ackN; }
 
     if (plain.type === "audio") {
       const encBlob = await encryptObject(state.encKey, { data: plain.data, mimeType: plain.mimeType });
@@ -2094,10 +2141,18 @@ async function sendMessage() {
   // round-trip to the relay for this; see the delivered/✔️✔️ path below,
   // which is the real recipient-confirmed signal (an auto-ack reaction).
   let status = "failed";
+  // n/ack hoisted out of the try so the final mergeMessages() below can
+  // stamp the same values onto our own stored copy regardless of whether
+  // the send itself succeeded. See getAckPointer()'s comment for what
+  // these feed into (Roadmap.md's causal-ordering entry).
+  let n = null, ack = null;
   try {
     const me     = state.contacts[state.publicId];
     const relay  = me?.lastRelay ? { wss: me.lastRelay } : undefined;
-    const payload = { id, text, ts, deviceId: state.deviceId, endpointId: state.endpointId, n: nextSendCounter(state.currentChat), ...(relay ? { relay } : {}) };
+    ack = getAckPointer(state.currentChat);
+    n   = nextSendCounter(state.currentChat);
+    const payload = { id, text, ts, deviceId: state.deviceId, endpointId: state.endpointId, n,
+                       ...(ack ? { ackDeviceId: ack.deviceId, ackN: ack.n } : {}), ...(relay ? { relay } : {}) };
     const blob   = await encryptMessage(contact.encKey, payload);
     const sig    = await signBlob(blob);
 
@@ -2113,7 +2168,8 @@ async function sendMessage() {
     mlog.err(`→ MSG          to   ${pid(state.currentChat)} — send failed: ${e.message}`);
   }
 
-  contact.messages = mergeMessages(contact.messages, [{ id, from: fromId, text, ts, valid: true, status }]);
+  contact.messages = mergeMessages(contact.messages, [{ id, from: fromId, text, ts, valid: true, status,
+    ...(n !== null ? { deviceId: state.deviceId, n } : {}), ...(ack ? { ackDeviceId: ack.deviceId, ackN: ack.n } : {}) }]);
   await saveContacts();
   input.value = "";
   renderMessages();
@@ -2227,11 +2283,15 @@ async function sendCallNotice(id) {
   const text  = `${callerName} is attempting a WebRTC connection`;
 
   let status = "failed";
+  let n = null, ack = null;   // see sendMessage()'s comment on why these are hoisted
   try {
     const me    = state.contacts[state.publicId];
     const relay = me?.lastRelay ? { wss: me.lastRelay } : undefined;
+    ack = getAckPointer(id);
+    n   = nextSendCounter(id);
     const payload = { id: msgId, type: "system", kind: "call", text, ts,
-                       deviceId: state.deviceId, endpointId: state.endpointId, n: nextSendCounter(id), ...(relay ? { relay } : {}) };
+                       deviceId: state.deviceId, endpointId: state.endpointId, n,
+                       ...(ack ? { ackDeviceId: ack.deviceId, ackN: ack.n } : {}), ...(relay ? { relay } : {}) };
     const blob    = await encryptMessage(contact.encKey, payload);
     const sig     = await signBlob(blob);
 
@@ -2246,7 +2306,8 @@ async function sendCallNotice(id) {
     mlog.err(`→ CALL_NOTICE  to   ${pid(id)} — send failed: ${e.message}`);
   }
 
-  contact.messages = mergeMessages(contact.messages, [{ id: msgId, from: state.publicId, type: "system", kind: "call", text, ts, valid: true, status }]);
+  contact.messages = mergeMessages(contact.messages, [{ id: msgId, from: state.publicId, type: "system", kind: "call", text, ts, valid: true, status,
+    ...(n !== null ? { deviceId: state.deviceId, n } : {}), ...(ack ? { ackDeviceId: ack.deviceId, ackN: ack.n } : {}) }]);
   await saveContacts();
   if (state.currentChat === id) renderMessages();
   updateContactPreview();
