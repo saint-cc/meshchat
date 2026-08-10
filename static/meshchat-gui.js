@@ -527,7 +527,26 @@ function renderContactList() {
     li.onclick    = () => openChat(c.publicId);
     const unread  = state.unread[c.publicId] || 0;
     const msgs    = c.messages || [];
-    const last    = msgs[msgs.length - 1];
+    // Skip anything that isn't a real, previewable message: reactions
+    // (including the RECEIVED auto-ack, a reaction with emoji:null — see
+    // protocol.md's Delivery Acknowledgement section) have no `.text`, so
+    // one landing as the array's literal last entry — which happens
+    // routinely, since it's sent back within ~500ms of any real message
+    // arriving — was previously blanking the preview right after a real
+    // message came in. A plain-text message with empty/whitespace-only
+    // text (shouldn't normally get stored — sendMessage() requires a
+    // trimmed, non-empty body — but defensive against any future path
+    // that isn't as careful) is skipped the same way. audio/image/system
+    // messages always count, since they render their own preview text
+    // below regardless of `.text`.
+    let last = null;
+    for (let i = msgs.length - 1; i >= 0; i--) {
+      const m = msgs[i];
+      if (m.type === "reaction") continue;
+      if ((m.type === undefined) && !(m.text && m.text.trim())) continue;
+      last = m;
+      break;
+    }
     const preview = last
       ? last.type === "audio"
         ? "🎤 audio message"

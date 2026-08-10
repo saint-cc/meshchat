@@ -48,6 +48,23 @@ Recent, for context on where "next" picks up from:
   sender flips that message's status to `delivered` on receipt. Rendered
   client-side as ✔️ (sent) / ✔️✔️ (delivered) / ✗ (failed). READ status is
   explicitly **not** part of this — see below, still deferred on purpose.
+- **Causal message ordering — both slices done.** Slice 1: all four send
+  paths (`sendMessage`, `sendAudioMessage`, `sendImageMessage`,
+  `sendCallNotice`) now stamp `ackDeviceId`/`ackN` on outgoing
+  text/audio/image/system payloads via `getAckPointer(contactId)` (reads
+  the freshest usable entry straight off the existing device registry, no
+  new storage), and both sides persist `deviceId`/`n`/`ackDeviceId`/`ackN`
+  on the stored message object. Slice 2: `mergeMessages` (`meshchat-lib.js`)
+  resolves a message's `ackDeviceId`/`ackN` against the merged set and
+  splices it in directly after the message it references — recursively, so
+  a reply-to-a-reply nests correctly — instead of trusting `ts`. Anything
+  unresolvable (no ack fields, or a reference outside the merged set) keeps
+  its place in the existing `(ts, id)` sort, unchanged. Deliberately not a
+  full causal/vector-clock reorder — multiple acks on the same target keep
+  their relative `(ts, id)` order rather than being further disambiguated,
+  per the "reordering as the exception, not the norm" framing below.
+  `protocol.md`'s [Message Merging](protocol.md#message-merging) and
+  [Message Payload](protocol.md#message-payload) sections updated to match.
 
 ---
 
@@ -55,13 +72,6 @@ Recent, for context on where "next" picks up from:
 
 Things with a rough shape already, not blocked on a bigger design call:
 
-- **Causal message ordering.** Use the `n`/device-registry groundwork from
-  Phase 1 to insert messages correctly instead of relying on `ts` (which
-  drifts across devices/network delay). Likely shape: payload carries
-  `ackDeviceId`/`ackN` — "the last (device, n) I'd seen from you when I sent
-  this" — and merge inserts relative to that reference when present, falling
-  back to today's `(ts, id)` sort otherwise. Turns sync closer into
-  fetch-missing + dedupe, with reordering as the exception, not the norm.
 - **Keep `protocol.md` from drifting again.** No process yet beyond "notice
   it during unrelated work," which is how the `deviceId` envelope drift sat
   unnoticed for a while. Worth a lightweight habit at minimum (docs pass

@@ -308,7 +308,63 @@ function mergeMessages(a, b) {
   // between renders. id is stable and arbitrary but always the same for
   // the same message, so adding it as the tiebreak makes the result of
   // this sort identical no matter which order a/b were merged in.
-  return Object.values(byId).sort((x,y) => (x.ts - y.ts) || (x.id < y.id ? -1 : x.id > y.id ? 1 : 0));
+  const base = Object.values(byId).sort((x,y) => (x.ts - y.ts) || (x.id < y.id ? -1 : x.id > y.id ? 1 : 0));
+
+  // ── causal-ordering pass (Roadmap.md's "Causal message ordering" slice 2) ──
+  // ackDeviceId/ackN (see protocol.md's Message Payload section), when
+  // present, mean "the last (device, n) of yours I'd seen when I wrote
+  // this." Resolve each one against byDeviceN below and splice the acking
+  // message in directly after the message it references, instead of
+  // trusting ts (which drifts across devices/network delay — the whole
+  // reason this exists). Anything that doesn't resolve — no ack fields at
+  // all (reactions never have them), or a reference to a message not in
+  // this merged set — is untouched and keeps its place in the (ts, id)
+  // sort. This is deliberately NOT a full causal/vector-clock reorder:
+  // just enough to repair the specific drift case, per the roadmap note
+  // that reordering should stay the exception, not the norm.
+  const byDeviceN = {};
+  for (const m of base) {
+    if (m.deviceId && typeof m.n === "number") byDeviceN[m.deviceId + "|" + m.n] = m.id;
+  }
+
+  // childrenOf[targetId] = message ids that should be spliced in directly
+  // after targetId, in the relative order they already hold in `base`
+  // (stable — matches the "simple version first" call on multiple acks
+  // against the same target).
+  const childrenOf = {};
+  const hasParent  = new Set();
+  for (const m of base) {
+    if (!m.ackDeviceId || typeof m.ackN !== "number") continue;
+    const targetId = byDeviceN[m.ackDeviceId + "|" + m.ackN];
+    if (!targetId || targetId === m.id) continue;   // unresolved, or a self-reference that shouldn't occur
+    (childrenOf[targetId] ||= []).push(m.id);
+    hasParent.add(m.id);
+  }
+
+  // Walk `base` in its normal (ts,id) order, emitting each message with no
+  // resolved parent, then immediately (and recursively) splicing in
+  // anything that acks it before moving to the next top-level entry.
+  // `visited` is a defensive guard against a reference cycle, which
+  // shouldn't be reachable (ack references only ever point at a message
+  // already sent before the acking one was written) but must not cause a
+  // message to be silently dropped if it somehow occurred.
+  const visited = new Set();
+  const result  = [];
+  function emit(id) {
+    if (visited.has(id)) return;
+    visited.add(id);
+    result.push(byId[id]);
+    for (const childId of (childrenOf[id] || [])) emit(childId);
+  }
+  for (const m of base) {
+    if (hasParent.has(m.id)) continue;   // emitted as a child of its target instead
+    emit(m.id);
+  }
+  // Safety net — anything never reached above (only possible via a cycle)
+  // still gets appended in base order rather than dropped.
+  for (const m of base) emit(m.id);
+
+  return result;
 }
 
 function mergeContactMeta(local, remote) {

@@ -214,7 +214,7 @@ The `relay` field carries the sender's current relay WSS URL. Recipients update 
 
 `endpointId` (see [Device Endpoint ID](#device-endpoint-id)) travels alongside `deviceId` inside this same encrypted payload — it's how a contact passively *learns* a sender's endpointId, the same way they learn `deviceId`, recorded into the device registry only once the envelope's signature has verified. Optional; older payloads that omit it leave whatever's already on file for that device untouched rather than being treated as a clear-it signal.
 
-`ackDeviceId`/`ackN` (optional, causal-ordering groundwork — see `Roadmap.md`'s Causal message ordering entry) travel on the same payload types that carry a send counter (`text`, `audio`, `image`, `system` — never `reaction`, which has no `n` of its own to anchor). They mean "the last (device, n) of yours I'd seen when I wrote this," stamped at send time from the sender's own device registry (the freshest entry in `knownDevices` with a real, nonzero `lastN` — a device that's only ever reacted has nothing to anchor to and is skipped). Recipients persist both fields on the stored message object alongside `deviceId`/`n`, same "only when present" rule as everything else in this section. Nothing consumes them for ordering yet — that's the next piece of this work, still using today's `(ts, id)` sort — so for now they're purely additive metadata carried for future use.
+`ackDeviceId`/`ackN` (optional, causal-ordering groundwork — see `Roadmap.md`'s Causal message ordering entry) travel on the same payload types that carry a send counter (`text`, `audio`, `image`, `system` — never `reaction`, which has no `n` of its own to anchor). They mean "the last (device, n) of yours I'd seen when I wrote this," stamped at send time from the sender's own device registry (the freshest entry in `knownDevices` with a real, nonzero `lastN` — a device that's only ever reacted has nothing to anchor to and is skipped). Recipients persist both fields on the stored message object alongside `deviceId`/`n`, same "only when present" rule as everything else in this section. `mergeMessages` (see [Message Merging](#message-merging)) consumes these to insert a message directly after the one it references instead of trusting `ts` alone; anything unresolvable falls back to the existing `(ts, id)` sort unchanged.
 
 **Other payload types:** `audio`, `image`, `reaction`, `system`. Audio and image carry `data` (base64) and `mimeType`. Reactions carry `targetId` and `emoji`. System notices carry `kind` and `text` — a real, encrypted `app:message` artifact (not a signaling-only packet) used today for the WebRTC call notice (`kind: "call"`), so an offline callee still gets it via the normal offline-buffer/push path and both sides keep a visible record of the attempt regardless of whether the call itself connects.
 
@@ -694,7 +694,7 @@ A 5-minute cooldown per contact prevents restore flooding. The `sig:seen` presen
 
 ## Message Merging
 
-All message stores use last-write-wins merge by message ID:
+All message stores use last-write-wins merge by message ID, with an additional causal-ordering pass on top of the base sort:
 
 ```javascript
 function mergeMessages(a, b) {
@@ -703,9 +703,16 @@ function mergeMessages(a, b) {
   // ts alone isn't a reliable order for near-simultaneous messages — id is
   // added as a stable tiebreak so the result is identical regardless of
   // which side of the merge a message originated from.
-  return Object.values(byId).sort((x, y) => (x.ts - y.ts) || (x.id < y.id ? -1 : x.id > y.id ? 1 : 0));
+  const base = Object.values(byId).sort((x, y) => (x.ts - y.ts) || (x.id < y.id ? -1 : x.id > y.id ? 1 : 0));
+  // ... then any message carrying a resolvable ackDeviceId/ackN is spliced
+  // in directly after the message it references, instead of trusting ts.
+  // See below and the implementation in meshchat-lib.js for the full pass.
+  // Everything unresolvable (no ack fields, or a reference to a message
+  // outside this merged set) keeps its place in `base` unchanged.
 }
 ```
+
+**The causal-ordering pass** resolves `ackDeviceId`/`ackN` (see [Message Payload](#message-payload)) against every other message in the merged set that carries a matching `(deviceId, n)` pair, and — when a match is found — moves the acking message to sit directly after the one it references, recursively (a message acking an already-relocated message nests after it in turn). This is deliberately *not* a full causal/vector-clock reorder: multiple messages acking the same target keep their relative `(ts, id)` order rather than being further disambiguated, and a genuinely disconnected third message with no ack link to anything nearby is not accounted for — reordering is meant to repair the specific cross-device/network-delay drift case, not replace `(ts, id)` as the general-purpose sort. Reactions never participate as the *acking* side (their payload has no `n` to derive an ack from), but are valid *targets* for nothing either, since they carry no `deviceId`/`n` of their own to be acked against — they're untouched by this pass in both directions, same as before.
 
 Reactions use a stable derived ID (`SHA-256("reaction:" + myId + ":" + targetMsgId)`) so a user's reaction to a given message always has the same ID — naturally replacing rather than duplicating on merge. The delivery-acknowledgement reaction (see [Delivery Acknowledgement](#delivery-acknowledgement-received)) uses this identical derivation, so it merges the same way.
 
