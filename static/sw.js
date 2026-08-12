@@ -7,7 +7,15 @@ self.addEventListener("activate", (event) => {
 });
 
 self.addEventListener("fetch", event => {
-  event.respondWith(fetch(event.request));
+  event.respondWith(
+    fetch(event.request).catch(() => {
+      // aborted (tab closed mid-request), offline, or a CDN hiccup —
+      // swallow rather than let it surface as an unhandled SW error.
+      // Real offline support (cache-first for the app shell) is a
+      // separate, bigger piece of work, not implied by this.
+      return new Response("", { status: 504, statusText: "offline or network error" });
+    })
+  );
 });
 
 /* ══════════════════════════════════════════
