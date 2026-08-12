@@ -208,6 +208,71 @@ because there's a plan yet.
   the fuller manifest/hook-point design with shell as the reference
   implementation. Undecided — flagged in chat, not yet a decision.
 
+### Account-based key layer on top of the deterministic bootstrap
+- **Not a plan to replace deterministic identity.** The `(username,
+  passphrase)` derivation stays permanently — it's the root of trust for
+  routing/discovery and the only thing that lets a brand-new node
+  bootstrap a DH exchange with someone at all. This idea is a layer
+  *on top*: an actual random (non-derivable) account keypair, generated
+  once, local-only, never in backups (backups can genuinely never
+  contain it — if it's lost, the answer is renegotiate, not restore).
+  Static/no-ratchet for now, same as today's pairwise key — the point
+  isn't forward secrecy yet, it's making the *identity* key rotatable
+  instead of eternally re-derivable from credentials, which is what
+  actually unlocks real revocation (burn stops being social-only).
+- Shape is structurally close to X3DH's identity-key/signed-prekey split:
+  the deterministic bootstrap key plays "identity key" (never rotates,
+  already trusted via the out-of-band QR/address exchange), the account
+  key plays "signed prekey" (rotates, and every rotation is *signed by*
+  the bootstrap key that vouches for it) — so a renegotiation packet is
+  a signed statement from an already-trusted key, not fresh DH exposed
+  to MITM. The real exposure isn't the crypto, it's (a) replay/rollback
+  of an old-but-validly-signed rotation, which needs a strict monotonic
+  epoch guard, stricter than `updateRelay`'s plain "newer wins", and
+  (b) the human "accept this?" confirmation itself, which is a social-
+  engineering target the same way Signal's safety-number-changed prompt
+  is — load-bearing, same as the never-seen-device confirmation already
+  planned for Double Ratchet bootstrap.
+- **Renegotiation has to be async/store-and-forward**, not a live
+  handshake — the relay deliberately holds no prekey-bundle state the
+  way a real X3DH server would. Closest existing pattern is
+  `app:migrate`/`app:burn`: overwrite-per-sender, long TTL, durably
+  buffered even when a live session is reached (same stale-session race
+  those two already guard against). "Fail" (an AEAD decrypt failure) is
+  a reasonable *technical* trigger to prompt a user but must NOT be
+  sufficient on its own to accept a new key — indistinguishable from
+  ordinary corruption/desync, and accepting on decrypt-failure alone is
+  a remotely-triggerable identity-swap primitive. Needs its own
+  independent authentication step, not "then whatever key shows up
+  next is trusted."
+- **Multi-device forks this hard.** Deterministic identity is what lets
+  a second device "just log in" and land on the same keys today; a
+  random account key can't be independently re-derived, so multi-device
+  needs an explicit pairing/transfer step instead. Two of the user's own
+  devices independently deciding they're the "fresh node" and each
+  proposing a new account key could genuinely fork what contacts believe
+  the current key is — same class of race as `call:claim`'s self-
+  targeted dedup echo, but identity-critical instead of cosmetic where
+  that one is cosmetic.
+- **Likely the same design conversation as device-layer routing, not a
+  separate one** — see [Per-device encryption & relay-stored
+  messages](#per-device-encryption--relay-stored-messages) above. An
+  account key that ends up per-device (which multi-device pushes it
+  toward) is close to what `endpointId` becomes the moment it stops
+  being routing-only metadata and starts being a real keypair. Device
+  routing is agreed to ship first regardless.
+- **"Triple ratchet" — deliberately not scoped, flagged half-joking in
+  chat but worth keeping on file:** a third tier stacked on top of the
+  usual two (identity/account-key rotation below, Signal-style session
+  ratchet above) rather than the unrelated "add a post-quantum KEM
+  ratchet alongside classic DH" meaning the term has elsewhere. Same
+  underlying problems as everything above, just a third rotation cadence
+  — nothing to design until the layers below it are real.
+- **Status: prep-only for the foreseeable future, not scheduled.** Real
+  blockers exist ahead of it (device routing chief among them). The
+  point of writing this down now is to have somewhere for the half-formed
+  version of this thinking to live, not to imply it's next.
+
 ---
 
 ## Deliberately not doing (yet or ever)
