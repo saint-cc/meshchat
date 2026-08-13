@@ -13,7 +13,7 @@
 
    Load order: meshchat-lib.js → meshchat-gui.js → meshchat.js → statemachine.js
 ═══════════════════════════════════════════════════════════════ */
-const CLIENT_VERSION = "0.4.3";
+const CLIENT_VERSION = "0.4.4";
 
 const POLL_INTERVAL_MS        	= 30_000;			// base interval between presence polls
 const POLL_JITTER_MS          	= 10_000;			// ± random jitter added to poll interval
@@ -304,11 +304,47 @@ async function deserialiseContacts(raw){
   return out;
 }
 
-async function saveContacts() {
-  if (!state.cryptoKey) return;
-  const encrypted = await encryptObject(state.cryptoKey, serialiseContacts());
-  localStorage.setItem(STORAGE_KEY + "_" + state.publicId, JSON.stringify(encrypted));
-  return encrypted;
+/* ══════════════════════════════════════════
+   saveContacts() SERIALIZATION
+   Without this, two overlapping calls (e.g. an outgoing send and an
+   incoming auto-ack landing within the same tick of each other) race:
+   each snapshots serialiseContacts() synchronously at call time, but the
+   actual localStorage.setItem only lands after encryptObject's async
+   crypto.subtle.encrypt + gzip finish. Nothing guarantees they finish in
+   the order they started — whichever encryption happens to resolve
+   SECOND wins the write, even if its snapshot was the OLDER, less
+   complete one. Everything still looks correct live (the in-memory merge
+   was always fine) — the loss is invisible until the next reload, which
+   is exactly what made this hard to spot.
+   Fix: a simple promise-chained mutex. Every call to saveContacts()
+   queues behind whatever's currently in flight, so a snapshot is only
+   ever taken (and only ever written) after the previous write has fully
+   landed — out-of-order completion becomes structurally impossible
+   rather than merely unlikely.
+══════════════════════════════════════════ */
+let _saveContactsChain = Promise.resolve();
+
+function saveContacts() {
+  const run = _saveContactsChain.then(async () => {
+    if (!state.cryptoKey) return;
+    try {
+      const encrypted = await encryptObject(state.cryptoKey, serialiseContacts());
+      localStorage.setItem(STORAGE_KEY + "_" + state.publicId, JSON.stringify(encrypted));
+      return encrypted;
+    } catch(e) {
+      // previously an unhandled rejection here failed completely silently —
+      // same failure shape as the race this function now prevents, just a
+      // different trigger (crypto/storage error instead of ordering).
+      mlog.err(`STORAGE    saveContacts failed: ${e.message}`);
+      return undefined;
+    }
+  });
+  // Chain continues regardless of this call's outcome — one failed save
+  // must not permanently wedge every future save behind a rejected
+  // promise. Caller still awaits `run` itself, so it observes success/
+  // failure normally; only the QUEUE'S continuation is failure-proofed.
+  _saveContactsChain = run.catch(() => {});
+  return run;
 }
 
 let messagesSinceBackup = 0;
@@ -1588,6 +1624,7 @@ async function sendImageMessage(file) {
       contact.messages = mergeMessages(contact.messages, [{ id, from: state.publicId, type: "image", mimeType, ts, valid: true, status, n: sentN }]);
       await saveContacts();
       renderMessages();
+      updateContactPreview();   // sidebar preview otherwise only ever updates on incoming traffic
     };
     reader.readAsDataURL(blob);
   }, "image/jpeg", 0.85);
@@ -1638,6 +1675,7 @@ async function sendAudioMessage(blob) {
     contact.messages = mergeMessages(contact.messages, [{ id, from: state.publicId, type: "audio", mimeType, ts, valid: true, status, n: sentN }]);
     await saveContacts();
     renderMessages();
+    updateContactPreview();   // sidebar preview otherwise only ever updates on incoming traffic
   };
   reader.readAsDataURL(blob);
 }
@@ -2258,6 +2296,7 @@ async function sendMessage() {
   await saveContacts();
   input.value = "";
   renderMessages();
+  updateContactPreview();   // sidebar preview otherwise only ever updates on incoming traffic
   pushMiniBackup(contact.publicId);
 }
 
