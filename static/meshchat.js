@@ -179,6 +179,95 @@ function schedulePoll() {
 }
 
 /* ══════════════════════════════════════════
+   DELIVERY STATUS RECONCILIATION
+   Pulled out of receiveMessage's inline flip so every mergeMessages()
+   call site can re-run it after a merge, not just the live-receive path.
+   A reaction (any emoji, or the null-emoji auto-ack — see protocol.md's
+   Delivery Acknowledgement section) targeting one of OUR OWN outbound
+   messages proves a real device decrypted+verified it, REGARDLESS of
+   whether that reaction arrived live, via peer backup push, via
+   self-sync restore/backup push, or via manual app:sync exchange —
+   those are all just different transports for the same fact. Without
+   this being callable from every merge site, a reaction that only ever
+   reaches us through, say, a restore push (e.g. it landed on a different
+   one of our own devices first) would never flip the sender's status
+   here, even though the underlying proof is just as real.
+   Idempotent — only touches messages not already "delivered", safe to
+   call after every merge regardless of whether anything actually changed.
+══════════════════════════════════════════ */
+function reconcileDeliveryStatus(contact) {
+  if (!contact?.messages?.length) return;
+  const ackedTargets = new Set(
+    contact.messages.filter(m => m.type === "reaction" && m.targetId).map(m => m.targetId)
+  );
+  for (const m of contact.messages) {
+    if (m.from === state.publicId && m.status && m.status !== "delivered" && ackedTargets.has(m.id)) {
+      m.status = "delivered";
+    }
+  }
+}
+
+/* ══════════════════════════════════════════
+   MISSING-MESSAGE RECONCILIATION
+   recordKnownDevice() (above) only strikes an n off a device's `missing`
+   list when a message carrying that EXACT n arrives live — it has no
+   visibility into messages that show up any other way. That misses a
+   real case: a message that was missing via the live path can still
+   turn up through a peer backup push, a self-sync restore, or a manual
+   app:sync exchange, all of which merge into contact.messages WITHOUT
+   ever touching the device registry. Call this after every such merge
+   (same call sites as reconcileDeliveryStatus) so `missing` reflects
+   what's ACTUALLY on disk, not just what arrived through one specific
+   channel.
+   Matching is by (deviceId, n) where the stored message has a deviceId
+   (see receiveMessage) — for older messages saved before that field
+   existed, falls back to matching by n alone against contact.publicId,
+   which is imprecise for a contact running multiple devices but never
+   wrong in the sense of clearing a genuinely-still-missing message: the
+   message we matched against is real and present either way.
+══════════════════════════════════════════ */
+function reconcileMissingDevices(contact) {
+  if (!contact?.publicId) return;
+  const devices = state.knownDevices[contact.publicId];
+  if (!devices) return;
+  let changed = false;
+  for (const [deviceId, info] of Object.entries(devices)) {
+    if (!Array.isArray(info.missing) || !info.missing.length) continue;
+    const present = new Set(
+      (contact.messages || [])
+        .filter(m => m.n != null && (m.deviceId ? m.deviceId === deviceId : true))
+        .map(m => m.n)
+    );
+    const before = info.missing.length;
+    info.missing = info.missing.filter(n => !present.has(n));
+    if (info.missing.length !== before) changed = true;
+  }
+  if (changed) saveDeviceRegistry();
+}
+
+// user-facing: called from the banner's dismiss (✕) button — see
+// buildMissingBanner in meshchat-gui.js. For the case reconciliation
+// above CAN'T fix: a gap that's genuinely permanent (the sender's local
+// retention is only the last 15 messages per contact — serialiseContacts()
+// — and there's no wire-level backfill request yet, see Roadmap.md), so
+// nothing will ever arrive to clear it automatically. This is explicitly
+// "stop warning me," not "these messages were found" — the banner's title
+// attribute says as much.
+function dismissMissingWarning(contactId) {
+  const devices = state.knownDevices[contactId];
+  if (!devices) return;
+  let changed = false;
+  for (const info of Object.values(devices)) {
+    if (Array.isArray(info.missing) && info.missing.length) { info.missing = []; changed = true; }
+  }
+  if (changed) {
+    saveDeviceRegistry();
+    mlog.info(`DEVICE     missing-message warning dismissed  contact=${pid(contactId)}`);
+    if (state.currentChat === contactId) renderMessages();
+  }
+}
+
+/* ══════════════════════════════════════════
    STORAGE
    Audio messages are stripped of their data
    before serialising — only a stub is kept so
@@ -297,6 +386,9 @@ function loadDeviceRegistry() {
       // is actually seen sending something with an n on it.
       for (const devId of Object.keys(devs)) {
         if (typeof devs[devId] === "number") devs[devId] = { lastSeen: devs[devId], lastN: 0 };
+        // migrate pre-`missing` entries too — an older registry entry
+        // simply has no gap tracking yet; start empty rather than guess.
+        if (devs[devId] && !Array.isArray(devs[devId].missing)) devs[devId].missing = [];
       }
       let entries = Object.entries(devs).filter(([, v]) => v.lastSeen > cutoff);
       if (entries.length > 20) {
@@ -317,20 +409,32 @@ function saveDeviceRegistry() {
 // shared by app:message receipt and the existing self-sync fingerprint
 // tagging — local-only knowledge, never part of serialiseContacts()/backup.
 // `n`, when provided, is the sender's per-(their device, us) send counter —
-// see nextSendCounter() below for the mirror-image local-send side. This
-// is bookkeeping only for now: a gap, dupe, or reorder is logged and
-// `lastN` is updated to whatever's highest seen, but nothing is dropped or
-// enforced yet. Callers that don't have an `n` (restore/backup/self-sync
-// paths) simply omit it — lastSeen still updates, lastN is left alone.
+// see nextSendCounter() below for the mirror-image local-send side.
+//
+// Beyond bookkeeping, a gap (n arriving ahead of prevLastN+1) is now
+// recorded into `missing` — the list of n's we know this device sent but
+// haven't seen — so the UI can surface "message #N not received yet"
+// (see renderMessages in meshchat-gui.js). This is purely a DISPLAY hint,
+// not a resend queue: there is no wire-level backfill request yet (see
+// Roadmap.md — folded into the future session-bootstrap/reset design
+// pass rather than freelanced here). `missing` is capped at 50 entries
+// since it exists to inform a person, not to be exhaustive.
+// An out-of-order arrival (n <= prevLastN) clears that n from `missing`
+// if it was recorded, since the "missing" message just showed up late.
 function recordKnownDevice(identityId, deviceId, n, endpointId) {
   if (!identityId || !deviceId) return;
   if (!state.knownDevices[identityId]) state.knownDevices[identityId] = {};
   const existing = state.knownDevices[identityId][deviceId];
   const prevLastN = (existing && typeof existing === "object") ? (existing.lastN || 0) : 0;
+  let missing = (existing && Array.isArray(existing.missing)) ? existing.missing.slice() : [];
   let lastN = prevLastN;
   if (typeof n === "number") {
-    if (n !== prevLastN + 1) {
-      mlog.debug(`DEVICE     n gap/reorder  id=${pid(identityId)}  device=${pid(deviceId)}  expected=${prevLastN + 1}  got=${n}`);
+    if (n > prevLastN + 1) {
+      for (let g = prevLastN + 1; g < n; g++) if (!missing.includes(g)) missing.push(g);
+      mlog.debug(`DEVICE     n gap  id=${pid(identityId)}  device=${pid(deviceId)}  expected=${prevLastN + 1}  got=${n}  missing=${missing.length}`);
+    } else if (n <= prevLastN && missing.includes(n)) {
+      missing = missing.filter(g => g !== n);
+      mlog.debug(`DEVICE     n late-arrival, cleared from missing  id=${pid(identityId)}  device=${pid(deviceId)}  n=${n}`);
     }
     lastN = Math.max(prevLastN, n);
   }
@@ -340,7 +444,10 @@ function recordKnownDevice(identityId, deviceId, n, endpointId) {
   // for contact.type. Older/other callers that don't pass it (e.g. restore
   // paths) leave whatever's already on file untouched.
   const prevRoutingId = (existing && typeof existing === "object") ? existing.endpointId : undefined;
-  state.knownDevices[identityId][deviceId] = { lastSeen: Date.now(), lastN, endpointId: endpointId || prevRoutingId || null };
+  state.knownDevices[identityId][deviceId] = {
+    lastSeen: Date.now(), lastN, missing: missing.slice(0, 50),
+    endpointId: endpointId || prevRoutingId || null
+  };
   saveDeviceRegistry();
 }
 
@@ -372,34 +479,6 @@ function nextSendCounter(contactId) {
   state.sendCounters[contactId] = n;
   saveSendCounters();
   return n;
-}
-
-// Causal-ordering groundwork (see Roadmap.md's "Causal message ordering"
-// entry). Returns { deviceId, n } for the most recently active device
-// we've heard a REAL counted message from for this contact, or null if we
-// have nothing usable yet. Deliberately reads straight off the existing
-// device registry (state.knownDevices, maintained by recordKnownDevice())
-// rather than tracking any new per-contact pointer — the freshest entry
-// there already IS "the last (device, n) of theirs we've seen."
-//
-// lastN === 0 is skipped — that means every packet we've recorded from
-// that device so far was one with no `n` of its own (i.e. only ever a
-// reaction; see recordKnownDevice), which isn't a usable ack target. This
-// does NOT fully resolve which of several genuinely active devices is
-// most current — a device that's only reacted can still have the newest
-// lastSeen and get skipped correctly, but two devices that have both sent
-// real messages are disambiguated by lastSeen alone, which is a coarser
-// signal than a real per-device fanout would give. That's the harder,
-// deliberately-deferred multi-device work (see Roadmap.md), not this pass.
-function getAckPointer(contactId) {
-  const devices = state.knownDevices[contactId];
-  if (!devices) return null;
-  let best = null;
-  for (const [deviceId, info] of Object.entries(devices)) {
-    if (!info || typeof info.lastN !== "number" || info.lastN <= 0) continue;
-    if (!best || info.lastSeen > best.lastSeen) best = { deviceId, n: info.lastN, lastSeen: info.lastSeen };
-  }
-  return best ? { deviceId: best.deviceId, n: best.n } : null;
 }
 
 /* ══════════════════════════════════════════
@@ -513,6 +592,8 @@ async function handleBackupPush(msg) {
 			else {
 			  mergeContactMeta(state.contacts[id], contact);
 			  state.contacts[id].messages = mergeMessages(state.contacts[id].messages, contact.messages);
+			  reconcileDeliveryStatus(state.contacts[id]);
+			  reconcileMissingDevices(state.contacts[id]);
 			}
 		  }
 		  await saveContacts();
@@ -753,6 +834,8 @@ async function handleRestorePush(msg) {
         mergeContactMeta(state.contacts[id], contact);
         const before = state.contacts[id].messages.length;
         state.contacts[id].messages = mergeMessages(state.contacts[id].messages, contact.messages);
+        reconcileDeliveryStatus(state.contacts[id]);
+        reconcileMissingDevices(state.contacts[id]);
         msgsMerged += state.contacts[id].messages.length - before;
       }
     }
@@ -797,10 +880,14 @@ async function handleMsgExchange(msg) {
     sendSignal({ type: "app:sync", from: state.publicId, to: msg.from, msgs: getLast(msg.from), reply: true });
     const before = contact.messages.length;
     contact.messages = mergeMessages(contact.messages, pending);
+    reconcileDeliveryStatus(contact);
+    reconcileMissingDevices(contact);
     mlog.debug(`SYNC merge +${contact.messages.length - before} msgs from ${pid(msg.from)}`);
   } else {
     const before = contact.messages.length;
     contact.messages = mergeMessages(contact.messages, msg.msgs || []);
+    reconcileDeliveryStatus(contact);
+    reconcileMissingDevices(contact);
     mlog.info(`← SYNC_REPLY   from ${pid(msg.from)} — +${contact.messages.length - before} msgs`);
     setSyncStatus("synced with " + contact.name + " ✓");
   }
@@ -1473,15 +1560,13 @@ async function sendImageMessage(file) {
       const id       = crypto.randomUUID();
 
       let status = "failed";
-      let n = null, ack = null;   // see sendMessage()'s comment on why these are hoisted
+      let sentN  = null;
       try {
         const me       = state.contacts[state.publicId];
         const relay    = me?.lastRelay ? { wss: me.lastRelay } : undefined;
 
-        ack = getAckPointer(state.currentChat);
-        n   = nextSendCounter(state.currentChat);
-        const payload   = { id, type: "image", data: base64, mimeType, ts, deviceId: state.deviceId, endpointId: state.endpointId, n,
-                             ...(ack ? { ackDeviceId: ack.deviceId, ackN: ack.n } : {}), ...(relay ? { relay } : {}) };
+        sentN = nextSendCounter(state.currentChat);
+        const payload   = { id, type: "image", data: base64, mimeType, ts, deviceId: state.deviceId, endpointId: state.endpointId, n: sentN, ...(relay ? { relay } : {}) };
         const encrypted = await encryptMessage(contact.encKey, payload);
         const sig       = await signBlob(encrypted);
 
@@ -1500,8 +1585,7 @@ async function sendImageMessage(file) {
         mlog.err(`→ IMAGE        to   ${pid(state.currentChat)} — send failed: ${e.message}`);
       }
 
-      contact.messages = mergeMessages(contact.messages, [{ id, from: state.publicId, type: "image", mimeType, ts, valid: true, status,
-        ...(n !== null ? { deviceId: state.deviceId, n } : {}), ...(ack ? { ackDeviceId: ack.deviceId, ackN: ack.n } : {}) }]);
+      contact.messages = mergeMessages(contact.messages, [{ id, from: state.publicId, type: "image", mimeType, ts, valid: true, status, n: sentN }]);
       await saveContacts();
       renderMessages();
     };
@@ -1523,16 +1607,14 @@ async function sendAudioMessage(blob) {
     const mimeType = blob.type;
 
     let status = "failed";
-    let n = null, ack = null;   // see sendMessage()'s comment on why these are hoisted
+    let sentN  = null;
     try {
       const me       = state.contacts[state.publicId];
       const relay    = me?.lastRelay ? { wss: me.lastRelay } : undefined;
 
       // encrypt for transit
-      ack = getAckPointer(state.currentChat);
-      n   = nextSendCounter(state.currentChat);
-      const payload   = { id, type: "audio", data: base64, mimeType, ts, deviceId: state.deviceId, endpointId: state.endpointId, n,
-                           ...(ack ? { ackDeviceId: ack.deviceId, ackN: ack.n } : {}), ...(relay ? { relay } : {}) };
+      sentN = nextSendCounter(state.currentChat);
+      const payload   = { id, type: "audio", data: base64, mimeType, ts, deviceId: state.deviceId, endpointId: state.endpointId, n: sentN, ...(relay ? { relay } : {}) };
       const encrypted = await encryptMessage(contact.encKey, payload);
       const sig       = await signBlob(encrypted);
 
@@ -1553,8 +1635,7 @@ async function sendAudioMessage(blob) {
     }
 
     // stub in messages — data stays in audioCache only
-    contact.messages = mergeMessages(contact.messages, [{ id, from: state.publicId, type: "audio", mimeType, ts, valid: true, status,
-      ...(n !== null ? { deviceId: state.deviceId, n } : {}), ...(ack ? { ackDeviceId: ack.deviceId, ackN: ack.n } : {}) }]);
+    contact.messages = mergeMessages(contact.messages, [{ id, from: state.publicId, type: "audio", mimeType, ts, valid: true, status, n: sentN }]);
     await saveContacts();
     renderMessages();
   };
@@ -1715,15 +1796,15 @@ async function receiveMessage(msg) {
     mlog.info(`← MSG          from ${pid(msg.from)}  sig:${valid ? "✓" : "✗"}`);
 
     const msgObj = { id: plain.id, from: msg.from, ts: plain.ts || Date.now(), valid };
-    // Causal-ordering groundwork (see Roadmap.md) — persist the sender's
-    // device/counter and, when present, their ack-back reference to OUR
-    // last-seen (device, n) of ours. Only ever present on payload types
-    // that carry `n` in the first place (text/audio/image/system) — a
-    // reaction's payload has neither field, so this is naturally a no-op
-    // there rather than needing its own type check.
+    // persist the sender's per-device send counter locally too, not just
+    // in the wire payload — needed both for the gap/"missing" display
+    // (recordKnownDevice above only tracks it on the registry side) and
+    // as a durable record of what n's we actually have stored per contact.
+    if (plain.n != null) msgObj.n = plain.n;
+    // also stamp which device sent it — needed by reconcileMissingDevices
+    // below to attribute a stored n to the right device's `missing` list,
+    // not just "some device of this contact's."
     if (plain.deviceId) msgObj.deviceId = plain.deviceId;
-    if (typeof plain.n === "number") msgObj.n = plain.n;
-    if (plain.ackDeviceId && typeof plain.ackN === "number") { msgObj.ackDeviceId = plain.ackDeviceId; msgObj.ackN = plain.ackN; }
 
     if (plain.type === "audio") {
       const encBlob = await encryptObject(state.encKey, { data: plain.data, mimeType: plain.mimeType });
@@ -1744,37 +1825,48 @@ async function receiveMessage(msg) {
       mlog.debug(`MSG content: "${(plain.text||"").slice(0,40)}${(plain.text||"").length>40?"…":""}"  id=${plain.id}`);
     }
 
+    // ── merge + reconcile happens BEFORE any ack is sent — see below ──
     if (msgObj.type === "reaction") {
       contact.messages = mergeMessages(contact.messages, [msgObj]);
       // Any reaction — including our own auto-ack below, which is itself
       // a reaction with emoji:null — targeting a message WE sent proves
       // the other side decrypted it. A genuine "they cleared their
       // reaction" is indistinguishable on the wire and implies the exact
-      // same thing, so no special-casing is needed: just flip status
-      // once, on whichever reaction gets there first.
-      const target = contact.messages.find(m => m.id === msgObj.targetId);
-      if (target && target.from === state.publicId && target.status !== "delivered") {
-        target.status = "delivered";
-      }
+      // same thing, so no special-casing is needed. reconcileDeliveryStatus
+      // (shared with every other merge site — see its own doc comment)
+      // does this flip now instead of a one-off inline check here.
+      reconcileDeliveryStatus(contact);
+      reconcileMissingDevices(contact);
     } else {
       contact.messages = mergeMessages(contact.messages, [msgObj]);
       if (state.currentChat !== msg.from) {
         state.unread[msg.from] = (state.unread[msg.from] || 0) + 1;
       }
-      // Auto-ack — reuses the existing reaction channel (emoji:null)
-      // rather than a new packet type. Only for a message that both
-      // decrypted AND verified: an ack should mean "a real device
-      // confirmed this," not just "something decryptable arrived."
-      // Never fires on our own self-targeted traffic (msg.from ===
-      // state.publicId) — there's no delivery concept to signal to
-      // ourselves. Deliberately NOT gated on state.currentChat — this
-      // must go to msg.from regardless of which chat happens to be open.
-      if (valid && msg.from !== state.publicId) {
-        sendReaction(plain.id, null, msg.from);
-      }
     }
+
+    // Durability point — everything above this line is in-memory only.
+    // The auto-ack below deliberately waits until AFTER this completes,
+    // so RECEIVED means "I actually have this on disk," not "I decrypted
+    // this and I'm about to try to save it." Previously the ack fired
+    // inline above, before this await — a tab/app killed between the ack
+    // leaving the socket and this write completing could show the sender
+    // ✔️✔️ delivered for a message the recipient never actually persisted.
     await saveContacts();
     saveContactsBackup();
+
+    // Auto-ack — reuses the existing reaction channel (emoji:null) rather
+    // than a new packet type. Only for a message that both decrypted AND
+    // verified: an ack should mean "a real device confirmed this," not
+    // just "something decryptable arrived." Never fires on our own
+    // self-targeted traffic (msg.from === state.publicId) — there's no
+    // delivery concept to signal to ourselves. Deliberately NOT gated on
+    // state.currentChat — this must go to msg.from regardless of which
+    // chat happens to be open. Never fires for an incoming reaction
+    // itself — no meta-acking.
+    if (msgObj.type !== "reaction" && valid && msg.from !== state.publicId) {
+      sendReaction(plain.id, null, msg.from);
+    }
+
     if (state.currentChat === msg.from) renderMessages();
     updateContactPreview();
   } catch(e) {
@@ -2141,18 +2233,12 @@ async function sendMessage() {
   // round-trip to the relay for this; see the delivered/✔️✔️ path below,
   // which is the real recipient-confirmed signal (an auto-ack reaction).
   let status = "failed";
-  // n/ack hoisted out of the try so the final mergeMessages() below can
-  // stamp the same values onto our own stored copy regardless of whether
-  // the send itself succeeded. See getAckPointer()'s comment for what
-  // these feed into (Roadmap.md's causal-ordering entry).
-  let n = null, ack = null;
+  let sentN  = null;
   try {
     const me     = state.contacts[state.publicId];
     const relay  = me?.lastRelay ? { wss: me.lastRelay } : undefined;
-    ack = getAckPointer(state.currentChat);
-    n   = nextSendCounter(state.currentChat);
-    const payload = { id, text, ts, deviceId: state.deviceId, endpointId: state.endpointId, n,
-                       ...(ack ? { ackDeviceId: ack.deviceId, ackN: ack.n } : {}), ...(relay ? { relay } : {}) };
+    sentN = nextSendCounter(state.currentChat);
+    const payload = { id, text, ts, deviceId: state.deviceId, endpointId: state.endpointId, n: sentN, ...(relay ? { relay } : {}) };
     const blob   = await encryptMessage(contact.encKey, payload);
     const sig    = await signBlob(blob);
 
@@ -2168,8 +2254,7 @@ async function sendMessage() {
     mlog.err(`→ MSG          to   ${pid(state.currentChat)} — send failed: ${e.message}`);
   }
 
-  contact.messages = mergeMessages(contact.messages, [{ id, from: fromId, text, ts, valid: true, status,
-    ...(n !== null ? { deviceId: state.deviceId, n } : {}), ...(ack ? { ackDeviceId: ack.deviceId, ackN: ack.n } : {}) }]);
+  contact.messages = mergeMessages(contact.messages, [{ id, from: fromId, text, ts, valid: true, status, n: sentN }]);
   await saveContacts();
   input.value = "";
   renderMessages();
@@ -2283,15 +2368,13 @@ async function sendCallNotice(id) {
   const text  = `${callerName} is attempting a WebRTC connection`;
 
   let status = "failed";
-  let n = null, ack = null;   // see sendMessage()'s comment on why these are hoisted
+  let sentN  = null;
   try {
     const me    = state.contacts[state.publicId];
     const relay = me?.lastRelay ? { wss: me.lastRelay } : undefined;
-    ack = getAckPointer(id);
-    n   = nextSendCounter(id);
+    sentN = nextSendCounter(id);
     const payload = { id: msgId, type: "system", kind: "call", text, ts,
-                       deviceId: state.deviceId, endpointId: state.endpointId, n,
-                       ...(ack ? { ackDeviceId: ack.deviceId, ackN: ack.n } : {}), ...(relay ? { relay } : {}) };
+                       deviceId: state.deviceId, endpointId: state.endpointId, n: sentN, ...(relay ? { relay } : {}) };
     const blob    = await encryptMessage(contact.encKey, payload);
     const sig     = await signBlob(blob);
 
@@ -2306,8 +2389,7 @@ async function sendCallNotice(id) {
     mlog.err(`→ CALL_NOTICE  to   ${pid(id)} — send failed: ${e.message}`);
   }
 
-  contact.messages = mergeMessages(contact.messages, [{ id: msgId, from: state.publicId, type: "system", kind: "call", text, ts, valid: true, status,
-    ...(n !== null ? { deviceId: state.deviceId, n } : {}), ...(ack ? { ackDeviceId: ack.deviceId, ackN: ack.n } : {}) }]);
+  contact.messages = mergeMessages(contact.messages, [{ id: msgId, from: state.publicId, type: "system", kind: "call", text, ts, valid: true, status, n: sentN }]);
   await saveContacts();
   if (state.currentChat === id) renderMessages();
   updateContactPreview();
@@ -3041,6 +3123,8 @@ async function importBackup(file, passphrase) {
     else {
       mergeContactMeta(state.contacts[id], contact);
       state.contacts[id].messages = mergeMessages(state.contacts[id].messages, contact.messages);
+      reconcileDeliveryStatus(state.contacts[id]);
+      reconcileMissingDevices(state.contacts[id]);
     }
   }
   await saveContacts();

@@ -527,26 +527,7 @@ function renderContactList() {
     li.onclick    = () => openChat(c.publicId);
     const unread  = state.unread[c.publicId] || 0;
     const msgs    = c.messages || [];
-    // Skip anything that isn't a real, previewable message: reactions
-    // (including the RECEIVED auto-ack, a reaction with emoji:null — see
-    // protocol.md's Delivery Acknowledgement section) have no `.text`, so
-    // one landing as the array's literal last entry — which happens
-    // routinely, since it's sent back within ~500ms of any real message
-    // arriving — was previously blanking the preview right after a real
-    // message came in. A plain-text message with empty/whitespace-only
-    // text (shouldn't normally get stored — sendMessage() requires a
-    // trimmed, non-empty body — but defensive against any future path
-    // that isn't as careful) is skipped the same way. audio/image/system
-    // messages always count, since they render their own preview text
-    // below regardless of `.text`.
-    let last = null;
-    for (let i = msgs.length - 1; i >= 0; i--) {
-      const m = msgs[i];
-      if (m.type === "reaction") continue;
-      if ((m.type === undefined) && !(m.text && m.text.trim())) continue;
-      last = m;
-      break;
-    }
+    const last    = msgs[msgs.length - 1];
     const preview = last
       ? last.type === "audio"
         ? "🎤 audio message"
@@ -654,6 +635,48 @@ function openChat(id) {
   document.getElementById("chatInput").focus();
 }
 
+/* ── missing-message banner — see recordKnownDevice (meshchat.js) for
+   how `missing` gets populated (send-counter gap detection) and
+   Roadmap.md for why this is display-only for now: no wire-level
+   backfill request exists yet, and the sender may no longer even have
+   the message locally (15-message retention in serialiseContacts()).
+   Deliberately a single banner, not per-message placeholders spliced
+   into the timeline — we don't know WHERE chronologically a message we
+   never received belongs, only its device-relative n. ── */
+function buildMissingBanner(contactId) {
+  const contactDevices = Object.values(state.knownDevices[contactId] || {});
+  const allMissing = contactDevices.flatMap(d => Array.isArray(d.missing) ? d.missing : []);
+  if (!allMissing.length) return null;
+
+  // This clears itself automatically the moment the actual message shows
+  // up through ANY path — live, backup, restore, or manual sync (see
+  // reconcileMissingDevices in meshchat.js), not just a literal resend.
+  // The ✕ here is for the other case: no wire-level backfill request
+  // exists yet (see Roadmap.md), and the sender's local retention is only
+  // 15 messages per contact, so some gaps are permanent and nothing will
+  // ever arrive to clear them on their own. Dismissing doesn't claim the
+  // message was found — it just stops the warning.
+  const wrap = document.createElement("div");
+  wrap.style.cssText = "display:flex;align-items:center;justify-content:center;gap:6px;margin:2px 0";
+
+  const banner = document.createElement("span");
+  banner.className = "systemMsg";
+  banner.style.cssText = "color:var(--danger);opacity:0.9;margin:0";
+  banner.textContent = allMissing.length === 1
+    ? `⚠ message #${allMissing[0]} not received yet`
+    : `⚠ ${allMissing.length} messages not received yet (#${Math.min(...allMissing)}–#${Math.max(...allMissing)})`;
+  wrap.appendChild(banner);
+
+  const dismissBtn = document.createElement("button");
+  dismissBtn.textContent = "✕";
+  dismissBtn.title = "dismiss — this doesn't recover the message, just stops the warning";
+  dismissBtn.style.cssText = "background:none;border:none;color:var(--muted);cursor:pointer;font-size:11px;padding:0 2px;opacity:0.6;line-height:1";
+  dismissBtn.onclick = (e) => { e.stopPropagation(); dismissMissingWarning(contactId); };
+  wrap.appendChild(dismissBtn);
+
+  return wrap;
+}
+
 function renderMessages() {
   const container = document.getElementById("chatMessages");
   container.innerHTML = "";
@@ -669,10 +692,18 @@ function renderMessages() {
   // filter out reaction messages — they render as overlays on their target bubbles
   const visible = msgs.filter(m => m.type !== "reaction");
 
+  const missingBanner = buildMissingBanner(state.currentChat);
+
   if (!visible.length) {
-    container.innerHTML = '<div style="color:var(--muted);font-size:12px;text-align:center;margin-top:40px;letter-spacing:0.1em">no messages yet</div>';
+    if (missingBanner) container.appendChild(missingBanner);
+    const empty = document.createElement("div");
+    empty.style.cssText = "color:var(--muted);font-size:12px;text-align:center;margin-top:40px;letter-spacing:0.1em";
+    empty.textContent = "no messages yet";
+    container.appendChild(empty);
     return;
   }
+
+  if (missingBanner) container.appendChild(missingBanner);
 
   // Agent contacts read more like a terminal session than a conversation —
   // command and response both flow left, top to bottom, instead of the
