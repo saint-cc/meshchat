@@ -2,7 +2,7 @@
 
 A decentralised, encrypted messaging protocol built on WebSocket relay servers. No accounts, no central authority, no plaintext.
 
-Current client/server implementation version: `0.4.5`, surfaced informationally via the `version` field on `sig:relay_info` for drift visibility (not yet enforced). `0.3.6` added WebRTC data-channel shell escalation for agent contacts; `0.3.7` added the burn notice; `0.4.0` replaced the identity encryption key with an X25519 keypair (breaking, no backward compatibility); `0.4.1` adds web push notifications end to end — VAPID keypair generation, `sig:push_subscribe`/`sig:push_unsubscribe`, best-effort empty-payload pushes on genuinely-offline `app:message` delivery, the per-device opt-in checkbox (edit-contact panel, self only), the browser subscribe/re-subscribe flow, and the service worker's `push`/`notificationclick` handling; `0.4.2` is a client-side bugfix only (the WebRTC call notice previously always labelled the caller `"<name> (me)"`, regardless of who was actually calling, because it read the caller's own locally-decorated self-contact label instead of their plain username — no wire format change). See [Push Notifications](#push-notifications) for the full picture, including what's deliberately still out of scope.
+Current client/server implementation version: `0.4.6`, surfaced informationally via the `version` field on `sig:relay_info` for drift visibility (not yet enforced). `0.3.6` added WebRTC data-channel shell escalation for agent contacts; `0.3.7` added the burn notice; `0.4.0` replaced the identity encryption key with an X25519 keypair (breaking, no backward compatibility); `0.4.1` adds web push notifications end to end — VAPID keypair generation, `sig:push_subscribe`/`sig:push_unsubscribe`, best-effort empty-payload pushes on genuinely-offline `app:message` delivery, the per-device opt-in checkbox (edit-contact panel, self only), the browser subscribe/re-subscribe flow, and the service worker's `push`/`notificationclick` handling; `0.4.2` is a client-side bugfix only (the WebRTC call notice previously always labelled the caller `"<name> (me)"`, regardless of who was actually calling, because it read the caller's own locally-decorated self-contact label instead of their plain username — no wire format change); `0.4.5` adds the endpoint-keyed offline buffer (`BUF_DIR/<publicId>/_endpoints/<endpointId>/`, its own caps/TTL/expiry sweep, independent of the identity-level bucket), extends self-sync device targeting to `sync:backup_push`/`sync:backup_accept` (see [Peer Backup Protocol](#peer-backup-protocol)), and moves `deviceId`/`endpointId`/`fingerprint` off those two types' outer envelope and into the encrypted `blob` — the relay never read them, and an unsigned outer field is silently rewritable in transit by an untrusted relay with zero detection; `0.4.6` replaces the separate `toEndpoint` field with a single compound `to` address (`"id"` or `"id::endpointId"` — see [Compound Addressing](#compound-addressing)), applied first to the `0.4.5` self-sync backup work. See [Push Notifications](#push-notifications) for the full picture, including what's deliberately still out of scope.
 
 ---
 
@@ -87,7 +87,26 @@ This is **not** anonymity from the relay in any broader sense — a relay that w
 
 ---
 
-## Shareable Address
+### Compound Addressing
+
+As of `0.4.6`, a packet's `to` field may carry an optional device-routing suffix — the same way a house number carries an optional unit letter: `1534` routes to the building, `1534b` to one specific unit inside it.
+
+```
+to = "<publicId>"                  — routes to every live session under this identity (unchanged, today's form)
+to = "<publicId>::<endpointId>"    — routes to one specific registered device only
+```
+
+This replaces the separate `toEndpoint` field used in earlier `0.4.x` releases — one field to send and read instead of two, and a human glancing at a packet or a log line sees the whole routing story in one string. `parse_address()`/`build_address()` (`server.py`) and `parseAddress()`/`buildAddress()` (`meshchat-lib.js`) are the shared, mirrored implementations both sides use; nothing else should hand-roll the split.
+
+The separator is `::`. base64url — the charset every id in this protocol uses (`publicId`, `deviceId`, `endpointId`, `callId`, `sessionId`, all `[A-Za-z0-9\-_]{8,64}`) — never contains `:`, so the split is unambiguous with no escaping needed, the same property that already makes the shareable address's `.`-joined segments unambiguous.
+
+**`from` never uses this form.** It's not a routing instruction — it's "who sent this," and the relay derives the true sender from the already-authenticated socket regardless of what's written there, the same way it's always derived `from`. Only `to` ever carries a unit.
+
+**Validation.** The relay's `valid_id()` (bare-id validator, used for `deviceId`/`callId`/`sessionId`/`endpoint_id` and more) deliberately does *not* accept the compound form — `parse_address()` is a separate function specifically for `to`, so nothing else in the protocol accidentally starts accepting `id::endpoint` where a bare id is actually required. `app:migrate`/`app:burn` reject a compound `to` outright (dropped, same as any other malformed packet) — neither type is ever device-targeted by design, so a compound address there is either a bug or something probing the boundary.
+
+**Delivery.** A compound `to` is honored on every branch that already knew how to route `app:message` device-targeted (`route_or_buffer`/`deliver_to_endpoint`) and on the shared `app:sync`/`sync:*`/`call:*`/`shell:*` branch — not a new capability, just a new, single-field way of expressing the same routing instruction that field previously carried. Live-only wherever it was live-only before; the offline buffer honors it wherever it already did (see [Offline Delivery](#offline-delivery)) — nothing about *what* gets buffered or delivered changed in this pass, only how the target device is written on the wire.
+
+
 
 Everything needed to reach someone, encoded as a single dot-separated string:
 
@@ -245,14 +264,13 @@ The wire packet wrapping the encrypted blob:
   "to":        "<publicId>",
   "blob":      { "v": 1, "iv": [...], "data": [...] },
   "sig":       [...],
-  "deviceId":  "<deviceId>",
-  "toEndpoint":  "<recipient's endpointId>"
+  "deviceId":  "<deviceId>"
 }
 ```
 
 `deviceId` is the sender's device identity (see [Device Identity](#device-identity)). It is plaintext — not inside the encrypted blob — so the relay and recipient can read it without decryption. Recipients record it in the local device registry to build passive knowledge of which devices a given identity runs. It is optional; old clients that omit it are handled gracefully (the contact's device list stays at the "unknown" placeholder).
 
-`toEndpoint`, when present, is the **recipient's** `endpointId` (learned earlier via the mechanism above) — a request to route this specific message to one registered device rather than fanning it out to every live session under `to`. The relay honors this via `deliver_to_endpoint`/`connected_by_endpoint` (see [Device Endpoint ID](#device-endpoint-id)); a `toEndpoint` value that isn't currently registered is treated as "that device is offline," not silently broadcast to every session. Optional and orthogonal to the sender's own `deviceId`/`endpointId` fields above — a message can identify its sender's device, target the recipient's device, both, or neither.
+`to` may carry a compound `"<publicId>::<endpointId>"` address (see [Compound Addressing](#compound-addressing)) — the endpoint half, when present, is the **recipient's** `endpointId` (learned earlier via the mechanism above), a request to route this specific message to one registered device rather than fanning it out to every live session under that identity. The relay honors this via `deliver_to_endpoint`/`connected_by_endpoint` (see [Device Endpoint ID](#device-endpoint-id)); a targeted device that isn't currently registered is treated as "that device is offline," not silently broadcast to every session. Orthogonal to the sender's own `deviceId` field above — a message can identify its sender's device, target the recipient's device, both, or neither.
 
 ---
 
@@ -289,16 +307,22 @@ If a contact is not connected to their relay when the message arrives, the relay
 ```
 relay_buf/
   <recipientPublicId>/
-    <timestamp>_<uuid>.json
+    <timestamp>_<uuid>.json          — identity-level bucket, reached by any live session under this identity
+    _endpoints/
+      <endpointId>/
+        <timestamp>_<uuid>.json      — device-targeted bucket, reached only by a connection presenting this exact endpoint_id at auth
 ```
 
-On reconnect and successful auth, the relay flushes all buffered packets oldest-first and deletes them on successful delivery. Unauthenticated connections never receive buffered messages.
+A packet whose `to` address is bare (see [Compound Addressing](#compound-addressing)) goes into the identity-level bucket, exactly as before compound addressing existed. A packet whose `to` carries a `::endpointId` suffix goes into that specific device's own bucket instead — mirroring the same split live delivery already makes between `deliver()` and `deliver_to_endpoint()`.
 
-**Per-recipient limits** (configurable via environment):
+On reconnect and successful auth, the relay flushes all buffered packets oldest-first and deletes them on successful delivery. A connection that presents `endpoint_id` at auth gets **both** its identity-level bucket and its own endpoint bucket flushed; a connection that doesn't only ever gets the identity-level one — a device-targeted packet is never handed to whichever session happens to reconnect first, only to the one it was actually addressed to. Unauthenticated connections never receive buffered messages of either kind.
+
+**Per-recipient limits** (configurable via environment), applied independently to the identity-level bucket and to each endpoint bucket:
 - `BUF_MAX_MSGS` — maximum buffered packets (default 100, drops oldest)
 - `BUF_MAX_MB`  — maximum total size in MB (default 10, drops new)
 - `BUF_MAX_AGE` — expiry in seconds (default 86400 = 24h, swept periodically)
-- `app:migrate` packets use different semantics entirely — overwrite-per-sender and a longer TTL — see [Relay Migration](#relay-migration) below.
+- `MAX_ENDPOINTS_PER_RECIPIENT` — maximum distinct endpoint buckets one identity can accumulate (default 20), checked only when a *new* bucket would be created; an already-admitted endpoint keeps accepting writes regardless. Same spirit as `MAX_BUF_RECIPIENTS` below, one level down — `endpoint_id` is only ever presented by an already-authenticated socket, though, so this is a narrower abuse surface than `to` itself, which only has to satisfy `valid_id()`.
+- `app:migrate`/`app:burn` packets use different semantics entirely — overwrite-per-sender and a longer TTL, always identity-level (never device-targeted by design — see [Compound Addressing](#compound-addressing)) — see [Relay Migration](#relay-migration) below.
 
 ---
 
@@ -602,13 +626,13 @@ The service worker (`sw.js`) handles the two events every push implies: `push` (
 | `sig:auth_init`     | `x25519_pub`, `ed25519_pub`, `no_receive?`, `endpoint_id?` | no  | Begin challenge-response, presenting both public keys. `no_receive: true` skips registration and buffer flush (used by probes). `endpoint_id`, if present, additionally registers the socket into `connected_by_endpoint` for device-targeted delivery (see [Device Endpoint ID](#device-endpoint-id)) |
 | `sig:auth_proof`    | `sig`                                     | no  | Return Ed25519 signature over the server's nonce |
 | `sig:announce`      | `ids[]`                                   | yes  | Check local presence of up to 10 IDs |
-| `app:message`       | `from`, `to`, `blob`, `sig`, `deviceId?`, `toEndpoint?` | yes | Deliver message — `from` must match authed identity on this socket. `toEndpoint`, if present, targets one specific registered device (the recipient's `endpointId`) instead of every live session under `to` |
+| `app:message`       | `from`, `to`, `blob`, `sig`, `deviceId?` | yes | Deliver message — `from` must match authed identity on this socket. `to` may be compound (`"id::endpointId"` — see [Compound Addressing](#compound-addressing)) to target one specific registered device instead of every live session under that identity |
 | `app:migrate`       | `from`, `to`, `blob`, `sig`               | yes | Notify of a relay migration — always durably buffered in addition to live delivery |
 | `app:burn`          | `from`, `to`, `blob`, `sig`               | yes | Notify of a burn (self-destruct / stop-trusting) — always durably buffered in addition to live delivery, own overwrite bucket |
 | `app:sync`          | `from`, `to`, `msgs[]`, `reply`           | yes  | Manual sync exchange |
 | `sync:backup_offer` | `from`, `to`, `size`                      | yes  | Offer backup blob to peer |
-| `sync:backup_accept`| `from`, `to`, `blob?`, `toEndpoint?` | yes  | Accept a backup offer. Self-sync device-freshness ack: `blob` (present only on this variant, never on a plain contact-offer accept) encrypts `{ deviceId, endpointId, fingerprint }`. `toEndpoint`, when present, targets the ack back at the specific sibling device that just sent the push it's acking |
-| `sync:backup_push`  | `from`, `to`, `blob`, `toEndpoint?` | yes | Push backup blob. Self-sync path: `blob` encrypts `{ deviceId, endpointId, fingerprint, contacts }` (fingerprint-tracked full push) or a bare contacts map (`pushMiniBackup`'s untracked slim push — no fingerprint dance). `toEndpoint`, when present, targets one specific self-device instead of every live self-session (see [Device Endpoint ID](#device-endpoint-id)) |
+| `sync:backup_accept`| `from`, `to`, `blob?` | yes  | Accept a backup offer. Self-sync device-freshness ack: `blob` (present only on this variant, never on a plain contact-offer accept) encrypts `{ deviceId, endpointId, fingerprint }`. `to` may be compound to target the ack back at the specific sibling device that just sent the push it's acking |
+| `sync:backup_push`  | `from`, `to`, `blob` | yes | Push backup blob. Self-sync path: `blob` encrypts `{ deviceId, endpointId, fingerprint, contacts }` (fingerprint-tracked full push) or a bare contacts map (`pushMiniBackup`'s untracked slim push — no fingerprint dance). `to` may be compound (see [Compound Addressing](#compound-addressing)) to target one specific self-device instead of every live self-session |
 | `sync:restore_req`  | `from`, `to`, `blob`                      | yes  | Request peer send their stored backup |
 | `sync:restore_ack`  | `from`, `to`                              | yes  | Acknowledge restore request |
 | `sync:restore_push` | `from`, `to`, `blob`                      | yes  | Push stored backup to requester |
@@ -650,12 +674,12 @@ The service worker (`sw.js`) handles the two events every push implies: `push` (
 - `app:message`, `app:migrate`, `app:sync`, and all `sync:*` types require auth AND validate `from` ∈ `client_ids` on the socket. `sig:relay_req` and `sig:ping` only require the socket to be authed (no `from` field to check). `sig:announce` has no `from` field at all — its response targets the socket's own authed identity via `last_id()`.
 - `app:migrate` and `app:burn` are always written to the durable buffer in addition to any live delivery — each to its own overwrite bucket, keyed by its own filename suffix, so one can never evict the other.
 - `sync:backup_accept` and `sync:backup_push` carry an optional `blob` on the self-sync path, encrypting `{ deviceId, endpointId, fingerprint }` (plus `contacts` for the push) — never as outer envelope fields. `blob`'s presence on `sync:backup_accept` is what disambiguates a self-device-freshness ack from a normal contact-offer accept, which never sets one. Old clients that predate this — or omit `endpointId` inside the blob — are handled gracefully; only an explicitly-provided `endpointId` is ever adopted.
-- `toEndpoint` is honored on the same shared delivery branch as `app:sync`, every `sync:*` type, and every `call:*`/`shell:*` type — not just `app:message`. In practice only `sync:backup_push`/`sync:backup_accept` set it today (self-device targeting); `call:*`/`shell:*` never do, so their delivery is unaffected. Like `app:message`'s `toEndpoint`, this is live-only here too — none of these types are durably buffered, so a `toEndpoint` aimed at a currently-offline device simply reaches nobody, the same as an untargeted send to an offline recipient already does.
+- Compound `to` device-targeting (see [Compound Addressing](#compound-addressing)) is honored on the same shared delivery branch as `app:sync`, every `sync:*` type, and every `call:*`/`shell:*` type — not just `app:message`. In practice only `sync:backup_push`/`sync:backup_accept` use it today (self-device targeting); `call:*`/`shell:*` never send a compound `to`, so their delivery is unaffected. Like `app:message`'s device targeting, this is live-only here too — none of these types are durably buffered, so a `to` aimed at a currently-offline device simply reaches nobody, the same as an untargeted send to an offline recipient already does.
 - Sync and backup types are e2e encrypted and routed by the server without inspection of contents — but the socket itself must be authed before any of these are accepted. This closes a prior gap where an unauthenticated connection could reach these branches before completing the challenge-response.
 - All seven `call:*` types and all seven `shell:*` types are delivered live-only via the same `deliver()`/`from`-validation path as `app:sync` and the `sync:*` types; unlike `app:message`/`app:migrate`/`app:burn` they are never durably buffered, so an offline callee/agent simply never rings.
 - `call:invite`/`call:claim`/`call:cancel`/`call:end` and `shell:invite`/`shell:claim`/`shell:cancel`/`shell:end` carry no `blob` — signed only, nothing to encrypt. `call:offer`/`call:answer`/`call:ice` and `shell:offer`/`shell:answer`/`shell:ice` carry an encrypted `blob` (SDP or one ICE candidate) and sign the ciphertext along with the envelope, same protection principle as `app:migrate`/`app:burn`.
 - Delivery acknowledgement (RECEIVED) is not a distinct signal-server packet type — it is an ordinary `app:message` carrying a `reaction` payload with `emoji: null`, routed exactly like any other message. See [Delivery Acknowledgement](#delivery-acknowledgement-received).
-- `toEndpoint`-targeted delivery is live-only in its device-scoping — the offline buffer (`buf_write`/`buf_deliver`) remains identity-level regardless of `toEndpoint`. A device-targeted message that misses live delivery still lands in the same shared per-`to`-identity buffer as any other message and is flushed to whichever device authenticates first, not held back for the named device specifically. Making the buffer itself device-aware is explicitly deferred — see `Roadmap.md`.
+- Device-targeted delivery (a compound `to`) is honored by the offline buffer too, not just live delivery — see [Offline Delivery](#offline-delivery)'s endpoint-bucket description. A device-targeted message that misses live delivery lands in that specific device's own bucket (`BUF_DIR/<id>/_endpoints/<endpointId>/`) and is only ever flushed to a connection presenting that exact `endpoint_id` at auth — never to whichever device happens to reconnect first.
 
 ---
 
@@ -679,13 +703,13 @@ fingerprint = base64url( SHA-256( JSON(serialiseContacts()) )[0:12] )
 
 Each device maintains an in-memory table of `{ deviceId → fingerprint }` for the other devices it has heard from this session (`knownDeviceFingerprints`). If every known device already has the current fingerprint, the push is skipped. The table resets on reload — worst case is one extra push on cold start, no data-loss risk.
 
-The `sync:backup_push` self-path encrypts `{ deviceId, endpointId, fingerprint, contacts }` as one blob — the outer envelope carries only `type`/`from`/`to`/`blob`(/`toEndpoint`), nothing else; the relay only ever needs `toEndpoint` to route, and everything else here would be a plaintext, unsigned, silently-rewritable-in-transit field otherwise (the relay is untrusted infrastructure — cryptographic proof is the only trust boundary, same principle `app:message`'s `deviceId` placement already follows). The receiver merges, then replies with a `sync:backup_accept` whose own blob encrypts `{ deviceId, endpointId, fingerprint }` — a lightweight ack that lets the sender record the receiver's current state and endpoint. The presence of `blob` on `backup_accept` is what distinguishes this device-ack from a normal contact offer-accept, which never sets one; old clients (or the pre-this-pass wire shape) fall through to today's behavior unchanged. Since self-sync packets carry no `sig`, this buys tamper-*evidence* (AES-GCM simply fails to decrypt on any bit flip) rather than the stronger sender-authentication `app:message`'s Ed25519 signature provides — sufficient here since this is self-to-self traffic on an already-authenticated socket, but worth stating plainly rather than implying an equivalent guarantee.
+The `sync:backup_push` self-path encrypts `{ deviceId, endpointId, fingerprint, contacts }` as one blob — the outer envelope carries only `type`/`from`/`to`/`blob`, nothing else; `to` may be a compound address (see [Compound Addressing](#compound-addressing)) when the push is targeted, and everything else here would be a plaintext, unsigned, silently-rewritable-in-transit field otherwise (the relay is untrusted infrastructure — cryptographic proof is the only trust boundary, same principle `app:message`'s `deviceId` placement already follows). The receiver merges, then replies with a `sync:backup_accept` whose own blob encrypts `{ deviceId, endpointId, fingerprint }` — a lightweight ack that lets the sender record the receiver's current state and endpoint. The presence of `blob` on `backup_accept` is what distinguishes this device-ack from a normal contact offer-accept, which never sets one; old clients (or the pre-this-pass wire shape) fall through to today's behavior unchanged. Since self-sync packets carry no `sig`, this buys tamper-*evidence* (AES-GCM simply fails to decrypt on any bit flip) rather than the stronger sender-authentication `app:message`'s Ed25519 signature provides — sufficient here since this is self-to-self traffic on an already-authenticated socket, but worth stating plainly rather than implying an equivalent guarantee.
 
 `pushMiniBackup` (a smaller, single-contact self-push fired after every outgoing message — see [Message Merging](#message-merging) context) shares this same `sync:backup_push` handler but sends a bare, unwrapped contacts map with no `deviceId`/`endpointId`/`fingerprint` at all — it doesn't participate in the fingerprint-tracking dance above. The receiving handler distinguishes the two shapes by checking for a string `deviceId` alongside an object `contacts` field; a genuine contacts map's top-level keys are always publicIds, never the literal string `"deviceId"`, so this is unambiguous.
 
-**Per-device targeting.** When a known sibling device's fingerprint is stale AND its `endpointId` is already on file (`state.knownDevices[state.publicId][deviceId].endpointId`, populated passively by the ack exchange above), the push is sent with `toEndpoint` set to that device's endpoint — reaching only that device, not every live self-session. A device already reached this way may still receive a broadcast copy if some *other* stale device's `endpointId` isn't known yet (an older client, or one that simply hasn't acked this session); this is accepted, harmless redundancy — merging the same blob twice is a no-op — rather than something worth the complexity of excluding already-targeted sockets from the fallback broadcast. The ack itself is targeted the same way: `handleBackupPush`'s self branch now knows the pushing device's `endpointId` the instant the push arrives, so the reply ack sets `toEndpoint` back to it rather than broadcasting.
+**Per-device targeting.** When a known sibling device's fingerprint is stale AND its `endpointId` is already on file (`state.knownDevices[state.publicId][deviceId].endpointId`, populated passively by the ack exchange above), the push is sent with `to` set to the compound `buildAddress(state.publicId, endpointId)` address — reaching only that device, not every live self-session. A device already reached this way may still receive a broadcast copy (bare `to`) if some *other* stale device's `endpointId` isn't known yet (an older client, or one that simply hasn't acked this session); this is accepted, harmless redundancy — merging the same blob twice is a no-op — rather than something worth the complexity of excluding already-targeted sockets from the fallback broadcast. The ack itself is targeted the same way: `handleBackupPush`'s self branch now knows the pushing device's `endpointId` the instant the push arrives, so the reply ack's `to` becomes the compound address pointing back at it rather than broadcasting.
 
-A broadcast (no `toEndpoint`) is still the first move whenever no device has been heard from yet this session — there's nothing to target, and the broadcast is what populates `knownDeviceFingerprints`/`endpointId` for every subsequent push to actually target against.
+A broadcast (bare `to`, no unit) is still the first move whenever no device has been heard from yet this session — there's nothing to target, and the broadcast is what populates `knownDeviceFingerprints`/`endpointId` for every subsequent push to actually target against.
 
 **Restore handshake** (fires on connect for all known contacts):
 1. Client sends `sync:restore_req` to each contact
@@ -768,6 +792,8 @@ The relay itself is untrusted infrastructure. Cryptographic proof — signatures
 | `BUF_MAX_AGE_MIGRATE` | `604800`      | Buffer expiry in seconds (7d) — `app:migrate` packets only |
 | `BUF_MAX_AGE_BURN`    | `604800`      | Buffer expiry in seconds (7d) — `app:burn` packets only, independent bucket |
 | `BUF_MAX_MB`          | `10`          | Max buffer size per recipient in MB |
+| `MAX_BUF_RECIPIENTS`  | `10000`       | Max distinct identity-level recipient directories under `BUF_DIR` at once — a brake on fanning out to unlimited fabricated recipient IDs, since `to` only has to satisfy `valid_id()` |
+| `MAX_ENDPOINTS_PER_RECIPIENT` | `20`  | Max distinct endpoint buckets (`_endpoints/<endpointId>/`) one identity can accumulate — see [Offline Delivery](#offline-delivery) |
 | `AUTH_TIMEOUT`        | `15`          | Seconds to complete challenge-response before disconnect |
 | `VAPID_SUBJECT`       | `mailto:admin@example.com` | Operator contact required by the VAPID spec, sent in every push JWT's `sub` claim |
 | `VAPID_KEY_FILE`      | next to `BUF_DIR` | Path to the persisted VAPID EC P-256 private key (PEM); generated on first boot if missing |
