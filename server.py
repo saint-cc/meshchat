@@ -46,7 +46,7 @@ RELAY_WSS_URL = os.environ.get("RELAY_WSS_URL", "")   # e.g. wss://yourrelay.exa
 # Protocol version — informational only for now, surfaced in sig:relay_info
 # so client/server version drift shows up in both logs. Not enforced yet;
 # room to add real backwards-compat handling once this is actually needed.
-PROTOCOL_VERSION = os.environ.get("PROTOCOL_VERSION", "0.4.5")
+PROTOCOL_VERSION = os.environ.get("PROTOCOL_VERSION", "0.4.6")
 
 # Connection limits
 MAX_CONNECTIONS        = int(os.environ.get("MAX_CONNECTIONS",        100))   # total WS sessions
@@ -163,6 +163,49 @@ WS_MAX_SIZE = int(os.environ.get("WS_MAX_SIZE", 2 * 1024 * 1024))   # 2 MB per f
 # ID validation — base64url chars only, 8–64 chars
 _ID_RE = re.compile(r'^[A-Za-z0-9\-_]{8,64}$')
 def valid_id(s): return isinstance(s, str) and bool(_ID_RE.match(s))
+
+# ── COMPOUND ADDRESSING — "id::endpointId" ──
+# `to` may now carry an optional device-routing suffix, the same way a
+# house number carries an optional unit letter: "1534" routes to the
+# building, "1534b" to one specific unit inside it. `id::endpointId`
+# replaces the old separate `toEndpoint` field entirely — one field to
+# read instead of two, and a human glancing at a log line sees the whole
+# routing story in one string.
+#
+# Deliberately NOT folded into valid_id() itself: valid_id() is reused for
+# deviceId, callId, sessionId, and endpoint_id — none of which should ever
+# accept the compound form, only `to` should. base64url (valid_id's own
+# charset) never contains ':', so the split is unambiguous with no
+# escaping needed — the same property that already makes the shareable
+# address's '.'-joined segments unambiguous.
+#
+# `from` deliberately stays bare — it's not a routing instruction, it's
+# "who sent this", and the relay derives the true sender from the authed
+# socket regardless of what's written there. Only `to` ever carries a unit.
+ADDR_SEP = "::"
+
+def parse_address(addr):
+    """"id" or "id::endpointId" -> (id, endpoint_or_None). Returns
+    (None, None) if addr isn't a string, or either half fails valid_id() —
+    callers treat that identically to today's `not valid_id(to)` check."""
+    if not isinstance(addr, str):
+        return None, None
+    if ADDR_SEP in addr:
+        parts = addr.split(ADDR_SEP)
+        if len(parts) != 2:
+            return None, None
+        base_id, endpoint_id = parts
+        if not (valid_id(base_id) and valid_id(endpoint_id)):
+            return None, None
+        return base_id, endpoint_id
+    return (addr, None) if valid_id(addr) else (None, None)
+
+def build_address(base_id, endpoint_id=None):
+    """Inverse of parse_address() — mirrors the client's buildAddress() in
+    meshchat-lib.js exactly. Used server-side only for constructing log
+    lines / any packet the relay itself originates that might need one;
+    routing always goes through parse_address() on the way in."""
+    return f"{base_id}{ADDR_SEP}{endpoint_id}" if endpoint_id else base_id
 
 # Online presence
 ONLINE_EXPIRY_SECONDS = 300   # prune peers not seen within this window
@@ -288,6 +331,18 @@ def fmt_bytes(b):
 def short(id_str):
     if not id_str: return "?"
     return id_str[:8] + "…"
+
+def short_addr(addr):
+    """Same truncation as short(), but shape-aware for a compound
+    'id::endpointId' address — truncates each half independently so a log
+    line still reads as 'Bob…::laptop…' rather than swallowing the
+    endpoint half entirely under a flat 8-char cut of the whole string."""
+    if not addr:
+        return "?"
+    if ADDR_SEP in addr:
+        base_id, _, endpoint_id = addr.partition(ADDR_SEP)
+        return f"{short(base_id)}{ADDR_SEP}{short(endpoint_id)}"
+    return short(addr)
 
 def peer_info(ws):
     try:
@@ -564,12 +619,13 @@ async def deliver(to_id, obj, exclude=None):
 async def deliver_to_endpoint(to_id, endpoint_id, obj, exclude=None):
     """Same shape as deliver(), scoped to the socket(s) registered under
     this specific (identity, endpointId) pair — see connected_by_endpoint.
-    Used when an app:message envelope carries an optional toEndpoint field.
-    Deliberately does NOT fall back to every session under to_id if the
-    named device isn't currently registered — a device-targeted send
-    reaching nobody is exactly the "offline" case route_or_buffer already
-    handles via the shared identity-level buffer; broadcasting instead
-    would silently defeat the whole point of asking for one device."""
+    Used when a `to` address carries a compound "id::endpointId" suffix
+    (see parse_address() near valid_id). Deliberately does NOT fall back
+    to every session under to_id if the named device isn't currently
+    registered — a device-targeted send reaching nobody is exactly the
+    "offline" case route_or_buffer already handles via the shared
+    identity-level buffer; broadcasting instead would silently defeat the
+    whole point of asking for one device."""
     sessions = connected_by_endpoint.get(to_id, {}).get(endpoint_id, set())
     reached  = 0
     for ws in list(sessions):
@@ -577,11 +633,18 @@ async def deliver_to_endpoint(to_id, endpoint_id, obj, exclude=None):
         if await send_to(ws, obj): reached += 1
     return reached
 
-async def route_or_buffer(kind, frm, to, msg, ws):
+async def route_or_buffer(kind, frm, to_id, to_endpoint, msg, ws):
     """Shared delivery path for from-authenticated, to-routed packet types
     (app:message, app:migrate). Delivers live if the recipient is
     connected, otherwise falls back to the offline buffer — buf_write
     handles per-type overwrite/TTL behaviour on its own.
+
+    to_id/to_endpoint are pre-parsed by the caller from the wire's single
+    compound `to` field ("id" or "id::endpointId" — see parse_address()
+    near valid_id) rather than parsed again here — one parse point, not
+    two. Migrate/burn are never device-targeted, so their caller already
+    rejects a compound address before this function is ever reached;
+    to_endpoint is only ever non-None here for an app:message.
 
     app:migrate is the one exception to "buffer only if delivery failed":
     it always gets written to the durable buffer in addition to any live
@@ -608,37 +671,32 @@ async def route_or_buffer(kind, frm, to, msg, ws):
     receive the message live. app:migrate/app:burn never push — neither
     is something a human needs to be woken up for.
 
-    Device targeting (app:message only): an envelope carrying `toEndpoint`
-    (a endpointId — see connected_by_endpoint) is delivered only to that
-    specific registered device via deliver_to_endpoint(), not fanned out to
-    every live session under `to`. The offline buffer now honours this too
-    (see buf_write's endpoint_id param / buf_endpoint_dir): a device-
-    targeted send that misses live delivery lands in that device's OWN
-    bucket (BUF_DIR/<to>/_endpoints/<toEndpoint>/) rather than the shared
+    Device targeting (app:message only): a `to` address carrying a
+    "::endpointId" suffix is delivered only to that specific registered
+    device via deliver_to_endpoint(), not fanned out to every live session
+    under `to_id`. The offline buffer honours this too (see buf_write's
+    endpoint_id param / buf_endpoint_dir): a device-targeted send that
+    misses live delivery lands in that device's OWN bucket
+    (BUF_DIR/<to_id>/_endpoints/<endpointId>/) rather than the shared
     identity-level one, and is only ever flushed to a connection that
     later presents that exact endpoint_id at auth — never to whichever
-    device happens to reconnect first. Nothing upstream of this function
-    sets toEndpoint yet (no client send path targets a specific device
-    today — see meshchat.js), so this bucket is currently dormant, wired
-    ahead of need the same way connected_by_endpoint/deliver_to_endpoint
-    were before anything used them either."""
-    to_endpoint = msg.get("toEndpoint") if kind == "app:message" else None
+    device happens to reconnect first."""
     if to_endpoint:
-        reached = await deliver_to_endpoint(to, to_endpoint, msg, exclude=ws)
+        reached = await deliver_to_endpoint(to_id, to_endpoint, msg, exclude=ws)
     else:
-        reached = await deliver(to, msg, exclude=ws)
+        reached = await deliver(to_id, msg, exclude=ws)
+    addr_disp = build_address(to_id, to_endpoint)
     if reached:
-        log.info("%-10s from=%s  to=%s  reached=%d%s", kind.upper(), short(frm), short(to), reached,
-                  f"  endpoint={short(to_endpoint)}" if to_endpoint else "")
+        log.info("%-10s from=%s  to=%s  reached=%d", kind.upper(), short(frm), short_addr(addr_disp), reached)
     if not reached or kind in ("app:migrate", "app:burn"):
-        await buf_write(to, msg, to_endpoint)
+        await buf_write(to_id, msg, to_endpoint)
         if reached:
             log.info("BUF Q      from=%s  to=%s  (also buffered — %s, durability required)  type=%s",
-                      short(frm), short(to), "migrate" if kind == "app:migrate" else "burn", kind)
+                      short(frm), short_addr(addr_disp), "migrate" if kind == "app:migrate" else "burn", kind)
         else:
-            log.info("BUF Q      from=%s  to=%s  (offline)  type=%s", short(frm), short(to), kind)
+            log.info("BUF Q      from=%s  to=%s  (offline)  type=%s", short(frm), short_addr(addr_disp), kind)
     if not reached and kind == "app:message":
-        await push_notify(to)
+        await push_notify(to_id)
 
 # ══════════════════════════════════════════
 #   AUTH HELPERS
@@ -782,10 +840,11 @@ def buf_files(to_id):
 
 def buf_endpoint_dir(to_id, endpoint_id):
     """BUF_DIR/<to_id>/_endpoints/<endpoint_id> — a second, independent
-    bucket alongside the identity-level one, for app:message packets that
-    carried toEndpoint and missed live delivery to that specific device
-    (see route_or_buffer/deliver_to_endpoint). Never used for
-    app:migrate/app:burn — those aren't device-targeted and stay
+    bucket alongside the identity-level one, for app:message packets whose
+    `to` address carried a device-targeted "::endpointId" suffix (see
+    parse_address() near valid_id) and missed live delivery to that
+    specific device (see route_or_buffer/deliver_to_endpoint). Never used
+    for app:migrate/app:burn — those aren't device-targeted and stay
     identity-level exclusively, same as today."""
     parent = buf_dir(to_id)   # raises ValueError on traversal attempt in to_id itself
     path = os.path.realpath(os.path.join(parent, "_endpoints", endpoint_id))
@@ -1318,15 +1377,22 @@ async def handler(ws):
             # ── message / migrate: from must match an authed identity on this socket ──
             elif kind in ("app:message", "app:migrate", "app:burn"):
                 frm = msg.get("from", "?")
-                to  = msg.get("to")
-                if not valid_id(to):
+                to_id, to_endpoint = parse_address(msg.get("to"))
+                if to_id is None:
                     log.warning("  %s with invalid 'to', dropped", kind)
+                    continue
+                # migrate/burn are never device-targeted by design — a
+                # compound address here is either a bug or something
+                # probing the boundary, dropped outright rather than
+                # silently treated as the bare identity.
+                if to_endpoint and kind in ("app:migrate", "app:burn"):
+                    log.warning("  %s with device-targeted 'to' — not allowed for this type, dropped", kind)
                     continue
                 if frm not in client_ids:
                     log.warning("%-10s from=%s  not authed  peer=%s  dropped", kind.upper(), short(frm), addr)
                     await send_to(ws, {"type": "error", "reason": "not_authenticated"})
                     continue
-                await route_or_buffer(kind, frm, to, msg, ws)
+                await route_or_buffer(kind, frm, to_id, to_endpoint, msg, ws)
 
             # ── push subscribe/unsubscribe: from must match an authed
             #    identity on this socket, same rule as app:message et al.
@@ -1403,35 +1469,33 @@ async def handler(ws):
                           "shell:invite", "shell:claim", "shell:cancel", "shell:end",
                           "shell:offer", "shell:answer", "shell:ice"):
                 frm = msg.get("from", "?")
-                to  = msg.get("to")
-                if not valid_id(to):
+                # `to` may carry a compound "id::endpointId" address — see
+                # parse_address()'s comment near valid_id for the format.
+                # This replaces the old separate `toEndpoint` field
+                # entirely: one field to read instead of two. Live-only
+                # here, same as everything else in this branch already is
+                # — none of these types are durably buffered, so a
+                # device-targeted `to` aimed at a currently-offline device
+                # simply reaches nobody, exactly like an untargeted send to
+                # an offline recipient already does today. call:*/shell:*
+                # never send a device-targeted address, so their behavior
+                # is byte-for-byte unchanged; sync:backup_push/accept are
+                # the first types to actually use it, for self-device-
+                # targeted backup pushes and their acks.
+                to_id, to_endpoint = parse_address(msg.get("to"))
+                if to_id is None:
                     log.warning("  %s with invalid 'to', dropped", kind)
                     continue
                 if frm not in client_ids:
                     log.warning("%-10s from=%s  not authed  peer=%s  dropped", kind.upper(), short(frm), addr)
                     await send_to(ws, {"type": "error", "reason": "not_authenticated"})
                     continue
-                # toEndpoint — same device-targeting field app:message already
-                # honors (see route_or_buffer/deliver_to_endpoint), generalized
-                # onto this shared branch. Live-only here, same as everything
-                # else in this branch already is — none of these types are
-                # durably buffered, so a toEndpoint aimed at a currently-
-                # offline device simply reaches nobody, exactly like an
-                # untargeted send to an offline recipient already does today.
-                # call:*/shell:* never set this field, so their behavior is
-                # byte-for-byte unchanged; sync:backup_push is the first type
-                # to actually use it, for self-device-targeted backup pushes.
-                to_endpoint = msg.get("toEndpoint")
-                if to_endpoint and not valid_id(to_endpoint):
-                    log.warning("  %s with invalid toEndpoint, dropped", kind)
-                    continue
                 if to_endpoint:
-                    reached = await deliver_to_endpoint(to, to_endpoint, msg, exclude=ws)
+                    reached = await deliver_to_endpoint(to_id, to_endpoint, msg, exclude=ws)
                 else:
-                    reached = await deliver(to, msg, exclude=ws)
-                log.info("%-16s from=%s  to=%s  reached=%d%s",
-                         kind.upper()[:16], short(frm), short(to), reached,
-                         f"  endpoint={short(to_endpoint)}" if to_endpoint else "")
+                    reached = await deliver(to_id, msg, exclude=ws)
+                log.info("%-16s from=%s  to=%s  reached=%d",
+                         kind.upper()[:16], short(frm), short_addr(msg.get("to")), reached)
 
             elif kind == "sig:relay_req":
                 await send_to(ws, {

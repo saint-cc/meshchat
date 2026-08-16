@@ -13,7 +13,7 @@
 
    Load order: meshchat-lib.js → meshchat-gui.js → meshchat.js → statemachine.js
 ═══════════════════════════════════════════════════════════════ */
-const CLIENT_VERSION = "0.4.5";
+const CLIENT_VERSION = "0.4.6";
 
 const POLL_INTERVAL_MS        	= 30_000;			// base interval between presence polls
 const POLL_JITTER_MS          	= 10_000;			// ± random jitter added to poll interval
@@ -546,16 +546,18 @@ async function pushBackupToContacts(blob) {
 		// see knownDeviceFingerprints) already has this exact content.
 		//
 		// Targeting: a device we've heard from AND already know a current
-		// endpointId for gets a TARGETED push (toEndpoint) once its
-		// fingerprint is confirmed stale — a real per-device send, not a
-		// broadcast every live self-session has to receive and discard.
-		// state.knownDevices[state.publicId][deviceId].endpointId is what
-		// supplies this — populated passively by handleBackupAccept/
-		// handleBackupPush below, the same "only adopt an explicit value"
-		// rule the message-receipt path already uses for endpointId.
+		// endpointId for gets a TARGETED push — `to` becomes the compound
+		// "id::endpointId" address (buildAddress(), see meshchat-lib.js)
+		// once its fingerprint is confirmed stale — a real per-device
+		// send, not a broadcast every live self-session has to receive
+		// and discard. state.knownDevices[state.publicId][deviceId]
+		// .endpointId is what supplies this — populated passively by
+		// handleBackupAccept/handleBackupPush below, the same "only adopt
+		// an explicit value" rule the message-receipt path already uses
+		// for endpointId.
 		//
-		// A broadcast (untargeted sync:backup_push) is still used,
-		// deliberately, in two cases:
+		// A broadcast (bare `to`, no unit) is still used, deliberately,
+		// in two cases:
 		//   (a) we haven't heard an ack from ANYONE yet this session — there
 		//       is nothing to target, and this broadcast doubles as the
 		//       discovery mechanism that populates knownDeviceFingerprints/
@@ -585,13 +587,14 @@ async function pushBackupToContacts(blob) {
 			// deviceId/endpointId/fingerprint ride INSIDE the encrypted blob
 			// now, alongside the actual contacts payload — never as outer
 			// envelope metadata. The relay never reads any of these three
-			// (only `toEndpoint` is a routing field it actually touches), and
-			// an unsigned outer field is silently rewritable in transit by an
-			// untrusted relay with zero detection — the same reasoning that
-			// already moved app:message's deviceId off its outer envelope and
-			// into its signed+encrypted payload. self-sync packets carry no
-			// `sig` today, so this buys tamper-EVIDENCE (AES-GCM simply fails
-			// to decrypt on any bit flip) rather than the stronger sender-
+			// (only the `to` address's optional "::endpointId" unit is a
+			// routing detail it actually touches), and an unsigned outer
+			// field is silently rewritable in transit by an untrusted relay
+			// with zero detection — the same reasoning that already moved
+			// app:message's deviceId off its outer envelope and into its
+			// signed+encrypted payload. self-sync packets carry no `sig`
+			// today, so this buys tamper-EVIDENCE (AES-GCM simply fails to
+			// decrypt on any bit flip) rather than the stronger sender-
 			// authentication app:message's Ed25519 signature provides — good
 			// enough here since this is self-to-self on an already-authed
 			// socket, just worth being honest it's not an identical guarantee.
@@ -609,11 +612,11 @@ async function pushBackupToContacts(blob) {
 			} else {
 				let targeted = 0, unresolved = 0;
 				for (const devId of staleKnown) {
-					const toEndpoint = selfDevices[devId]?.endpointId;
-					if (!toEndpoint) { unresolved++; continue; }
-					sendSignal({ type: "sync:backup_push", from: state.publicId, to: id, blob: freshBlob, toEndpoint });
+					const targetEndpoint = selfDevices[devId]?.endpointId;
+					if (!targetEndpoint) { unresolved++; continue; }
+					sendSignal({ type: "sync:backup_push", from: state.publicId, to: buildAddress(id, targetEndpoint), blob: freshBlob });
 					targeted++;
-					mlog.info(`→ BACKUP_PUSH  to self — targeted  device=${pid(devId)}  endpoint=${pid(toEndpoint)}`);
+					mlog.info(`→ BACKUP_PUSH  to self — targeted  device=${pid(devId)}  endpoint=${pid(targetEndpoint)}`);
 				}
 				if (unresolved > 0) {
 					sendSignal({ type: "sync:backup_push", from: state.publicId, to: id, blob: freshBlob });
@@ -749,14 +752,14 @@ async function handleBackupPush(msg) {
 		  // self-session. Falls back to broadcast if this particular
 		  // push came from an endpointId-less sender (older client).
 		  // deviceId/endpointId/fingerprint ride inside the ack's own
-		  // small encrypted blob, same reasoning as the push above —
-		  // toEndpoint stays outside since the relay genuinely needs it
-		  // to route.
+		  // small encrypted blob, same reasoning as the push above — the
+		  // `to` address's optional "::endpointId" unit stays outside
+		  // since the relay genuinely needs it to route.
 		  const ackBlob = await encryptObject(state.cryptoKey, {
 			  deviceId: state.deviceId, endpointId: state.endpointId, fingerprint: ownFingerprint,
 		  });
-		  sendSignal({ type: "sync:backup_accept", from: state.publicId, to: state.publicId, blob: ackBlob,
-					   ...(plain.endpointId ? { toEndpoint: plain.endpointId } : {}) });
+		  sendSignal({ type: "sync:backup_accept", from: state.publicId,
+					   to: buildAddress(state.publicId, plain.endpointId), blob: ackBlob });
 		  mlog.debug(`→ BACKUP_ACK   to self — fingerprint ${ownFingerprint}${plain.endpointId ? "  targeted="+pid(plain.endpointId) : "  (broadcast — sender endpoint unknown)"}`);
 		} catch(e) {
 		  mlog.warn(`← BACKUP_PUSH  from self — decrypt failed`);
@@ -931,7 +934,7 @@ async function handleRestoreRequest(msg) {
 
 async function handleRestoreAck(msg) {
   if (!msg.from || !msg.to) return;
-  if (msg.to !== state.publicId) return;
+  if (parseAddress(msg.to).id !== state.publicId) return;
   if (msg.deviceId) recordKnownDevice(msg.from, msg.deviceId);
 
   if (msg.from === state.publicId) {
@@ -1537,7 +1540,7 @@ function drainOldRelay(url) {
     // deleted it server-side. Put it straight back so a straggler device
     // arriving after we've disconnected can still find it. Reuse the
     // blob/sig as-is — same fact, no re-encryption needed.
-	if (msg.type === "app:migrate" && msg.from === state.publicId && msg.to === state.publicId) {
+	if (msg.type === "app:migrate" && msg.from === state.publicId && parseAddress(msg.to).id === state.publicId) {
 	  ws.send(JSON.stringify(msg));
 	  mlog.info(`MIGRATE    drain — own breadcrumb consumed, replanted`);
 	  return;
@@ -2584,7 +2587,7 @@ function endCall(contactId) {
 /* ── receive side ── */
 
 async function handleCallInvite(msg) {
-  if (!msg.from || !msg.to || !msg.callId || msg.to !== state.publicId) return;
+  if (!msg.from || !msg.to || !msg.callId || parseAddress(msg.to).id !== state.publicId) return;
   const contact = state.contacts[msg.from];
   if (!contact || contact.blocked) return;
   if (!verifyCallPacket(msg, contact.signPublicKey)) {
@@ -2607,7 +2610,7 @@ async function handleCallInvite(msg) {
 }
 
 async function handleCallClaim(msg) {
-  if (!msg.from || !msg.to || !msg.callId || msg.to !== state.publicId) return;
+  if (!msg.from || !msg.to || !msg.callId || parseAddress(msg.to).id !== state.publicId) return;
 
   if (msg.from === state.publicId) {
     // one of OUR OTHER devices answered — verify against our own signing
@@ -2641,7 +2644,7 @@ async function handleCallClaim(msg) {
 }
 
 async function handleCallCancel(msg) {
-  if (!msg.from || !msg.to || !msg.callId || msg.to !== state.publicId) return;
+  if (!msg.from || !msg.to || !msg.callId || parseAddress(msg.to).id !== state.publicId) return;
   const contact = state.contacts[msg.from];
   if (!contact) return;
   if (!verifyCallPacket(msg, contact.signPublicKey)) {
@@ -2653,7 +2656,7 @@ async function handleCallCancel(msg) {
 }
 
 async function handleCallEnd(msg) {
-  if (!msg.from || !msg.to || !msg.callId || msg.to !== state.publicId) return;
+  if (!msg.from || !msg.to || !msg.callId || parseAddress(msg.to).id !== state.publicId) return;
   const contact = state.contacts[msg.from];
   if (!contact) return;
   if (!verifyCallPacket(msg, contact.signPublicKey)) {
@@ -2665,7 +2668,7 @@ async function handleCallEnd(msg) {
 }
 
 async function handleShellInvite(msg) {
-  if (!msg.from || !msg.to || !msg.sessionId || msg.to !== state.publicId) return;
+  if (!msg.from || !msg.to || !msg.sessionId || parseAddress(msg.to).id !== state.publicId) return;
   const contact = state.contacts[msg.from];
   if (!contact || contact.blocked) return;
   if (!verifyShellPacket(msg, contact.signPublicKey)) {
@@ -2682,7 +2685,7 @@ async function handleShellInvite(msg) {
 }
 
 async function handleShellClaim(msg) {
-  if (!msg.from || !msg.to || !msg.sessionId || msg.to !== state.publicId) return;
+  if (!msg.from || !msg.to || !msg.sessionId || parseAddress(msg.to).id !== state.publicId) return;
   const contact = state.contacts[msg.from];
   if (!contact || contact.blocked) return;
   if (!verifyShellPacket(msg, contact.signPublicKey)) {
@@ -2698,7 +2701,7 @@ async function handleShellClaim(msg) {
 }
 
 async function handleShellCancel(msg) {
-  if (!msg.from || !msg.to || !msg.sessionId || msg.to !== state.publicId) return;
+  if (!msg.from || !msg.to || !msg.sessionId || parseAddress(msg.to).id !== state.publicId) return;
   const contact = state.contacts[msg.from];
   if (!contact) return;
   if (!verifyShellPacket(msg, contact.signPublicKey)) {
@@ -2710,7 +2713,7 @@ async function handleShellCancel(msg) {
 }
 
 async function handleShellEnd(msg) {
-  if (!msg.from || !msg.to || !msg.sessionId || msg.to !== state.publicId) return;
+  if (!msg.from || !msg.to || !msg.sessionId || parseAddress(msg.to).id !== state.publicId) return;
   const contact = state.contacts[msg.from];
   if (!contact) return;
   if (!verifyShellPacket(msg, contact.signPublicKey)) {
@@ -2730,7 +2733,7 @@ async function handleShellOffer(msg) {
 }
  
 async function handleShellAnswer(msg) {
-  if (!msg.from || !msg.to || !msg.sessionId || msg.to !== state.publicId) return;
+  if (!msg.from || !msg.to || !msg.sessionId || parseAddress(msg.to).id !== state.publicId) return;
   const contact = state.contacts[msg.from];
   if (!contact || contact.blocked) return;
   if (!verifyShellPacket(msg, contact.signPublicKey)) {
@@ -2756,7 +2759,7 @@ async function handleShellAnswer(msg) {
 }
  
 async function handleShellIce(msg) {
-  if (!msg.from || !msg.to || !msg.sessionId || msg.to !== state.publicId) return;
+  if (!msg.from || !msg.to || !msg.sessionId || parseAddress(msg.to).id !== state.publicId) return;
   const contact = state.contacts[msg.from];
   if (!contact || contact.blocked) return;
   if (!verifyShellPacket(msg, contact.signPublicKey)) {
@@ -2803,7 +2806,7 @@ async function sendCallIce(id, candidate) {
 }
 
 async function handleCallOffer(msg) {
-  if (!msg.from || !msg.to || !msg.callId || msg.to !== state.publicId) return;
+  if (!msg.from || !msg.to || !msg.callId || parseAddress(msg.to).id !== state.publicId) return;
   const contact = state.contacts[msg.from];
   if (!contact || contact.blocked) return;
   if (!verifyCallPacket(msg, contact.signPublicKey)) {
@@ -2836,7 +2839,7 @@ async function handleCallOffer(msg) {
 }
 
 async function handleCallAnswer(msg) {
-  if (!msg.from || !msg.to || !msg.callId || msg.to !== state.publicId) return;
+  if (!msg.from || !msg.to || !msg.callId || parseAddress(msg.to).id !== state.publicId) return;
   const contact = state.contacts[msg.from];
   if (!contact || contact.blocked) return;
   if (!verifyCallPacket(msg, contact.signPublicKey)) {
@@ -2862,7 +2865,7 @@ async function handleCallAnswer(msg) {
 }
 
 async function handleCallIce(msg) {
-  if (!msg.from || !msg.to || !msg.callId || msg.to !== state.publicId) return;
+  if (!msg.from || !msg.to || !msg.callId || parseAddress(msg.to).id !== state.publicId) return;
   const contact = state.contacts[msg.from];
   if (!contact || contact.blocked) return;
   if (!verifyCallPacket(msg, contact.signPublicKey)) {
