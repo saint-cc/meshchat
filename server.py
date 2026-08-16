@@ -46,7 +46,7 @@ RELAY_WSS_URL = os.environ.get("RELAY_WSS_URL", "")   # e.g. wss://yourrelay.exa
 # Protocol version — informational only for now, surfaced in sig:relay_info
 # so client/server version drift shows up in both logs. Not enforced yet;
 # room to add real backwards-compat handling once this is actually needed.
-PROTOCOL_VERSION = os.environ.get("PROTOCOL_VERSION", "0.4.4")
+PROTOCOL_VERSION = os.environ.get("PROTOCOL_VERSION", "0.4.5")
 
 # Connection limits
 MAX_CONNECTIONS        = int(os.environ.get("MAX_CONNECTIONS",        100))   # total WS sessions
@@ -104,6 +104,19 @@ def is_trusted_proxy(addr):
 # Existing recipients are never affected — this only stops NEW directories
 # from being created once the ceiling is hit.
 MAX_BUF_RECIPIENTS = int(os.environ.get("MAX_BUF_RECIPIENTS", 10000))
+
+# Endpoint-bucket cap — same spirit as MAX_BUF_RECIPIENTS, one level down.
+# MAX_BUF_RECIPIENTS bounds how many distinct <publicId> directories can
+# exist under BUF_DIR at once; this bounds how many distinct
+# <publicId>/_endpoints/<endpointId> subdirectories a SINGLE identity can
+# accumulate. Unlike `to` (which only has to satisfy valid_id() — see
+# MAX_BUF_RECIPIENTS' own comment), endpoint_id is only ever set by a
+# socket that has already completed the full auth handshake (see
+# auth_verify) — it isn't a stranger-facing surface the way `to` is, so
+# the abuse case here is narrower: an already-authed identity spinning up
+# many distinct endpoint_ids against itself. Bounded anyway, same "brake
+# on unbounded directory growth" reasoning, just a smaller blast radius.
+MAX_ENDPOINTS_PER_RECIPIENT = int(os.environ.get("MAX_ENDPOINTS_PER_RECIPIENT", 20))
 
 # Rate limiter
 RATE_LIMIT_RATE  = 10   # tokens refilled per second
@@ -255,6 +268,7 @@ stats = {
     "msgs_in":   0, "msgs_out":  0,
     "buf_in":    0, "buf_out":   0,
     "buf_cap_rejected":  0,   # writes dropped for hitting MAX_BUF_RECIPIENTS
+    "buf_endpoint_cap_rejected": 0,   # writes dropped for hitting MAX_ENDPOINTS_PER_RECIPIENT
     "buf_rate_rejected": 0,   # writes dropped for hitting a recipient's write-rate limit
     "auth_admission_rejected": 0,   # auth completions dropped by the global admission limiter
     "push_sent":    0,   # pushes that got a non-error response from the push service
@@ -597,11 +611,17 @@ async def route_or_buffer(kind, frm, to, msg, ws):
     Device targeting (app:message only): an envelope carrying `toEndpoint`
     (a endpointId — see connected_by_endpoint) is delivered only to that
     specific registered device via deliver_to_endpoint(), not fanned out to
-    every live session under `to`. The offline buffer stays IDENTITY-level
-    regardless — a device-targeted send that misses live delivery still
-    falls into the same shared buffer as everything else and is flushed to
-    whichever device reconnects first. Making the buffer itself
-    device-aware is a separate, deliberately deferred piece of work."""
+    every live session under `to`. The offline buffer now honours this too
+    (see buf_write's endpoint_id param / buf_endpoint_dir): a device-
+    targeted send that misses live delivery lands in that device's OWN
+    bucket (BUF_DIR/<to>/_endpoints/<toEndpoint>/) rather than the shared
+    identity-level one, and is only ever flushed to a connection that
+    later presents that exact endpoint_id at auth — never to whichever
+    device happens to reconnect first. Nothing upstream of this function
+    sets toEndpoint yet (no client send path targets a specific device
+    today — see meshchat.js), so this bucket is currently dormant, wired
+    ahead of need the same way connected_by_endpoint/deliver_to_endpoint
+    were before anything used them either."""
     to_endpoint = msg.get("toEndpoint") if kind == "app:message" else None
     if to_endpoint:
         reached = await deliver_to_endpoint(to, to_endpoint, msg, exclude=ws)
@@ -611,7 +631,7 @@ async def route_or_buffer(kind, frm, to, msg, ws):
         log.info("%-10s from=%s  to=%s  reached=%d%s", kind.upper(), short(frm), short(to), reached,
                   f"  endpoint={short(to_endpoint)}" if to_endpoint else "")
     if not reached or kind in ("app:migrate", "app:burn"):
-        await buf_write(to, msg)
+        await buf_write(to, msg, to_endpoint)
         if reached:
             log.info("BUF Q      from=%s  to=%s  (also buffered — %s, durability required)  type=%s",
                       short(frm), short(to), "migrate" if kind == "app:migrate" else "burn", kind)
@@ -727,7 +747,7 @@ async def auth_verify(ws, sig_bytes: list, addr: str) -> str | None:
              f"  endpoint={short(endpoint_id)}" if (endpoint_id and not no_receive) else "")
     await send_to(ws, {"type": "sig:auth_ok", "public_id": public_id})
     if not no_receive:
-        await buf_deliver(public_id, ws)
+        await buf_deliver(public_id, ws, endpoint_id)
     return public_id
 
 # ══════════════════════════════════════════
@@ -751,14 +771,49 @@ def buf_dir(to_id):
     return path
 
 def buf_files(to_id):
-    """Return list of buffer files for recipient, oldest first."""
+    """Return list of buffer files for recipient, oldest first. Identity-
+    level only — deliberately does NOT glob into _endpoints/ (a directory
+    name, never matches the *.json pattern, so this is naturally scoped
+    without an explicit exclusion)."""
     d = buf_dir(to_id)
     if not os.path.isdir(d): return []
     pattern = os.path.join(d, "*.json")
     return sorted(glob.glob(pattern, recursive=False))
 
-def _buf_write_sync(to_id, msg):
+def buf_endpoint_dir(to_id, endpoint_id):
+    """BUF_DIR/<to_id>/_endpoints/<endpoint_id> — a second, independent
+    bucket alongside the identity-level one, for app:message packets that
+    carried toEndpoint and missed live delivery to that specific device
+    (see route_or_buffer/deliver_to_endpoint). Never used for
+    app:migrate/app:burn — those aren't device-targeted and stay
+    identity-level exclusively, same as today."""
+    parent = buf_dir(to_id)   # raises ValueError on traversal attempt in to_id itself
+    path = os.path.realpath(os.path.join(parent, "_endpoints", endpoint_id))
+    if not path.startswith(os.path.realpath(parent) + os.sep):
+        raise ValueError(f"path traversal attempt: {endpoint_id!r}")
+    return path
+
+def buf_endpoint_files(to_id, endpoint_id):
+    """Return list of buffer files in one identity's endpoint-specific
+    bucket, oldest first."""
+    try:
+        d = buf_endpoint_dir(to_id, endpoint_id)
+    except ValueError:
+        return []
+    if not os.path.isdir(d): return []
+    return sorted(glob.glob(os.path.join(d, "*.json"), recursive=False))
+
+def _buf_write_sync(to_id, msg, endpoint_id=None):
     """Sync body of buf_write — runs in a worker thread, no awaits.
+
+    endpoint_id present → this is a device-targeted app:message that
+    missed live delivery (see route_or_buffer/deliver_to_endpoint) and
+    goes into to_id's own _endpoints/<endpoint_id> bucket instead of the
+    identity-level one. app:migrate/app:burn never carry an endpoint_id —
+    they aren't device-targeted — so this branch is exclusively an
+    app:message path in practice, though nothing here assumes that beyond
+    what route_or_buffer already guarantees by only ever passing
+    endpoint_id through for that kind.
 
     app:migrate packets use overwrite semantics: only the most recent
     packet from a given sender is kept (any older buffered migrate from
@@ -769,19 +824,22 @@ def _buf_write_sync(to_id, msg):
     app:migrate, kept as a fully separate bucket — the overwrite scan below
     only ever drops files carrying the SAME suffix as the incoming packet,
     so a migrate can never evict a buffered burn notice and a burn can
-    never evict a buffered migrate breadcrumb."""
+    never evict a buffered migrate breadcrumb. Both are identity-level
+    only — this overwrite logic never runs for an endpoint_id write."""
     try:
-        d = buf_dir(to_id)
+        top_dir = buf_dir(to_id)
+        d = buf_endpoint_dir(to_id, endpoint_id) if endpoint_id else top_dir
     except ValueError as e:
         log.warning("BUF        rejected  to=%s  reason=%s", short(to_id), e)
         return
 
-    # Recipient cap — only matters for a NEW recipient directory. An
-    # existing recipient (one that already has a dir, real or previously
-    # allowed) is never turned away by this; it's purely a brake on an
-    # attacker fanning out to unlimited fabricated recipient IDs. See
+    # Recipient cap — only matters for a NEW recipient directory (the
+    # top-level <to_id> dir itself, whether this particular write is
+    # identity- or endpoint-level — both create it). An existing recipient
+    # is never turned away by this; it's purely a brake on an attacker
+    # fanning out to unlimited fabricated recipient IDs. See
     # MAX_BUF_RECIPIENTS comment near its definition.
-    if not os.path.isdir(d):
+    if not os.path.isdir(top_dir):
         try:
             existing = sum(1 for e in os.scandir(BUF_DIR) if e.is_dir()) if os.path.isdir(BUF_DIR) else 0
         except Exception:
@@ -790,6 +848,21 @@ def _buf_write_sync(to_id, msg):
             stats["buf_cap_rejected"] += 1
             log.warning("BUF        recipient cap reached (%d) — rejecting new recipient  to=%s",
                         MAX_BUF_RECIPIENTS, short(to_id))
+            return
+
+    # Endpoint-bucket cap — only matters for a NEW endpoint bucket under
+    # an ALREADY-admitted recipient. See MAX_ENDPOINTS_PER_RECIPIENT
+    # comment near its definition.
+    if endpoint_id and not os.path.isdir(d):
+        endpoints_root = os.path.join(top_dir, "_endpoints")
+        try:
+            existing_eps = sum(1 for e in os.scandir(endpoints_root) if e.is_dir()) if os.path.isdir(endpoints_root) else 0
+        except Exception:
+            existing_eps = 0
+        if existing_eps >= MAX_ENDPOINTS_PER_RECIPIENT:
+            stats["buf_endpoint_cap_rejected"] += 1
+            log.warning("BUF        endpoint cap reached (%d) — rejecting new endpoint bucket  to=%s  endpoint=%s",
+                        MAX_ENDPOINTS_PER_RECIPIENT, short(to_id), short(endpoint_id))
             return
 
     try:
@@ -803,7 +876,7 @@ def _buf_write_sync(to_id, msg):
     is_burn    = kind == "app:burn"
     frm        = msg.get("from")
 
-    files = buf_files(to_id)
+    files = buf_endpoint_files(to_id, endpoint_id) if endpoint_id else buf_files(to_id)
 
     if (is_migrate or is_burn) and frm:
         own_suffix = MIGRATE_SUFFIX if is_migrate else BURN_SUFFIX
@@ -850,8 +923,9 @@ def _buf_write_sync(to_id, msg):
         with open(fname, "w") as f:
             json.dump(msg, f)
         stats["buf_in"] += 1
-        log.info("BUF        write  to=%s  file=%s%s", short(to_id), os.path.basename(fname),
-                  "  [migrate]" if is_migrate else ("  [burn]" if is_burn else ""))
+        log.info("BUF        write  to=%s  file=%s%s%s", short(to_id), os.path.basename(fname),
+                  "  [migrate]" if is_migrate else ("  [burn]" if is_burn else ""),
+                  f"  endpoint={short(endpoint_id)}" if endpoint_id else "")
     except Exception as e:
         log.warning("BUF        write failed  to=%s  err=%s", short(to_id), e)
 
@@ -890,36 +964,48 @@ async def _release_buf_lock(to_id, lock):
         else:
             buf_lock_refs[to_id] = remaining
 
-async def buf_write(to_id, msg):
-    """Async wrapper: serializes per-recipient writes via a lock, offloads
-    sync file I/O to a worker thread so the event loop stays unblocked.
-    The lock prevents count/size-check races between concurrent writes for
-    the same recipient. Unlike a plain to_id → Lock dict, the lock entry
-    is evicted once unreferenced — otherwise any syntactically-valid `to`
-    (it need not correspond to a real identity — see valid_id) leaves a
-    permanent Lock object behind, an unbounded memory leak an authenticated
-    client could trigger at will simply by sending to junk recipient ids.
+async def buf_write(to_id, msg, endpoint_id=None):
+    """Async wrapper: serializes per-recipient (or per-recipient-device)
+    writes via a lock, offloads sync file I/O to a worker thread so the
+    event loop stays unblocked. The lock prevents count/size-check races
+    between concurrent writes for the same bucket. Unlike a plain
+    key → Lock dict, the lock entry is evicted once unreferenced —
+    otherwise any syntactically-valid `to` (it need not correspond to a
+    real identity — see valid_id) leaves a permanent Lock object behind,
+    an unbounded memory leak an authenticated client could trigger at
+    will simply by sending to junk recipient ids.
 
-    Write-rate limited per recipient BEFORE any of that — see
+    endpoint_id present → rate limiter and lock are keyed on
+    "<to_id>::<endpoint_id>", a bucket independent of to_id's own
+    identity-level key and of every other endpoint under the same
+    identity. Without this, a flood targeted at one of a recipient's
+    devices would spend the SAME rate budget as traffic aimed at the
+    recipient generally (or at their other devices) — device targeting
+    is supposed to isolate delivery, and sharing a limiter here would
+    quietly undo that isolation.
+
+    Write-rate limited per bucket BEFORE any of that — see
     BUF_WRITE_RATE_LIMIT comment near its definition. This is what actually
     stops a distributed flood of one-shot senders from blowing through a
     specific real recipient's BUF_MAX_MSGS cap fast enough to evict their
     genuine buffered messages; the lock/thread machinery below only cares
     about serializing writes that get past this gate."""
-    limiter = buf_recipient_limiters.get(to_id)
+    limiter_key = f"{to_id}::{endpoint_id}" if endpoint_id else to_id
+    limiter = buf_recipient_limiters.get(limiter_key)
     if limiter is None:
         limiter = RateLimiter(rate=BUF_WRITE_RATE_LIMIT, burst=BUF_WRITE_RATE_BURST)
-        buf_recipient_limiters[to_id] = limiter
+        buf_recipient_limiters[limiter_key] = limiter
     if not limiter.allow():
         stats["buf_rate_rejected"] += 1
-        log.warning("BUF        write-rate limit reached  to=%s — dropped", short(to_id))
+        log.warning("BUF        write-rate limit reached  to=%s%s — dropped", short(to_id),
+                     f"  endpoint={short(endpoint_id)}" if endpoint_id else "")
         return
 
-    lock = await _acquire_buf_lock(to_id)
+    lock = await _acquire_buf_lock(limiter_key)
     try:
-        await asyncio.to_thread(_buf_write_sync, to_id, msg)
+        await asyncio.to_thread(_buf_write_sync, to_id, msg, endpoint_id)
     finally:
-        await _release_buf_lock(to_id, lock)
+        await _release_buf_lock(limiter_key, lock)
 
 def _buf_read_all(files):
     """Read all buffer files in one thread call. Returns list parallel to
@@ -933,16 +1019,30 @@ def _buf_read_all(files):
             results.append(None)
     return results
 
-async def buf_deliver(to_id, ws):
-    """Flush all buffered packets for a reconnecting client. Delete on success.
-    File reads are batched into a single worker-thread call so the event
-    loop stays unblocked even when the buffer is large."""
-    files = await asyncio.to_thread(buf_files, to_id)
-    if not files:
+async def buf_deliver(to_id, ws, endpoint_id=None):
+    """Flush all buffered packets for a reconnecting client. Delete on
+    success. File reads are batched into a single worker-thread call so
+    the event loop stays unblocked even when the buffer is large.
+
+    endpoint_id present → this connection also gets its own device's
+    endpoint bucket flushed, IN ADDITION TO the shared identity-level
+    bucket it always gets regardless. A connection that authenticates
+    WITHOUT an endpoint_id only ever sees the identity-level bucket —
+    exactly as before this feature existed — since there's no device
+    identity to match a targeted packet against. That's deliberate: a
+    device-targeted message sitting in someone else's endpoint bucket
+    must never leak to a connection that didn't present the matching
+    endpoint_id, and doesn't — buf_endpoint_files only ever reads the
+    one bucket asked for."""
+    files    = await asyncio.to_thread(buf_files, to_id)
+    ep_files = await asyncio.to_thread(buf_endpoint_files, to_id, endpoint_id) if endpoint_id else []
+    all_files = files + ep_files
+    if not all_files:
         return
-    log.info("BUF        flush  to=%s  count=%d", short(to_id), len(files))
-    messages = await asyncio.to_thread(_buf_read_all, files)
-    for fpath, msg in zip(files, messages):
+    log.info("BUF        flush  to=%s  count=%d%s", short(to_id), len(all_files),
+              f"  (identity=%d endpoint=%d)" % (len(files), len(ep_files)) if endpoint_id else "")
+    messages = await asyncio.to_thread(_buf_read_all, all_files)
+    for fpath, msg in zip(all_files, messages):
         if msg is None:
             log.warning("BUF        flush error  to=%s  file=%s  err=read failed",
                         short(to_id), os.path.basename(fpath))
@@ -958,7 +1058,11 @@ async def buf_deliver(to_id, ws):
 async def buf_expire():
     """Background task — remove buffer files older than their TTL bucket.
     Regular packets use BUF_MAX_AGE; migrate packets (tagged via
-    MIGRATE_SUFFIX) use the much longer BUF_MAX_AGE_MIGRATE."""
+    MIGRATE_SUFFIX) use the much longer BUF_MAX_AGE_MIGRATE. Endpoint
+    buckets (_endpoints/<endpointId>/) always use plain BUF_MAX_AGE — an
+    app:message is the only kind that ever lands there, migrate/burn are
+    never device-targeted, so MIGRATE_SUFFIX/BURN_SUFFIX simply never
+    appear under _endpoints/ in practice."""
     while True:
         await asyncio.sleep(BUF_EXPIRE_INTERVAL)
         now     = time.time()
@@ -983,7 +1087,39 @@ async def buf_expire():
                                 dropped += 1
                             except Exception:
                                 pass
-                    # clean up empty recipient dirs
+
+                    # sweep this recipient's per-device endpoint buckets —
+                    # same TTL logic, one directory level down. Always plain
+                    # BUF_MAX_AGE (see docstring above re: migrate/burn).
+                    endpoints_root = os.path.join(rec_dir.path, "_endpoints")
+                    if os.path.isdir(endpoints_root):
+                        for ep_dir in os.scandir(endpoints_root):
+                            if not ep_dir.is_dir():
+                                continue
+                            for entry in os.scandir(ep_dir.path):
+                                if not entry.name.endswith(".json"):
+                                    continue
+                                if now - entry.stat().st_mtime > BUF_MAX_AGE:
+                                    try:
+                                        os.remove(entry.path)
+                                        dropped += 1
+                                    except Exception:
+                                        pass
+                            # clean up an emptied-out endpoint bucket
+                            if not os.listdir(ep_dir.path):
+                                try: os.rmdir(ep_dir.path)
+                                except Exception: pass
+                        # clean up the _endpoints dir itself once every
+                        # bucket under it is gone
+                        if not os.listdir(endpoints_root):
+                            try: os.rmdir(endpoints_root)
+                            except Exception: pass
+
+                    # clean up empty recipient dirs — checked last, after
+                    # _endpoints/ has had a chance to empty out above, so a
+                    # recipient with nothing left in EITHER bucket is
+                    # correctly pruned rather than kept alive by a now-empty
+                    # _endpoints/ directory still sitting inside it.
                     if not os.listdir(rec_dir.path):
                         try: os.rmdir(rec_dir.path)
                         except Exception: pass
@@ -1015,12 +1151,12 @@ async def log_stats():
     while True:
         await asyncio.sleep(STATS_INTERVAL)
         log.info("STATS      keys=%d  sessions=%d  in=%s(%d msgs)  out=%s(%d msgs)  "
-                 "buf_in=%d  buf_out=%d  buf_cap_rejected=%d  buf_rate_rejected=%d  auth_admission_rejected=%d  "
+                 "buf_in=%d  buf_out=%d  buf_cap_rejected=%d  buf_endpoint_cap_rejected=%d  buf_rate_rejected=%d  auth_admission_rejected=%d  "
                  "push_sent=%d  push_failed=%d  push_pruned=%d",
                  unique_keys(), session_count(),
                  fmt_bytes(stats["bytes_in"]),  stats["msgs_in"],
                  fmt_bytes(stats["bytes_out"]), stats["msgs_out"],
-                 stats["buf_in"], stats["buf_out"], stats["buf_cap_rejected"],
+                 stats["buf_in"], stats["buf_out"], stats["buf_cap_rejected"], stats["buf_endpoint_cap_rejected"],
                  stats["buf_rate_rejected"], stats["auth_admission_rejected"],
                  stats["push_sent"], stats["push_failed"], stats["push_pruned"])
 
@@ -1275,9 +1411,27 @@ async def handler(ws):
                     log.warning("%-10s from=%s  not authed  peer=%s  dropped", kind.upper(), short(frm), addr)
                     await send_to(ws, {"type": "error", "reason": "not_authenticated"})
                     continue
-                reached = await deliver(to, msg, exclude=ws)
-                log.info("%-16s from=%s  to=%s  reached=%d",
-                         kind.upper()[:16], short(frm), short(to), reached)
+                # toEndpoint — same device-targeting field app:message already
+                # honors (see route_or_buffer/deliver_to_endpoint), generalized
+                # onto this shared branch. Live-only here, same as everything
+                # else in this branch already is — none of these types are
+                # durably buffered, so a toEndpoint aimed at a currently-
+                # offline device simply reaches nobody, exactly like an
+                # untargeted send to an offline recipient already does today.
+                # call:*/shell:* never set this field, so their behavior is
+                # byte-for-byte unchanged; sync:backup_push is the first type
+                # to actually use it, for self-device-targeted backup pushes.
+                to_endpoint = msg.get("toEndpoint")
+                if to_endpoint and not valid_id(to_endpoint):
+                    log.warning("  %s with invalid toEndpoint, dropped", kind)
+                    continue
+                if to_endpoint:
+                    reached = await deliver_to_endpoint(to, to_endpoint, msg, exclude=ws)
+                else:
+                    reached = await deliver(to, msg, exclude=ws)
+                log.info("%-16s from=%s  to=%s  reached=%d%s",
+                         kind.upper()[:16], short(frm), short(to), reached,
+                         f"  endpoint={short(to_endpoint)}" if to_endpoint else "")
 
             elif kind == "sig:relay_req":
                 await send_to(ws, {
@@ -1349,8 +1503,8 @@ async def run_signal_server():
     log.info("=" * 50)
     log.info("MeshChat signal server")
     log.info("Listening on %s:%d", WS_HOST, WS_PORT)
-    log.info("Buffer dir: %s  max_msgs=%d  max_age=%ds  migrate_age=%ds  burn_age=%ds  max_mb=%.1f  max_recipients=%d",
-             BUF_DIR, BUF_MAX_MSGS, BUF_MAX_AGE, BUF_MAX_AGE_MIGRATE, BUF_MAX_AGE_BURN, BUF_MAX_MB, MAX_BUF_RECIPIENTS)
+    log.info("Buffer dir: %s  max_msgs=%d  max_age=%ds  migrate_age=%ds  burn_age=%ds  max_mb=%.1f  max_recipients=%d  max_endpoints_per_recipient=%d",
+             BUF_DIR, BUF_MAX_MSGS, BUF_MAX_AGE, BUF_MAX_AGE_MIGRATE, BUF_MAX_AGE_BURN, BUF_MAX_MB, MAX_BUF_RECIPIENTS, MAX_ENDPOINTS_PER_RECIPIENT)
     log.info("Buffer write-rate: %.1f/s per recipient  burst=%.0f  idle_prune=%ds",
              BUF_WRITE_RATE_LIMIT, BUF_WRITE_RATE_BURST, BUF_RATE_LIMITER_IDLE_S)
     log.info("Global auth admission: %.1f/s  burst=%.0f", GLOBAL_AUTH_RATE, GLOBAL_AUTH_BURST)

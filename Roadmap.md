@@ -4,7 +4,7 @@ Working notes on what's done, what's next, and what still needs a real design
 conversation before it gets touched. Not a promise of order or timing — just
 so the list lives somewhere other than someone's head.
 
-Current version: `0.4.2`. See `protocol.md` for the authoritative wire spec
+Current version: `0.4.5`. See `protocol.md` for the authoritative wire spec
 and `known-limitations.md` for permanent, by-design tradeoffs (no TURN, no
 real revocation, etc.) — those aren't roadmap items, they're not going to
 change.
@@ -65,6 +65,34 @@ Recent, for context on where "next" picks up from:
   per the "reordering as the exception, not the norm" framing below.
   `protocol.md`'s [Message Merging](protocol.md#message-merging) and
   [Message Payload](protocol.md#message-payload) sections updated to match.
+- **Endpoint-keyed offline buffer.** `server.py`'s `buf_write`/`buf_deliver`
+  now support a per-`(publicId, endpointId)` bucket
+  (`BUF_DIR/<publicId>/_endpoints/<endpointId>/`) alongside the existing
+  identity-level one — the hard blocker flagged under per-device fanout
+  below. A connection presenting `endpoint_id` at auth gets both buckets
+  flushed; one that doesn't only ever gets the identity-level bucket, same
+  as before this existed. Own rate limiter/lock per bucket, own
+  `MAX_ENDPOINTS_PER_RECIPIENT` cap (default 20) independent of
+  `MAX_BUF_RECIPIENTS`, own expiry sweep. `app:migrate`/`app:burn` never
+  touch this — they aren't device-targeted and stay identity-level only.
+  Dormant until something actually sets `toEndpoint` on a message that
+  misses live delivery — see the next line for the first real consumer.
+- **First real per-device fanout: self-sync backup targeting.**
+  `sync:backup_push`/`sync:backup_accept` now carry `endpointId` (learned
+  the same passive "only adopt an explicit value" way as the message path
+  already does), and the relay honors `toEndpoint` on the shared
+  `app:sync`/`sync:*`/`call:*`/`shell:*` delivery branch, not just
+  `app:message`. `pushBackupToContacts`'s self branch went from "broadcast
+  to every live self-session unless ALL of them are current" to targeting
+  each individually-stale, endpoint-known sibling device directly, falling
+  back to broadcast only for genuine discovery (no acks yet this session)
+  or a stale device whose endpoint isn't known yet. Deliberately scoped to
+  self-sync backup/restore only — the contact-facing `backup_offer`/
+  `backup_accept`/`backup_push` path and the manual `app:sync` (SYNC
+  button) exchange are untouched. See the "sync strategy needs a real
+  rethink" note under Planned below — this slice was a deliberately narrow
+  proof of per-device routing working end to end, not a sync-protocol
+  redesign.
 
 ---
 
@@ -165,14 +193,61 @@ before implementation starts, not just during it.
     auto-fire, at least until there's real usage data on false-positive
     rate. Design bootstrap and reset together — don't build bootstrap
     first and bolt reset on as an afterthought.
+  - **Self-devices get a ratchet session too, same as any other
+    peer — no special-casing.** Resolved during the self-device-backup-
+    targeting session: self was never special-cased for encryption
+    (`X25519(myPriv, myPub)` just falls out of the general pairwise ECDH
+    function — see [Encryption](protocol.md#encryption)), and there's no
+    reason the ratchet should be different. Each pair of a user's own
+    devices establishes its own session exactly like a session with a
+    contact would. This directly answers the open question under "Sync /
+    backup device-smartness" below about what happens to self-sync once
+    device-layer routing lands: it stops being a special case entirely.
+    Two consequences worth carrying forward to that design session:
+    - **The `backupKey`-encrypted backup blob itself does NOT ratchet.**
+      It stays deterministic across every device holding the same
+      passphrase, on purpose — that determinism is what makes an
+      exported backup file, or a freshly-recovered identity with no
+      session state at all, restorable in the first place. Ratcheting it
+      would break that property for no gain. What ratchets is the
+      *transport* the already-encrypted blob rides inside — the blob
+      becomes opaque payload inside a per-device-pair session, the same
+      way image/audio bytes already ride as opaque payload inside an
+      ordinary pairwise `app:message` today.
+    - **`pushMiniBackup`'s purpose survives, its plumbing doesn't.** It
+      exists to keep siblings live-current on conversation after every
+      outgoing message, not just periodically reconciled — a real need,
+      worth keeping. But it works today only because self-sync shares one
+      static, coordination-free key across every device; that's exactly
+      the property a real ratchet removes. Once per-device sessions
+      exist, mini-backup's payload just becomes whatever rides inside
+      one, same as the full backup push above. Bonus: self-sync packets
+      carry no `sig` at all today (unlike `app:message`) — riding inside
+      a real ratchet session fixes that for free, not as a separate task.
 
 ### Sync / backup device-smartness (for later, no urgency)
-- Sync: when syncing a conversation, also check other-self devices, not
-  just the other party
+- Self-device backup targeting is now done — see Done above. What's left
+  here:
+- Sync: when syncing a conversation (the manual `app:sync`/SYNC-button
+  path), also check other-self devices, not just the other party
+- Contact-facing backup (`backup_offer`/`backup_accept`/`backup_push`) has
+  no device-targeting at all yet — still broadcasts to every live session
+  under the contact's identity, same as before this pass
 - Backup: if devices reliably merge first, a backup push might be able to
   go out as just "identity," with no contact-device specificity needed —
-  worth revisiting once the device-layer routing question above is
-  settled, since it changes what's possible here
+  **resolved above**: self-devices get their own ratchet sessions like any
+  other peer, so this stops being a special case once that work lands
+
+### Sync strategy — needs a real rethink, not just the dev2dev slice
+Flagged explicitly during the self-device-backup-targeting session: the
+whole sync story (manual `app:sync`, contact `backup_offer`/`accept`/
+`push`, `restore_req`/`ack`/`push`, and now the self-device-targeted push
+on top) has accreted piece by piece and deserves being looked at as one
+system rather than patched incrementally forever. Not scoped yet — this is
+a flag to come back to, not a plan. The self-device targeting slice above
+was deliberately kept narrow (self-only, backup/restore only) specifically
+so it wouldn't get tangled up with this larger question before the larger
+question has actually been thought through.
 
 ---
 
@@ -207,71 +282,6 @@ because there's a plan yet.
   (prove the lazy-load pattern against shell as-is), or go straight for
   the fuller manifest/hook-point design with shell as the reference
   implementation. Undecided — flagged in chat, not yet a decision.
-
-### Account-based key layer on top of the deterministic bootstrap
-- **Not a plan to replace deterministic identity.** The `(username,
-  passphrase)` derivation stays permanently — it's the root of trust for
-  routing/discovery and the only thing that lets a brand-new node
-  bootstrap a DH exchange with someone at all. This idea is a layer
-  *on top*: an actual random (non-derivable) account keypair, generated
-  once, local-only, never in backups (backups can genuinely never
-  contain it — if it's lost, the answer is renegotiate, not restore).
-  Static/no-ratchet for now, same as today's pairwise key — the point
-  isn't forward secrecy yet, it's making the *identity* key rotatable
-  instead of eternally re-derivable from credentials, which is what
-  actually unlocks real revocation (burn stops being social-only).
-- Shape is structurally close to X3DH's identity-key/signed-prekey split:
-  the deterministic bootstrap key plays "identity key" (never rotates,
-  already trusted via the out-of-band QR/address exchange), the account
-  key plays "signed prekey" (rotates, and every rotation is *signed by*
-  the bootstrap key that vouches for it) — so a renegotiation packet is
-  a signed statement from an already-trusted key, not fresh DH exposed
-  to MITM. The real exposure isn't the crypto, it's (a) replay/rollback
-  of an old-but-validly-signed rotation, which needs a strict monotonic
-  epoch guard, stricter than `updateRelay`'s plain "newer wins", and
-  (b) the human "accept this?" confirmation itself, which is a social-
-  engineering target the same way Signal's safety-number-changed prompt
-  is — load-bearing, same as the never-seen-device confirmation already
-  planned for Double Ratchet bootstrap.
-- **Renegotiation has to be async/store-and-forward**, not a live
-  handshake — the relay deliberately holds no prekey-bundle state the
-  way a real X3DH server would. Closest existing pattern is
-  `app:migrate`/`app:burn`: overwrite-per-sender, long TTL, durably
-  buffered even when a live session is reached (same stale-session race
-  those two already guard against). "Fail" (an AEAD decrypt failure) is
-  a reasonable *technical* trigger to prompt a user but must NOT be
-  sufficient on its own to accept a new key — indistinguishable from
-  ordinary corruption/desync, and accepting on decrypt-failure alone is
-  a remotely-triggerable identity-swap primitive. Needs its own
-  independent authentication step, not "then whatever key shows up
-  next is trusted."
-- **Multi-device forks this hard.** Deterministic identity is what lets
-  a second device "just log in" and land on the same keys today; a
-  random account key can't be independently re-derived, so multi-device
-  needs an explicit pairing/transfer step instead. Two of the user's own
-  devices independently deciding they're the "fresh node" and each
-  proposing a new account key could genuinely fork what contacts believe
-  the current key is — same class of race as `call:claim`'s self-
-  targeted dedup echo, but identity-critical instead of cosmetic where
-  that one is cosmetic.
-- **Likely the same design conversation as device-layer routing, not a
-  separate one** — see [Per-device encryption & relay-stored
-  messages](#per-device-encryption--relay-stored-messages) above. An
-  account key that ends up per-device (which multi-device pushes it
-  toward) is close to what `endpointId` becomes the moment it stops
-  being routing-only metadata and starts being a real keypair. Device
-  routing is agreed to ship first regardless.
-- **"Triple ratchet" — deliberately not scoped, flagged half-joking in
-  chat but worth keeping on file:** a third tier stacked on top of the
-  usual two (identity/account-key rotation below, Signal-style session
-  ratchet above) rather than the unrelated "add a post-quantum KEM
-  ratchet alongside classic DH" meaning the term has elsewhere. Same
-  underlying problems as everything above, just a third rotation cadence
-  — nothing to design until the layers below it are real.
-- **Status: prep-only for the foreseeable future, not scheduled.** Real
-  blockers exist ahead of it (device routing chief among them). The
-  point of writing this down now is to have somewhere for the half-formed
-  version of this thinking to live, not to imply it's next.
 
 ---
 

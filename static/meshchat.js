@@ -13,7 +13,7 @@
 
    Load order: meshchat-lib.js → meshchat-gui.js → meshchat.js → statemachine.js
 ═══════════════════════════════════════════════════════════════ */
-const CLIENT_VERSION = "0.4.4";
+const CLIENT_VERSION = "0.4.5";
 
 const POLL_INTERVAL_MS        	= 30_000;			// base interval between presence polls
 const POLL_JITTER_MS          	= 10_000;			// ± random jitter added to poll interval
@@ -542,20 +542,86 @@ async function pushBackupToContacts(blob) {
 
 	if (id === state.publicId) {
 		// self-sync: no negotiation needed, push directly — unless every
-		// device we've heard from this session already has this exact content.
+		// device we've HEARD FROM this session (via a backup_accept ack —
+		// see knownDeviceFingerprints) already has this exact content.
+		//
+		// Targeting: a device we've heard from AND already know a current
+		// endpointId for gets a TARGETED push (toEndpoint) once its
+		// fingerprint is confirmed stale — a real per-device send, not a
+		// broadcast every live self-session has to receive and discard.
+		// state.knownDevices[state.publicId][deviceId].endpointId is what
+		// supplies this — populated passively by handleBackupAccept/
+		// handleBackupPush below, the same "only adopt an explicit value"
+		// rule the message-receipt path already uses for endpointId.
+		//
+		// A broadcast (untargeted sync:backup_push) is still used,
+		// deliberately, in two cases:
+		//   (a) we haven't heard an ack from ANYONE yet this session — there
+		//       is nothing to target, and this broadcast doubles as the
+		//       discovery mechanism that populates knownDeviceFingerprints/
+		//       endpointId in the first place.
+		//   (b) a stale device whose endpointId isn't known yet (an older
+		//       client that never sent one, or one that simply hasn't acked
+		//       this session yet).
+		// A device already reached by a targeted send in the loop below MAY
+		// also receive this fallback broadcast when case (b) applies to some
+		// OTHER device — accepted redundancy for now: merging the same
+		// backup blob twice is a no-op (mergeContactMeta/mergeMessages are
+		// idempotent), just wasted bandwidth, not a correctness problem.
+		// Excluding already-targeted sockets from the broadcast would need
+		// either a multi-exclude on deliver() or one broadcast per gap,
+		// neither of which earns its complexity yet — revisit once this is
+		// proven out on real traffic.
 		try {
 			const fingerprint = await computeBackupFingerprint();
 			const knownIds    = Object.keys(state.knownDeviceFingerprints);
-			const allCaughtUp = knownIds.length > 0 &&
-			  knownIds.every(devId => state.knownDeviceFingerprints[devId] === fingerprint);
-			if (allCaughtUp) {
+			const staleKnown  = knownIds.filter(devId => state.knownDeviceFingerprints[devId] !== fingerprint);
+
+			if (knownIds.length > 0 && staleKnown.length === 0) {
 				mlog.debug(`→ BACKUP_PUSH  to self — skipped, ${knownIds.length} known device(s) already current`);
 				continue;
 			}
-			const freshBlob = await encryptObject(state.cryptoKey, serialiseContacts());
-			sendSignal({ type: "sync:backup_push", from: state.publicId, to: id, blob: freshBlob,
-						 deviceId: state.deviceId, fingerprint });
-			mlog.info(`→ BACKUP_PUSH  to self — sent fresh data`);
+
+			// deviceId/endpointId/fingerprint ride INSIDE the encrypted blob
+			// now, alongside the actual contacts payload — never as outer
+			// envelope metadata. The relay never reads any of these three
+			// (only `toEndpoint` is a routing field it actually touches), and
+			// an unsigned outer field is silently rewritable in transit by an
+			// untrusted relay with zero detection — the same reasoning that
+			// already moved app:message's deviceId off its outer envelope and
+			// into its signed+encrypted payload. self-sync packets carry no
+			// `sig` today, so this buys tamper-EVIDENCE (AES-GCM simply fails
+			// to decrypt on any bit flip) rather than the stronger sender-
+			// authentication app:message's Ed25519 signature provides — good
+			// enough here since this is self-to-self on an already-authed
+			// socket, just worth being honest it's not an identical guarantee.
+			const freshBlob = await encryptObject(state.cryptoKey, {
+				deviceId: state.deviceId, endpointId: state.endpointId, fingerprint,
+				contacts: serialiseContacts(),
+			});
+			const selfDevices = state.knownDevices[state.publicId] || {};
+
+			if (staleKnown.length === 0) {
+				// nobody heard from yet this session — broadcast; also
+				// serves as discovery for the targeted path above
+				sendSignal({ type: "sync:backup_push", from: state.publicId, to: id, blob: freshBlob });
+				mlog.info(`→ BACKUP_PUSH  to self — broadcast (no known devices yet this session)`);
+			} else {
+				let targeted = 0, unresolved = 0;
+				for (const devId of staleKnown) {
+					const toEndpoint = selfDevices[devId]?.endpointId;
+					if (!toEndpoint) { unresolved++; continue; }
+					sendSignal({ type: "sync:backup_push", from: state.publicId, to: id, blob: freshBlob, toEndpoint });
+					targeted++;
+					mlog.info(`→ BACKUP_PUSH  to self — targeted  device=${pid(devId)}  endpoint=${pid(toEndpoint)}`);
+				}
+				if (unresolved > 0) {
+					sendSignal({ type: "sync:backup_push", from: state.publicId, to: id, blob: freshBlob });
+					mlog.info(`→ BACKUP_PUSH  to self — broadcast fallback  (${unresolved} stale device(s) with unknown endpoint)`);
+				} else {
+					mlog.info(`→ BACKUP_PUSH  to self — ${targeted} targeted send(s), no broadcast needed`);
+				}
+			}
 		} catch(e) {
 			mlog.warn(`→ BACKUP_PUSH  to self — encrypt failed`);
 		}
@@ -579,18 +645,26 @@ function handleBackupOffer(msg) {
   sendSignal({ type: "sync:backup_accept", from: state.publicId, to: msg.from });
 }
 
-function handleBackupAccept(msg) {
+async function handleBackupAccept(msg) {
   if (!msg.from) return;
 
   // device-fingerprint ack (self-sync freshness tracking) — disambiguated
-  // from the normal contact-offer accept by the presence of deviceId,
-  // which the regular handshake never sets.
-  if (msg.deviceId) {
-    if (msg.deviceId === state.deviceId) return;  // own echo, shouldn't happen
-    if (msg.fingerprint) {
-      state.knownDeviceFingerprints[msg.deviceId] = msg.fingerprint;
-	  recordKnownDevice(state.publicId, msg.deviceId);
-      mlog.debug(`← BACKUP_ACK   from device ${msg.deviceId.slice(0,8)} — fingerprint recorded`);
+  // from the normal contact-offer accept by the presence of `blob`, which
+  // the regular contact handshake (handleBackupOffer's reply, just above)
+  // never sets. deviceId/endpointId/fingerprint no longer appear as outer
+  // fields at all — see the push side's comment for why — so blob presence
+  // is the only signal left to branch on here.
+  if (msg.blob) {
+    try {
+      const plain = await decryptObject(state.cryptoKey, msg.blob);
+      if (!plain?.deviceId || plain.deviceId === state.deviceId) return;  // malformed, or own echo (shouldn't happen)
+      if (plain.fingerprint) {
+        state.knownDeviceFingerprints[plain.deviceId] = plain.fingerprint;
+        recordKnownDevice(state.publicId, plain.deviceId, undefined, plain.endpointId);
+        mlog.debug(`← BACKUP_ACK   from device ${plain.deviceId.slice(0,8)} — fingerprint recorded${plain.endpointId ? "  endpoint="+pid(plain.endpointId) : ""}`);
+      }
+    } catch(e) {
+      mlog.warn(`← BACKUP_ACK   decrypt failed`);
     }
     return;
   }
@@ -617,11 +691,28 @@ async function handleBackupPush(msg) {
   markOnline(msg.from);
 
 	if (msg.from === state.publicId) {
-		if (msg.deviceId && msg.deviceId === state.deviceId) return;  // own echo, shouldn't happen but be defensive
 		try {
 		  const plain = await decryptObject(state.cryptoKey, msg.blob);
 		  if (typeof plain !== "object" || Array.isArray(plain)) return;
-		  const restored      = await deserialiseContacts(plain);
+
+		  // Two self-push shapes share this handler: the periodic full-
+		  // backup push, wrapped as { deviceId, endpointId, fingerprint,
+		  // contacts } (see pushBackupToContacts) — and pushMiniBackup's
+		  // slim single-contact push, still a bare { contactId: {...} }
+		  // map with no deviceId/fingerprint at all, since it never
+		  // participated in the fingerprint-tracking dance. Disambiguated
+		  // by a string deviceId alongside an object contacts — never
+		  // ambiguous with a genuine contacts map, whose top-level keys
+		  // are publicIds, never the literal string "deviceId".
+		  const isWrapped   = typeof plain.deviceId === "string" && typeof plain.contacts === "object";
+		  const contactsMap = isWrapped ? plain.contacts : plain;
+
+		  // own-echo guard — only ever meaningful for the wrapped shape; a
+		  // mini-backup carries no deviceId to compare and was never
+		  // subject to this guard even before deviceId moved inside the blob.
+		  if (isWrapped && plain.deviceId === state.deviceId) return;
+
+		  const restored      = await deserialiseContacts(contactsMap);
 		  const prevSelfRelay = state.contacts[state.publicId]?.lastRelay;
 		  for (const [id, contact] of Object.entries(restored)) {
 			if (!state.contacts[id]) state.contacts[id] = contact;
@@ -640,19 +731,33 @@ async function handleBackupPush(msg) {
 			mlog.info(`BACKUP_PUSH    self relay changed via other device — rebooting signal`);
 			rebootSignal();
 		  }
+
+		  if (!isWrapped) return;   // mini-backup — no fingerprint tracking, no ack, done here
+
 		  // record sender's fingerprint, then ack back with our own post-merge
-		  // fingerprint — reuses backup_accept's shape, disambiguated by the
-		  // presence of deviceId (never set on the normal contact handshake).
-		  if (msg.deviceId && msg.fingerprint) {
-			state.knownDeviceFingerprints[msg.deviceId] = msg.fingerprint;
-			recordKnownDevice(state.publicId, msg.deviceId);
+		  // fingerprint — reuses backup_accept's shape, disambiguated (on the
+		  // receiving end, in handleBackupAccept) by the presence of `blob`,
+		  // which the normal contact handshake never sets.
+		  if (plain.fingerprint) {
+			state.knownDeviceFingerprints[plain.deviceId] = plain.fingerprint;
+			recordKnownDevice(state.publicId, plain.deviceId, undefined, plain.endpointId);
 		  }
-		  if (msg.deviceId) {
-			const ownFingerprint = await computeBackupFingerprint();
-			sendSignal({ type: "sync:backup_accept", from: state.publicId, to: state.publicId,
-						 deviceId: state.deviceId, fingerprint: ownFingerprint });
-			mlog.debug(`→ BACKUP_ACK   to self — fingerprint ${ownFingerprint}`);
-		  }
+		  const ownFingerprint = await computeBackupFingerprint();
+		  // plain.endpointId just arrived on this very push — target the
+		  // ack straight back to the device that sent it when we have
+		  // it, rather than broadcasting a small ack to every live
+		  // self-session. Falls back to broadcast if this particular
+		  // push came from an endpointId-less sender (older client).
+		  // deviceId/endpointId/fingerprint ride inside the ack's own
+		  // small encrypted blob, same reasoning as the push above —
+		  // toEndpoint stays outside since the relay genuinely needs it
+		  // to route.
+		  const ackBlob = await encryptObject(state.cryptoKey, {
+			  deviceId: state.deviceId, endpointId: state.endpointId, fingerprint: ownFingerprint,
+		  });
+		  sendSignal({ type: "sync:backup_accept", from: state.publicId, to: state.publicId, blob: ackBlob,
+					   ...(plain.endpointId ? { toEndpoint: plain.endpointId } : {}) });
+		  mlog.debug(`→ BACKUP_ACK   to self — fingerprint ${ownFingerprint}${plain.endpointId ? "  targeted="+pid(plain.endpointId) : "  (broadcast — sender endpoint unknown)"}`);
 		} catch(e) {
 		  mlog.warn(`← BACKUP_PUSH  from self — decrypt failed`);
 		}
