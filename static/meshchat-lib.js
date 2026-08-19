@@ -110,7 +110,34 @@ function linguisticPenalty(str) {
 
 /* ── ids / text / misc ── */
 
-function pid(id) { return id ? String(id).slice(0, 8) : "?"; }
+// pid(id) — unchanged: 8-char display truncation of a publicId/contactId,
+// used everywhere as before.
+//
+// pid(id, { deviceId, endpointId }) — same base, optionally annotated with
+// whichever of the two sub-ids is in scope at the call site. Deliberately
+// TWO different separators, not one, because deviceId and endpointId are
+// intentionally unlinkable (see deriveDeviceEndpointId) and a log line
+// should never make them look like the same kind of thing:
+//   "::EPID"  — endpointId, 4 chars. Reuses ADDR_SEP ("::"), the same
+//               separator the wire's compound "id::endpointId" address
+//               already uses (see buildAddress/parseAddress) and the one
+//               server.py's short_addr() already renders in relay logs —
+//               so a client log line reads the same way the server-side
+//               log for the same packet would.
+//   " DVID"   — deviceId, 4 chars, space-separated. deviceId never rides
+//               on `to`/routing the way endpointId does, so it gets no
+//               wire-format-flavored separator — this is purely a local
+//               display convenience, not something that means anything
+//               to the relay.
+// Both are truncated to 4 chars — display-only disambiguation ("which of
+// my 2-3 sessions is this"), not a full id; never compare/match on this
+// output, only pid()/the untruncated id itself for that.
+function pid(id, opts) {
+  let s = id ? String(id).slice(0, 8) : "?";
+  if (opts?.endpointId) s += ADDR_SEP + String(opts.endpointId).slice(0, 4);
+  if (opts?.deviceId)   s += " "      + String(opts.deviceId).slice(0, 4);
+  return s;
+}
 
 /* ── COMPOUND ADDRESSING — "id::endpointId" ──
    Mirrors server.py's parse_address()/build_address() exactly. `to` may

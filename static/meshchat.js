@@ -616,7 +616,7 @@ async function pushBackupToContacts(blob) {
 					if (!targetEndpoint) { unresolved++; continue; }
 					sendSignal({ type: "sync:backup_push", from: state.publicId, to: buildAddress(id, targetEndpoint), blob: freshBlob });
 					targeted++;
-					mlog.info(`→ BACKUP_PUSH  to self — targeted  device=${pid(devId)}  endpoint=${pid(targetEndpoint)}`);
+					mlog.info(`→ BACKUP_PUSH  to self — targeted  ${pid(state.publicId, { deviceId: devId, endpointId: targetEndpoint })}`);
 				}
 				if (unresolved > 0) {
 					sendSignal({ type: "sync:backup_push", from: state.publicId, to: id, blob: freshBlob });
@@ -664,7 +664,7 @@ async function handleBackupAccept(msg) {
       if (plain.fingerprint) {
         state.knownDeviceFingerprints[plain.deviceId] = plain.fingerprint;
         recordKnownDevice(state.publicId, plain.deviceId, undefined, plain.endpointId);
-        mlog.debug(`← BACKUP_ACK   from device ${plain.deviceId.slice(0,8)} — fingerprint recorded${plain.endpointId ? "  endpoint="+pid(plain.endpointId) : ""}`);
+        mlog.debug(`← BACKUP_ACK   from self  ${pid(state.publicId, { deviceId: plain.deviceId, endpointId: plain.endpointId })} — fingerprint recorded`);
       }
     } catch(e) {
       mlog.warn(`← BACKUP_ACK   decrypt failed`);
@@ -729,7 +729,7 @@ async function handleBackupPush(msg) {
 		  await saveContacts();
 		  renderContactList();
 		  if (state.currentChat) renderMessages();
-		  mlog.info(`← BACKUP_PUSH  from self — merged other-me`);
+		  mlog.info(`← BACKUP_PUSH  from self  ${isWrapped ? pid(state.publicId, { deviceId: plain.deviceId, endpointId: plain.endpointId }) : pid(state.publicId)} — merged other-me`);
 		  if (state.contacts[state.publicId]?.lastRelay !== prevSelfRelay) {
 			mlog.info(`BACKUP_PUSH    self relay changed via other device — rebooting signal`);
 			rebootSignal();
@@ -760,7 +760,7 @@ async function handleBackupPush(msg) {
 		  });
 		  sendSignal({ type: "sync:backup_accept", from: state.publicId,
 					   to: buildAddress(state.publicId, plain.endpointId), blob: ackBlob });
-		  mlog.debug(`→ BACKUP_ACK   to self — fingerprint ${ownFingerprint}${plain.endpointId ? "  targeted="+pid(plain.endpointId) : "  (broadcast — sender endpoint unknown)"}`);
+		  mlog.debug(`→ BACKUP_ACK   to self  ${plain.endpointId ? pid(state.publicId, { deviceId: plain.deviceId, endpointId: plain.endpointId }) : pid(state.publicId)} — fingerprint ${ownFingerprint}${plain.endpointId ? "" : "  (broadcast — sender endpoint unknown)"}`);
 		} catch(e) {
 		  mlog.warn(`← BACKUP_PUSH  from self — decrypt failed`);
 		}
@@ -1106,7 +1106,7 @@ function startAuth() {
     ed25519_pub: Array.from(base64ToRaw(parts[1])),
     endpoint_id:  state.endpointId || undefined,
   }));
-  mlog.info("AUTH       init");
+  mlog.info(`AUTH       init  ${pid(state.publicId, { endpointId: state.endpointId })}`);
 }
 
 // Possession proof is now "sign the nonce with your Ed25519 private key,"
@@ -1429,7 +1429,7 @@ function getOrOpenRelayConn(url, messageOnly) {
         ed25519_pub: Array.from(base64ToRaw(parts[1])),
         endpoint_id:  state.endpointId || undefined,
       }));
-      mlog.info(`RELAY      open, authing  host=${hostname}`);
+      mlog.info(`RELAY      open, authing  host=${hostname}  ${pid(state.publicId, { endpointId: state.endpointId })}`);
     };
 
     ws.onmessage = async (evt) => {
@@ -1939,7 +1939,12 @@ async function receiveMessage(msg) {
       updateRelay(contact, plain.relay.wss, plain.ts || Date.now());
       if (state.currentChat === msg.from) updateChatRelayInfo(msg.from);
     }
-    mlog.info(`← MSG          from ${pid(msg.from)}  sig:${valid ? "✓" : "✗"}`);
+    // sub-id annotation only once signed+verified — same trust gate as
+    // recordKnownDevice just above; an unverified plain.deviceId/endpointId
+    // isn't safe to trust even for display, since the outer envelope's
+    // deviceId doesn't exist anymore (it moved inside the signed payload).
+    const fromDisp = valid ? pid(msg.from, { deviceId: plain.deviceId, endpointId: plain.endpointId }) : pid(msg.from);
+    mlog.info(`← MSG          from ${fromDisp}  sig:${valid ? "✓" : "✗"}`);
 
     const msgObj = { id: plain.id, from: msg.from, ts: plain.ts || Date.now(), valid };
     // persist the sender's per-device send counter locally too, not just
@@ -1962,7 +1967,7 @@ async function receiveMessage(msg) {
       msgObj.type = "image"; msgObj.mimeType = plain.mimeType;
     } else if (plain.type === "reaction") {
       msgObj.type = "reaction"; msgObj.targetId = plain.targetId; msgObj.emoji = plain.emoji || null;
-      mlog.info(`← REACTION     from ${pid(msg.from)}  target=${pid(plain.targetId)}  emoji=${plain.emoji || "nil"}`);
+      mlog.info(`← REACTION     from ${valid ? pid(msg.from, { deviceId: plain.deviceId, endpointId: plain.endpointId }) : pid(msg.from)}  target=${pid(plain.targetId)}  emoji=${plain.emoji || "nil"}`);
     } else if (plain.type === "system") {
       msgObj.type = "system"; msgObj.kind = plain.kind || null; msgObj.text = plain.text;
       mlog.info(`← SYSTEM_MSG   from ${pid(msg.from)}  kind=${plain.kind || "?"}  "${(plain.text||"").slice(0,60)}"`);
