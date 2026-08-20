@@ -77,6 +77,31 @@ function markRestored(id) {
 }
 
 /* ══════════════════════════════════════════
+   INBOUND DUPLICATE SUPPRESSION — short window
+   Mirrors canRestore/markRestored's shape just above, but generic across
+   packet kinds — keyed by a caller-supplied "kind:senderId" string rather
+   than baked to one packet type. Exists for the case a sender's own
+   traffic (a near-simultaneous retry, or more than one live device
+   answering the same broadcast) delivers the functionally same packet
+   twice within the same second or two — mergeMessages() etc. already
+   make RE-PROCESSING harmless, this is purely about not doing the
+   redundant work (re-sending an accept, a doubled log line) in the first
+   place. A few seconds is enough to catch "two sessions answered in the
+   same tick," nowhere near enough to ever suppress a genuinely later
+   occurrence of the same packet type from the same sender (e.g. the next
+   ~10-minute backup cycle).
+══════════════════════════════════════════ */
+const DEDUP_WINDOW_MS = 3000;
+const _recentInbound  = new Map();   // "kind:senderId" → last-seen timestamp
+
+function isDuplicateInbound(key, windowMs = DEDUP_WINDOW_MS) {
+  const now  = Date.now();
+  const last = _recentInbound.get(key);
+  _recentInbound.set(key, now);
+  return last !== undefined && (now - last) < windowMs;
+}
+
+/* ══════════════════════════════════════════
    ONLINE PRESENCE — time-based expiry
 ══════════════════════════════════════════ */
 const onlineTimestamps = {};
@@ -684,6 +709,10 @@ async function handleBackupOffer(msg) {
   const { id: fromId, endpoint: fromEndpoint } = parseAddress(msg.from);
   if (!fromId) { mlog.warn(`← BACKUP_OFFER  bad 'from' address, dropped`); return; }
   if (state.contacts[fromId]?.blocked) return;
+  if (isDuplicateInbound(`backup_offer:${fromId}`)) {
+    mlog.debug(`← BACKUP_OFFER from ${pid(fromId)} — duplicate within ${DEDUP_WINDOW_MS}ms, suppressed`);
+    return;
+  }
   markOnline(fromId);
 
   // Verification is only possible once we already have this sender as a
