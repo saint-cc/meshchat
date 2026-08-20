@@ -520,13 +520,50 @@ function nextSendCounter(contactId) {
 /* ══════════════════════════════════════════
    PEER BACKUP DISTRIBUTION
    Protocol (non-self peers):
-     1. sender → backup_offer  { from, to, size }
-     2. receiver → backup_accept { from, to } (only if willing)
-     3. sender → backup_push   { from, to, blob }
-   Self-sync skips the offer step (always accepted).
+     1. sender → backup_offer  { from, to, size, ts, sig }
+     2. receiver → backup_accept { from, to, ts, sig } (only if willing)
+     3. sender → backup_push   { from, to, blob, ts, sig }
+   Self-sync skips the offer step (always accepted) and is unaffected by
+   anything below — its `from` stays bare state.publicId, unchanged.
    Constrained peers (C64 etc.) can simply never
    send backup_accept and they will never receive blobs.
+
+   `from` on these three types carries our own compound "id::endpointId"
+   address (buildAddress) — the ONE deliberate exception to "from always
+   stays bare" (see ADDR_SEP's own comment in meshchat-lib.js and
+   protocol.md's Compound Addressing section for the general rule this
+   departs from). Every other packet type in the app is unaffected.
+
+   Why here specifically: self-sync can wrap deviceId/endpointId inside
+   its blob because sender and recipient share one key (same identity).
+   app:message can do the same because by the time a message exists, the
+   pairwise ECDH key already works. backup_offer has neither guarantee —
+   it may be reaching a contact who hasn't added the sender back yet, so
+   there may be no shared key material at all. Plaintext-on-the-address is
+   the only channel guaranteed to reach a genuinely fresh/not-yet-mutual
+   recipient, so that's what carries it here, same tier of exposure the
+   relay's own auth-time endpoint_id already has.
+
+   Signed regardless — every send below is signed with the identity's
+   Ed25519 key (signBackupPacket), even though verification is only ever
+   POSSIBLE once the recipient already has this sender as a contact (needs
+   their signPublicKey, same precondition encryption already has here).
+   An unverifiable packet (no sig, or sender unknown) is processed exactly
+   as this handshake always has been — bootstrap must keep working. Only
+   an ACTIVELY WRONG signature (sig present, sender's key on file, doesn't
+   check out — i.e. tampered in transit by the untrusted relay) is treated
+   as tampering and dropped, logged either way.
 ══════════════════════════════════════════ */
+
+function signBackupPacket(obj) {
+  const { type, from, to, size, ts, blob } = obj;
+  return signBlob({ type, from, to, size: size ?? null, ts, blob: blob || null });
+}
+function verifyBackupPacket(obj, contactSignPublicKey) {
+  if (!obj.sig || !contactSignPublicKey) return false;
+  const { type, from, to, size, ts, blob } = obj;
+  return verifyBlob({ type, from, to, size: size ?? null, ts, blob: blob || null }, obj.sig, contactSignPublicKey);
+}
 
 // tracks which peers we have a pending offer waiting for accept
 const pendingBackupOffer = {};   // id → { blob, ts }
@@ -633,23 +670,48 @@ async function pushBackupToContacts(blob) {
 
     // estimate wire size before sending
     const size = JSON.stringify(blob).length;
-    pendingBackupOffer[id] = { blob, ts: Date.now() };
-    sendSignal({ type: "sync:backup_offer", from: state.publicId, to: id, size });
+    const offerTs = Date.now();
+    pendingBackupOffer[id] = { blob, ts: offerTs };
+    const offerObj = { type: "sync:backup_offer", from: buildAddress(state.publicId, state.endpointId), to: id, size, ts: offerTs };
+    offerObj.sig = signBackupPacket(offerObj);
+    sendSignal(offerObj);
     mlog.info(`→ BACKUP_OFFER to   ${pid(id)}  size=${size}`);
   }
 }
 
-function handleBackupOffer(msg) {
+async function handleBackupOffer(msg) {
   if (!msg.from || !msg.size) return;
-  if (state.contacts[msg.from]?.blocked) return;
-  markOnline(msg.from);
+  const { id: fromId, endpoint: fromEndpoint } = parseAddress(msg.from);
+  if (!fromId) { mlog.warn(`← BACKUP_OFFER  bad 'from' address, dropped`); return; }
+  if (state.contacts[fromId]?.blocked) return;
+  markOnline(fromId);
+
+  // Verification is only possible once we already have this sender as a
+  // contact (their signPublicKey) — a genuinely fresh/not-yet-mutual
+  // sender can still reach us here, same as this handshake has always
+  // allowed. Only an ACTIVE verification failure (sig present, key on
+  // file, doesn't check out) is treated as tampering and dropped.
+  const contact    = state.contacts[fromId];
+  const verifiable = !!(msg.sig && contact?.signPublicKey);
+  const verified   = verifiable && verifyBackupPacket(msg, contact.signPublicKey);
+  if (verifiable && !verified) {
+    mlog.warn(`← BACKUP_OFFER from ${pid(fromId)} — signature invalid, dropped`);
+    return;
+  }
+
   // accept unconditionally — a constrained peer would simply not implement this handler
-  mlog.info(`← BACKUP_OFFER from ${pid(msg.from)}  size=${msg.size} — accepting`);
-  sendSignal({ type: "sync:backup_accept", from: state.publicId, to: msg.from });
+  mlog.info(`← BACKUP_OFFER from ${pid(fromId, verified ? { endpointId: fromEndpoint } : {})}  size=${msg.size}  sig:${verified ? "✓" : "·"} — accepting`);
+  const acceptTs  = Date.now();
+  const acceptObj = { type: "sync:backup_accept", from: buildAddress(state.publicId, state.endpointId), to: fromId, ts: acceptTs };
+  acceptObj.sig = signBackupPacket(acceptObj);
+  sendSignal(acceptObj);
 }
 
 async function handleBackupAccept(msg) {
   if (!msg.from) return;
+  const { id: fromId, endpoint: fromEndpoint } = parseAddress(msg.from);
+  if (!fromId) return;
+  markOnline(fromId);   // covers both branches below — self-sync's own `from` is always bare, so fromId === msg.from there
 
   // device-fingerprint ack (self-sync freshness tracking) — disambiguated
   // from the normal contact-offer accept by the presence of `blob`, which
@@ -671,29 +733,46 @@ async function handleBackupAccept(msg) {
     }
     return;
   }
-  
-  const pending = pendingBackupOffer[msg.from];
+
+  // plain contact-offer accept — from here down mirrors handleBackupOffer's
+  // verification stance exactly: unverifiable (no sig / sender not yet a
+  // contact) proceeds as this handshake always has; an ACTIVE verification
+  // failure is dropped.
+  const contact    = state.contacts[fromId];
+  const verifiable = !!(msg.sig && contact?.signPublicKey);
+  const verified   = verifiable && verifyBackupPacket(msg, contact.signPublicKey);
+  if (verifiable && !verified) {
+    mlog.warn(`BACKUP_ACCEPT  from ${pid(fromId)} — signature invalid, dropped`);
+    return;
+  }
+
+  const pending = pendingBackupOffer[fromId];
   if (!pending) {
-    mlog.debug(`BACKUP_ACCEPT  from ${pid(msg.from)} — no pending offer, ignored`);
+    mlog.debug(`BACKUP_ACCEPT  from ${pid(fromId, verified ? { endpointId: fromEndpoint } : {})} — no pending offer, ignored`);
     return;
   }
   // honour TTL — don't send a stale blob
   if (Date.now() - pending.ts > BACKUP_OFFER_TTL) {
-    delete pendingBackupOffer[msg.from];
-    mlog.warn(`BACKUP_ACCEPT  from ${pid(msg.from)} — offer expired, ignored`);
+    delete pendingBackupOffer[fromId];
+    mlog.warn(`BACKUP_ACCEPT  from ${pid(fromId)} — offer expired, ignored`);
     return;
   }
-  delete pendingBackupOffer[msg.from];
-  sendSignal({ type: "sync:backup_push", from: state.publicId, to: msg.from, blob: pending.blob });
-  mlog.info(`→ BACKUP_PUSH  to   ${pid(msg.from)} — accepted`);
+  delete pendingBackupOffer[fromId];
+  const pushTs  = Date.now();
+  const pushObj = { type: "sync:backup_push", from: buildAddress(state.publicId, state.endpointId), to: fromId, blob: pending.blob, ts: pushTs };
+  pushObj.sig = signBackupPacket(pushObj);
+  sendSignal(pushObj);
+  mlog.info(`→ BACKUP_PUSH  to   ${pid(fromId, verified ? { endpointId: fromEndpoint } : {})}  sig:${verified ? "✓" : "·"} — accepted`);
 }
 
 async function handleBackupPush(msg) {
   if (!msg.from || !msg.blob) return;
-  if (state.contacts[msg.from]?.blocked) return;
-  markOnline(msg.from);
+  const { id: fromId, endpoint: fromEndpoint } = parseAddress(msg.from);
+  if (!fromId) return;
+  if (state.contacts[fromId]?.blocked) return;
+  markOnline(fromId);   // self-sync's own `from` is always bare, so fromId === msg.from there
 
-	if (msg.from === state.publicId) {
+	if (fromId === state.publicId) {
 		try {
 		  const plain = await decryptObject(state.cryptoKey, msg.blob);
 		  if (typeof plain !== "object" || Array.isArray(plain)) return;
@@ -767,19 +846,32 @@ async function handleBackupPush(msg) {
 		return;
 	}
 
-  if (!state.contacts[msg.from]) {
-    mlog.warn(`← BACKUP_PUSH  from ${pid(msg.from)} — unknown contact, dropped`);
+  if (!state.contacts[fromId]) {
+    mlog.warn(`← BACKUP_PUSH  from ${pid(fromId)} — unknown contact, dropped`);
     return;
   }
 
-  state.peerBackups[msg.from] = msg.blob;
+  // Same verification stance as handleBackupOffer/handleBackupAccept:
+  // unverifiable (no sig, or we somehow have no signPublicKey on file
+  // despite having a contact record) proceeds as always; an ACTIVE
+  // verification failure — sig present, key on file, doesn't check out —
+  // is treated as tampering and dropped.
+  const contact    = state.contacts[fromId];
+  const verifiable = !!(msg.sig && contact.signPublicKey);
+  const verified   = verifiable && verifyBackupPacket(msg, contact.signPublicKey);
+  if (verifiable && !verified) {
+    mlog.warn(`← BACKUP_PUSH  from ${pid(fromId)} — signature invalid, dropped`);
+    return;
+  }
+
+  state.peerBackups[fromId] = msg.blob;
   savePeerBackups();
-  mlog.info(`← BACKUP_PUSH  from ${pid(msg.from)} — stored`);
+  mlog.info(`← BACKUP_PUSH  from ${pid(fromId, verified ? { endpointId: fromEndpoint } : {})}  sig:${verified ? "✓" : "·"} — stored`);
 
   // token exchange — one time only
-  if (!state.peerTokens[msg.from]) {
-    sendSignal({ type: "sync:token_req", from: state.publicId, to: msg.from });
-    mlog.info(`→ TOKEN_REQ    to   ${pid(msg.from)} — no token yet`);
+  if (!state.peerTokens[fromId]) {
+    sendSignal({ type: "sync:token_req", from: state.publicId, to: fromId });
+    mlog.info(`→ TOKEN_REQ    to   ${pid(fromId)} — no token yet`);
   }
 }
 
@@ -1255,9 +1347,9 @@ function handleSignal(msg) {
     case "app:migrate":               	handleMigrate(msg);        	break;
 	case "app:burn": 					handleBurn(msg); 			break;
     case "app:sync":         			markOnline(msg.from);		handleMsgExchange(msg);    	break;
-    case "sync:backup_offer":         	markOnline(msg.from);		handleBackupOffer(msg);    	break;
-    case "sync:backup_accept":        	markOnline(msg.from);		handleBackupAccept(msg);   	break;
-    case "sync:backup_push":          	markOnline(msg.from);		handleBackupPush(msg);     	break;
+    case "sync:backup_offer":         	handleBackupOffer(msg);    	break;
+    case "sync:backup_accept":        	handleBackupAccept(msg);   	break;
+    case "sync:backup_push":          	handleBackupPush(msg);     	break;
 
     default: mlog.debug(`SIG unknown type=${msg.type}`);
   }

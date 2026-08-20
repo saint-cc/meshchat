@@ -1486,8 +1486,28 @@ async def handler(ws):
                 if to_id is None:
                     log.warning("  %s with invalid 'to', dropped", kind)
                     continue
-                if frm not in client_ids:
-                    log.warning("%-10s from=%s  not authed  peer=%s  dropped", kind.upper(), short(frm), addr)
+                # sync:backup_offer/accept/push (contact path) are the ONE
+                # deliberate exception letting `from` itself carry a
+                # compound "id::endpointId" address — see build_address/
+                # parse_address's own comments and protocol.md's Compound
+                # Addressing section for the general "from always stays
+                # bare" rule this departs from. Every other type in this
+                # branch is completely unaffected: frm_id falls straight
+                # through to the original bare string, so the client_ids
+                # membership check below is byte-for-byte the same check
+                # it always was for app:sync/restore_*/token_*/call:*/
+                # shell:*. The message is forwarded to the recipient
+                # exactly as received — this only changes what the AUTH
+                # check itself is allowed to match against.
+                if kind in ("sync:backup_offer", "sync:backup_accept", "sync:backup_push"):
+                    frm_id, _frm_endpoint = parse_address(frm)
+                    if frm_id is None:
+                        log.warning("  %s with invalid 'from', dropped", kind)
+                        continue
+                else:
+                    frm_id = frm
+                if frm_id not in client_ids:
+                    log.warning("%-10s from=%s  not authed  peer=%s  dropped", kind.upper(), short_addr(frm), addr)
                     await send_to(ws, {"type": "error", "reason": "not_authenticated"})
                     continue
                 if to_endpoint:
@@ -1495,7 +1515,7 @@ async def handler(ws):
                 else:
                     reached = await deliver(to_id, msg, exclude=ws)
                 log.info("%-16s from=%s  to=%s  reached=%d",
-                         kind.upper()[:16], short(frm), short_addr(msg.get("to")), reached)
+                         kind.upper()[:16], short_addr(frm), short_addr(msg.get("to")), reached)
 
             elif kind == "sig:relay_req":
                 await send_to(ws, {
