@@ -1486,20 +1486,26 @@ async def handler(ws):
                 if to_id is None:
                     log.warning("  %s with invalid 'to', dropped", kind)
                     continue
-                # sync:backup_offer/accept/push (contact path) are the ONE
-                # deliberate exception letting `from` itself carry a
-                # compound "id::endpointId" address — see build_address/
-                # parse_address's own comments and protocol.md's Compound
-                # Addressing section for the general "from always stays
-                # bare" rule this departs from. Every other type in this
-                # branch is completely unaffected: frm_id falls straight
-                # through to the original bare string, so the client_ids
-                # membership check below is byte-for-byte the same check
-                # it always was for app:sync/restore_*/token_*/call:*/
-                # shell:*. The message is forwarded to the recipient
-                # exactly as received — this only changes what the AUTH
-                # check itself is allowed to match against.
-                if kind in ("sync:backup_offer", "sync:backup_accept", "sync:backup_push"):
+                # sync:backup_offer/accept/push and sync:restore_ack/push
+                # (contact-path variants) are the deliberate exception
+                # letting `from` itself carry a compound "id::endpointId"
+                # address — see build_address/parse_address's own comments
+                # and protocol.md's Compound Addressing section for the
+                # general "from always stays bare" rule this departs from.
+                # sync:restore_req is NOT in this set — its `from` stays
+                # bare (decrypting it already requires an established
+                # mutual contact, so there's no fresh-recipient case here
+                # needing the address to carry anything extra). Every
+                # other type in this branch is completely unaffected:
+                # frm_id falls straight through to the original bare
+                # string, so the client_ids membership check below is
+                # byte-for-byte the same check it always was for
+                # app:sync/restore_req/token_*/call:*/shell:*. The message
+                # is forwarded to the recipient exactly as received — this
+                # only changes what the AUTH check itself is allowed to
+                # match against.
+                if kind in ("sync:backup_offer", "sync:backup_accept", "sync:backup_push",
+                            "sync:restore_ack", "sync:restore_push"):
                     frm_id, _frm_endpoint = parse_address(frm)
                     if frm_id is None:
                         log.warning("  %s with invalid 'from', dropped", kind)

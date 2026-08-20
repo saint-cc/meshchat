@@ -570,7 +570,7 @@ function nextSendCounter(contactId) {
    relay's own auth-time endpoint_id already has.
 
    Signed regardless — every send below is signed with the identity's
-   Ed25519 key (signBackupPacket), even though verification is only ever
+   Ed25519 key (signHandshakePacket), even though verification is only ever
    POSSIBLE once the recipient already has this sender as a contact (needs
    their signPublicKey, same precondition encryption already has here).
    An unverifiable packet (no sig, or sender unknown) is processed exactly
@@ -578,13 +578,21 @@ function nextSendCounter(contactId) {
    an ACTIVELY WRONG signature (sig present, sender's key on file, doesn't
    check out — i.e. tampered in transit by the untrusted relay) is treated
    as tampering and dropped, logged either way.
+
+   Reused (not backup-specific despite the name history) by sync:restore_ack
+   and sync:restore_push — both reachable from a non-mutual/unknown sender
+   too, via sig:seen's fresh-device bootstrap ping (see handleSignal), so
+   they need this exact same soft stance. sync:restore_req is the one
+   sibling type that does NOT use this pair — see signRestorePacket below,
+   which is deliberately stricter because that type can only ever be
+   decrypted by an already-mutual contact in the first place.
 ══════════════════════════════════════════ */
 
-function signBackupPacket(obj) {
+function signHandshakePacket(obj) {
   const { type, from, to, size, ts, blob } = obj;
   return signBlob({ type, from, to, size: size ?? null, ts, blob: blob || null });
 }
-function verifyBackupPacket(obj, contactSignPublicKey) {
+function verifyHandshakePacket(obj, contactSignPublicKey) {
   if (!obj.sig || !contactSignPublicKey) return false;
   const { type, from, to, size, ts, blob } = obj;
   return verifyBlob({ type, from, to, size: size ?? null, ts, blob: blob || null }, obj.sig, contactSignPublicKey);
@@ -698,7 +706,7 @@ async function pushBackupToContacts(blob) {
     const offerTs = Date.now();
     pendingBackupOffer[id] = { blob, ts: offerTs };
     const offerObj = { type: "sync:backup_offer", from: buildAddress(state.publicId, state.endpointId), to: id, size, ts: offerTs };
-    offerObj.sig = signBackupPacket(offerObj);
+    offerObj.sig = signHandshakePacket(offerObj);
     sendSignal(offerObj);
     mlog.info(`→ BACKUP_OFFER to   ${pid(id)}  size=${size}`);
   }
@@ -722,7 +730,7 @@ async function handleBackupOffer(msg) {
   // file, doesn't check out) is treated as tampering and dropped.
   const contact    = state.contacts[fromId];
   const verifiable = !!(msg.sig && contact?.signPublicKey);
-  const verified   = verifiable && verifyBackupPacket(msg, contact.signPublicKey);
+  const verified   = verifiable && verifyHandshakePacket(msg, contact.signPublicKey);
   if (verifiable && !verified) {
     mlog.warn(`← BACKUP_OFFER from ${pid(fromId)} — signature invalid, dropped`);
     return;
@@ -732,7 +740,7 @@ async function handleBackupOffer(msg) {
   mlog.info(`← BACKUP_OFFER from ${pid(fromId, verified ? { endpointId: fromEndpoint } : {})}  size=${msg.size}  sig:${verified ? "✓" : "·"} — accepting`);
   const acceptTs  = Date.now();
   const acceptObj = { type: "sync:backup_accept", from: buildAddress(state.publicId, state.endpointId), to: fromId, ts: acceptTs };
-  acceptObj.sig = signBackupPacket(acceptObj);
+  acceptObj.sig = signHandshakePacket(acceptObj);
   sendSignal(acceptObj);
 }
 
@@ -769,7 +777,7 @@ async function handleBackupAccept(msg) {
   // failure is dropped.
   const contact    = state.contacts[fromId];
   const verifiable = !!(msg.sig && contact?.signPublicKey);
-  const verified   = verifiable && verifyBackupPacket(msg, contact.signPublicKey);
+  const verified   = verifiable && verifyHandshakePacket(msg, contact.signPublicKey);
   if (verifiable && !verified) {
     mlog.warn(`BACKUP_ACCEPT  from ${pid(fromId)} — signature invalid, dropped`);
     return;
@@ -789,7 +797,7 @@ async function handleBackupAccept(msg) {
   delete pendingBackupOffer[fromId];
   const pushTs  = Date.now();
   const pushObj = { type: "sync:backup_push", from: buildAddress(state.publicId, state.endpointId), to: fromId, blob: pending.blob, ts: pushTs };
-  pushObj.sig = signBackupPacket(pushObj);
+  pushObj.sig = signHandshakePacket(pushObj);
   sendSignal(pushObj);
   mlog.info(`→ BACKUP_PUSH  to   ${pid(fromId, verified ? { endpointId: fromEndpoint } : {})}  sig:${verified ? "✓" : "·"} — accepted`);
 }
@@ -887,7 +895,7 @@ async function handleBackupPush(msg) {
   // is treated as tampering and dropped.
   const contact    = state.contacts[fromId];
   const verifiable = !!(msg.sig && contact.signPublicKey);
-  const verified   = verifiable && verifyBackupPacket(msg, contact.signPublicKey);
+  const verified   = verifiable && verifyHandshakePacket(msg, contact.signPublicKey);
   if (verifiable && !verified) {
     mlog.warn(`← BACKUP_PUSH  from ${pid(fromId)} — signature invalid, dropped`);
     return;
@@ -931,7 +939,46 @@ async function handleTokenResponse(msg) {
   savePeerTokens();
   mlog.info(`← TOKEN_RESP   from ${pid(msg.from)} — stored`);
 }
+/* ══════════════════════════════════════════
+   RESTORE_REQ — mandatory signature, unlike the handshake pair above
+   restore_req is fundamentally different from backup_offer/restore_ack/
+   restore_push: it can ONLY ever be successfully processed by a recipient
+   who already has the sender as a mutual contact — decrypting it requires
+   contact.encKey, and handleRestoreRequest returns immediately if that
+   contact doesn't exist (see its own comment on why: the old symmetric-
+   key scheme let ANY sender decrypt-with-our-own-key; real ECDH closed
+   that, on purpose). A contact's signPublicKey is populated the instant
+   they're added — straight from the shareable address, no prior message
+   exchange needed — so by the time this handler would reach a signature
+   check, verification is ALWAYS possible. No fresh-client leniency is
+   warranted here the way it is for the other three; missing or invalid
+   is simply dropped, same tier as app:migrate/call:*.
+══════════════════════════════════════════ */
+function signRestorePacket(obj) {
+  const { type, from, to, ts, blob } = obj;
+  return signBlob({ type, from, to, ts, blob: blob || null });
+}
+function verifyRestorePacket(obj, contactSignPublicKey) {
+  if (!obj.sig || !contactSignPublicKey) return false;
+  const { type, from, to, ts, blob } = obj;
+  return verifyBlob({ type, from, to, ts, blob: blob || null }, obj.sig, contactSignPublicKey);
+}
+
 const pendingRestoreRequest = new Set();
+
+// Shared by sig:seen's three bootstrap-ping call sites below (self, known
+// contact, and — deliberately — a completely unknown id too, in case a
+// fresh device with no local data at all happens to be talking to a
+// stranger who was actually a contact on a prior device). Same soft
+// verification stance as the rest of this handshake pair: signed
+// unconditionally, verified only when the recipient already has us on
+// file.
+function sendRestoreAckPing(toId) {
+  const ts  = Date.now();
+  const obj = { type: "sync:restore_ack", from: buildAddress(state.publicId, state.endpointId), to: toId, ts };
+  obj.sig = signHandshakePacket(obj);
+  sendSignal(obj);
+}
 
 async function sendRestoreRequest(id) {
   const contact = state.contacts[id];
@@ -953,7 +1000,9 @@ async function sendRestoreRequest(id) {
 	deviceId:      state.deviceId,
   });
   const token = state.peerTokens[id] || null;
-  const reqObj = { type: "sync:restore_req", from: state.publicId, to: id, blob, ...(token ? { token } : {}) };
+  const ts = Date.now();
+  const reqObj = { type: "sync:restore_req", from: state.publicId, to: id, blob, ts, ...(token ? { token } : {}) };
+  reqObj.sig = signRestorePacket(reqObj);
   const viaRelay = sendToRelay(id, reqObj, true);
   if (!viaRelay) sendSignal(reqObj);
   mlog.info(`→ RESTORE_REQ  to   ${pid(id)}${token ? "  +token" : ""}  via=${viaRelay ? "relay" : "signal(fallback)"}`);  
@@ -973,6 +1022,10 @@ async function handleRestoreRequest(msg) {
     // sending side, so this isn't a new practical limitation — just
     // enforced by the crypto now instead of a policy check after decrypt.
     mlog.warn(`← RESTORE_REQ  from ${pid(msg.from)} — unknown contact, can't decrypt, dropped`);
+    return;
+  }
+  if (!verifyRestorePacket(msg, contact.signPublicKey)) {
+    mlog.warn(`← RESTORE_REQ  from ${pid(msg.from)} — signature invalid, dropped`);
     return;
   }
   let plain;
@@ -1035,7 +1088,9 @@ async function handleRestoreRequest(msg) {
   }
 
   // send ack — cross domain if we have their wss
-  const ackObj = { type: "sync:restore_ack", from: state.publicId, to: msg.from, deviceId: state.deviceId };
+  const ackTs  = Date.now();
+  const ackObj = { type: "sync:restore_ack", from: buildAddress(state.publicId, state.endpointId), to: msg.from, ts: ackTs };
+  ackObj.sig = signHandshakePacket(ackObj);
   const senderWss = plain.wss || state.contacts[msg.from]?.lastRelay || null;
   let ackSent = false;
   if (senderWss) {
@@ -1056,34 +1111,76 @@ async function handleRestoreRequest(msg) {
 async function handleRestoreAck(msg) {
   if (!msg.from || !msg.to) return;
   if (parseAddress(msg.to).id !== state.publicId) return;
-  if (msg.deviceId) recordKnownDevice(msg.from, msg.deviceId);
+  const { id: fromId, endpoint: fromEndpoint } = parseAddress(msg.from);
+  if (!fromId) return;
+  markOnline(fromId);
 
-  if (msg.from === state.publicId) {
+  // Same soft stance as backup_offer/accept/push: this ack is reachable
+  // from a non-mutual/unknown sender too (sig:seen's fresh-device
+  // bootstrap ping, see sendRestoreAckPing), so verification is only ever
+  // possible once we already have the sender as a contact. Drop only on
+  // an ACTIVE failure; unverifiable proceeds exactly as this has always
+  // worked. deviceId is deliberately no longer read from an outer field
+  // here at all (see the compound-from note on the send side) — there is
+  // no safe way to learn it on this specific path, so it simply isn't
+  // learned here; recordKnownDevice still gets fed via every other path
+  // that DOES have a safe channel for it (app:message, self-sync).
+  const contact    = state.contacts[fromId];
+  const verifiable = !!(msg.sig && contact?.signPublicKey);
+  const verified   = verifiable && verifyHandshakePacket(msg, contact.signPublicKey);
+  if (verifiable && !verified) {
+    mlog.warn(`← RESTORE_ACK  from ${pid(fromId)} — signature invalid, dropped`);
+    return;
+  }
+  const fromDisp = pid(fromId, verified ? { endpointId: fromEndpoint } : {});
+
+  if (fromId === state.publicId) {
+    const pushTs    = Date.now();
     const freshBlob = await encryptObject(state.cryptoKey, serialiseContacts());
-    sendSignal({ type: "sync:restore_push", from: state.publicId, to: msg.from, blob: freshBlob });
-    mlog.info(`← RESTORE_ACK  from self — sending fresh data`);
+    const pushObj   = { type: "sync:restore_push", from: buildAddress(state.publicId, state.endpointId), to: fromId, blob: freshBlob, ts: pushTs };
+    pushObj.sig = signHandshakePacket(pushObj);
+    sendSignal(pushObj);
+    mlog.info(`← RESTORE_ACK  from self  ${fromDisp} — sending fresh data`);
     return;
   }
 
-  const backup = state.peerBackups[msg.from];
+  const backup = state.peerBackups[fromId];
   if (!backup) {
-    mlog.info(`← RESTORE_ACK  from ${pid(msg.from)} — no backup stored, nothing sent`);
+    mlog.info(`← RESTORE_ACK  from ${fromDisp} — no backup stored, nothing sent`);
     return;
   }
-  mlog.info(`← RESTORE_ACK  from ${pid(msg.from)} — sending restore_push`);
-  sendSignal({ type: "sync:restore_push", from: state.publicId, to: msg.from, blob: backup });
+  mlog.info(`← RESTORE_ACK  from ${fromDisp} — sending restore_push`);
+  const pushTs  = Date.now();
+  const pushObj = { type: "sync:restore_push", from: buildAddress(state.publicId, state.endpointId), to: fromId, blob: backup, ts: pushTs };
+  pushObj.sig = signHandshakePacket(pushObj);
+  sendSignal(pushObj);
 }
 
 async function handleRestorePush(msg) {
   if (!msg.from || !msg.blob) return;
-  if (!canRestore(msg.from)) {
-    mlog.info(`← RESTORE_PUSH from ${pid(msg.from)} — cooldown, ignored`);
+  const { id: fromId, endpoint: fromEndpoint } = parseAddress(msg.from);
+  if (!fromId) return;
+  markOnline(fromId);
+  if (!canRestore(fromId)) {
+    mlog.info(`← RESTORE_PUSH from ${pid(fromId)} — cooldown, ignored`);
     return;
   }
+  // Same soft stance as the rest of this handshake — restore_push is
+  // reachable from a non-mutual sender the same way restore_ack is (it's
+  // the reply half of the same bootstrap flow), so an unsigned or
+  // unverifiable packet still proceeds; only an active mismatch drops.
+  const contact    = state.contacts[fromId];
+  const verifiable = !!(msg.sig && contact?.signPublicKey);
+  const verified   = verifiable && verifyHandshakePacket(msg, contact.signPublicKey);
+  if (verifiable && !verified) {
+    mlog.warn(`← RESTORE_PUSH from ${pid(fromId)} — signature invalid, dropped`);
+    return;
+  }
+  const fromDisp = pid(fromId, verified ? { endpointId: fromEndpoint } : {});
   try {
     const plain = await decryptObject(state.cryptoKey, msg.blob);
     if (typeof plain !== "object" || Array.isArray(plain)) {
-      mlog.warn(`← RESTORE_PUSH from ${pid(msg.from)} — bad structure, dropped`);
+      mlog.warn(`← RESTORE_PUSH from ${fromDisp} — bad structure, dropped`);
       return;
     }
     const restored      = await deserialiseContacts(plain);
@@ -1104,19 +1201,19 @@ async function handleRestorePush(msg) {
         msgsMerged += state.contacts[id].messages.length - before;
       }
     }
-    markRestored(msg.from);
+    markRestored(fromId);
     sessionFresh = false;
     await saveContacts();
     renderContactList();
 	if (state.currentChat) renderMessages();
-    mlog.info(`← RESTORE_PUSH from ${pid(msg.from)} — +${added} contacts  +${msgsMerged} msgs`);
+    mlog.info(`← RESTORE_PUSH from ${fromDisp} — +${added} contacts  +${msgsMerged} msgs`);
     setSyncStatus("restored from network ✓");
     if (state.contacts[state.publicId]?.lastRelay !== prevSelfRelay) {
       mlog.info(`RESTORE_PUSH   self relay changed via other device — rebooting signal`);
       rebootSignal();
     }
   } catch(e) {
-    mlog.warn(`← RESTORE_PUSH from ${pid(msg.from)} — decrypt failed, dropped`);
+    mlog.warn(`← RESTORE_PUSH from ${fromDisp} — decrypt failed, dropped`);
   }
 }
 
@@ -1350,26 +1447,26 @@ function handleSignal(msg) {
       if (msg.id === state.publicId) {
         markOnline(msg.id);
         if (sessionFresh) {
-          sendSignal({ type: "sync:restore_ack", from: state.publicId, to: state.publicId });
+          sendRestoreAckPing(state.publicId);
           mlog.info(`→ RESTORE_ACK  to self — fresh start, skipping handshake`);
         }
       } else if (state.contacts[msg.id]) {
         markOnline(msg.id);
         if (canRestore(msg.id)) sendRestoreRequest(msg.id);
         if (sessionFresh) {
-          sendSignal({ type: "sync:restore_ack", from: state.publicId, to: msg.id });
+          sendRestoreAckPing(msg.id);
           mlog.info(`→ RESTORE_ACK  to   ${pid(msg.id)} — fresh, asking for peer backup`);
         }
       } else if (sessionFresh) {
-        sendSignal({ type: "sync:restore_ack", from: state.publicId, to: msg.id });
+        sendRestoreAckPing(msg.id);
         mlog.info(`→ RESTORE_ACK  to   ${pid(msg.id)} — fresh, asking for peer backup`);
       }
       renderContactList();
       break;
 
     case "sync:restore_req":			markOnline(msg.from);		handleRestoreRequest(msg); 	break;
-    case "sync:restore_ack":     		markOnline(msg.from);		handleRestoreAck(msg);     	break;
-    case "sync:restore_push":         	markOnline(msg.from);		handleRestorePush(msg);    	break;
+    case "sync:restore_ack":     		handleRestoreAck(msg);     	break;
+    case "sync:restore_push":         	handleRestorePush(msg);    	break;
     case "sync:token_req":  		 	markOnline(msg.from); 		handleTokenRequest(msg);  	break;
     case "sync:token_resp": 		 	markOnline(msg.from); 		handleTokenResponse(msg); 	break;
     case "app:message":              	receiveMessage(msg);       	break;
