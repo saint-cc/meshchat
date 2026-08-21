@@ -1,0 +1,30 @@
+services:
+  meshrelay-main:
+    build:
+      context: ../source
+      dockerfile: ../docker/Dockerfile
+
+    container_name: meshrelay-main
+
+    restart: unless-stopped
+
+    environment:
+      RELAY_WSS_URL: wss://meshchat.example.com/ws/
+
+      TRUSTED_PROXIES: 172.18.0.1
+
+      BUF_DIR: /app/relay_buf
+      BUF_MAX_MSGS: 100
+      BUF_MAX_AGE: 86400
+      BUF_MAX_MB: 10
+
+      HTTP_PORT: 8000
+      WS_PORT: 8888
+
+    volumes:
+      - ./data:/app/relay_buf
+
+    ports:
+      - "127.0.0.1:8000:8000"
+      - "127.0.0.1:8888:8888"
+
