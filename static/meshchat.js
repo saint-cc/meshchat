@@ -64,21 +64,80 @@ const EXCHANGE_COUNT	= 10;
 
 /* ══════════════════════════════════════════
    RESTORE HANDSHAKE — rate limiting
+   Three distinct jobs used to share ONE map (lastRestoreTime), which
+   meant activity on any one of them could silently suppress a
+   completely different device's legitimate turn for up to
+   RESTORE_COOLDOWN:
+     1. OUTBOUND — sendRestoreRequest deciding whether to send another
+        restore_req to this identity. Stays identity-level: we address
+        restore_req at the identity broadly, not at a specific device.
+     2. INBOUND SERVE — handleRestoreRequest deciding whether to bother
+        acking an incoming restore_req. Device-keyed: restore_req is
+        mandatory-signed and already decrypted by the point this check
+        runs, so plain.deviceId is fully trustworthy here.
+     3. INBOUND ACCEPT — handleRestorePush deciding whether to bother
+        processing an incoming restore_push. Endpoint-keyed once the
+        packet's signature verifies — restore_push carries no deviceId
+        at all (see protocol.md), only endpointId via the compound
+        `from`, and only trustworthy post-verification. Falls back to
+        identity-level for the unverifiable case, same tier the rest of
+        this handshake family already uses.
+   Kept as three separate maps rather than one with mixed key shapes —
+   deviceId and endpointId are deliberately unlinkable namespaces (see
+   deriveDeviceEndpointId in lib.js); a map mixing device-keyed and
+   endpoint-keyed entries side by side invites exactly the kind of
+   correlation-by-accident this app otherwise goes out of its way to
+   avoid.
 ══════════════════════════════════════════ */
-const lastRestoreTime  = {};
 
-function canRestore(id) {
-  const last = lastRestoreTime[id];
+// 1. OUTBOUND — sendRestoreRequest's own send cadence toward an identity.
+const lastRestoreRequestSent = {};
+
+function canSendRestoreRequest(id) {
+  const last = lastRestoreRequestSent[id];
   return !last || (Date.now() - last) > RESTORE_COOLDOWN;
 }
-function markRestored(id) {
-  lastRestoreTime[id] = Date.now();
+// Called whenever a restore_push actually lands and gets processed for
+// this identity — regardless of which of their devices sent it — since
+// that's what completes the outbound request/response cycle from our
+// side. Also clears pendingRestoreRequest, letting a future genuine gap
+// trigger a fresh request instead of staying wedged on the old one.
+function markRestoreRequestFulfilled(id) {
+  lastRestoreRequestSent[id] = Date.now();
   pendingRestoreRequest.delete(id);
+}
+
+// 2. INBOUND SERVE — handleRestoreRequest's "did I just ack this device
+// recently" gate. Falls back to the bare identity if deviceId is somehow
+// unavailable (shouldn't happen on this path — see call site).
+function inboundServeKey(id, deviceId) { return deviceId ? `${id}:${deviceId}` : id; }
+const lastRestoreRequestServed = {};
+function canServeRestoreRequest(id, deviceId) {
+  const last = lastRestoreRequestServed[inboundServeKey(id, deviceId)];
+  return !last || (Date.now() - last) > RESTORE_COOLDOWN;
+}
+function markRestoreRequestServed(id, deviceId) {
+  lastRestoreRequestServed[inboundServeKey(id, deviceId)] = Date.now();
+}
+
+// 3. INBOUND ACCEPT — handleRestorePush's "did I just accept a push from
+// this specific device recently" gate. endpointId is only ever passed in
+// once verified by the caller — an unverified/absent one collapses to
+// the bare identity, same soft-verification tier the rest of this
+// handshake pair already uses.
+function inboundAcceptKey(id, endpointId) { return endpointId ? `${id}:${endpointId}` : id; }
+const lastRestorePushAccepted = {};
+function canAcceptRestorePush(id, endpointId) {
+  const last = lastRestorePushAccepted[inboundAcceptKey(id, endpointId)];
+  return !last || (Date.now() - last) > RESTORE_COOLDOWN;
+}
+function markRestorePushAccepted(id, endpointId) {
+  lastRestorePushAccepted[inboundAcceptKey(id, endpointId)] = Date.now();
 }
 
 /* ══════════════════════════════════════════
    INBOUND DUPLICATE SUPPRESSION — short window
-   Mirrors canRestore/markRestored's shape just above, but generic across
+   Mirrors the restore-cooldown trackers' shape just above, but generic across
    packet kinds — keyed by a caller-supplied "kind:senderId" string rather
    than baked to one packet type. Exists for the case a sender's own
    traffic (a near-simultaneous retry, or more than one live device
@@ -760,6 +819,14 @@ async function handleBackupAccept(msg) {
     try {
       const plain = await decryptObject(state.cryptoKey, msg.blob);
       if (!plain?.deviceId || plain.deviceId === state.deviceId) return;  // malformed, or own echo (shouldn't happen)
+      // Self-sync carries no signature to verify (see protocol.md), so
+      // deviceId — trustworthy the moment decrypt succeeds, since decrypt
+      // itself requires state.cryptoKey, which only this identity's own
+      // devices hold — is what dedup keys on here instead of an endpoint.
+      if (isDuplicateInbound(`backup_accept_self:${plain.deviceId}`)) {
+        mlog.debug(`← BACKUP_ACK   from self  ${pid(state.publicId, { deviceId: plain.deviceId, endpointId: plain.endpointId })} — duplicate within ${DEDUP_WINDOW_MS}ms, suppressed`);
+        return;
+      }
       if (plain.fingerprint) {
         state.knownDeviceFingerprints[plain.deviceId] = plain.fingerprint;
         recordKnownDevice(state.publicId, plain.deviceId, undefined, plain.endpointId);
@@ -778,6 +845,17 @@ async function handleBackupAccept(msg) {
   const contact    = state.contacts[fromId];
   const verifiable = !!(msg.sig && contact?.signPublicKey);
   const verified   = verifiable && verifyHandshakePacket(msg, contact.signPublicKey);
+  // Endpoint-aware once verified — otherwise a second of the sender's own
+  // devices genuinely accepting within the same few seconds would collapse
+  // into one identity-level dedup slot and get silently swallowed as a
+  // "duplicate" of the first, the same cross-device suppression bug the
+  // restore-cooldown split fixed. Falls back to bare fromId when
+  // unverified, same tier as everywhere else in this handshake family.
+  const dedupKey = `backup_accept:${fromId}${verified && fromEndpoint ? ":" + fromEndpoint : ""}`;
+  if (isDuplicateInbound(dedupKey)) {
+    mlog.debug(`BACKUP_ACCEPT  from ${pid(fromId, verified ? { endpointId: fromEndpoint } : {})} — duplicate within ${DEDUP_WINDOW_MS}ms, suppressed`);
+    return;
+  }
   if (verifiable && !verified) {
     mlog.warn(`BACKUP_ACCEPT  from ${pid(fromId)} — signature invalid, dropped`);
     return;
@@ -830,6 +908,17 @@ async function handleBackupPush(msg) {
 		  // mini-backup carries no deviceId to compare and was never
 		  // subject to this guard even before deviceId moved inside the blob.
 		  if (isWrapped && plain.deviceId === state.deviceId) return;
+
+		  // Dedup on deviceId, same reasoning as handleBackupAccept's self
+		  // branch — no signature on self-sync traffic to key an endpoint
+		  // check off, but decrypt succeeding already proves it's genuinely
+		  // one of our own devices. Skipped for a mini-backup (isWrapped
+		  // false): no deviceId to key on there, and re-merging the same
+		  // slim single-contact push twice is a harmless no-op anyway.
+		  if (isWrapped && isDuplicateInbound(`backup_push_self:${plain.deviceId}`)) {
+			mlog.debug(`← BACKUP_PUSH  from self  ${pid(state.publicId, { deviceId: plain.deviceId, endpointId: plain.endpointId })} — duplicate within ${DEDUP_WINDOW_MS}ms, suppressed`);
+			return;
+		  }
 
 		  const restored      = await deserialiseContacts(contactsMap);
 		  const prevSelfRelay = state.contacts[state.publicId]?.lastRelay;
@@ -896,6 +985,14 @@ async function handleBackupPush(msg) {
   const contact    = state.contacts[fromId];
   const verifiable = !!(msg.sig && contact.signPublicKey);
   const verified   = verifiable && verifyHandshakePacket(msg, contact.signPublicKey);
+  // Endpoint-aware once verified — see handleBackupAccept's dedupKey
+  // comment for why bare fromId alone would risk swallowing a second,
+  // genuinely distinct sibling device's push.
+  const dedupKey = `backup_push:${fromId}${verified && fromEndpoint ? ":" + fromEndpoint : ""}`;
+  if (isDuplicateInbound(dedupKey)) {
+    mlog.debug(`← BACKUP_PUSH  from ${pid(fromId, verified ? { endpointId: fromEndpoint } : {})} — duplicate within ${DEDUP_WINDOW_MS}ms, suppressed`);
+    return;
+  }
   if (verifiable && !verified) {
     mlog.warn(`← BACKUP_PUSH  from ${pid(fromId)} — signature invalid, dropped`);
     return;
@@ -987,7 +1084,7 @@ async function sendRestoreRequest(id) {
     mlog.debug(`RESTORE_REQ already pending  to ${pid(id)}`);
     return;
   }
-  if (!canRestore(id)) {
+  if (!canSendRestoreRequest(id)) {
     mlog.debug(`RESTORE_REQ skipped cooldown  to ${pid(id)}`);
     return;
   }
@@ -1051,8 +1148,8 @@ async function handleRestoreRequest(msg) {
   
   if (plain.deviceId) recordKnownDevice(msg.from, plain.deviceId);
 
-  if (!canRestore(msg.from)) {
-    mlog.info(`← RESTORE_REQ  from ${pid(msg.from)} — cooldown, no ack`);
+  if (!canServeRestoreRequest(msg.from, plain.deviceId)) {
+    mlog.info(`← RESTORE_REQ  from ${pid(msg.from, plain.deviceId ? { deviceId: plain.deviceId } : {})} — cooldown, no ack`);
     return;
   }
 
@@ -1080,12 +1177,10 @@ async function handleRestoreRequest(msg) {
   } else if (fresh) {
     mlog.info(`← RESTORE_REQ  from ${pid(msg.from)} — fresh client, no token, ignored`);
     return;
-  } else {
-    if (fresh) {
-      mlog.info(`← RESTORE_REQ  from ${pid(msg.from)} — fresh client, requesting back`);
-      sendRestoreRequest(msg.from);
-    }
   }
+  // else: no token, not fresh — an already-known contact re-requesting
+  // without a token. Nothing further to validate; falls through to the
+  // ack below same as the token-valid path does.
 
   // send ack — cross domain if we have their wss
   const ackTs  = Date.now();
@@ -1105,7 +1200,8 @@ async function handleRestoreRequest(msg) {
     }
   }
   if (!ackSent) sendSignal(ackObj);
-  mlog.info(`← RESTORE_REQ  from ${pid(msg.from)} — ack sent  via=${ackSent ? "relay(" + senderWss + ")" : "signal(fallback)"}`);
+  markRestoreRequestServed(msg.from, plain.deviceId);
+  mlog.info(`← RESTORE_REQ  from ${pid(msg.from, plain.deviceId ? { deviceId: plain.deviceId } : {})} — ack sent  via=${ackSent ? "relay(" + senderWss + ")" : "signal(fallback)"}`);
 }
 
 async function handleRestoreAck(msg) {
@@ -1128,6 +1224,15 @@ async function handleRestoreAck(msg) {
   const contact    = state.contacts[fromId];
   const verifiable = !!(msg.sig && contact?.signPublicKey);
   const verified   = verifiable && verifyHandshakePacket(msg, contact.signPublicKey);
+  // Endpoint-aware once verified, same reasoning as the backup handshake
+  // pair's dedup keys above — a second of the sender's own devices acking
+  // within the same few seconds is a genuinely distinct, real ack, not a
+  // duplicate of the first.
+  const dedupKey = `restore_ack:${fromId}${verified && fromEndpoint ? ":" + fromEndpoint : ""}`;
+  if (isDuplicateInbound(dedupKey)) {
+    mlog.debug(`← RESTORE_ACK  from ${pid(fromId, verified ? { endpointId: fromEndpoint } : {})} — duplicate within ${DEDUP_WINDOW_MS}ms, suppressed`);
+    return;
+  }
   if (verifiable && !verified) {
     mlog.warn(`← RESTORE_ACK  from ${pid(fromId)} — signature invalid, dropped`);
     return;
@@ -1161,14 +1266,14 @@ async function handleRestorePush(msg) {
   const { id: fromId, endpoint: fromEndpoint } = parseAddress(msg.from);
   if (!fromId) return;
   markOnline(fromId);
-  if (!canRestore(fromId)) {
-    mlog.info(`← RESTORE_PUSH from ${pid(fromId)} — cooldown, ignored`);
-    return;
-  }
-  // Same soft stance as the rest of this handshake — restore_push is
-  // reachable from a non-mutual sender the same way restore_ack is (it's
-  // the reply half of the same bootstrap flow), so an unsigned or
-  // unverifiable packet still proceeds; only an active mismatch drops.
+
+  // Verify BEFORE the cooldown check (reordered — used to run after).
+  // The cooldown below is endpoint-keyed once verified (see
+  // canAcceptRestorePush), and fromEndpoint isn't safe to key anything on
+  // until the signature backing it actually checks out. Same soft stance
+  // as the rest of this handshake: unverifiable (no sig, or sender not
+  // yet a contact) proceeds exactly as this has always worked; only an
+  // ACTIVE verification failure is dropped.
   const contact    = state.contacts[fromId];
   const verifiable = !!(msg.sig && contact?.signPublicKey);
   const verified   = verifiable && verifyHandshakePacket(msg, contact.signPublicKey);
@@ -1177,6 +1282,26 @@ async function handleRestorePush(msg) {
     return;
   }
   const fromDisp = pid(fromId, verified ? { endpointId: fromEndpoint } : {});
+  // Only trust the endpoint suffix for cooldown-keying once signed+verified
+  // — an unverified sender collapses to the identity-level fallback, same
+  // tier canServeRestoreRequest/canAcceptRestorePush apply elsewhere.
+  const cooldownEndpoint = verified ? fromEndpoint : null;
+
+  // Dedup first, before the (much longer) accept-cooldown gate — cheapest,
+  // most content-independent check goes first, same ordering principle
+  // backup_offer's original dedup already established. Reuses
+  // cooldownEndpoint rather than computing a separate key.
+  const dedupKey = `restore_push:${fromId}${cooldownEndpoint ? ":" + cooldownEndpoint : ""}`;
+  if (isDuplicateInbound(dedupKey)) {
+    mlog.debug(`← RESTORE_PUSH from ${fromDisp} — duplicate within ${DEDUP_WINDOW_MS}ms, suppressed`);
+    return;
+  }
+
+  if (!canAcceptRestorePush(fromId, cooldownEndpoint)) {
+    mlog.info(`← RESTORE_PUSH from ${fromDisp} — cooldown, ignored`);
+    return;
+  }
+
   try {
     const plain = await decryptObject(state.cryptoKey, msg.blob);
     if (typeof plain !== "object" || Array.isArray(plain)) {
@@ -1201,7 +1326,8 @@ async function handleRestorePush(msg) {
         msgsMerged += state.contacts[id].messages.length - before;
       }
     }
-    markRestored(fromId);
+    markRestorePushAccepted(fromId, cooldownEndpoint);
+    markRestoreRequestFulfilled(fromId);
     sessionFresh = false;
     await saveContacts();
     renderContactList();
@@ -1452,7 +1578,7 @@ function handleSignal(msg) {
         }
       } else if (state.contacts[msg.id]) {
         markOnline(msg.id);
-        if (canRestore(msg.id)) sendRestoreRequest(msg.id);
+        if (canSendRestoreRequest(msg.id)) sendRestoreRequest(msg.id);
         if (sessionFresh) {
           sendRestoreAckPing(msg.id);
           mlog.info(`→ RESTORE_ACK  to   ${pid(msg.id)} — fresh, asking for peer backup`);
