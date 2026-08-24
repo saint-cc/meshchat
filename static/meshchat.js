@@ -601,6 +601,29 @@ function nextSendCounter(contactId) {
   return n;
 }
 
+// getAckPointer(contactId) — freshest usable (deviceId, n) pointer into
+// contactId's device registry, or null if none exists yet. Read-only
+// against state.knownDevices — no new bookkeeping.
+//
+// "Usable" excludes any device whose lastN isn't a real message number:
+// lastSeen alone isn't enough, since it's bumped by reactions (which
+// carry no n) and by self-sync fingerprint acks — neither is something
+// worth pointing a reply at. lastN > 0 also naturally excludes the
+// pre-n migration placeholder (lastN: 0) from loadDeviceRegistry.
+function getAckPointer(contactId) {
+  const devices = state.knownDevices[contactId];
+  if (!devices) return null;
+
+  let best = null;
+  for (const [deviceId, info] of Object.entries(devices)) {
+    if (!info || !(info.lastN > 0)) continue;
+    if (!best || info.lastSeen > best.lastSeen) {
+      best = { deviceId, lastN: info.lastN, lastSeen: info.lastSeen };
+    }
+  }
+  return best ? { ackDeviceId: best.deviceId, ackN: best.lastN } : null;
+}
+
 /* ══════════════════════════════════════════
    PEER BACKUP DISTRIBUTION
    Protocol (non-self peers):
@@ -2049,12 +2072,14 @@ async function sendImageMessage(file) {
 
       let status = "failed";
       let sentN  = null;
+      let ackPointer = {};
       try {
         const me       = state.contacts[state.publicId];
         const relay    = me?.lastRelay ? { wss: me.lastRelay } : undefined;
 
         sentN = nextSendCounter(state.currentChat);
-        const payload   = { id, type: "image", data: base64, mimeType, ts, deviceId: state.deviceId, endpointId: state.endpointId, n: sentN, ...(relay ? { relay } : {}) };
+        ackPointer = getAckPointer(state.currentChat) || {};
+        const payload   = { id, type: "image", data: base64, mimeType, ts, deviceId: state.deviceId, endpointId: state.endpointId, n: sentN, ...ackPointer, ...(relay ? { relay } : {}) };
         const encrypted = await encryptMessage(contact.encKey, payload);
         const sig       = await signBlob(encrypted);
 
@@ -2073,7 +2098,7 @@ async function sendImageMessage(file) {
         mlog.err(`→ IMAGE        to   ${pid(state.currentChat)} — send failed: ${e.message}`);
       }
 
-      contact.messages = mergeMessages(contact.messages, [{ id, from: state.publicId, type: "image", mimeType, ts, valid: true, status, n: sentN }]);
+      contact.messages = mergeMessages(contact.messages, [{ id, from: state.publicId, type: "image", mimeType, ts, valid: true, status, n: sentN, ...ackPointer }]);
       await saveContacts();
       renderMessages();
       updateContactPreview();   // sidebar preview otherwise only ever updates on incoming traffic
@@ -2097,13 +2122,15 @@ async function sendAudioMessage(blob) {
 
     let status = "failed";
     let sentN  = null;
+    let ackPointer = {};
     try {
       const me       = state.contacts[state.publicId];
       const relay    = me?.lastRelay ? { wss: me.lastRelay } : undefined;
 
       // encrypt for transit
       sentN = nextSendCounter(state.currentChat);
-      const payload   = { id, type: "audio", data: base64, mimeType, ts, deviceId: state.deviceId, endpointId: state.endpointId, n: sentN, ...(relay ? { relay } : {}) };
+      ackPointer = getAckPointer(state.currentChat) || {};
+      const payload   = { id, type: "audio", data: base64, mimeType, ts, deviceId: state.deviceId, endpointId: state.endpointId, n: sentN, ...ackPointer, ...(relay ? { relay } : {}) };
       const encrypted = await encryptMessage(contact.encKey, payload);
       const sig       = await signBlob(encrypted);
 
@@ -2124,7 +2151,7 @@ async function sendAudioMessage(blob) {
     }
 
     // stub in messages — data stays in audioCache only
-    contact.messages = mergeMessages(contact.messages, [{ id, from: state.publicId, type: "audio", mimeType, ts, valid: true, status, n: sentN }]);
+    contact.messages = mergeMessages(contact.messages, [{ id, from: state.publicId, type: "audio", mimeType, ts, valid: true, status, n: sentN, ...ackPointer }]);
     await saveContacts();
     renderMessages();
     updateContactPreview();   // sidebar preview otherwise only ever updates on incoming traffic
@@ -2300,6 +2327,13 @@ async function receiveMessage(msg) {
     // below to attribute a stored n to the right device's `missing` list,
     // not just "some device of this contact's."
     if (plain.deviceId) msgObj.deviceId = plain.deviceId;
+    // causal-ordering pointer (getAckPointer) — carried straight through
+    // from the sender's payload onto our stored copy, same "just persist
+    // whatever's there" treatment as n/deviceId above. Consumed later by
+    // mergeMessages to splice this message directly after whatever it's
+    // acknowledging, instead of trusting ts alone.
+    if (plain.ackDeviceId) msgObj.ackDeviceId = plain.ackDeviceId;
+    if (plain.ackN != null) msgObj.ackN = plain.ackN;
 
     if (plain.type === "audio") {
       const encBlob = await encryptObject(state.encKey, { data: plain.data, mimeType: plain.mimeType });
@@ -2729,11 +2763,13 @@ async function sendMessage() {
   // which is the real recipient-confirmed signal (an auto-ack reaction).
   let status = "failed";
   let sentN  = null;
+  let ackPointer = {};
   try {
     const me     = state.contacts[state.publicId];
     const relay  = me?.lastRelay ? { wss: me.lastRelay } : undefined;
     sentN = nextSendCounter(state.currentChat);
-    const payload = { id, text, ts, deviceId: state.deviceId, endpointId: state.endpointId, n: sentN, ...(relay ? { relay } : {}) };
+    ackPointer = getAckPointer(state.currentChat) || {};
+    const payload = { id, text, ts, deviceId: state.deviceId, endpointId: state.endpointId, n: sentN, ...ackPointer, ...(relay ? { relay } : {}) };
     const blob   = await encryptMessage(contact.encKey, payload);
     const sig    = await signBlob(blob);
 
@@ -2749,7 +2785,7 @@ async function sendMessage() {
     mlog.err(`→ MSG          to   ${pid(state.currentChat)} — send failed: ${e.message}`);
   }
 
-  contact.messages = mergeMessages(contact.messages, [{ id, from: fromId, text, ts, valid: true, status, n: sentN }]);
+  contact.messages = mergeMessages(contact.messages, [{ id, from: fromId, text, ts, valid: true, status, n: sentN, ...ackPointer }]);
   await saveContacts();
   input.value = "";
   renderMessages();
@@ -2865,12 +2901,14 @@ async function sendCallNotice(id) {
 
   let status = "failed";
   let sentN  = null;
+  let ackPointer = {};
   try {
     const me    = state.contacts[state.publicId];
     const relay = me?.lastRelay ? { wss: me.lastRelay } : undefined;
     sentN = nextSendCounter(id);
+    ackPointer = getAckPointer(id) || {};
     const payload = { id: msgId, type: "system", kind: "call", text, ts,
-                       deviceId: state.deviceId, endpointId: state.endpointId, n: sentN, ...(relay ? { relay } : {}) };
+                       deviceId: state.deviceId, endpointId: state.endpointId, n: sentN, ...ackPointer, ...(relay ? { relay } : {}) };
     const blob    = await encryptMessage(contact.encKey, payload);
     const sig     = await signBlob(blob);
 
@@ -2885,7 +2923,7 @@ async function sendCallNotice(id) {
     mlog.err(`→ CALL_NOTICE  to   ${pid(id)} — send failed: ${e.message}`);
   }
 
-  contact.messages = mergeMessages(contact.messages, [{ id: msgId, from: state.publicId, type: "system", kind: "call", text, ts, valid: true, status, n: sentN }]);
+  contact.messages = mergeMessages(contact.messages, [{ id: msgId, from: state.publicId, type: "system", kind: "call", text, ts, valid: true, status, n: sentN, ...ackPointer }]);
   await saveContacts();
   if (state.currentChat === id) renderMessages();
   updateContactPreview();
