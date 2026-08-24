@@ -7,9 +7,10 @@ commands (ls / cd) from trusted contacts, and replies with the output —
 same protocol, same crypto as meshchat.js / meshchat-lib.js. Add its
 shareable key to your real MeshChat client like any other contact.
 
-Crypto is a line-for-line mirror of meshchat-lib.js as of protocol 0.4.0
+Crypto is a line-for-line mirror of meshchat-lib.js as of protocol 0.4.8
 (X25519 ECDH pairwise encryption — the earlier "shared AES key baked into
-the address" scheme is gone):
+the address" scheme is gone since 0.4.0; the fields/derivations below
+haven't changed since, only client-side handshake robustness work has):
 
   masterSecret   = PBKDF2(passphrase, salt=SHA256("meshchat-v1:"+username), 100000, SHA-256, 32B)
   x25519Seed     = HKDF-SHA256(master, salt=32 zero bytes, info="meshchat-v1:x25519",  32B)  — private scalar, NEVER shared
@@ -324,6 +325,18 @@ def derive_shared_aes_key(my_x25519_priv: X25519PrivateKey, their_x25519_pub_byt
         info=b"meshchat-v1:pairwise",
     ).derive(shared)
     return AESGCM(aes_key_bytes)
+
+
+def derive_reaction_id(my_public_id: str, target_msg_id: str) -> str:
+    """Mirrors deriveReactionId() in meshchat-lib.js — SHA-256("reaction:" +
+    myPublicId + ":" + targetMsgId)[0:12], base64url. Stable per (sender,
+    target) pair so the client's mergeMessages() naturally replaces rather
+    than duplicates on re-delivery, exactly like an ordinary emoji
+    reaction — this is what lets the RECEIVED auto-ack (see send_ack)
+    below ride the same reaction channel instead of a dedicated packet
+    type."""
+    digest = hashlib.sha256(f"reaction:{my_public_id}:{target_msg_id}".encode()).digest()[:12]
+    return base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
 
 
 def raw_to_b64url(raw: bytes) -> str:
@@ -908,6 +921,35 @@ async def do_auth(ws, identity: Identity):
         # anything else during handshake is ignored
 
 
+async def send_ack(ws, identity: Identity, contact: dict, target_msg_id: str):
+    """RECEIVED delivery acknowledgement — mirrors receiveMessage()'s
+    auto-ack in meshchat.js exactly: rides the existing reaction channel
+    (emoji: null) rather than a dedicated packet type, so the sender's
+    client flips that message's status from sent (✔️) to delivered (✔️✔️)
+    the same way it would for a human recipient. Fired the instant an
+    incoming app:message both decrypts AND verifies — see the call site in
+    handle_message, which fires this regardless of whether the message's
+    content turns out to be a whitelisted command, an unrecognized one, or
+    anything else. RECEIVED means "a real device confirmed this," not
+    "this was something I acted on." No `n` on this payload — reactions
+    are deliberately excluded from the send-counter sequence, same as the
+    client (see next_send_counter's own docstring)."""
+    payload = {
+        "id": derive_reaction_id(identity.public_id, target_msg_id),
+        "type": "reaction", "targetId": target_msg_id, "emoji": None,
+        "ts": int(time.time() * 1000),
+        "deviceId": identity.device_id, "endpointId": identity.endpoint_id,
+    }
+    blob = encrypt_message(contact["aesgcm"], payload)
+    sig  = sign_blob(identity.sign_key, blob)
+    obj = {
+        "type": "app:message", "from": identity.public_id, "to": contact["public_id"],
+        "blob": blob, "sig": sig,
+    }
+    await ws.send(json.dumps(obj))
+    log.info("→ ACK      to=%s  target=%s", contact["name"], pid(target_msg_id))
+
+
 async def send_reply(ws, identity: Identity, contact: dict, text: str):
     await asyncio.sleep(0.5)
     payload = {
@@ -952,6 +994,16 @@ async def handle_message(ws, identity: Identity, contacts_by_id: dict, cwd_holde
     if not (sig and verify_blob(blob, sig, contact["sign_pub"])):
         log.warning("MSG        from %s — invalid/missing signature, ignored", contact["name"])
         return
+
+    # RECEIVED ack — fires here, ahead of the content-type filter below, so
+    # it covers any decrypted+verified payload (a recognized command, an
+    # unrecognized one, or a future payload type this agent doesn't act
+    # on), not just the text commands this agent happens to execute. Never
+    # fired for an incoming reaction itself (no meta-acking, mirroring the
+    # client's own `msgObj.type !== "reaction"` guard) or for a payload
+    # with no id to target.
+    if plain.get("type") != "reaction" and plain.get("id"):
+        await send_ack(ws, identity, contact, plain["id"])
 
     if plain.get("type") not in (None, "text"):
         log.debug("MSG        from %s — non-text payload (%s), ignored", contact["name"], plain.get("type"))
