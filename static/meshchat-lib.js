@@ -361,18 +361,106 @@ function updateRelay(contact, wss, ts) {
   }
 }
 
+// mergeMessages(a, b) — last-write-wins merge by id, THEN a causal splice
+// pass on top of the plain (ts, id) baseline order.
+//
+// Baseline first, same as before this pass: ts alone isn't a reliable
+// order for near-simultaneous messages (two events with equal/very-close
+// ts would otherwise tiebreak on whichever side of the merge happened to
+// list them first, which flips depending on merge direction), so id is
+// added as a stable tiebreak. That baseline is now ALSO the fallback for
+// anything the causal pass below can't resolve, and the sibling order
+// used among multiple messages that ack the same target — reordering is
+// the exception here, not the norm (see Roadmap.md).
+//
+// Causal pass: a message stamped with ackDeviceId/ackN (see
+// getAckPointer, meshchat.js) is understood as "sent after seeing that
+// specific (device, n) message" — if that target is present in this
+// merged set, splice the message in directly after it, recursively, so
+// a reply-to-a-reply nests correctly. Deliberately NOT a full causal/
+// vector-clock reorder: multiple messages acking the SAME target keep
+// their existing relative (ts, id) order rather than being further
+// disambiguated against each other.
 function mergeMessages(a, b) {
   const byId = {};
   for (const m of [...(a||[]),...(b||[])]) if (m.id) byId[m.id] = m;
-  // ts alone isn't a reliable order for near-simultaneous messages — two
-  // events with equal/very-close ts would otherwise tiebreak on whichever
-  // side of the merge happened to list them first, which flips depending
-  // on merge direction (send-side push vs. receive-side merge vs. restore
-  // merge) and is exactly what causes a message to visibly jump position
-  // between renders. id is stable and arbitrary but always the same for
-  // the same message, so adding it as the tiebreak makes the result of
-  // this sort identical no matter which order a/b were merged in.
-  return Object.values(byId).sort((x,y) => (x.ts - y.ts) || (x.id < y.id ? -1 : x.id > y.id ? 1 : 0));
+
+  const baseline = Object.values(byId)
+    .sort((x,y) => (x.ts - y.ts) || (x.id < y.id ? -1 : x.id > y.id ? 1 : 0));
+
+  // Index every (deviceId, n)-bearing message for O(1) ack-pointer
+  // resolution instead of scanning the merged set per message. Anything
+  // missing either field (reactions, pre-this-feature messages) simply
+  // can't be pointed at — it can still be a CHILD via its own ack fields,
+  // it just never becomes anyone's parent.
+  const byDeviceN = new Map();
+  for (const m of baseline) {
+    if (m.deviceId && m.n != null) byDeviceN.set(`${m.deviceId}:${m.n}`, m.id);
+  }
+
+  // Resolve ack pointers into parent edges. A pointer that resolves to
+  // nothing in THIS merged set (target not (yet) present — could still
+  // arrive on a later merge) or to the message itself gets no edge and
+  // simply stays at its baseline position.
+  const parentOf = new Map();   // childId -> targetId
+  for (const m of baseline) {
+    if (!m.ackDeviceId || m.ackN == null) continue;
+    const targetId = byDeviceN.get(`${m.ackDeviceId}:${m.ackN}`);
+    if (targetId && targetId !== m.id) parentOf.set(m.id, targetId);
+  }
+
+  // Cycle guard. A real ack graph is always a forest — you can only ack a
+  // message that already existed when yours was sent, so nothing should
+  // ever point back at its own descendant. This is a pure function over
+  // whatever's handed to it, though, and a malformed or replayed set
+  // could otherwise send the depth-first emit below into infinite
+  // recursion. Walk each parent chain looking for a revisit; break the
+  // offending edge (demoting that one message back to its baseline slot)
+  // rather than failing the whole merge.
+  for (const childId of Array.from(parentOf.keys())) {
+    const seen = new Set([childId]);
+    let cur = parentOf.get(childId);
+    while (cur != null) {
+      if (seen.has(cur)) { parentOf.delete(childId); break; }
+      seen.add(cur);
+      cur = parentOf.get(cur);
+    }
+  }
+
+  // Group children by target, walked in baseline order — this is what
+  // keeps multiple replies to the SAME message in their existing
+  // relative (ts, id) order among each other; only a child's position
+  // relative to non-siblings changes, never sibling-vs-sibling order.
+  const childrenOf = new Map();   // targetId -> [childId, ...] in baseline order
+  for (const m of baseline) {
+    const targetId = parentOf.get(m.id);
+    if (targetId == null) continue;
+    if (!childrenOf.has(targetId)) childrenOf.set(targetId, []);
+    childrenOf.get(targetId).push(m.id);
+  }
+
+  // Emit depth-first: walk baseline order, and for every message that
+  // ISN'T itself someone's child (a root), place it, then recursively
+  // place its children in their own baseline order, then theirs, etc. A
+  // message that IS someone's child is skipped at the top level — it
+  // already went out when its parent was placed.
+  const out    = [];
+  const placed = new Set();
+  function place(id) {
+    if (placed.has(id)) return;
+    placed.add(id);
+    out.push(byId[id]);
+    for (const childId of childrenOf.get(id) || []) place(childId);
+  }
+  for (const m of baseline) if (!parentOf.has(m.id)) place(m.id);
+  // Belt-and-suspenders: every parent id is guaranteed present in
+  // baseline and the graph is guaranteed acyclic after the guard above,
+  // so this should be a no-op — but emitting anything somehow still
+  // unplaced (in baseline order, at the end) beats silently dropping a
+  // message if that invariant is ever wrong.
+  for (const m of baseline) place(m.id);
+
+  return out;
 }
 
 function mergeContactMeta(local, remote) {

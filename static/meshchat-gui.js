@@ -681,13 +681,13 @@ function renderMessages() {
   const container = document.getElementById("chatMessages");
   container.innerHTML = "";
   if (!state.currentChat) return;
-  // Defensive — storage should already be sorted (every mutation path goes
-  // through mergeMessages), but render shouldn't be the thing that silently
-  // breaks if some future code path appends without merging. Same ts/id
-  // tiebreak as mergeMessages, so this is a no-op when storage is already
-  // correct and never produces an order that conflicts with it.
-  const msgs = [...(state.contacts[state.currentChat]?.messages || [])]
-    .sort((x,y) => (x.ts - y.ts) || (x.id < y.id ? -1 : x.id > y.id ? 1 : 0));
+  // Order is trusted as-is from storage — mergeMessages (meshchat-lib.js)
+  // is the single source of truth for message order now, including
+  // causal splicing (ackDeviceId/ackN), not just ts/id. A defensive
+  // re-sort here used to be a genuine no-op, back when storage order was
+  // always plain (ts, id) — it would now silently UNDO every causal
+  // splice on every render, so it's gone rather than kept "just in case."
+  const msgs = state.contacts[state.currentChat]?.messages || [];
 
   // filter out reaction messages — they render as overlays on their target bubbles
   const visible = msgs.filter(m => m.type !== "reaction");
