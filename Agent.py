@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
 """
-agent.py — MeshChat command agent (PoC)
+agent.py — MeshChat shell-escalation agent
 
-A headless MeshChat identity that lives on a box, takes whitelisted shell
-commands (ls / cd) from trusted contacts, and replies with the output —
-same protocol, same crypto as meshchat.js / meshchat-lib.js. Add its
-shareable key to your real MeshChat client like any other contact.
+A headless MeshChat identity that lives on a box. It no longer executes
+any command sent to it as an ordinary encrypted text message — that
+bounded-whitelist feature (ls/cd/cat/etc. over app:message) has been
+removed entirely. Any decrypted+verified text from a known contact now
+gets a single static reply pointing them at the real capability: WebRTC
+shell escalation (see SHELL CONFIG below), gated by its own, stricter
+SHELL_CONTACTS allowlist. Same protocol, same crypto as meshchat.js /
+meshchat-lib.js. Add its shareable key to your real MeshChat client like
+any other contact.
 
 Crypto is a line-for-line mirror of meshchat-lib.js as of protocol 0.4.8
 (X25519 ECDH pairwise encryption — the earlier "shared AES key baked into
@@ -75,11 +80,8 @@ import json
 import logging
 import os
 import pty
-import shlex
 import signal
 import struct
-import subprocess
-import sys
 import termios
 import time
 import uuid
@@ -94,9 +96,10 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives.hashes import SHA256
 
 # aiortc is only needed for the shell-escalation feature (see SHELL CONFIG
-# below) — the bounded command whitelist works fine without it. Kept
-# optional so this file still runs on a box where aiortc doesn't install
-# cleanly (it pulls in native deps like libavcodec/libopus).
+# below). Kept optional so this file still runs on a box where aiortc
+# doesn't install cleanly (it pulls in native deps like libavcodec/libopus)
+# — without it, the agent still authenticates, still acks, and still sends
+# the shell nudge below, it just can't accept a shell:invite.
 try:
     from aiortc import (
         RTCConfiguration, RTCIceServer, RTCPeerConnection, RTCSessionDescription,
@@ -165,44 +168,23 @@ USERNAME   = os.environ.get("AGENT_USERNAME", "agent-bot")                      
 PASSPHRASE = os.environ.get("AGENT_PASSPHRASE", "change-this-passphrase")           # this agent's MeshChat passphrase
 RELAY_WSS  = os.environ.get("AGENT_RELAY_WSS", "wss://yourrelay.example.com/ws/")   # relay this agent connects to
 
-# Who is allowed to send it commands. name -> shareable key
+# Who this agent will exchange ordinary text with at all (auto-ack +
+# shell-nudge reply — see SHELL_NUDGE_TEXT below). name -> shareable key
 # ("x25519Pub_b64url.signPubKey_b64url" or with a third ".relay_b64" segment —
-# the relay segment is ignored here; see NOTE below).
+# the relay segment is ignored here; see NOTE below). This is no longer a
+# COMMAND allowlist — nothing sent as plain text is ever executed anymore,
+# regardless of who sends it. Real capability (a full pty) is gated
+# separately and more strictly by SHELL_CONTACTS below.
 CONTACTS = _parse_contacts(os.environ.get("AGENT_CONTACTS", "")) or {
     "admin": "PASTE_SHAREABLE_KEY_HERE",
 }
 
-# Whitelist — nothing outside this dict is executed. Each entry:
-#   needs_arg     — must have at least one non-flag argument (blocks cat/head/
-#                   tail/file from being invoked bare, which would otherwise
-#                   sit reading stdin forever since nothing is piped to it)
-#   no_args       — informational commands; any args the caller sent are
-#                   dropped rather than passed through
-#   blocked_flags — exact-match flags that would make the command not
-#                   terminate on its own (tail -f and friends). This is a
-#                   simple exact-token check, not a real arg parser — it
-#                   won't catch a combined short flag like "-nf". Good
-#                   enough for a whitelist of contacts you already trust;
-#                   tighten if that assumption stops holding.
-COMMAND_SPECS = {
-    "ls":       {},
-    "cd":       {},
-    "pwd":      {"no_args": True},
-    "cat":      {"needs_arg": True},
-    "head":     {"needs_arg": True},
-    "tail":     {"needs_arg": True, "blocked_flags": {"-f", "-F", "--follow", "--retry"}},
-    "file":     {"needs_arg": True},
-    "df":       {},
-    "du":       {},
-    "whoami":   {"no_args": True},
-    "hostname": {"no_args": True},
-    "uptime":   {"no_args": True},
-}
-MAX_OUTPUT_CHARS = 4000
-COMMAND_TIMEOUT  = 10             # seconds, per command — also the cap on a
-                                   # blocked-flag command's non-terminating
-                                   # cousin slipping through some other way;
-                                   # see the TimeoutExpired handling below
+# The one message every contact in CONTACTS gets back for any text they
+# send, once it's decrypted and its signature verifies. Deliberately
+# static — there is no command interpreter left on this path at all, only
+# the auto-ack (RECEIVED) and this nudge.
+SHELL_NUDGE_TEXT = "Use WebRTC to start a shell session with this agent."
+
 RECONNECT_DELAY  = 5              # seconds, on disconnect
 
 # NOTE — single-relay assumption: replies are sent back over this agent's
@@ -232,17 +214,19 @@ SEND_COUNTER_FILE = os.path.join(AGENT_STATE_DIR, "agent_send_counters.json")
 # ══════════════════════════════════════════
 #   SHELL ESCALATION (WebRTC)
 #   ---------------------------------------
+#   The agent's only remaining "do something on this box" capability.
 #   Two data channels, opened by the human side (the offerer):
 #     "shell-data" — raw pty bytes, ordered+reliable
 #     "shell-ctrl" — JSON control messages, currently just
 #                    {"type":"resize","cols":N,"rows":N}
 #   No TURN — same permanent decision as audio calls. If ICE fails, there
-#   is no escalation, full stop; the bounded command whitelist above is
-#   the fallback and needs no WebRTC to work.
+#   is no escalation, full stop; there is no whitelisted-command fallback
+#   anymore — SHELL_NUDGE_TEXT is just a pointer at this path, not an
+#   alternate capability.
 #
-#   Trust tiers are DELIBERATELY separate: being in CONTACTS (bounded
-#   command access) does NOT imply shell access. Only names also listed
-#   in SHELL_CONTACTS can ever get a full pty.
+#   Trust tiers are DELIBERATELY separate: being in CONTACTS (eligible
+#   for the auto-ack + nudge reply) does NOT imply shell access. Only
+#   names also listed in SHELL_CONTACTS can ever get a full pty.
 # ══════════════════════════════════════════
 
 # subset of CONTACTS names allowed to request a full shell — empty = disabled
@@ -511,80 +495,12 @@ def parse_contact(name: str, shareable_key: str, identity: Identity) -> dict:
 
 
 # ══════════════════════════════════════════
-#   COMMAND EXECUTION — ls / cd only
-# ══════════════════════════════════════════
-
-def run_command(text: str, cwd_holder: dict) -> str:
-    try:
-        parts = shlex.split(text)
-    except ValueError as e:
-        return f"error parsing command: {e}"
-    if not parts:
-        return "(empty command)"
-
-    cmd = parts[0]
-    if cmd not in COMMAND_SPECS:
-        return f"command not allowed — whitelisted: {', '.join(sorted(COMMAND_SPECS))}"
-
-    spec = COMMAND_SPECS[cmd]
-    args = parts[1:]
-
-    if spec.get("no_args"):
-        args = []   # informational commands — drop whatever was passed rather than error
-
-    blocked = spec.get("blocked_flags")
-    if blocked:
-        hit = blocked.intersection(args)
-        if hit:
-            return f"{cmd}: not allowed here — blocked flag(s): {', '.join(sorted(hit))} (would never terminate)"
-
-    if spec.get("needs_arg") and not any(not a.startswith("-") for a in args):
-        return f"{cmd}: requires at least one argument (a bare invocation would block reading stdin)"
-
-    cwd = cwd_holder["cwd"]
-
-    if cmd == "cd":
-        target  = args[0] if args else os.path.expanduser("~")
-        newpath = target if os.path.isabs(target) else os.path.join(cwd, target)
-        newpath = os.path.normpath(newpath)
-        if os.path.isdir(newpath):
-            cwd_holder["cwd"] = newpath
-            return newpath
-        return f"cd: no such directory: {target}"
-
-    # argv list, never shell=True — nothing in args can break out into shell
-    # syntax, it's all literal arguments passed straight to the binary.
-    # stdin is always /dev/null: with no pipe attached, a command that would
-    # otherwise wait on stdin (e.g. a bare "cat") would hang until the
-    # COMMAND_TIMEOUT kill instead of erroring immediately.
-    timed_out = False
-    try:
-        proc = subprocess.run(
-            [cmd] + args, cwd=cwd, capture_output=True, text=True,
-            timeout=COMMAND_TIMEOUT, stdin=subprocess.DEVNULL,
-        )
-        out = proc.stdout + (("\n" + proc.stderr) if proc.stderr else "")
-    except subprocess.TimeoutExpired as e:
-        # Python still hands back whatever stdout/stderr had been read
-        # before the kill — treat it as a snapshot rather than a failure.
-        # This is what lets something like a slow `du` on a huge tree come
-        # back with partial results instead of nothing.
-        timed_out = True
-        out = (e.stdout or "") + (("\n" + e.stderr) if e.stderr else "")
-    except Exception as e:
-        out = f"error: {e}"
-
-    out = out.strip() or "(no output)"
-    if len(out) > MAX_OUTPUT_CHARS:
-        out = out[:MAX_OUTPUT_CHARS] + f"\n… truncated ({len(out)} chars total)"
-    if timed_out:
-        out += f"\n… [killed after {COMMAND_TIMEOUT}s — showing partial output]"
-    return out
-
-
-# ══════════════════════════════════════════
 #   PTY PLUMBING — no aiortc dependency, testable standalone
 #   (spawn a shell, read/write it, resize it)
+#   This is the ONLY code in this file that ever runs a shell/process on
+#   behalf of a contact, and it only ever runs behind a WebRTC data
+#   channel opened after a SHELL_CONTACTS-gated shell:invite/claim/offer
+#   handshake — never as a reaction to a plain app:message.
 # ══════════════════════════════════════════
 
 def _set_winsize(fd: int, rows: int, cols: int):
@@ -751,8 +667,9 @@ def verify_shell_packet(obj: dict, pubkey: Ed25519PublicKey) -> bool:
 async def handle_shell_invite(ws, identity: "Identity", contacts_by_id: dict, msg: dict):
     """Agent is always the callee here — only the human client escalates.
     Auto-accepts (no human on this end to click answer) iff the sender is
-    both a known contact AND explicitly in SHELL_CONTACTS. Being whitelisted
-    for bounded commands does NOT imply shell eligibility."""
+    both a known contact AND explicitly in SHELL_CONTACTS. Being in
+    CONTACTS (eligible for the auto-ack + nudge reply) does NOT imply
+    shell eligibility."""
     if not AIORTC_AVAILABLE:
         log.warning("SHELL      invite received but aiortc isn't installed — ignoring")
         return
@@ -929,11 +846,11 @@ async def send_ack(ws, identity: Identity, contact: dict, target_msg_id: str):
     the same way it would for a human recipient. Fired the instant an
     incoming app:message both decrypts AND verifies — see the call site in
     handle_message, which fires this regardless of whether the message's
-    content turns out to be a whitelisted command, an unrecognized one, or
-    anything else. RECEIVED means "a real device confirmed this," not
-    "this was something I acted on." No `n` on this payload — reactions
-    are deliberately excluded from the send-counter sequence, same as the
-    client (see next_send_counter's own docstring)."""
+    content turns out to be recognized text or anything else. RECEIVED
+    means "a real device confirmed this," not "this was something I acted
+    on." No `n` on this payload — reactions are deliberately excluded
+    from the send-counter sequence, same as the client (see
+    next_send_counter's own docstring)."""
     payload = {
         "id": derive_reaction_id(identity.public_id, target_msg_id),
         "type": "reaction", "targetId": target_msg_id, "emoji": None,
@@ -971,7 +888,13 @@ async def send_reply(ws, identity: Identity, contact: dict, text: str):
     log.info("→ REPLY    to=%s  (%d chars)  n=%d", contact["name"], len(text), payload["n"])
 
 
-async def handle_message(ws, identity: Identity, contacts_by_id: dict, cwd_holder: dict, msg: dict):
+async def handle_message(ws, identity: Identity, contacts_by_id: dict, msg: dict):
+    """Decrypt + verify, ack, and — for ordinary text — reply with the
+    static shell nudge. There is no command interpreter here anymore:
+    nothing in `text` is parsed or executed, regardless of content. The
+    only path that ever runs anything on this box is the WebRTC shell
+    escalation handshake (handle_shell_invite and friends, above), gated
+    by SHELL_CONTACTS."""
     frm, blob, sig = msg.get("from"), msg.get("blob"), msg.get("sig")
     if not frm or not blob or msg.get("to") != identity.public_id:
         return
@@ -996,9 +919,7 @@ async def handle_message(ws, identity: Identity, contacts_by_id: dict, cwd_holde
         return
 
     # RECEIVED ack — fires here, ahead of the content-type filter below, so
-    # it covers any decrypted+verified payload (a recognized command, an
-    # unrecognized one, or a future payload type this agent doesn't act
-    # on), not just the text commands this agent happens to execute. Never
+    # it covers any decrypted+verified payload, not just plain text. Never
     # fired for an incoming reaction itself (no meta-acking, mirroring the
     # client's own `msgObj.type !== "reaction"` guard) or for a payload
     # with no id to target.
@@ -1009,10 +930,8 @@ async def handle_message(ws, identity: Identity, contacts_by_id: dict, cwd_holde
         log.debug("MSG        from %s — non-text payload (%s), ignored", contact["name"], plain.get("type"))
         return
 
-    text = (plain.get("text") or "").strip()
-    log.info("← CMD      from=%s  \"%s\"", contact["name"], text)
-    output = run_command(text, cwd_holder)
-    await send_reply(ws, identity, contact, output)
+    log.info("← MSG      from=%s  (%d chars) — replying with shell nudge", contact["name"], len(plain.get("text") or ""))
+    await send_reply(ws, identity, contact, SHELL_NUDGE_TEXT)
 
 
 async def run():
@@ -1048,8 +967,6 @@ async def run():
         else:
             log.info("SHELL      escalation enabled for: %s", ", ".join(sorted(SHELL_CONTACTS)))
 
-    cwd_holder = {"cwd": os.path.expanduser("~")}
-
     while True:
         try:
             async with websockets.connect(RELAY_WSS) as ws:
@@ -1062,7 +979,7 @@ async def run():
                         continue
                     kind = msg.get("type")
                     if kind == "app:message":
-                        await handle_message(ws, identity, contacts_by_id, cwd_holder, msg)
+                        await handle_message(ws, identity, contacts_by_id, msg)
                     elif kind == "sig:auth_fail":
                         log.warning("relay rejected traffic: %s", msg.get("reason"))
                     elif kind == "shell:invite":
