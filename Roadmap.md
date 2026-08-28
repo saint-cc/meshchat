@@ -15,6 +15,31 @@ change.
 
 Recent, for context on where "next" picks up from:
 
+- **Fixed: reactions silently disappearing on merge.** `mergeMessages`'
+  `byId` dedup was positional last-write-wins (`for (const m of [...a,
+  ...b]) if (m.id) byId[m.id] = m` — whichever copy landed later in the
+  concatenated array won, full stop). Harmless for text/audio/image/system
+  messages, since a given id's content there never changes after send —
+  but `deriveReactionId(myPublicId, targetMsgId)` deliberately produces
+  the *same* id across every state a (sender, target) pair can be in: a
+  real emoji, a manual clear, and the RECEIVED auto-ack (`emoji: null`,
+  fired automatically on decrypt+verify — see protocol.md's Delivery
+  Acknowledgement section) all collide on one id by design, so an emoji
+  change/clear replaces rather than duplicates on merge. That design was
+  sound; the collision-resolution rule sitting on top of it wasn't. If a
+  stale `emoji:null` auto-ack ever arrived at a `mergeMessages` call
+  *after* a genuinely newer real reaction — a delayed live delivery, a
+  peer/self backup push carrying an older snapshot, a multi-device
+  fingerprint-mismatch resend — the old positional rule let the stale ack
+  silently clobber the real reaction, with no error and no log line. Fix:
+  `byId` collisions now resolve by `ts` (whichever action actually
+  happened later in real time wins), not by which side of the merge
+  concatenation the message happened to land on. No-op for
+  immutable-content ids (same id always carries the same `ts` there), so
+  applied unconditionally in the one shared dedup path rather than
+  special-casing reactions out. See `meshchat-lib.js`'s `mergeMessages`
+  comment and `protocol.md`'s [Message Merging](protocol.md#message-merging)
+  section for the full writeup.
 - X25519 static-static ECDH pairwise message encryption, replacing the old
   shared-AES-in-the-address scheme (breaking change, `0.4.0`)
 - Burn notice (`app:burn`), two-gate confirmation UI, own buffer/TTL bucket

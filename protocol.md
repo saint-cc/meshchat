@@ -751,6 +751,7 @@ Restore flooding is prevented by three independent 5-minute cooldowns rather tha
 
 All message stores use last-write-wins merge by message ID, then a causal splice pass on top of the plain `(ts, id)` baseline:
 
+- **Dedup by id is recency-based, not positional.** For most message types a given id's content is immutable once sent (text/audio/image/system never change after the fact), so "last one wins" and "last one *in time* wins" are the same statement regardless of how the dedup is implemented. Reaction ids are the deliberate exception: `deriveReactionId(myPublicId, targetMsgId)` (see [Message Merging](#message-merging) below and [Delivery Acknowledgement](#delivery-acknowledgement-received)) intentionally produces the *same* id across every state a given (sender, target) pair can be in — a real emoji, a manual clear, and the RECEIVED auto-ack (`emoji: null`) all collide on one id, by design, so an emoji change/clear replaces rather than duplicates on merge. A dedup rule that resolves same-id collisions by array/iteration position rather than by `ts` is therefore unsafe for this one message type: an auto-ack fires independently of whatever reaction state the user is in, on its own delivery path (live, peer/self backup push, manual sync), and can reach `mergeMessages` after a genuinely newer real reaction has already been recorded elsewhere. A positional rule lets that stale ack silently overwrite the newer reaction with `null` — no error, the reaction just disappears on the next render. `mergeMessages`'s `byId` construction resolves same-id collisions by `ts` instead (whichever copy happened later in real time wins, regardless of which side of the merge it arrived from), which is a no-op for immutable-content ids and fixes the reaction case for free.
 - **Baseline**: merge by id, sort by `(ts, id)` — `id` is a stable tiebreak for near-simultaneous messages, giving an order independent of which side of the merge a message originated from.
 - **Causal pass**: a message stamped with `ackDeviceId`/`ackN` (see [Device Awareness](#device-awareness) and [Message Payload](#message-payload)) is understood as "sent after seeing that specific (device, n) message." If that target is present in the merged set, the message is spliced in directly after it, recursively, so a reply-to-a-reply nests correctly. A pointer that resolves to nothing in the merged set (target not yet present, or removed by local retention — see below) simply keeps its baseline position, falling back to plain `(ts, id)` order. This is deliberately not a full causal/vector-clock reorder — multiple messages acking the same target keep their existing relative `(ts, id)` order among each other rather than being further disambiguated; reordering is the exception here, not the norm.
 - **Cycle guard**: a genuine ack graph is always a forest — a message can only ack something that already existed when it was sent, so nothing should ever point back at its own descendant. The merge walks each parent chain looking for a revisit and breaks the offending edge (demoting that one message back to its baseline slot) rather than risking runaway recursion on a malformed or replayed set.
@@ -758,7 +759,13 @@ All message stores use last-write-wins merge by message ID, then a causal splice
 ```javascript
 function mergeMessages(a, b) {
   const byId = {};
-  for (const m of [...a, ...b]) if (m.id) byId[m.id] = m;
+  for (const m of [...a, ...b]) {
+    if (!m.id) continue;
+    const existing = byId[m.id];
+    // recency wins on a same-id collision, not position — see the dedup
+    // bullet above for why this matters specifically for reaction ids.
+    if (!existing || (m.ts || 0) >= (existing.ts || 0)) byId[m.id] = m;
+  }
   // ts alone isn't a reliable order for near-simultaneous messages — id is
   // added as a stable tiebreak so the baseline is identical regardless of
   // which side of the merge a message originated from. The causal splice

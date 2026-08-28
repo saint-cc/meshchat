@@ -259,6 +259,19 @@ async function deriveDeviceEndpointId(deviceSeed) {
 
 // Stable reaction message ID: same sender + same target always → same ID.
 // This makes mergeMessages naturally replace rather than duplicate reactions.
+//
+// IMPORTANT: this ID is stable across DIFFERENT reaction states — the
+// same (myPublicId, targetMsgId) pair produces the same id whether the
+// stored payload is a real emoji, a cleared reaction (emoji: null typed
+// by the user), or the RECEIVED auto-ack (emoji: null, sent automatically
+// on decrypt+verify — see protocol.md's Delivery Acknowledgement section
+// and agent.py's send_ack). That's deliberate — it's what lets an emoji
+// change/clear naturally replace the old value on merge instead of
+// duplicating it. But it also means a "collision" on this id is a normal,
+// expected event representing one of several genuinely different
+// contents over time, NOT an error condition or a sign of an actual
+// duplicate — see mergeMessages()'s dedup comment for why that matters
+// for how collisions must be resolved.
 async function deriveReactionId(myPublicId, targetMsgId) {
   const enc  = new TextEncoder();
   const hash = await crypto.subtle.digest("SHA-256", enc.encode("reaction:" + myPublicId + ":" + targetMsgId));
@@ -418,14 +431,56 @@ function selectRetainedMessages(messages, n) {
 // mergeMessages(a, b) — last-write-wins merge by id, THEN a causal splice
 // pass on top of the plain (ts, id) baseline order.
 //
-// Baseline first, same as before this pass: ts alone isn't a reliable
-// order for near-simultaneous messages (two events with equal/very-close
-// ts would otherwise tiebreak on whichever side of the merge happened to
-// list them first, which flips depending on merge direction), so id is
-// added as a stable tiebreak. That baseline is now ALSO the fallback for
-// anything the causal pass below can't resolve, and the sibling order
-// used among multiple messages that ack the same target — reordering is
-// the exception here, not the norm (see Roadmap.md).
+// ── byId dedup: recency-based, NOT positional ──
+// A message id is not always immutable content. Ordinary text/audio/
+// image/system messages ARE immutable once sent — a given id's content
+// never changes, so which copy "wins" a same-id collision never matters
+// for them. Reactions are the deliberate exception: deriveReactionId()
+// produces the SAME id for every state a given (sender, target) pair
+// ever takes — a real emoji, a manual clear, and the emoji:null
+// RECEIVED auto-ack (see protocol.md's Delivery Acknowledgement section)
+// all collide on one id by design, so that an emoji change/clear
+// naturally replaces rather than duplicates on merge.
+//
+// The bug this fixes: byId used to be populated by plain array-order
+// last-write-wins —
+//   for (const m of [...a, ...b]) if (m.id) byId[m.id] = m;
+// — "last" meaning last in iteration order, not last in real time. For
+// immutable-content ids that's a distinction without a difference. For a
+// reaction id it isn't: the auto-ack fires the instant a message
+// decrypts+verifies, independent of whatever reaction the user has or
+// hasn't picked yet, and can reach a given contact.messages array via a
+// different path and a different merge call than the user's actual emoji
+// pick (a delayed live delivery, a peer/self backup push, a manual sync
+// exchange). If a stale emoji:null object ever ends up LATER in the
+// concatenated [...a, ...b] than a genuinely newer emoji pick — entirely
+// possible once backups/restores/multi-device are in the mix — the old
+// positional rule let it silently overwrite the real reaction with
+// nothing. No error, no log line: the reaction just disappears on the
+// next render.
+//
+// Fix: resolve same-id collisions by ts, not position — whichever copy
+// actually happened more recently in real time wins, regardless of which
+// side of the merge it arrived from or what order the arrays happen to
+// be concatenated in. Every reaction (auto-ack or real) stamps a fresh
+// Date.now() at send time, so this correctly resolves ack-then-react to
+// the emoji, react-then-clear to null, and a stale buffered/backed-up ack
+// can no longer regress a fresher local reaction. For immutable-content
+// ids this is a no-op (same id always carries the same ts), so it's safe
+// to apply unconditionally in this one shared dedup path rather than
+// special-casing reactions out. Tiebreak on an exact ts match: the
+// incoming (later-iterated) copy wins, same as the old behavior — two
+// genuinely different actions landing on the identical millisecond is
+// vanishingly unlikely in practice, and the two other unresolved
+// dimensions here (mergeMessages has no cross-device vector clock, only
+// per-contact ts) mean a perfect tiebreak isn't achievable anyway.
+//
+// Baseline sort is otherwise unchanged: ts alone isn't a reliable order
+// for near-simultaneous messages, so id is added as a stable secondary
+// sort key. That baseline is now ALSO the fallback for anything the
+// causal pass below can't resolve, and the sibling order used among
+// multiple messages that ack the same target — reordering is the
+// exception here, not the norm (see Roadmap.md).
 //
 // Causal pass: a message stamped with ackDeviceId/ackN (see
 // getAckPointer, meshchat.js) is understood as "sent after seeing that
@@ -437,7 +492,17 @@ function selectRetainedMessages(messages, n) {
 // disambiguated against each other.
 function mergeMessages(a, b) {
   const byId = {};
-  for (const m of [...(a||[]),...(b||[])]) if (m.id) byId[m.id] = m;
+  for (const m of [...(a||[]),...(b||[])]) {
+    if (!m.id) continue;
+    const existing = byId[m.id];
+    // recency wins, not position — see the function-level comment above
+    // for why this matters specifically for reaction ids (deriveReactionId
+    // deliberately collides across emoji states, including the RECEIVED
+    // auto-ack). >= means the incoming copy wins an exact ts tie, matching
+    // the old positional behavior for the (effectively never-occurring)
+    // case of two genuinely different actions on the identical millisecond.
+    if (!existing || (m.ts || 0) >= (existing.ts || 0)) byId[m.id] = m;
+  }
 
   const baseline = Object.values(byId)
     .sort((x,y) => (x.ts - y.ts) || (x.id < y.id ? -1 : x.id > y.id ? 1 : 0));
