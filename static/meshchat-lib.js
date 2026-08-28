@@ -361,6 +361,60 @@ function updateRelay(contact, wss, ts) {
   }
 }
 
+// selectRetainedMessages(messages, n) — chooses which messages survive
+// local persistence (serialiseContacts' retention cap / getLast's sync
+// window), keyed on actual recency (ts, id) rather than array position.
+//
+// Before causal splicing existed, contact.messages was always kept in
+// strict (ts, id) order, so "last n array elements" and "n most recent
+// messages" were the same statement — a plain slice(-n) was correct.
+// mergeMessages' ack-pointer splice (see its own comment) can now move a
+// message far from its timestamp-sorted position — a message can sit
+// well before messages that are chronologically newer than it, if it's
+// someone's causal parent. A positional slice(-n) after that splice can
+// therefore silently keep old messages and drop newer ones, or split a
+// message from the parent its ackDeviceId/ackN points at — which then
+// silently reverts to timestamp ordering on the next merge (see
+// mergeMessages: an ack pointer that resolves to nothing in the merged
+// set just gets no edge), with no way to ever recover the missing parent
+// since there's no wire-level backfill (see Roadmap.md).
+//
+// Fix: select the n most recent messages by (ts, id) — never by position
+// — then do one pass rescuing each kept message's direct ack-target if it
+// exists elsewhere in the full set, so a still-known parent doesn't get
+// severed purely for falling just outside the recency window. NOT a full
+// transitive closure — a rescued parent's own parent is not chased. Ack
+// chains here are shallow in practice (each message points at whichever
+// single device/n was freshest when it was composed, not a long
+// lineage), and anything unresolvable after one hop already degrades
+// gracefully via mergeMessages' existing fallback.
+//
+// Finally, filter the ORIGINAL array down to the surviving ids — this
+// preserves whatever causal order mergeMessages already established
+// among the kept messages, rather than re-deriving it here.
+function selectRetainedMessages(messages, n) {
+  if (!Array.isArray(messages) || messages.length <= n) return messages || [];
+
+  const byId = new Map(messages.map(m => [m.id, m]));
+  const byDeviceN = new Map();
+  for (const m of messages) {
+    if (m.deviceId && m.n != null) byDeviceN.set(`${m.deviceId}:${m.n}`, m.id);
+  }
+
+  const byRecency = [...messages].sort((a, b) =>
+    (b.ts - a.ts) || (a.id < b.id ? 1 : a.id > b.id ? -1 : 0));
+  const keep = new Set(byRecency.slice(0, n).map(m => m.id));
+
+  for (const id of Array.from(keep)) {
+    const m = byId.get(id);
+    if (!m?.ackDeviceId || m.ackN == null) continue;
+    const parentId = byDeviceN.get(`${m.ackDeviceId}:${m.ackN}`);
+    if (parentId && !keep.has(parentId)) keep.add(parentId);
+  }
+
+  return messages.filter(m => keep.has(m.id));
+}
+
 // mergeMessages(a, b) — last-write-wins merge by id, THEN a causal splice
 // pass on top of the plain (ts, id) baseline order.
 //

@@ -2,7 +2,7 @@
 
 A decentralised, encrypted messaging protocol built on WebSocket relay servers. No accounts, no central authority, no plaintext.
 
-Current client/server implementation version: `0.4.7`, surfaced informationally via the `version` field on `sig:relay_info` for drift visibility (not yet enforced). `0.3.6` added WebRTC data-channel shell escalation for agent contacts; `0.3.7` added the burn notice; `0.4.0` replaced the identity encryption key with an X25519 keypair (breaking, no backward compatibility); `0.4.1` adds web push notifications end to end — VAPID keypair generation, `sig:push_subscribe`/`sig:push_unsubscribe`, best-effort empty-payload pushes on genuinely-offline `app:message` delivery, the per-device opt-in checkbox (edit-contact panel, self only), the browser subscribe/re-subscribe flow, and the service worker's `push`/`notificationclick` handling; `0.4.2` is a client-side bugfix only (the WebRTC call notice previously always labelled the caller `"<name> (me)"`, regardless of who was actually calling, because it read the caller's own locally-decorated self-contact label instead of their plain username — no wire format change); `0.4.5` adds the endpoint-keyed offline buffer (`BUF_DIR/<publicId>/_endpoints/<endpointId>/`, its own caps/TTL/expiry sweep, independent of the identity-level bucket), extends self-sync device targeting to `sync:backup_push`/`sync:backup_accept` (see [Peer Backup Protocol](#peer-backup-protocol)), and moves `deviceId`/`endpointId`/`fingerprint` off those two types' outer envelope and into the encrypted `blob` — the relay never read them, and an unsigned outer field is silently rewritable in transit by an untrusted relay with zero detection; `0.4.6` replaces the separate `toEndpoint` field with a single compound `to` address (`"id"` or `"id::endpointId"` — see [Compound Addressing](#compound-addressing)), applied first to the `0.4.5` self-sync backup work; `0.4.7` is a client-side robustness pass on the restore/backup handshake family, no wire format change — the restore cooldown (previously one identity-keyed map shared across three unrelated jobs, which meant activity on any one job could silently suppress an unrelated device's legitimate turn) is split into three independent trackers (see [Peer Backup Protocol](#peer-backup-protocol)), and the short-window duplicate suppression already used for `backup_offer` is extended to `backup_accept`/`backup_push`/`restore_ack`/`restore_push`, keyed the same device/endpoint-aware way. See [Push Notifications](#push-notifications) for the full picture, including what's deliberately still out of scope.
+Current client/server implementation version: `0.4.8`, surfaced informationally via the `version` field on `sig:relay_info` for drift visibility (not yet enforced). `0.3.6` added WebRTC data-channel shell escalation for agent contacts; `0.3.7` added the burn notice; `0.4.0` replaced the identity encryption key with an X25519 keypair (breaking, no backward compatibility); `0.4.1` adds web push notifications end to end — VAPID keypair generation, `sig:push_subscribe`/`sig:push_unsubscribe`, best-effort empty-payload pushes on genuinely-offline `app:message` delivery, the per-device opt-in checkbox (edit-contact panel, self only), the browser subscribe/re-subscribe flow, and the service worker's `push`/`notificationclick` handling; `0.4.2` is a client-side bugfix only (the WebRTC call notice previously always labelled the caller `"<name> (me)"`, regardless of who was actually calling, because it read the caller's own locally-decorated self-contact label instead of their plain username — no wire format change); `0.4.5` adds the endpoint-keyed offline buffer (`BUF_DIR/<publicId>/_endpoints/<endpointId>/`, its own caps/TTL/expiry sweep, independent of the identity-level bucket), extends self-sync device targeting to `sync:backup_push`/`sync:backup_accept` (see [Peer Backup Protocol](#peer-backup-protocol)), and moves `deviceId`/`endpointId`/`fingerprint` off those two types' outer envelope and into the encrypted `blob` — the relay never read them, and an unsigned outer field is silently rewritable in transit by an untrusted relay with zero detection; `0.4.6` replaces the separate `toEndpoint` field with a single compound `to` address (`"id"` or `"id::endpointId"` — see [Compound Addressing](#compound-addressing)), applied first to the `0.4.5` self-sync backup work; `0.4.7` is a client-side robustness pass on the restore/backup handshake family, no wire format change — the restore cooldown (previously one identity-keyed map shared across three unrelated jobs, which meant activity on any one job could silently suppress an unrelated device's legitimate turn) is split into three independent trackers (see [Peer Backup Protocol](#peer-backup-protocol)), and the short-window duplicate suppression already used for `backup_offer` is extended to `backup_accept`/`backup_push`/`restore_ack`/`restore_push`, keyed the same device/endpoint-aware way; `0.4.8` finalizes causal message ordering end to end — `mergeMessages` (see [Message Merging](#message-merging)) now resolves `ackDeviceId`/`ackN` into parent edges and splices children in depth-first rather than trusting `(ts, id)` alone, `agent.py`'s `send_ack` mirrors the RECEIVED auto-ack, and local message retention (`serialiseContacts`'s per-contact cap, `getLast`'s sync window) selects by actual recency via `selectRetainedMessages` rather than a positional `slice`, since positional truncation after a causal splice could silently drop a message's causal parent or keep older messages over newer ones. `getAckPointer`'s device tiebreak is now deterministic (`lastSeen` → `lastN` → `deviceId`) rather than falling through to incidental object-iteration order on an exact timestamp tie. See [Push Notifications](#push-notifications) for the full picture, including what's deliberately still out of scope.
 
 ---
 
@@ -106,7 +106,9 @@ The separator is `::`. base64url — the charset every id in this protocol uses 
 
 **Delivery.** A compound `to` is honored on every branch that already knew how to route `app:message` device-targeted (`route_or_buffer`/`deliver_to_endpoint`) and on the shared `app:sync`/`sync:*`/`call:*`/`shell:*` branch — not a new capability, just a new, single-field way of expressing the same routing instruction that field previously carried. Live-only wherever it was live-only before; the offline buffer honors it wherever it already did (see [Offline Delivery](#offline-delivery)) — nothing about *what* gets buffered or delivered changed in this pass, only how the target device is written on the wire.
 
+---
 
+## Shareable Address
 
 Everything needed to reach someone, encoded as a single dot-separated string:
 
@@ -233,6 +235,8 @@ The `relay` field carries the sender's current relay WSS URL. Recipients update 
 
 `endpointId` (see [Device Endpoint ID](#device-endpoint-id)) travels alongside `deviceId` inside this same encrypted payload — it's how a contact passively *learns* a sender's endpointId, the same way they learn `deviceId`, recorded into the device registry only once the envelope's signature has verified. Optional; older payloads that omit it leave whatever's already on file for that device untouched rather than being treated as a clear-it signal.
 
+**Causal ordering fields.** `ackDeviceId` and `ackN`, when present, point at the specific `(deviceId, n)` message this one was composed as a reply-after — see [Message Merging](#message-merging) for how the recipient uses this to splice the message into the right place rather than trusting `ts` alone. Populated by `getAckPointer(contactId)` on every text/audio/image/system send, reading the freshest usable entry off the sender's own local device registry (see [Device Registry](#device-registry)) — no extra round trip, no new storage. Absent when the registry has no usable pointer yet (e.g. no messages ever received from this contact), in which case the message simply keeps its baseline `(ts, id)` position on every recipient.
+
 **Other payload types:** `audio`, `image`, `reaction`, `system`. Audio and image carry `data` (base64) and `mimeType`. Reactions carry `targetId` and `emoji`. System notices carry `kind` and `text` — a real, encrypted `app:message` artifact (not a signaling-only packet) used today for the WebRTC call notice (`kind: "call"`), so an offline callee still gets it via the normal offline-buffer/push path and both sides keep a visible record of the attempt regardless of whether the call itself connects.
 
 ### Delivery Acknowledgement (RECEIVED)
@@ -250,6 +254,8 @@ There is no dedicated packet type for this — SEND and RECEIVED status both rid
 This is the exact same shape and stable-ID derivation (`SHA-256("reaction:" + myPublicId + ":" + targetMsgId)`) used for an ordinary emoji reaction — see [Message Merging](#message-merging). The sender treats *any* reaction targeting one of its own outbound messages as proof a real device received and cryptographically verified it — the emoji value is irrelevant to this purpose, `null` is simply what an auto-ack carries. On receipt, the sender flips that message's local status from `sent` to `delivered`.
 
 This acknowledgement deliberately never fires for self-targeted traffic (`msg.from === state.publicId`) — there is no delivery concept to signal to oneself — and only fires once signature verification has actually passed, so a message that merely decrypts but fails verification does not get silently marked delivered.
+
+`agent.py`'s `send_ack` mirrors this exactly (`derive_reaction_id` + the reaction channel with `emoji: null`), fired from `handle_message` immediately after signature verification, ahead of the whitelisted-command dispatch — RECEIVED means "a real device confirmed this," not "this was something I acted on," so it covers a recognized command, an unrecognized one, or any other decrypted+verified payload alike.
 
 **READ status is explicitly deferred**, unlike RECEIVED — sensitive, opinions vary widely on whether it should exist at all, and it is not part of this mechanism. See `Roadmap.md`.
 
@@ -430,6 +436,8 @@ This is local-only, never included in backup blobs or `serialiseContacts()`. It 
 2. **Self-sync backup path** — `sync:backup_push` and `sync:backup_accept` teach each of the user's own devices about the others (see [Peer Backup Protocol](#peer-backup-protocol)). `deviceId`, `fingerprint`, and (as of this pass) `endpointId` all ride inside the encrypted `blob` on both types now, not as outer envelope fields — the relay never read them, and an unsigned outer field is silently rewritable in transit by an untrusted relay with zero detection, the same reasoning that already moved `app:message`'s `deviceId` off its outer envelope. `endpointId` specifically is learned the same "only adopt an explicit value" way as the message-receipt path above — this is what lets `pushBackupToContacts` target a specific known-stale sibling device instead of broadcasting to every live self-session.
 
 The registry is displayed in a per-contact device popover in the UI. Contacts with no recorded devices show an "unknown" placeholder. The data accumulates passively through normal traffic — no dedicated discovery handshake.
+
+`getAckPointer(contactId)` (see [Message Merging](#message-merging)) reads this registry to pick which single `(deviceId, n)` pair to stamp as the causal-ordering pointer on an outgoing message — the device with the most recent `lastSeen` among entries carrying a real `lastN` (excludes reactions and self-sync acks, which bump `lastSeen` without a real message number, and the pre-`n` migration placeholder `lastN: 0`). Ties on `lastSeen` — plausible when two of a contact's devices send within the same millisecond, or a bulk restore/merge stamps several devices faster than the clock ticks — are broken by `lastN` (higher send counter wins), then by `deviceId` string comparison as a final deterministic tiebreak, rather than falling through to `Object.entries()` iteration order, which reflects nothing more meaningful than registry insertion order.
 
 ### Planned propagation
 
@@ -741,20 +749,41 @@ Restore flooding is prevented by three independent 5-minute cooldowns rather tha
 
 ## Message Merging
 
-All message stores use last-write-wins merge by message ID:
+All message stores use last-write-wins merge by message ID, then a causal splice pass on top of the plain `(ts, id)` baseline:
+
+- **Baseline**: merge by id, sort by `(ts, id)` — `id` is a stable tiebreak for near-simultaneous messages, giving an order independent of which side of the merge a message originated from.
+- **Causal pass**: a message stamped with `ackDeviceId`/`ackN` (see [Device Awareness](#device-awareness) and [Message Payload](#message-payload)) is understood as "sent after seeing that specific (device, n) message." If that target is present in the merged set, the message is spliced in directly after it, recursively, so a reply-to-a-reply nests correctly. A pointer that resolves to nothing in the merged set (target not yet present, or removed by local retention — see below) simply keeps its baseline position, falling back to plain `(ts, id)` order. This is deliberately not a full causal/vector-clock reorder — multiple messages acking the same target keep their existing relative `(ts, id)` order among each other rather than being further disambiguated; reordering is the exception here, not the norm.
+- **Cycle guard**: a genuine ack graph is always a forest — a message can only ack something that already existed when it was sent, so nothing should ever point back at its own descendant. The merge walks each parent chain looking for a revisit and breaks the offending edge (demoting that one message back to its baseline slot) rather than risking runaway recursion on a malformed or replayed set.
 
 ```javascript
 function mergeMessages(a, b) {
   const byId = {};
   for (const m of [...a, ...b]) if (m.id) byId[m.id] = m;
   // ts alone isn't a reliable order for near-simultaneous messages — id is
-  // added as a stable tiebreak so the result is identical regardless of
-  // which side of the merge a message originated from.
-  return Object.values(byId).sort((x, y) => (x.ts - y.ts) || (x.id < y.id ? -1 : x.id > y.id ? 1 : 0));
+  // added as a stable tiebreak so the baseline is identical regardless of
+  // which side of the merge a message originated from. The causal splice
+  // pass (see above) is layered on top of this baseline, not a
+  // replacement for it.
+  const baseline = Object.values(byId)
+    .sort((x, y) => (x.ts - y.ts) || (x.id < y.id ? -1 : x.id > y.id ? 1 : 0));
+  // ... ack-pointer resolution, cycle guard, depth-first emission — see
+  // meshchat-lib.js for the full implementation.
+  return baseline;
 }
 ```
 
 Reactions use a stable derived ID (`SHA-256("reaction:" + myId + ":" + targetMsgId)`) so a user's reaction to a given message always has the same ID — naturally replacing rather than duplicating on merge. The delivery-acknowledgement reaction (see [Delivery Acknowledgement](#delivery-acknowledgement-received)) uses this identical derivation, so it merges the same way.
+
+### Local retention
+
+Both `serialiseContacts()`'s per-contact storage cap (default 15 messages) and `getLast()`'s manual-sync window (default 10) select which messages survive by recency (`selectRetainedMessages`, `meshchat-lib.js`), not by raw array position.
+
+Before causal splicing existed, `contact.messages` was always kept in strict `(ts, id)` order, so "the last n array elements" and "the n most recent messages" were the same statement — a plain `slice(-n)` was correct. The causal pass above can now move a message far from its timestamp-sorted position — a message can sit well before messages that are chronologically newer than it, if it's someone's causal parent. A positional `slice(-n)` after that splice can therefore silently keep older messages over newer ones, or separate a message from the causal parent its `ackDeviceId`/`ackN` points at — which then permanently falls back to timestamp ordering on the next merge (an ack pointer that resolves to nothing in the merged set simply gets no edge), with no way to recover the missing parent since there is no wire-level backfill mechanism (see `Roadmap.md`, `known-limitations.md`).
+
+`selectRetainedMessages(messages, n)`:
+1. Selects the `n` most recent messages by `(ts, id)` — never by array position.
+2. Does one rescue pass: for each kept message with an `ackDeviceId`/`ackN` pointer, if that target exists elsewhere in the full set but fell outside the recency window, it's added to the kept set too. This is **not** a full transitive closure — a rescued parent's own parent is not chased. Ack chains are shallow in practice (each message points at whichever single device/n was freshest when it was composed, not a long lineage), so a single hop covers the common case; anything unresolvable beyond that already degrades gracefully via the causal pass's own fallback.
+3. Filters the *original* array down to the surviving ids, preserving whatever order `mergeMessages` already established among the kept messages rather than re-deriving it.
 
 ---
 
@@ -820,5 +849,5 @@ The relay itself is untrusted infrastructure. Cryptographic proof — signatures
 
 ---
 
-*MeshChat Protocol v1 — experimental, subject to change*  
+*MeshChat Protocol v1 — experimental, subject to change*
 *Last updated: August 2026*

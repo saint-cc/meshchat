@@ -26,7 +26,7 @@ const RESTORE_COOLDOWN 			= 5 * 60 * 1000;
 const BACKUP_THRESHOLD  		= 2;
 const BACKUP_OFFER_TTL   		= 60_000;
 const RELAY_IDLE_MS  			= 30_000;
-
+const RETENTION_COUNT 			= 15;   			// per-contact local persistence cap — see selectRetainedMessages
 /* ══════════════════════════════════════════
    STATE
 ══════════════════════════════════════════ */
@@ -242,7 +242,7 @@ function signBlob(blob){
   return Array.from(sig);
 }
 
-function getLast(contactId, n = EXCHANGE_COUNT) { return (state.contacts[contactId]?.messages || []).slice(-n); }
+function getLast(contactId, n = EXCHANGE_COUNT) { return selectRetainedMessages(state.contacts[contactId]?.messages || [], n); }
 
 function pollBatchSize() {
   return Math.min(10, Math.max(3, Math.round(Object.keys(state.contacts).length * 0.1)));
@@ -362,7 +362,7 @@ function serialiseContacts() {
   const out = {};
   for (const [id,c] of Object.entries(state.contacts))
     out[id] = { name: c.name, publicId: c.publicId, shareableKey: c.shareableKey,
-                messages: c.messages.slice(-15).map(m => m.type === "audio" ? {...m, data:null, expired:true} : m),
+                messages: selectRetainedMessages(c.messages, RETENTION_COUNT).map(m => m.type === "audio" ? {...m, data:null, expired:true} : m),
                 blocked: c.blocked || false,
                 type:            c.type            || "human",
                 lastStateChange: c.lastStateChange || 0,
@@ -610,6 +610,18 @@ function nextSendCounter(contactId) {
 // carry no n) and by self-sync fingerprint acks — neither is something
 // worth pointing a reply at. lastN > 0 also naturally excludes the
 // pre-n migration placeholder (lastN: 0) from loadDeviceRegistry.
+//
+// Tiebreak: two devices can legitimately share an identical lastSeen
+// millisecond (near-simultaneous multi-device traffic, or a bulk
+// restore/merge loop stamping several devices faster than the clock
+// ticks) — a bare `>` comparison then silently falls through to
+// Object.entries() iteration order, which is really just "whichever
+// device happened to be inserted into the registry first," an accident
+// with no relation to which device is actually the better ack target.
+// Break lastSeen ties by lastN (a higher send counter is a real,
+// meaningful signal — that device's stream has produced more messages),
+// then by deviceId string compare as a final deterministic fallback so
+// the same registry state always yields the same pick.
 function getAckPointer(contactId) {
   const devices = state.knownDevices[contactId];
   if (!devices) return null;
@@ -617,8 +629,14 @@ function getAckPointer(contactId) {
   let best = null;
   for (const [deviceId, info] of Object.entries(devices)) {
     if (!info || !(info.lastN > 0)) continue;
-    if (!best || info.lastSeen > best.lastSeen) {
-      best = { deviceId, lastN: info.lastN, lastSeen: info.lastSeen };
+    const candidate = { deviceId, lastN: info.lastN, lastSeen: info.lastSeen };
+    if (!best) { best = candidate; continue; }
+    if (candidate.lastSeen !== best.lastSeen) {
+      if (candidate.lastSeen > best.lastSeen) best = candidate;
+    } else if (candidate.lastN !== best.lastN) {
+      if (candidate.lastN > best.lastN) best = candidate;
+    } else if (candidate.deviceId > best.deviceId) {
+      best = candidate;
     }
   }
   return best ? { ackDeviceId: best.deviceId, ackN: best.lastN } : null;
@@ -1151,23 +1169,25 @@ async function handleRestoreRequest(msg) {
   let plain;
   try {
     plain = await decryptObject(contact.encKey, msg.blob);
-    if (plain.publicId_A !== msg.from) {
-      mlog.warn(`← RESTORE_REQ  from ${pid(msg.from)} — ID_A mismatch, dropped`);
-      return;
-    }
-    if (plain.publicId_B !== state.publicId) {
-      mlog.warn(`← RESTORE_REQ  from ${pid(msg.from)} — ID_B mismatch, dropped`);
-      return;
-    }
+// ID_A mismatch
+if (plain.publicId_A !== msg.from) {
+  mlog.warn(`← RESTORE_REQ  from ${pid(msg.from, plain.deviceId ? { deviceId: plain.deviceId } : {})} — ID_A mismatch, dropped`);
+  return;
+}
+if (plain.publicId_B !== state.publicId) {
+  mlog.warn(`← RESTORE_REQ  from ${pid(msg.from, plain.deviceId ? { deviceId: plain.deviceId } : {})} — ID_B mismatch, dropped`);
+  return;
+}
   } catch(e) {
     mlog.warn(`← RESTORE_REQ  from ${pid(msg.from)} — decrypt failed, dropped`);
     return;
   }
 
-  if (contact.blocked) {
-    mlog.info(`← RESTORE_REQ  from ${pid(msg.from)} — blocked, ignored`);
-    return;
-  }
+// blocked
+if (contact.blocked) {
+  mlog.info(`← RESTORE_REQ  from ${pid(msg.from, plain.deviceId ? { deviceId: plain.deviceId } : {})} — blocked, ignored`);
+  return;
+}
   
   if (plain.deviceId) recordKnownDevice(msg.from, plain.deviceId);
 
@@ -1192,15 +1212,17 @@ async function handleRestoreRequest(msg) {
           state.contacts[msg.from].signPublicKey = base64ToRaw(plain.signPublicKey);
         }
       }
-    } catch(e) {
-      mlog.warn(`← RESTORE_REQ  from ${pid(msg.from)} — token invalid, dropped`);
-      return;
-    }
+// token invalid
+} catch(e) {
+  mlog.warn(`← RESTORE_REQ  from ${pid(msg.from, plain.deviceId ? { deviceId: plain.deviceId } : {})} — token invalid, dropped`);
+  return;
+}
 	
-  } else if (fresh) {
-    mlog.info(`← RESTORE_REQ  from ${pid(msg.from)} — fresh client, no token, ignored`);
-    return;
-  }
+// fresh client, no token
+} else if (fresh) {
+  mlog.info(`← RESTORE_REQ  from ${pid(msg.from, plain.deviceId ? { deviceId: plain.deviceId } : {})} — fresh client, no token, ignored`);
+  return;
+}
   // else: no token, not fresh — an already-known contact re-requesting
   // without a token. Nothing further to validate; falls through to the
   // ack below same as the token-valid path does.
