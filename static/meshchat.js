@@ -601,45 +601,148 @@ function nextSendCounter(contactId) {
   return n;
 }
 
-// getAckPointer(contactId) — freshest usable (deviceId, n) pointer into
-// contactId's device registry, or null if none exists yet. Read-only
-// against state.knownDevices — no new bookkeeping.
+// getAckPointer(contactId) — freshest usable (deviceId, n) pointer for
+// contactId's conversation, or null if none exists yet.
 //
-// "Usable" excludes any device whose lastN isn't a real message number:
-// lastSeen alone isn't enough, since it's bumped by reactions (which
-// carry no n) and by self-sync fingerprint acks — neither is something
-// worth pointing a reply at. lastN > 0 also naturally excludes the
-// pre-n migration placeholder (lastN: 0) from loadDeviceRegistry.
+// REWRITTEN (0.4.9) — the previous version read state.knownDevices and
+// picked whichever of the CONTACT's devices had the largest lastSeen.
+// That looked sound (it even excluded lastN:0 placeholders) but missed a
+// sharper version of the same problem it was already trying to guard
+// against: lastSeen is bumped by EVERY incoming packet from a device,
+// including a bare RECEIVED-ack reaction (deviceId present, no n) — and
+// since reactions are now fanned to every known device of a contact (see
+// sendFanned above), a contact running two-plus devices means BOTH ack
+// every message you send, independently, in whatever order their acks
+// happen to race in. lastSeen stopped meaning "which device am I
+// actually talking to" the moment that became true — it started meaning
+// "whichever of this contact's devices most recently won an ack race,"
+// pure noise with respect to conversational relevance. A real message
+// several minutes old could out-rank one from seconds ago purely because
+// its device's ack landed a few milliseconds later.
 //
-// Tiebreak: two devices can legitimately share an identical lastSeen
-// millisecond (near-simultaneous multi-device traffic, or a bulk
-// restore/merge loop stamping several devices faster than the clock
-// ticks) — a bare `>` comparison then silently falls through to
-// Object.entries() iteration order, which is really just "whichever
-// device happened to be inserted into the registry first," an accident
-// with no relation to which device is actually the better ack target.
-// Break lastSeen ties by lastN (a higher send counter is a real,
-// meaningful signal — that device's stream has produced more messages),
-// then by deviceId string compare as a final deterministic fallback so
-// the same registry state always yields the same pick.
+// It also never considered YOUR OWN last sent message at all — only the
+// contact's devices were ever candidates — so a run of several outgoing
+// messages with no reply in between would each independently point back
+// at the same stale contact message instead of chaining onto each other.
+//
+// Fix: stop consulting the device registry for this. Look directly at
+// contactId's own message list and take the single most recent (ts)
+// entry that carries a real (deviceId, n) pair, EXCLUDING reactions
+// (they never carry n, by design — see nextSendCounter) — regardless of
+// whether it was sent by the contact or by us. ts is immutable content,
+// set once at compose time; unlike lastSeen it can't be perturbed by
+// unrelated later traffic. This requires outgoing messages to stamp
+// their own deviceId on the LOCALLY stored copy too (previously only the
+// wire payload got one, for the recipient's benefit) — see the four
+// send functions below, each now doing so.
+//
+// Tiebreak on an exact ts collision: id string compare, same stable
+// secondary key mergeMessages' own baseline sort already uses, so this
+// and that sort agree on ordering for the (rare) exact-millisecond case.
 function getAckPointer(contactId) {
-  const devices = state.knownDevices[contactId];
-  if (!devices) return null;
+  const messages = state.contacts[contactId]?.messages;
+  if (!messages || !messages.length) return null;
 
   let best = null;
-  for (const [deviceId, info] of Object.entries(devices)) {
-    if (!info || !(info.lastN > 0)) continue;
-    const candidate = { deviceId, lastN: info.lastN, lastSeen: info.lastSeen };
-    if (!best) { best = candidate; continue; }
-    if (candidate.lastSeen !== best.lastSeen) {
-      if (candidate.lastSeen > best.lastSeen) best = candidate;
-    } else if (candidate.lastN !== best.lastN) {
-      if (candidate.lastN > best.lastN) best = candidate;
-    } else if (candidate.deviceId > best.deviceId) {
-      best = candidate;
+  for (const m of messages) {
+    if (m.type === "reaction" || !m.deviceId || m.n == null) continue;
+    if (!best || m.ts > best.ts || (m.ts === best.ts && m.id > best.id)) best = m;
+  }
+  return best ? { ackDeviceId: best.deviceId, ackN: best.n } : null;
+}
+
+/* ══════════════════════════════════════════
+   CONTACT-FACING PER-DEVICE FANOUT (0.4.9)
+   Same shape as pushBackupToContacts' self-branch targeting, applied to
+   contacts instead of self. Crypto is UNCHANGED — same static pairwise
+   key, same blob, same sig — this only changes ADDRESSING: one copy per
+   known device (to = buildAddress(contactId, endpointId)) instead of one
+   bare-`to` broadcast the relay fans out to every live session.
+
+   Fixes a real gap, not just prep: today, if a contact has two offline
+   devices, a message lands in the identity-level buffer ONCE — whichever
+   device reconnects first drains and deletes it, the second device never
+   sees it directly (only recovers it later via the next periodic
+   self-sync backup push on THEIR end, reconstructing it from
+   contact.messages). Per-device fanout closes that for real.
+
+   FANOUT_STALE_MS is deliberately its OWN, shorter window — separate from
+   loadDeviceRegistry's 90-day/20-device prune (a bookkeeping/display
+   question: "do we still remember this device existed"). "Should I spend
+   a dedicated targeted send on this device right now" is a different,
+   more conservative tradeoff and shouldn't share a number just because
+   both involve staleness. A stale device is NEVER excluded outright —
+   see resolveDeviceTargets below — only demoted to the same broadcast
+   fallback an unresolved (no endpointId yet) device already gets.
+
+   Self-sync is deliberately NOT touched by this — it has its own,
+   session-based ("heard from this session or not") targeting logic
+   already, a different axis than calendar-day staleness. Giving it this
+   same treatment is a separate pass, not folded in here.
+══════════════════════════════════════════ */
+const FANOUT_STALE_MS = 7 * 24 * 60 * 60 * 1000;   // 7 days — see block comment above for why this differs from the registry's own 90-day prune
+
+// resolveDeviceTargets(contactId) — splits contactId's known devices into
+// "targeted" (endpointId known AND seen within FANOUT_STALE_MS) and a
+// single "needsBroadcast" flag: true whenever at least one known device
+// is unresolved (no endpointId on file yet — an older client, or one
+// that hasn't sent us anything this session) OR stale, OR there are no
+// known devices at all (a fresh contact — today's only case, unchanged).
+// Staleness never excludes a device — it only demotes it from "gets its
+// own targeted send" to "gets the broadcast fallback like everyone
+// else." Nothing is ever silently dropped by this function.
+function resolveDeviceTargets(contactId) {
+  const devices = state.knownDevices[contactId] || {};
+  const entries = Object.entries(devices);
+  const now = Date.now();
+
+  const targeted = [];
+  let needsBroadcast = entries.length === 0;   // fresh contact, nothing known yet
+
+  for (const [deviceId, info] of entries) {
+    const isStale = (now - (info.lastSeen || 0)) > FANOUT_STALE_MS;
+    if (info.endpointId && !isStale) {
+      targeted.push({ deviceId, endpointId: info.endpointId });
+    } else {
+      needsBroadcast = true;   // unresolved OR stale — falls back, not dropped
     }
   }
-  return best ? { ackDeviceId: best.deviceId, ackN: best.lastN } : null;
+  return { targeted, needsBroadcast };
+}
+
+// sendFanned(contactId, obj) — obj is a fully-built, already-signed
+// envelope ({ type: "app:message", from, to: <placeholder>, blob, sig }
+// or similar). Sends one copy per targeted device (to =
+// buildAddress(contactId, endpointId)), plus one bare-`to` broadcast copy
+// if needsBroadcast is set. blob/sig are IDENTICAL across every copy —
+// sig covers blob, not to, so re-signing per copy is never needed; only
+// the outer `to` field varies.
+//
+// Returns { sent, targetedCount, broadcastSent } rather than a bare
+// boolean so each call site can build its own type-tagged summary log
+// line (→ MSG / → IMAGE / → REACTION / etc.) instead of this function
+// logging per-device, which would otherwise dominate the in-page log's
+// 20-line ring buffer the moment a contact has more than one or two
+// known devices.
+function sendFanned(contactId, obj) {
+  const { targeted, needsBroadcast } = resolveDeviceTargets(contactId);
+  let sent = false;
+
+  for (const { endpointId } of targeted) {
+    const targetedObj = { ...obj, to: buildAddress(contactId, endpointId) };
+    const viaRelay = sendToRelay(contactId, targetedObj, true);
+    if (!viaRelay) sendSignal(targetedObj);
+    sent = sent || viaRelay || state.ws?.readyState === WebSocket.OPEN;
+  }
+
+  if (needsBroadcast) {
+    const broadcastObj = { ...obj, to: contactId };
+    const viaRelay = sendToRelay(contactId, broadcastObj, true);
+    if (!viaRelay) sendSignal(broadcastObj);
+    sent = sent || viaRelay || state.ws?.readyState === WebSocket.OPEN;
+  }
+
+  return { sent, targetedCount: targeted.length, broadcastSent: needsBroadcast };
 }
 
 /* ══════════════════════════════════════════
@@ -2111,16 +2214,14 @@ async function sendImageMessage(file) {
         const imgMsgObj  = { type: "app:message", from: state.publicId,
                    to: state.currentChat, blob: encrypted, sig };
         packetCache[id] = { envelope: imgMsgObj, payload };
-        const viaRelayImg = sendToRelay(state.currentChat, imgMsgObj, true);
-        const wsOpen      = state.ws?.readyState === WebSocket.OPEN;
-        if (!viaRelayImg) sendSignal(imgMsgObj);
-        status = (viaRelayImg || wsOpen) ? "sent" : "failed";
-        mlog.info(`→ IMAGE        to   ${pid(state.currentChat)}  ${w}×${h}  via=${viaRelayImg ? "relay" : (wsOpen ? "signal(fallback)" : "nowhere — no open socket")}`);
+        const fanned = sendFanned(state.currentChat, imgMsgObj);
+        status = fanned.sent ? "sent" : "failed";
+        mlog.info(`→ IMAGE        to   ${pid(state.currentChat)}  ${w}×${h}  ${fanned.targetedCount} targeted${fanned.broadcastSent ? " + broadcast" : ""}${!fanned.sent ? " — nowhere, no open socket" : ""}`);
       } catch(e) {
         mlog.err(`→ IMAGE        to   ${pid(state.currentChat)} — send failed: ${e.message}`);
       }
 
-      contact.messages = mergeMessages(contact.messages, [{ id, from: state.publicId, type: "image", mimeType, ts, valid: true, status, n: sentN, ...ackPointer }]);
+      contact.messages = mergeMessages(contact.messages, [{ id, from: state.publicId, type: "image", mimeType, ts, valid: true, status, deviceId: state.deviceId, n: sentN, ...ackPointer }]);
       await saveContacts();
       renderMessages();
       updateContactPreview();   // sidebar preview otherwise only ever updates on incoming traffic
@@ -2163,17 +2264,15 @@ async function sendAudioMessage(blob) {
       const audioMsgObj = { type: "app:message", from: state.publicId,
                to: state.currentChat, blob: encrypted, sig };
       packetCache[id] = { envelope: audioMsgObj, payload };
-      const viaRelayAud = sendToRelay(state.currentChat, audioMsgObj, true);
-      const wsOpen      = state.ws?.readyState === WebSocket.OPEN;
-      if (!viaRelayAud) sendSignal(audioMsgObj);
-      status = (viaRelayAud || wsOpen) ? "sent" : "failed";
-      mlog.info(`→ AUDIO        to   ${pid(state.currentChat)}  size=${blob.size}b  via=${viaRelayAud ? "relay" : (wsOpen ? "signal(fallback)" : "nowhere — no open socket")}`);
+      const fanned = sendFanned(state.currentChat, audioMsgObj);
+      status = fanned.sent ? "sent" : "failed";
+      mlog.info(`→ AUDIO        to   ${pid(state.currentChat)}  size=${blob.size}b  ${fanned.targetedCount} targeted${fanned.broadcastSent ? " + broadcast" : ""}${!fanned.sent ? " — nowhere, no open socket" : ""}`);
     } catch(e) {
       mlog.err(`→ AUDIO        to   ${pid(state.currentChat)} — send failed: ${e.message}`);
     }
 
     // stub in messages — data stays in audioCache only
-    contact.messages = mergeMessages(contact.messages, [{ id, from: state.publicId, type: "audio", mimeType, ts, valid: true, status, n: sentN, ...ackPointer }]);
+    contact.messages = mergeMessages(contact.messages, [{ id, from: state.publicId, type: "audio", mimeType, ts, valid: true, status, deviceId: state.deviceId, n: sentN, ...ackPointer }]);
     await saveContacts();
     renderMessages();
     updateContactPreview();   // sidebar preview otherwise only ever updates on incoming traffic
@@ -2319,6 +2418,37 @@ async function receiveMessage(msg) {
     valid = msg.sig && contact.signPublicKey
       ? verifyBlob(msg.blob, msg.sig, contact.signPublicKey)
       : false;
+
+    // Duplicate-delivery guard (0.4.9) — a targeted send and the
+    // identity-level broadcast fallback are NOT mutually exclusive: a
+    // device resolved enough to get its own targeted copy (see
+    // resolveDeviceTargets/sendFanned above) is still a live member of
+    // its identity's broadcast set, so it can legitimately receive the
+    // SAME message twice — once via deliver_to_endpoint, once via
+    // deliver() — whenever any OTHER device of the same contact is
+    // unresolved/stale and forces the broadcast fallback too.
+    //
+    // That overlap was always meant to be harmless — the same
+    // "redundant, but merging twice is a no-op" reasoning
+    // pushBackupToContacts already documents for its own self-sync
+    // targeting. It WAS harmless for the stored result (mergeMessages
+    // already dedups by id) but not for the SIDE EFFECTS below: each
+    // physical arrival independently bumped the unread counter and
+    // fired a fresh RECEIVED auto-ack — and since sendReaction is now
+    // itself fanned, two duplicate receives could each spawn two acks,
+    // flooding the sender with four.
+    //
+    // Reuses the exact dedup mechanism already used for the backup/
+    // restore handshake family rather than inventing a new one — keyed
+    // on (id, ts) together, not id alone, so a genuinely NEWER reaction
+    // sharing its stable derived id (see deriveReactionId — the same id
+    // deliberately persists across every emoji state) is never mistaken
+    // for a stale duplicate of an older one.
+    if (plain.id && isDuplicateInbound(`app_message:${plain.id}:${plain.ts}`)) {
+      mlog.debug(`← MSG          from ${pid(msg.from)} — duplicate delivery within ${DEDUP_WINDOW_MS}ms, suppressed`);
+      return;
+    }
+
     // deviceId now travels inside the encrypted+signed payload rather than
     // the outer envelope (see notifyMigration-style payloads / protocol.md) —
     // only recorded once the signature is confirmed valid, so a message that
@@ -2797,17 +2927,15 @@ async function sendMessage() {
 
     const msgObj = { type: "app:message", from: fromId, to: contact.publicId, blob, ...(sig ? { sig } : {}) };
     packetCache[id] = { envelope: msgObj, payload };
-    const viaRelay = sendToRelay(state.currentChat, msgObj, true);
-    const wsOpen   = state.ws?.readyState === WebSocket.OPEN;
-    if (!viaRelay) sendSignal(msgObj);
-    status = (viaRelay || wsOpen) ? "sent" : "failed";
-    mlog.info(`→ MSG          to   ${pid(state.currentChat)}  via=${viaRelay ? "relay" : (wsOpen ? "signal(fallback)" : "nowhere — no open socket")}`);
+    const fanned = sendFanned(state.currentChat, msgObj);
+    status = fanned.sent ? "sent" : "failed";
+    mlog.info(`→ MSG          to   ${pid(state.currentChat)}  ${fanned.targetedCount} targeted${fanned.broadcastSent ? " + broadcast" : ""}${!fanned.sent ? " — nowhere, no open socket" : ""}`);
     mlog.debug(`MSG content: "${text.slice(0,40)}${text.length>40?"…":""}"  id=${id}`);
   } catch(e) {
     mlog.err(`→ MSG          to   ${pid(state.currentChat)} — send failed: ${e.message}`);
   }
 
-  contact.messages = mergeMessages(contact.messages, [{ id, from: fromId, text, ts, valid: true, status, n: sentN, ...ackPointer }]);
+  contact.messages = mergeMessages(contact.messages, [{ id, from: fromId, text, ts, valid: true, status, deviceId: state.deviceId, n: sentN, ...ackPointer }]);
   await saveContacts();
   input.value = "";
   renderMessages();
@@ -2835,11 +2963,18 @@ async function sendReaction(targetMsgId, emoji, contactId = state.currentChat) {
   const sig      = await signBlob(blob);
 
   const reactMsgObj = { type: "app:message", from: state.publicId, to: contactId, blob, sig };
-  const viaRelayReact = sendToRelay(contactId, reactMsgObj, true);
-  if (!viaRelayReact) sendSignal(reactMsgObj);
-  const msgObj = { id, from: state.publicId, type: "reaction", targetId: targetMsgId, emoji, ts, valid: true };
+  const fanned = sendFanned(contactId, reactMsgObj);
+  const msgObj = { id, from: state.publicId, type: "reaction", targetId: targetMsgId, emoji, ts, valid: true, deviceId: state.deviceId };
   contact.messages = mergeMessages(contact.messages, [msgObj]);
-  mlog.info(`→ REACTION     to   ${pid(contactId)}  target=${pid(targetMsgId)}  emoji=${emoji || "nil"}  via=${viaRelayReact ? "relay" : "signal(fallback)"}`);
+  // Fanned deliberately, same as the four message-send paths above — a
+  // RECEIVED auto-ack (emoji:null) reaching only ONE of the sender's own
+  // devices would leave their OTHER devices stuck showing "sent" (✔️)
+  // forever for a message that genuinely was delivered, since nothing
+  // else would ever flip that status on those devices. A real emoji pick
+  // gets the same treatment for consistency, though the stakes there are
+  // lower (a missing emoji on a sibling device self-corrects on the next
+  // periodic self-sync backup push either way).
+  mlog.info(`→ REACTION     to   ${pid(contactId)}  target=${pid(targetMsgId)}  emoji=${emoji || "nil"}  ${fanned.targetedCount} targeted${fanned.broadcastSent ? " + broadcast" : ""}`);
   await saveContacts();
   // only the currently-open chat needs a re-render — an auto-ack fired
   // for some other contact shouldn't repaint whatever chat is on screen
@@ -2936,16 +3071,14 @@ async function sendCallNotice(id) {
 
     const noticeObj = { type: "app:message", from: state.publicId, to: id, blob, sig };
     packetCache[msgId] = { envelope: noticeObj, payload };
-    const viaRelay = sendToRelay(id, noticeObj, true);
-    const wsOpen    = state.ws?.readyState === WebSocket.OPEN;
-    if (!viaRelay) sendSignal(noticeObj);
-    status = (viaRelay || wsOpen) ? "sent" : "failed";
-    mlog.info(`→ CALL_NOTICE  to   ${pid(id)}  via=${viaRelay ? "relay" : (wsOpen ? "signal(fallback)" : "nowhere — no open socket")}`);
+    const fanned = sendFanned(id, noticeObj);
+    status = fanned.sent ? "sent" : "failed";
+    mlog.info(`→ CALL_NOTICE  to   ${pid(id)}  ${fanned.targetedCount} targeted${fanned.broadcastSent ? " + broadcast" : ""}${!fanned.sent ? " — nowhere, no open socket" : ""}`);
   } catch(e) {
     mlog.err(`→ CALL_NOTICE  to   ${pid(id)} — send failed: ${e.message}`);
   }
 
-  contact.messages = mergeMessages(contact.messages, [{ id: msgId, from: state.publicId, type: "system", kind: "call", text, ts, valid: true, status, n: sentN, ...ackPointer }]);
+  contact.messages = mergeMessages(contact.messages, [{ id: msgId, from: state.publicId, type: "system", kind: "call", text, ts, valid: true, status, deviceId: state.deviceId, n: sentN, ...ackPointer }]);
   await saveContacts();
   if (state.currentChat === id) renderMessages();
   updateContactPreview();

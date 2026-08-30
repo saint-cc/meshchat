@@ -555,7 +555,18 @@
 .devicePopover {
   display: none;
   position: absolute;
-  bottom: 22px;
+  /* Opens DOWNWARD (top: 100%) rather than upward (the old bottom: 22px)
+     — #contactList is overflow-y:auto, and an upward-opening popover on
+     the first row had nowhere to go but straight into that scroll
+     container's top clip edge, which sits right below #sidebarHeader.
+     Looked like the header was "blocking" it; it was actually just
+     getting clipped before ever reaching the header. Opening downward
+     keeps it inside the scrollable content for every row except
+     potentially the very last one, which is the same class of edge case
+     mirrored the other direction — not fixed here, not currently
+     reported as an issue. */
+  top: 100%;
+  margin-top: 2px;
   right: 6px;
   background: var(--surface2);
   border: 1px solid var(--border);
@@ -617,8 +628,7 @@
 }
 #answerCallBtn  { background: var(--online); color: #000; border-color: var(--online); font-weight: bold; }
 #declineCallBtn { background: none; color: var(--danger); border-color: var(--danger); }
-/* ── SHELL ESCALATION — prep only, dormant until script.js wires it.
-   Mirrors #callBtn's states exactly; nothing sets .visible on this yet. ── */
+
 #shellBtn {
   background: none; border: 1px solid var(--border); color: var(--accent);
   width: 28px; height: 28px; font-size: 14px; cursor: pointer;
@@ -635,9 +645,6 @@
 #shellBtn.state-failed    { color: var(--danger); border-color: var(--danger); animation: none; }
 #shellBtn:disabled { opacity: 0.5; cursor: default; animation: none; }
 
-/* ── AGENT CONTACTS — prep only. Nothing currently adds "agent-contact"
-   to a .contactItem or an .agentBadge span; renderContactList() still
-   only ever emits the markup it emits today. Dormant until wired. ── */
 .contactItem.agent-contact .contactAvatar {
   border-color: var(--accent);
   color: var(--accent);
