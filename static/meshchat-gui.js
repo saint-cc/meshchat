@@ -103,6 +103,14 @@ const notices = [
   if (el) el.innerHTML = notices[Math.floor(Math.random() * notices.length)];
 }
 
+['inputName', 'inputPassphrase'].forEach(id => {
+    document.getElementById(id).addEventListener('keydown', (event) => {
+        if (event.key === 'Enter') {
+            document.getElementById('loginButton').click();
+        }
+    });
+});
+
 /* ══════════════════════════════════════════
    FADING GREEN DOT
 ══════════════════════════════════════════ */
