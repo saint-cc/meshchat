@@ -1,19 +1,19 @@
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
-  :root {
-    --bg:       #0d0d0d;
-    --surface:  #141414;
-    --surface2: #1a1a1a;
-    --border:   #2a2a2a;
-    --muted:    #555;
-    --dim:      #888;
-    --text:     #e0e0e0;
-    --accent:   #4fc3f7;
-    --online:   #4caf50;
-    --mine:     #1e3a4a;
-    --theirs:   #1e1e1e;
-    --danger:   #e57373; 
-  }
+:root {
+  --bg:       #0b0b12;
+  --surface:  #12121c;
+  --surface2: #191927;
+  --border:   #30304a;
+  --muted:    #5f5f78;
+  --dim:      #9090a8;
+  --text:     #e6e6f0;
+  --accent:   #a78bfa;
+  --online:   #5ee6a8;
+  --mine:     #292044;
+  --theirs:   #20202b;
+  --danger:   #ff7b8a;
+}
 
   body { font-family: 'Courier New', monospace; background: var(--bg); color: var(--text); height: 100vh; overflow: hidden; }
 

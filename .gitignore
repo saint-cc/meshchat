@@ -7,7 +7,7 @@ __pycache__/
 start.bat
 start.sh
 minimizer.py
-
+static/style_local.css
  
 # local dev folders
 relay_buf/
@@ -17,3 +17,4 @@ static/FA6E31B89/
 static/htmls/
 
 /push_subs
+

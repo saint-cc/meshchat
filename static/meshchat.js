@@ -26,7 +26,7 @@ const RESTORE_COOLDOWN 			= 5 * 60 * 1000;
 const BACKUP_THRESHOLD  		= 2;
 const BACKUP_OFFER_TTL   		= 60_000;
 const RELAY_IDLE_MS  			= 30_000;
-const RETENTION_COUNT 			= 15;   			// per-contact local persistence cap — see selectRetainedMessages
+const RETENTION_COUNT 			= 25;   			// per-contact local persistence cap — see selectRetainedMessages
 /* ══════════════════════════════════════════
    STATE
 ══════════════════════════════════════════ */
