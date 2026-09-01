@@ -4,7 +4,7 @@
 >
 > It establishes a usable session immediately when the recipient is offline, and opportunistically upgrades that session when both devices are online.
 
-**Status: designed, not yet implemented.** Client/protocol version holds at `0.4.9` until this activates end to end — the jump to `0.5.0` is reserved for when it does.
+**Status: designed, not yet implemented.** Client/protocol version holds at `0.4.9` until this activates end to end — the jump to `0.5.0` is reserved for when it does. The root-key KDF construction (§6.1) is now fully specified; chain-key derivation and the rest of the Double Ratchet remain a separate, not-yet-scoped design session (see `Roadmap.md`).
 
 ---
 
@@ -178,15 +178,13 @@ This is the existing static pairwise X25519 relationship.
 DH2 = X25519(EK_A_priv, IK_B_pub)
 ```
 
-The initial root is derived from both values:
+The initial root is derived from both values via HKDF — see §6.1 for the precise, fully-specified construction (defined alongside the live upgrade, since both stages share one derivation scheme):
 
 ```text
-RK₀ = KDF(DH1 || DH2)
+RK0 = HKDF( salt = zero32, ikm = DH1 || DH2, info = "MeshChat-X4DH-v1/root", length = 32 )
 ```
 
-In practice the KDF includes an explicit protocol context and session binding information.
-
-Alice can therefore calculate `RK₀` **immediately**.
+Alice can therefore calculate `RK0` **immediately**.
 
 She does not need to wait for Bob.
 
@@ -309,36 +307,31 @@ DH3 = X25519(IK_A_priv, EK_B_pub)
 DH4 = X25519(EK_A_priv, EK_B_pub)
 ```
 
-The upgraded root can then be derived as:
+## 6.1 Precise KDF construction
+
+The root key is derived in **two stages**, matching whichever of §3/§6 the session has actually reached — never as one combined four-DH computation, since `DH3`/`DH4` simply don't exist until Bob's ephemeral arrives.
+
+**Stage 1 — offline, Alice only (§3):**
 
 ```text
-RK₁ = KDF(DH1 || DH2 || DH3 || DH4)
+IKM0 = DH1 || DH2
+RK0  = HKDF( salt = zero32, ikm = IKM0, info = "MeshChat-X4DH-v1/root", length = 32 )
 ```
 
-or equivalently by deriving the upgrade from the existing root:
+**Stage 2 — online upgrade, once `EK_B` arrives:**
 
 ```text
-RK₁ = KDF(RK₀ || DH3 || DH4)
+IKM1 = DH3 || DH4
+RK1  = HKDF( salt = RK0, ikm = IKM1, info = "MeshChat-X4DH-v1/root-v2", length = 32 )
 ```
 
-The latter makes the state transition explicit:
+`zero32` is 32 zero bytes — there is no prior shared secret to salt Stage 1 with, the same convention `deriveSharedAesKey` already uses elsewhere in this codebase. `HKDF(...)` here means the standard Extract-then-Expand construction as a single call — exactly what `crypto.subtle.deriveBits({ name: "HKDF", ... })` already does under the hood for every other derivation in this app (`hkdfExpand`, `deriveSharedAesKey`, `deriveDeviceEndpointId`) — not a separately exposed PRK step requiring new primitives.
 
-```text
-                    RK₀
-                     │
-              ┌──────┴──────┐
-              │             │
-             DH3           DH4
-              │             │
-              └──────┬──────┘
-                     │
-                    KDF
-                     │
-                     ▼
-                    RK₁
-```
+Using `RK0` itself as Stage 2's **salt** — rather than concatenating all four DH outputs into one derivation in a single shot — is what makes this the **incremental form** already settled on above: `RK1`'s derivation has the same "fold new DH material into the existing root" shape as every later Double Ratchet turn, on either side. This isn't a stylistic choice between two equivalent formulas; treating the online upgrade as the ratchet's first real step rather than a special bootstrap-only combination is the entire point of picking the incremental form.
 
-The exact construction should be fixed by the protocol specification rather than allowing implementations to choose between these forms independently. **Settled: use the incremental form, `RK1 = HKDF(RK0 || DH3 || DH4)`.** This is not an arbitrary pick between two equivalent options — it means Bob's `session:ack` uses exactly the same "fold a new DH result into the existing root" shape that every later Double Ratchet turn already uses, for either side. The live upgrade is then correctly understood as the ratchet's first real step, not a special bootstrap-only patch bolted in front of it.
+Both `info` strings are fixed, ASCII-only literals, matching every other domain-separation label already in this codebase (`meshchat-v1:x25519`, `meshchat-v1:pairwise`, `meshchat-v1:device-endpoint`) — no non-ASCII characters, since a label that has to byte-for-byte match across two independent implementations is exactly the wrong place for anything that could silently mis-encode. They're versioned (`/root` vs. `/root-v2`) purely to keep the two stages cryptographically distinguishable from one another; `sessionEpoch` and device identifiers are deliberately **not** mixed into either string — see §11 for why domain separation and session freshness are being kept as two separate concerns here.
+
+**Deliberately out of scope here: chain keys.** Deriving `CK_A→B`/`CK_B→A` directly from `RK0`/`RK1` at handshake time is tempting but premature — X4DH stops at the root key (§15). Symmetrically deriving both directions' chain keys from one shared root before any real ratchet step exists would also be a materially *weaker* construction than an actual Double Ratchet, not a simplified version of one: in Signal's design, the first sending chain key exists on only one side until the other side's first DH-ratchet reply arrives, and that asymmetry is precisely where the self-healing property against a one-time key compromise comes from. How chain keys get seeded from `RK0`/`RK1` is a decision for the dedicated ratchet-design session flagged in `Roadmap.md` (which deliberately wants Signal Sesame, Matrix Olm/Megolm, Session, and SimpleX surveyed fresh before committing to a shape), not something to pre-empt here.
 
 ---
 
@@ -376,6 +369,8 @@ IK_A                                       IK_B
   └────────── Double Ratchet ────────────────┘
 ```
 
+(See §6.1 for the exact two-stage HKDF construction both sides run to reach `RK₀`/`RK₁`.)
+
 The important distinction is:
 
 ```text
@@ -387,27 +382,10 @@ The protocol never blocks waiting for the second endpoint.
 
 ## 7.1 State this requires that isn't obvious from the diagram
 
-Two consequences fall out of the shape above that a naive reading of
-"Alice derives RK₀ and moves on" would miss:
+Two consequences fall out of the shape above that a naive reading of "Alice derives RK₀ and moves on" would miss:
 
-- **Alice cannot discard `EK_A_priv` the instant she sends
-  `session:propose`**, the way a stateless one-shot ephemeral might
-  suggest. She needs it available if/when `session:ack` arrives, to
-  compute `DH4`. This means a small, genuinely new piece of local
-  state: a pending-outbound-proposal entry keyed by
-  `(contactId, deviceId, sessionEpoch)`, holding `EK_A_priv` until
-  either the ack lands (fold into `RK1`, then discard) or a bounded
-  timeout passes (discard anyway, staying at `RK0` for that attempt).
-  This state is exactly as sensitive as any other ephemeral private
-  key in this document and must never be written anywhere that
-  persists across the timeout — local memory only, same tier as the
-  device seed.
-- **Bob never needs to compute `RK0` at all.** The moment he generates
-  `EK_B`, he already holds every input `RK1` requires — Alice's public
-  `EK_A` from the proposal, and his own fresh `EK_B`. His first reply
-  can go straight to `RK1`. Only Alice, the initiator, ever
-  legitimately sits at `RK0` — and only for however long Bob takes to
-  respond.
+- **Alice cannot discard `EK_A_priv` the instant she sends `session:propose`**, the way a stateless one-shot ephemeral might suggest. She needs it available if/when `session:ack` arrives, to compute `DH4`. This means a small, genuinely new piece of local state: a pending-outbound-proposal entry keyed by `(contactId, deviceId, sessionEpoch)`, holding `EK_A_priv` until either the ack lands (fold into `RK1`, then discard) or a bounded timeout passes (discard anyway, staying at `RK0` for that attempt). This state is exactly as sensitive as any other ephemeral private key in this document and must never be written anywhere that persists across the timeout — local memory only, same tier as the device seed.
+- **Bob never needs to compute `RK0` at all.** The moment he generates `EK_B`, he already holds every input `RK1` requires — Alice's public `EK_A` from the proposal, and his own fresh `EK_B`. His first reply can go straight to `RK1`. Only Alice, the initiator, ever legitimately sits at `RK0` — and only for however long Bob takes to respond.
 
 ---
 
@@ -504,8 +482,8 @@ private key alone, they can reconstruct `DH1` (paired with Bob's
 already-public `IK_B_pub`), but they **cannot** reconstruct `DH2` — `IK_A`
 was never one of its inputs, and `EK_A`'s matching private half was
 generated once and discarded, never derivable from `IK_A`. With `DH2`
-unrecoverable, `RK0 = KDF(DH1 || DH2)` cannot be reconstructed from a
-future compromise of Alice's identity key alone.
+unrecoverable, `RK0 = HKDF(zero32, DH1 || DH2, ...)` cannot be
+reconstructed from a future compromise of Alice's identity key alone.
 
 The reverse is not true. If an attacker later obtains **Bob's** long-term
 identity private key, they can reconstruct both terms — `DH1` (paired
@@ -571,23 +549,11 @@ For example:
 
 This value distinguishes independent attempts to establish sessions between the same devices.
 
-It should be included in the authenticated protocol transcript and in the KDF context.
+**It is authenticated, not mixed into the root-key KDF.** An earlier draft of this document sketched `sessionEpoch` and both sides' identity/`deviceId` as direct KDF inputs; §6.1's precise construction deliberately doesn't do this. The reasoning: `RK0`/`RK1`'s uniqueness already comes from `EK_A` (and `EK_B`) being freshly generated per session — two different `sessionEpoch` attempts between the same device pair necessarily produce different ephemeral keys, and therefore different DH outputs and different root keys, with no help needed from mixing metadata into the KDF itself.
 
-Conceptually:
+`sessionEpoch`, `deviceId`, and both identities instead live where they're actually enforced: inside the **signed** fields of `session:propose`/`session:ack` (§4, §13). The signature is what binds a given root key to a specific claimed session/device pair; the KDF's job is only to turn DH outputs into key bytes, with `info` providing fixed domain separation between the root key and any other future purpose this HKDF chain might need to serve (see §6.1) — not per-session uniqueness, which the ephemeral keys already guarantee on their own.
 
-```text
-KDF(
-    DH material,
-    "MeshChat-X4DH-v1",
-    Alice identity,
-    Alice deviceId,
-    Bob identity,
-    Bob deviceId,
-    sessionEpoch
-)
-```
-
-This prevents otherwise identical key material from being interpreted as the same protocol session.
+This still prevents otherwise identical key material from being interpreted as the same protocol session — the guarantee just comes from freshness plus authentication, rather than from the KDF's `info` string carrying session metadata directly.
 
 ---
 
@@ -676,6 +642,16 @@ any pair is ever capable of sending a proposal, two independent,
 mutually-conflicting proposals for the same pair cannot occur — this is
 not a race that resolves correctly most of the time, it is structurally
 absent.
+
+**Self-sessions need a second tiebreak.** `publicId` is identical on
+both sides of a self-pair — comparing it against itself resolves
+nothing, and self-devices are meant to establish ratchet sessions with
+each other exactly like any other contact pair (`Roadmap.md`). For this
+one case, fall through to comparing `deviceId`: the device whose
+`deviceId` sorts lexicographically lower is the fixed initiator toward
+that specific sibling device. Same permanence rule as the identity-level
+case — decided once per device pair, not renegotiated per session or
+reset.
 
 ## 13.2 Stale or out-of-order proposals
 
