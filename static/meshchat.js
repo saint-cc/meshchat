@@ -26,7 +26,8 @@ const RESTORE_COOLDOWN 			= 5 * 60 * 1000;
 const BACKUP_THRESHOLD  		= 2;
 const BACKUP_OFFER_TTL   		= 60_000;
 const RELAY_IDLE_MS  			= 30_000;
-const RETENTION_COUNT 			= 25;   			// per-contact local persistence cap — see selectRetainedMessages
+const RETENTION_COUNT 			= 15;   			// per-contact local persistence cap — see selectRetainedMessages
+const X4DH_PROPOSAL_TIMEOUT_MS 	= 60_000;			// how long EK_A_priv is held awaiting session:ack — see X4DH.md §7.1
 /* ══════════════════════════════════════════
    STATE
 ══════════════════════════════════════════ */
@@ -49,7 +50,13 @@ const state = {
   // to the relay at auth time (sig:auth_init) and, passively, to contacts
   // inside message payloads — never in serialiseContacts()/backups, same
   // tier as deviceId itself.
-  endpointId: null
+  endpointId: null,
+  // x4dhSessions — X4DH.md session-establishment state, keyed by
+  // contactId -> theirDeviceId -> { sessionEpoch, stage, rootKey, ... }.
+  // Loaded/saved by loadX4DHSessions()/saveX4DHSessions() below, local-
+  // only, never in serialiseContacts()/backups (see that section for why
+  // this is also encrypted at rest, unlike knownDevices/sendCounters).
+  x4dhSessions: {}
 };
 
 const SIGNAL_URL		=`wss://${window.location.hostname}/ws/`;
@@ -60,6 +67,7 @@ const DEVICE_REGISTRY_KEY = "meshchat_known_devices_v1";
 const DEVICE_KEY_STORAGE = "meshchat_device_seed_v1";
 const SEND_COUNTER_KEY = "meshchat_send_counters_v1";
 const PUSH_PREF_KEY = "meshchat_push_pref_v1";   // per-device opt-in preference, local-only
+const X4DH_SESSION_KEY = "meshchat_x4dh_sessions_v1";   // X4DH.md session-establishment state — encrypted at rest, see its own section below
 const EXCHANGE_COUNT	= 10;
 
 /* ══════════════════════════════════════════
@@ -743,6 +751,327 @@ function sendFanned(contactId, obj) {
   }
 
   return { sent, targetedCount: targeted.length, broadcastSent: needsBroadcast };
+}
+
+/* ══════════════════════════════════════════
+   X4DH — SESSION ESTABLISHMENT (see X4DH.md)
+   Root-key establishment only — NOT yet wired to fire automatically
+   (no caller invokes sendX4DHPropose() from anywhere in the app yet),
+   and NOT yet consumed by any send/receive path (sendMessage etc. are
+   untouched — this is dormant infrastructure, same pattern
+   endpoint-keyed buffering and per-device fanout landed under before
+   either was wired live). Two things still deliberately missing, by
+   design, not oversight:
+     - WHEN to call sendX4DHPropose (the fixed-initiator trigger logic,
+       hooked off passive endpoint discovery per X4DH.md §13.3) —
+       Roadmap.md's own "next session" item.
+     - Full replay/staleness hardening beyond the single sessionEpoch-
+       match guard below (X4DH.md §13.2) — also deferred.
+   Requires server.py to recognize "session:propose"/"session:ack" in
+   its routing switch (added alongside this) — without that, these
+   packets would silently vanish into the relay's UNKNOWN-type drop path.
+══════════════════════════════════════════ */
+
+// X4DH.md §13.1 — fixed initiator per pair, eliminating proposal glare
+// structurally rather than detecting/resolving it after the fact. Lower
+// publicId always initiates, permanently, for both first bootstrap and
+// any later reset. Self-sessions (contactId === state.publicId) can't
+// use publicId to break the tie — both sides ARE the same identity — so
+// this falls through to comparing deviceId instead, same permanence
+// rule, decided once per device pair.
+function isFixedInitiator(contactId, theirDeviceId) {
+  if (contactId === state.publicId) return state.deviceId < theirDeviceId;
+  return state.publicId < contactId;
+}
+
+// X4DH.md §7.1 — Alice cannot discard EK_A_priv the instant
+// session:propose is sent; she needs it if/when session:ack arrives, to
+// compute DH4. This map holds exactly that, in memory only — same
+// sensitivity tier as the device seed itself, NEVER written to
+// localStorage under any key. Keyed by contactId + the SPECIFIC target
+// device's deviceId + sessionEpoch, since a contact can have several
+// devices each mid-handshake with sessionEpochs of their own.
+//
+// X4DH_PROPOSAL_TIMEOUT_MS bounds how long a proposal stays "waiting for
+// a live ack" before its ephemeral is discarded and the session simply
+// stays at RK0 for that attempt (§7.1). This is NOT a "give up on ever
+// talking to this device" timeout — it only governs the narrow window
+// for the OPPORTUNISTIC live upgrade; a genuinely offline device still
+// receives (and can adopt) the buffered propose whenever it reconnects,
+// same as any other buffered packet — it just won't get the DH3/DH4
+// upgrade unless a fresh propose is sent while both sides are actually
+// online together. 60s mirrors BACKUP_OFFER_TTL's existing "how long is
+// a live handshake still fresh" precedent in this file. A dropped ack
+// specifically (as opposed to Bob genuinely being offline) is a known,
+// currently-undetected gap — see Roadmap.md's per-device-encryption
+// section for why closing it folds into the session-reset mechanism
+// rather than needing its own retry system.
+const pendingX4DHProposals = new Map();   // "contactId:theirDeviceId:sessionEpoch" -> { ekPriv, createdAt }
+
+function pendingX4DHKey(contactId, theirDeviceId, sessionEpoch) {
+  return `${contactId}:${theirDeviceId}:${sessionEpoch}`;
+}
+
+function sweepPendingX4DHProposals() {
+  const now = Date.now();
+  for (const [key, entry] of pendingX4DHProposals) {
+    if (now - entry.createdAt > X4DH_PROPOSAL_TIMEOUT_MS) {
+      pendingX4DHProposals.delete(key);
+      mlog.debug(`X4DH       proposal expired, ephemeral discarded  key=${key}`);
+    }
+  }
+}
+setInterval(sweepPendingX4DHProposals, X4DH_PROPOSAL_TIMEOUT_MS);
+
+/* ── session storage ──
+   meshchat_x4dh_sessions_v1_<publicId> — local-only, identity-scoped,
+   NEVER included in serialiseContacts()/backups/exports, same tier as
+   the device seed and send counters. Unlike those, though, the VALUE
+   stored here (a derived root key) is genuine session key material
+   rather than bookkeeping — so unlike the plaintext device registry/
+   send-counter storage, this is encrypted at rest with state.cryptoKey
+   (the same key protecting contacts/messages), via the existing
+   encryptObject/decryptObject helpers.
+
+   Deliberately NOT using saveContacts()'s promise-chained write mutex
+   for this first pass — concurrent writes across DIFFERENT contacts/
+   devices don't collide (each is its own top-level key), and same-
+   session writes are already sequential in practice (one propose, later
+   one ack). Worth revisiting once this is wired to fire automatically
+   (Roadmap.md's trigger-logic item), not before.
+
+   Shape:
+   {
+     "<contactId>": {
+       "<theirDeviceId>": {
+         sessionEpoch, stage: "rk0"|"rk1", rootKey (base64),
+         initiator, establishedAt, upgradedAt
+       }
+     }
+   }
+── */
+async function loadX4DHSessions() {
+  try {
+    if (!state.cryptoKey) { state.x4dhSessions = {}; return; }
+    const raw = localStorage.getItem(X4DH_SESSION_KEY + "_" + state.publicId);
+    if (!raw) { state.x4dhSessions = {}; return; }
+    state.x4dhSessions = await decryptObject(state.cryptoKey, JSON.parse(raw));
+    mlog.debug(`STORAGE    X4DH sessions loaded: ${Object.keys(state.x4dhSessions).length} contact(s)`);
+  } catch(e) {
+    mlog.warn(`STORAGE    X4DH session load failed: ${e.message}`);
+    state.x4dhSessions = {};
+  }
+}
+
+async function saveX4DHSessions() {
+  if (!state.cryptoKey) return;
+  try {
+    const encrypted = await encryptObject(state.cryptoKey, state.x4dhSessions);
+    localStorage.setItem(X4DH_SESSION_KEY + "_" + state.publicId, JSON.stringify(encrypted));
+  } catch(e) {
+    mlog.err(`STORAGE    X4DH session save failed: ${e.message}`);
+  }
+}
+
+function getX4DHSession(contactId, theirDeviceId) {
+  return state.x4dhSessions?.[contactId]?.[theirDeviceId] || null;
+}
+
+async function storeX4DHSessionRK0(contactId, theirDeviceId, sessionEpoch, rk0Bytes, initiator) {
+  if (!state.x4dhSessions[contactId]) state.x4dhSessions[contactId] = {};
+  state.x4dhSessions[contactId][theirDeviceId] = {
+    sessionEpoch, stage: "rk0", rootKey: rawToBase64(rk0Bytes),
+    initiator, establishedAt: Date.now(), upgradedAt: null,
+  };
+  await saveX4DHSessions();
+  mlog.info(`X4DH       RK0 established  ${pid(contactId, { deviceId: theirDeviceId })}  epoch=${pid(sessionEpoch)}`);
+}
+
+// Guards against upgrading the wrong session — if a session has already
+// moved on (a newer propose/reset landed since this ack's sessionEpoch
+// was issued), this ack is stale and must not regress it. Full
+// staleness/replay hardening beyond this single check is X4DH.md §13.2,
+// deliberately deferred past this pass.
+async function upgradeX4DHSessionToRK1(contactId, theirDeviceId, sessionEpoch, rk1Bytes) {
+  const existing = getX4DHSession(contactId, theirDeviceId);
+  if (!existing || existing.sessionEpoch !== sessionEpoch) {
+    mlog.warn(`X4DH       stale upgrade attempt — no matching rk0 session, dropped  ${pid(contactId, { deviceId: theirDeviceId })}  epoch=${pid(sessionEpoch)}`);
+    return false;
+  }
+  existing.stage      = "rk1";
+  existing.rootKey    = rawToBase64(rk1Bytes);
+  existing.upgradedAt = Date.now();
+  await saveX4DHSessions();
+  mlog.info(`X4DH       RK1 upgrade complete  ${pid(contactId, { deviceId: theirDeviceId })}  epoch=${pid(sessionEpoch)}`);
+  return true;
+}
+
+/* ── packet signing ──
+   session:propose / session:ack carry no blob — ekPub is a public key,
+   not secret, so nothing here needs encryption; the signature is what
+   makes it trustworthy. Mandatory signature, same trust tier as
+   app:migrate/app:burn/call:/shell: — this drives crypto session
+   state, not just display, so an unsigned or invalid packet is dropped
+   outright rather than flagged and shown.
+── */
+function signX4DHPacket(obj) {
+  const { type, from, to, sessionEpoch, ekPub, deviceId, ts } = obj;
+  return signBlob({ type, from, to, sessionEpoch, ekPub, deviceId: deviceId || null, ts });
+}
+function verifyX4DHPacket(obj, contactSignPublicKey) {
+  if (!obj.sig || !contactSignPublicKey) return false;
+  const { type, from, to, sessionEpoch, ekPub, deviceId, ts } = obj;
+  return verifyBlob({ type, from, to, sessionEpoch, ekPub, deviceId: deviceId || null, ts }, obj.sig, contactSignPublicKey);
+}
+
+/* ── send side ──
+   sendX4DHPropose(contactId, theirDeviceId) — X4DH.md §3/§4. Only ever
+   valid to call when isFixedInitiator(contactId, theirDeviceId) is true;
+   the eventual trigger logic (Roadmap.md, not this pass) is responsible
+   for that decision, but this function re-checks and refuses rather
+   than trusting every future call site to get it right.
+
+   Requires theirDeviceId's endpointId already on file (§13.3's
+   precondition — learned passively the same way ordinary message
+   fanout already learns it). If it isn't known yet, there's no compound
+   address to propose to, and this bails rather than guessing at a
+   broadcast form session:propose deliberately has no meaning for (see
+   server.py — a bare `to` is rejected outright for this type).
+── */
+async function sendX4DHPropose(contactId, theirDeviceId) {
+  const contact = state.contacts[contactId];
+  if (!contact || contact.blocked || !contact.x25519PublicKey) return false;
+  if (!isFixedInitiator(contactId, theirDeviceId)) {
+    mlog.warn(`X4DH       refusing to propose — not the fixed initiator  ${pid(contactId, { deviceId: theirDeviceId })}`);
+    return false;
+  }
+  const theirEndpoint = state.knownDevices[contactId]?.[theirDeviceId]?.endpointId;
+  if (!theirEndpoint) {
+    mlog.debug(`X4DH       propose deferred — no known endpoint yet  ${pid(contactId, { deviceId: theirDeviceId })}`);
+    return false;
+  }
+
+  const { priv: ekPriv, pub: ekPub } = generateX25519Ephemeral();
+  const dh1 = x25519.getSharedSecret(state.x25519Seed, contact.x25519PublicKey);
+  const dh2 = x25519.getSharedSecret(ekPriv, contact.x25519PublicKey);
+  const rk0 = await deriveX4DHRootStage1(dh1, dh2);
+
+  const sessionEpoch = crypto.randomUUID();
+  pendingX4DHProposals.set(pendingX4DHKey(contactId, theirDeviceId, sessionEpoch), {
+    ekPriv, createdAt: Date.now(),
+  });
+  await storeX4DHSessionRK0(contactId, theirDeviceId, sessionEpoch, rk0, true);
+
+  const obj = {
+    type: "session:propose", from: state.publicId, to: buildAddress(contactId, theirEndpoint),
+    sessionEpoch, ekPub: Array.from(ekPub), deviceId: state.deviceId, ts: Date.now(),
+  };
+  obj.sig = signX4DHPacket(obj);
+  const viaRelay = sendToRelay(contactId, obj, true);
+  if (!viaRelay) sendSignal(obj);
+  mlog.info(`→ X4DH_PROPOSE to   ${pid(contactId, { deviceId: theirDeviceId, endpointId: theirEndpoint })}  epoch=${pid(sessionEpoch)}  via=${viaRelay ? "relay" : "signal(fallback)"}`);
+  return true;
+}
+
+/* ── receive side ──
+   handleX4DHPropose(msg) — X4DH.md §6/§7. Always replies immediately:
+   unlike a voice/shell invite there is no human decision here (Roadmap's
+   "manual accept new device gate dropped... passive system notice"
+   precedent applies even more so — there's nothing for a person to even
+   look at). Per §6.1/§7.1, the receiving side computes RK0 too before
+   folding in DH3/DH4 — cheap (two ECDH calls with material already in
+   hand), not skippable under the incremental construction this project
+   settled on.
+── */
+async function handleX4DHPropose(msg) {
+  if (!msg.from || !msg.to || !msg.sessionEpoch || !msg.ekPub || parseAddress(msg.to).id !== state.publicId) return;
+  const contact = state.contacts[msg.from];
+  if (!contact || contact.blocked || !contact.x25519PublicKey) return;
+  if (!verifyX4DHPacket(msg, contact.signPublicKey)) {
+    mlog.warn(`← X4DH_PROPOSE from ${pid(msg.from)} — signature invalid, dropped`);
+    return;
+  }
+  const theirDeviceId = msg.deviceId;
+  // §13.1 — a propose from a sender who should never have been the
+  // initiator toward us is either a bug or something probing the
+  // structural glare-elimination rule. Reject rather than silently
+  // playing along.
+  if (theirDeviceId && isFixedInitiator(msg.from, theirDeviceId)) {
+    mlog.warn(`← X4DH_PROPOSE from ${pid(msg.from, { deviceId: theirDeviceId })} — sender is not the fixed initiator for this pair, dropped`);
+    return;
+  }
+  markOnline(msg.from);
+
+  const ekAPub = new Uint8Array(msg.ekPub);
+  const dh1 = x25519.getSharedSecret(state.x25519Seed, contact.x25519PublicKey);
+  const dh2 = x25519.getSharedSecret(state.x25519Seed, ekAPub);
+  const rk0 = await deriveX4DHRootStage1(dh1, dh2);
+  await storeX4DHSessionRK0(msg.from, theirDeviceId, msg.sessionEpoch, rk0, false);
+
+  const theirEndpoint = state.knownDevices[msg.from]?.[theirDeviceId]?.endpointId;
+  if (!theirEndpoint) {
+    // §13.3's precondition should already guarantee this is known by the
+    // time a propose can even be addressed to us — defensive only.
+    mlog.warn(`← X4DH_PROPOSE from ${pid(msg.from, { deviceId: theirDeviceId })} — no known endpoint to ack back to, staying at RK0`);
+    return;
+  }
+
+  const { priv: ekBPriv, pub: ekBPub } = generateX25519Ephemeral();
+  const dh3 = x25519.getSharedSecret(ekBPriv, contact.x25519PublicKey);
+  const dh4 = x25519.getSharedSecret(ekBPriv, ekAPub);
+  const rk1 = await deriveX4DHRootStage2(rk0, dh3, dh4);
+  await upgradeX4DHSessionToRK1(msg.from, theirDeviceId, msg.sessionEpoch, rk1);
+
+  const ackObj = {
+    type: "session:ack", from: state.publicId, to: buildAddress(msg.from, theirEndpoint),
+    sessionEpoch: msg.sessionEpoch, ekPub: Array.from(ekBPub), deviceId: state.deviceId, ts: Date.now(),
+  };
+  ackObj.sig = signX4DHPacket(ackObj);
+  const viaRelay = sendToRelay(msg.from, ackObj, true);
+  if (!viaRelay) sendSignal(ackObj);
+  mlog.info(`→ X4DH_ACK     to   ${pid(msg.from, { deviceId: theirDeviceId, endpointId: theirEndpoint })}  epoch=${pid(msg.sessionEpoch)}  via=${viaRelay ? "relay" : "signal(fallback)"}`);
+}
+
+// handleX4DHAck(msg) — X4DH.md §6/§7.1. Looks up the pending proposal
+// this ack answers; a miss means stale/duplicate/already-upgraded/
+// timed-out and is dropped rather than guessed at (full replay/
+// staleness hardening beyond this is §13.2, deliberately not this pass).
+async function handleX4DHAck(msg) {
+  if (!msg.from || !msg.to || !msg.sessionEpoch || !msg.ekPub || parseAddress(msg.to).id !== state.publicId) return;
+  const contact = state.contacts[msg.from];
+  if (!contact || contact.blocked || !contact.x25519PublicKey) return;
+  if (!verifyX4DHPacket(msg, contact.signPublicKey)) {
+    mlog.warn(`← X4DH_ACK     from ${pid(msg.from)} — signature invalid, dropped`);
+    return;
+  }
+  markOnline(msg.from);
+
+  const theirDeviceId = msg.deviceId;
+  const key     = pendingX4DHKey(msg.from, theirDeviceId, msg.sessionEpoch);
+  const pending = pendingX4DHProposals.get(key);
+  if (!pending) {
+    mlog.debug(`← X4DH_ACK     from ${pid(msg.from, { deviceId: theirDeviceId })} — no matching pending proposal, dropped`);
+    return;
+  }
+
+  const session = getX4DHSession(msg.from, theirDeviceId);
+  if (!session || session.sessionEpoch !== msg.sessionEpoch) {
+    mlog.warn(`← X4DH_ACK     from ${pid(msg.from, { deviceId: theirDeviceId })} — no matching rk0 session on file, dropped`);
+    pendingX4DHProposals.delete(key);
+    return;
+  }
+
+  const ekBPub = new Uint8Array(msg.ekPub);
+  const dh3    = x25519.getSharedSecret(state.x25519Seed, ekBPub);
+  const dh4    = x25519.getSharedSecret(pending.ekPriv, ekBPub);
+  const rk0    = base64ToRaw(session.rootKey);
+  const rk1    = await deriveX4DHRootStage2(rk0, dh3, dh4);
+  await upgradeX4DHSessionToRK1(msg.from, theirDeviceId, msg.sessionEpoch, rk1);
+
+  // Ephemeral private key's job is done — discard it now rather than
+  // waiting for the timeout sweep.
+  pendingX4DHProposals.delete(key);
+  mlog.info(`← X4DH_ACK     from ${pid(msg.from, { deviceId: theirDeviceId })}  epoch=${pid(msg.sessionEpoch)} — session upgraded to RK1`);
 }
 
 /* ══════════════════════════════════════════
@@ -1655,6 +1984,8 @@ function handleSignal(msg) {
     case "shell:offer": handleShellOffer(msg);  break;
     case "shell:answer":handleShellAnswer(msg); break;
     case "shell:ice":   handleShellIce(msg);    break;
+	case "session:propose": handleX4DHPropose(msg); break;
+	case "session:ack":     handleX4DHAck(msg);     break;
 	
 	
     case "sig:auth_challenge": handleAuthChallenge(msg); break;
@@ -2755,7 +3086,7 @@ async function burnBlockContact(id) {
 ══════════════════════════════════════════ */
 function selfDestruct() {
   const suffix = "_" + state.publicId;
-  [STORAGE_KEY, PEER_BACKUP_KEY, PEER_TOKEN_KEY, DEVICE_REGISTRY_KEY, DEVICE_KEY_STORAGE]
+  [STORAGE_KEY, PEER_BACKUP_KEY, PEER_TOKEN_KEY, DEVICE_REGISTRY_KEY, DEVICE_KEY_STORAGE, X4DH_SESSION_KEY]
     .forEach(key => localStorage.removeItem(key + suffix));
  
   mlog.warn("BURN       self-destruct — all local identity data wiped, reloading");

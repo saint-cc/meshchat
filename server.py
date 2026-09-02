@@ -231,6 +231,18 @@ MIGRATE_SUFFIX       = "_migrate.json"   # filename tag — lets buf_expire pick
 BUF_MAX_AGE_BURN = int(os.environ.get("BUF_MAX_AGE_BURN", 7 * 86400))
 BURN_SUFFIX       = "_burn.json"   # filename tag — same role as MIGRATE_SUFFIX
 
+# session:propose packets get overwrite-per-sender treatment too (see
+# X4DH.md §13.2) — a fresh proposal fully supersedes an older buffered
+# one from the same sender toward the same device, same reasoning as
+# app:migrate/app:burn. Deliberately NOT given the long migrate/burn TTL
+# though — plain BUF_MAX_AGE applies (own suffix just keeps it out of
+# MIGRATE_SUFFIX/BURN_SUFFIX's own overwrite scans, never a new TTL
+# bucket in buf_expire). An unanswered handshake attempt isn't something
+# that must eventually be seen no matter what; a fresh one follows
+# naturally whenever the conversation actually resumes. session:ack is
+# NOT in this overwrite group — see route_or_buffer's docstring.
+X4DH_PROPOSE_SUFFIX = "_x4dh_propose.json"
+
 # ══════════════════════════════════════════
 #   VAPID / WEB PUSH — configuration
 #   Push is opt-in per-device (client-side checkbox) and deliberately
@@ -933,12 +945,13 @@ def _buf_write_sync(to_id, msg, endpoint_id=None):
     kind       = msg.get("type")
     is_migrate = kind == "app:migrate"
     is_burn    = kind == "app:burn"
+    is_propose = kind == "session:propose"
     frm        = msg.get("from")
 
     files = buf_endpoint_files(to_id, endpoint_id) if endpoint_id else buf_files(to_id)
 
-    if (is_migrate or is_burn) and frm:
-        own_suffix = MIGRATE_SUFFIX if is_migrate else BURN_SUFFIX
+    if (is_migrate or is_burn or is_propose) and frm:
+        own_suffix = MIGRATE_SUFFIX if is_migrate else (BURN_SUFFIX if is_burn else X4DH_PROPOSE_SUFFIX)
         kept = []
         for fpath in files:
             if not fpath.endswith(own_suffix):
@@ -954,7 +967,7 @@ def _buf_write_sync(to_id, msg, endpoint_id=None):
                 try:
                     os.remove(fpath)
                     log.info("BUF        %s overwrite  to=%s  from=%s",
-                              "migrate" if is_migrate else "burn", short(to_id), short(frm))
+                              "migrate" if is_migrate else ("burn" if is_burn else "x4dh_propose"), short(to_id), short(frm))
                 except Exception:
                     kept.append(fpath)
             else:
@@ -976,14 +989,14 @@ def _buf_write_sync(to_id, msg, endpoint_id=None):
         log.warning("BUF        size limit reached  to=%s  dropping", short(to_id))
         return
 
-    suffix = MIGRATE_SUFFIX if is_migrate else (BURN_SUFFIX if is_burn else ".json")
+    suffix = MIGRATE_SUFFIX if is_migrate else (BURN_SUFFIX if is_burn else (X4DH_PROPOSE_SUFFIX if is_propose else ".json"))
     fname  = os.path.join(d, f"{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}{suffix}")
     try:
         with open(fname, "w") as f:
             json.dump(msg, f)
         stats["buf_in"] += 1
         log.info("BUF        write  to=%s  file=%s%s%s", short(to_id), os.path.basename(fname),
-                  "  [migrate]" if is_migrate else ("  [burn]" if is_burn else ""),
+                  "  [migrate]" if is_migrate else ("  [burn]" if is_burn else ("  [x4dh_propose]" if is_propose else "")),
                   f"  endpoint={short(endpoint_id)}" if endpoint_id else "")
     except Exception as e:
         log.warning("BUF        write failed  to=%s  err=%s", short(to_id), e)

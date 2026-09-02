@@ -365,6 +365,68 @@ function verifyBlob(blob,sig,contactSignPublicKey){
 }
 
 /* ══════════════════════════════════════════
+   X4DH — pure crypto primitives (see X4DH.md)
+   Session establishment's root-key derivation. Pure functions only, same
+   rule as the rest of this file — no state access, no network. The
+   state-touching half (signing, pending-proposal tracking, session
+   storage, send/receive handlers) lives in meshchat.js's own X4DH
+   section.
+══════════════════════════════════════════ */
+
+// Generic HKDF (Extract-then-Expand, one crypto.subtle.deriveBits call) —
+// a reusable building block for X4DH's two-stage root derivation below.
+// Deliberately NOT used to refactor hkdfExpand/deriveSharedAesKey/
+// deriveDeviceEndpointId above — those are existing, working, unrelated
+// derivations; unifying them onto one shared helper is a separate
+// cleanup, not part of landing X4DH.
+async function hkdfBits(saltBytes, ikmBytes, infoStr, lengthBits = 256) {
+  const key  = await crypto.subtle.importKey("raw", ikmBytes, { name: "HKDF" }, false, ["deriveBits"]);
+  const bits = await crypto.subtle.deriveBits(
+    { name: "HKDF", hash: "SHA-256", salt: saltBytes, info: new TextEncoder().encode(infoStr) },
+    key, lengthBits
+  );
+  return new Uint8Array(bits);
+}
+
+const X4DH_INFO_ROOT    = "MeshChat-X4DH-v1/root";
+const X4DH_INFO_ROOT_V2 = "MeshChat-X4DH-v1/root-v2";
+
+// X4DH.md §6.1 — Stage 1, offline-usable. Salted with 32 zero bytes,
+// same "no prior shared secret yet" convention deriveSharedAesKey above
+// already uses. dh1/dh2 are raw X25519 shared-secret Uint8Arrays.
+async function deriveX4DHRootStage1(dh1, dh2) {
+  const ikm = new Uint8Array(dh1.length + dh2.length);
+  ikm.set(dh1, 0);
+  ikm.set(dh2, dh1.length);
+  return hkdfBits(new Uint8Array(32), ikm, X4DH_INFO_ROOT);
+}
+
+// X4DH.md §6.1 — Stage 2, the online upgrade. RK0 itself becomes the
+// salt here, rather than re-deriving from all four DH outputs combined —
+// this is what makes the upgrade read as the ratchet's first real step
+// rather than a special bootstrap-only formula (see §6.1's own comment
+// for why that distinction matters, and §7.1 for why this means BOTH
+// sides compute RK0 as a genuine intermediate, not just Alice).
+async function deriveX4DHRootStage2(rk0, dh3, dh4) {
+  const ikm = new Uint8Array(dh3.length + dh4.length);
+  ikm.set(dh3, 0);
+  ikm.set(dh4, dh3.length);
+  return hkdfBits(rk0, ikm, X4DH_INFO_ROOT_V2);
+}
+
+// Fresh, one-time X25519 ephemeral keypair (EK). Generated the same way
+// device seeds already are (crypto.getRandomValues(32)) rather than
+// reaching for a noble-curves-specific "randomPrivateKey" export whose
+// availability isn't already relied on elsewhere in this codebase —
+// x25519.getPublicKey() only needs 32 random bytes (clamped internally),
+// same as every other X25519 private scalar here.
+function generateX25519Ephemeral() {
+  const priv = crypto.getRandomValues(new Uint8Array(32));
+  const pub  = x25519.getPublicKey(priv);
+  return { priv, pub };
+}
+
+/* ══════════════════════════════════════════
    HELPERS
 ══════════════════════════════════════════ */
 function updateRelay(contact, wss, ts) {

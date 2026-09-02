@@ -1453,6 +1453,7 @@ document.getElementById("loginButton").onclick = async (e) => {
     loadPeerTokens();
 	loadDeviceRegistry();
 	loadSendCounters();
+	await loadX4DHSessions();
 	recordKnownDevice(state.publicId, state.deviceId);
 	
     document.getElementById("loginScreen").style.display  = "none";

@@ -385,7 +385,7 @@ The protocol never blocks waiting for the second endpoint.
 Two consequences fall out of the shape above that a naive reading of "Alice derives RK₀ and moves on" would miss:
 
 - **Alice cannot discard `EK_A_priv` the instant she sends `session:propose`**, the way a stateless one-shot ephemeral might suggest. She needs it available if/when `session:ack` arrives, to compute `DH4`. This means a small, genuinely new piece of local state: a pending-outbound-proposal entry keyed by `(contactId, deviceId, sessionEpoch)`, holding `EK_A_priv` until either the ack lands (fold into `RK1`, then discard) or a bounded timeout passes (discard anyway, staying at `RK0` for that attempt). This state is exactly as sensitive as any other ephemeral private key in this document and must never be written anywhere that persists across the timeout — local memory only, same tier as the device seed.
-- **Bob never needs to compute `RK0` at all.** The moment he generates `EK_B`, he already holds every input `RK1` requires — Alice's public `EK_A` from the proposal, and his own fresh `EK_B`. His first reply can go straight to `RK1`. Only Alice, the initiator, ever legitimately sits at `RK0` — and only for however long Bob takes to respond.
+- **Bob does still compute `RK0` — but it costs him nothing extra.** An earlier draft of this section assumed a combined, single-shot KDF over all four DH outputs, under which Bob genuinely could skip straight to `RK1`. §6.1's incremental construction (`RK1` salted with `RK0`, not re-derived from scratch) means `RK0` is a real intermediate value on both sides, not just Alice's. This isn't a meaningful cost: Bob already holds `IK_B_priv` and, from the proposal itself, `IK_A_pub` and `EK_A_pub` — computing `DH1`/`DH2` and folding them into `RK0` is two ordinary ECDH calls plus one HKDF call, all with material he already has in hand, with no extra network round trip. Only Alice, the initiator, ever has to sit at `RK0` *waiting on a reply*; Bob simply computes both stages back-to-back the instant the proposal arrives, before ever sending `session:ack`.
 
 ---
 
@@ -530,6 +530,30 @@ This is an intentional trade-off.
 MeshChat X4DH chooses:
 
 > **immediate asynchronous usability over requiring a responder prekey.**
+
+## 10.1 `DH1` is identity-level, not device-level
+
+`IK_A`/`IK_B` are the existing per-*identity* static X25519 keys (§2) —
+the same ones used for today's pre-X4DH pairwise messaging key. They are
+**not** per-device. Consequently `DH1 = X25519(IK_A, IK_B)` is the
+identical value for *every* device pair between Alice and Bob — Alice's
+laptop and Alice's phone both compute the same `DH1` against any of
+Bob's devices, since none of `IK_A`/`IK_B` vary by device at all.
+
+This is not a new vulnerability introduced by X4DH — it's the same
+identity-key exposure the static pairwise scheme already has (see
+`protocol.md`'s Encryption section: "if either party's X25519 private
+key is later compromised, previously recorded ciphertext... becomes
+decryptable in hindsight"). It is worth stating plainly here anyway,
+because X4DH changes the *blast radius* of that same fact: a single
+future compromise of `IK_A` or `IK_B` doesn't just retroactively break
+one 2DH-only session, it retroactively breaks **every** 2DH-only session
+that identity has ever bootstrapped with that contact, across every
+device pair, all at once — since `DH1` alone is already half of every
+one of those sessions' `RK0` inputs. A session that completed the live
+4DH upgrade (§6) is unaffected by this specific exposure, because `DH4`
+never involves either identity key (§10) — this is precisely why the
+opportunistic upgrade matters, not just as a "nice to have."
 
 ---
 

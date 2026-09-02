@@ -157,6 +157,31 @@ before implementation starts, not just during it.
   more granular
 - Directly enables the sync/backup device-smartness ideas below
 
+### Passphrase KDF iteration count (PBKDF2 → possibly Argon2id)
+- Flagged by external review: `masterSecret` derivation (see
+  `protocol.md`'s Identity and Key Derivation) uses PBKDF2-HMAC-SHA256 at
+  100,000 iterations. Current OWASP guidance for PBKDF2-HMAC-SHA256 is
+  600k+ iterations — this sits well below that.
+- Matters more than it might look at first glance: `publicId` is public
+  by design (`SHA-256(x25519_pub || ed25519_pub)[0:12]`, shared freely in
+  the shareable address), so given a known username an attacker already
+  has a fast, fully offline verification oracle — derive candidate keys
+  from a guessed passphrase, hash, compare against the known `publicId`
+  — no captured ciphertext or network access required at all. Every
+  forward-secrecy property X4DH/the ratchet ever provide is ultimately
+  bounded by how expensive that oracle is to run at scale.
+- Raising the iteration count alone is compatible with existing
+  identities (same algorithm, more rounds) but still needs *some*
+  migration story to actually take effect for already-created identities,
+  not just new ones. Switching to Argon2id is a bigger lift — breaking,
+  same blast radius as the 0.4.0 X25519 swap — and not a native WebCrypto
+  primitive, unlike everything else in this codebase's crypto stack
+  (would need a WASM dependency).
+- Not urgent, not free — needs its own design pass on migration strategy
+  before picking a direction. Deliberately kept separate from X4DH/
+  ratchet work; the two are unrelated axes of the same broader "how
+  strong are our guarantees really" question.
+
 ### Per-device encryption & relay-stored messages
 - Flagged as the hardest open item, not a simple loose end
 - Today's identity-level pairwise key means multi-device "just works" —
@@ -249,6 +274,34 @@ before implementation starts, not just during it.
       one, same as the full backup push above. Bonus: self-sync packets
       carry no `sig` at all today (unlike `app:message`) — riding inside
       a real ratchet session fixes that for free, not as a separate task.
+  - **External review flagged a real gap: a dropped `session:ack` causes
+    a silent, undetected 2DH downgrade.** If the relay (or an active
+    attacker) drops `session:ack`, the session simply stays at `RK0`
+    (X4DH.md §7.1's timeout only governs how long the ephemeral is held
+    waiting for a reply — nothing retries or surfaces "still on 2DH"
+    afterward). Not fully closable against a relay that consistently
+    drops the ack specifically — no client-side signal distinguishes
+    "genuinely offline" from "online, but the ack keeps vanishing" — so
+    part of this is a `known-limitations.md`-shaped admission, not purely
+    an implementation gap. What IS closable: this reduces to the same
+    "propose a fresh root key with this endpoint" mechanism the
+    bootstrap/reset item above already needs — a stuck-at-RK0 session
+    observed via presence (reusing the same `sig:seen`/`markOnline` path
+    `sendRestoreRequest` already piggybacks on) past some cooldown is
+    just another reset trigger, not a separate retry system to design.
+  - **A worked Double Ratchet sketch matching this shape already exists**
+    (from an external cross-model design discussion) — session state
+    keyed by `(networkID, deviceID, sessionEpoch)`, a symmetric ratchet
+    (`MK = HMAC(CK, "message")`, `CK' = HMAC(CK, "chain")`) with
+    independent send/recv chains, and an 11-step DH-ratchet transition
+    (reject stale `dhGen` → fold incoming DH into `RK` → reseed
+    `CK_recv` → generate new local ephemeral → fold the complementary DH
+    into `RK` → reseed `CK_send` → destroy the old ephemeral → advance
+    `dhGen`) that deliberately doesn't disturb the old sending chain
+    mid-transition. Textbook Signal-shape and consistent with everything
+    landed so far — useful input for the competitive-research pass
+    above, not a substitute for it, since Signal's is only one of the
+    four systems that pass is meant to weigh.
 
 ### Sync / backup device-smartness (for later, no urgency)
 - Self-device backup targeting is now done — see Done above. What's left
