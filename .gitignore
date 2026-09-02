@@ -7,7 +7,7 @@ __pycache__/
 start.bat
 start.sh
 minimizer.py
-static/style_local.css
+
  
 # local dev folders
 relay_buf/
