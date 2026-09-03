@@ -910,9 +910,9 @@ async function upgradeX4DHSessionToRK1(contactId, theirDeviceId, sessionEpoch, r
    session:propose / session:ack carry no blob — ekPub is a public key,
    not secret, so nothing here needs encryption; the signature is what
    makes it trustworthy. Mandatory signature, same trust tier as
-   app:migrate/app:burn/call:/shell: — this drives crypto session
-   state, not just display, so an unsigned or invalid packet is dropped
-   outright rather than flagged and shown.
+   app:migrate / app:burn / the call and shell signaling groups — this
+   drives crypto session state, not just display, so an unsigned or
+   invalid packet is dropped outright rather than flagged and shown.
 ── */
 function signX4DHPacket(obj) {
   const { type, from, to, sessionEpoch, ekPub, deviceId, ts } = obj;

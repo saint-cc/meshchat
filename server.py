@@ -647,16 +647,21 @@ async def deliver_to_endpoint(to_id, endpoint_id, obj, exclude=None):
 
 async def route_or_buffer(kind, frm, to_id, to_endpoint, msg, ws):
     """Shared delivery path for from-authenticated, to-routed packet types
-    (app:message, app:migrate). Delivers live if the recipient is
-    connected, otherwise falls back to the offline buffer — buf_write
-    handles per-type overwrite/TTL behaviour on its own.
+    (app:message, app:migrate, app:burn, session:propose, session:ack).
+    Delivers live if the recipient is connected, otherwise falls back to
+    the offline buffer — buf_write handles per-type overwrite/TTL
+    behaviour on its own.
 
     to_id/to_endpoint are pre-parsed by the caller from the wire's single
     compound `to` field ("id" or "id::endpointId" — see parse_address()
     near valid_id) rather than parsed again here — one parse point, not
     two. Migrate/burn are never device-targeted, so their caller already
     rejects a compound address before this function is ever reached;
-    to_endpoint is only ever non-None here for an app:message.
+    to_endpoint is non-None here for an app:message (optional, live-only
+    fanout targeting) or for a session:propose/session:ack (mandatory —
+    a session is always device-to-device, see X4DH.md §13.3 — the caller
+    rejects a BARE `to` for these two, the inverse of migrate/burn's own
+    compound-`to` rejection).
 
     app:migrate is the one exception to "buffer only if delivery failed":
     it always gets written to the durable buffer in addition to any live
@@ -677,11 +682,27 @@ async def route_or_buffer(kind, frm, to_id, to_endpoint, msg, ws):
     throughout — never merged into the migrate buffer slot — so a routing
     update can't clobber a pending burn notice or vice versa.
 
+    session:propose and session:ack get the same "always durably buffer
+    regardless of live delivery" treatment, for a narrower version of the
+    same race: propose/ack are device-targeted via deliver_to_endpoint(),
+    not deliver(), so the exposure is scoped to one specific endpoint
+    session momentarily still connected-but-about-to-drop rather than
+    migrate/burn's identity-wide broadcast race — smaller, but not zero,
+    and a lost handshake packet is comparatively costlier to silently
+    drop than an ordinary chat message (nothing yet retries it — see
+    Roadmap.md's X4DH trigger-logic item). propose additionally gets
+    buf_write's overwrite-per-sender treatment (X4DH.md §13.2); ack does
+    not, since a stale ack for an already-superseded sessionEpoch simply
+    fails upgradeX4DHSessionToRK1's epoch-match guard client-side and is
+    otherwise harmless sitting in the buffer until it expires normally.
+
     Push (app:message only): fired only when live delivery genuinely
     failed — a push exists to tell someone to open the app and check,
     which is meaningless if they're already connected and about to
-    receive the message live. app:migrate/app:burn never push — neither
-    is something a human needs to be woken up for.
+    receive the message live. app:migrate/app:burn/session:propose/
+    session:ack never push — none of them are something a human needs to
+    be woken up for (the handshake is transparent crypto housekeeping,
+    same reasoning call:*/shell:* signaling packets never push either).
 
     Device targeting (app:message only): a `to` address carrying a
     "::endpointId" suffix is delivered only to that specific registered
@@ -700,11 +721,16 @@ async def route_or_buffer(kind, frm, to_id, to_endpoint, msg, ws):
     addr_disp = build_address(to_id, to_endpoint)
     if reached:
         log.info("%-10s from=%s  to=%s  reached=%d", kind.upper(), short(frm), short_addr(addr_disp), reached)
-    if not reached or kind in ("app:migrate", "app:burn"):
+    DURABLE_KINDS = ("app:migrate", "app:burn", "session:propose", "session:ack")
+    if not reached or kind in DURABLE_KINDS:
         await buf_write(to_id, msg, to_endpoint)
         if reached:
+            durable_tag = {
+                "app:migrate": "migrate", "app:burn": "burn",
+                "session:propose": "x4dh_propose", "session:ack": "x4dh_ack",
+            }.get(kind, kind)
             log.info("BUF Q      from=%s  to=%s  (also buffered — %s, durability required)  type=%s",
-                      short(frm), short_addr(addr_disp), "migrate" if kind == "app:migrate" else "burn", kind)
+                      short(frm), short_addr(addr_disp), durable_tag, kind)
         else:
             log.info("BUF Q      from=%s  to=%s  (offline)  type=%s", short(frm), short_addr(addr_disp), kind)
     if not reached and kind == "app:message":
@@ -1388,7 +1414,7 @@ async def handler(ws):
                 await send_to(ws, {"type": "sig:auth_fail", "reason": "not_authenticated"})
 
             # ── message / migrate: from must match an authed identity on this socket ──
-            elif kind in ("app:message", "app:migrate", "app:burn"):
+            elif kind in ("app:message", "app:migrate", "app:burn", "session:propose", "session:ack"):
                 frm = msg.get("from", "?")
                 to_id, to_endpoint = parse_address(msg.get("to"))
                 if to_id is None:
@@ -1400,6 +1426,13 @@ async def handler(ws):
                 # silently treated as the bare identity.
                 if to_endpoint and kind in ("app:migrate", "app:burn"):
                     log.warning("  %s with device-targeted 'to' — not allowed for this type, dropped", kind)
+                    continue
+                # session:propose/session:ack are the inverse case — a
+                # session is always device-to-device (X4DH.md §13.3), so
+                # a BARE 'to' has no defined meaning here, unlike
+                # app:message's broadcast-to-every-session fallback.
+                if not to_endpoint and kind in ("session:propose", "session:ack"):
+                    log.warning("  %s without device-targeted 'to' — required for this type, dropped", kind)
                     continue
                 if frm not in client_ids:
                     log.warning("%-10s from=%s  not authed  peer=%s  dropped", kind.upper(), short(frm), addr)
