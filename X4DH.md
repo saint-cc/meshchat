@@ -4,7 +4,7 @@
 >
 > It establishes a usable session immediately when the recipient is offline, and opportunistically upgrades that session when both devices are online.
 
-**Status: designed, not yet implemented.** Client/protocol version holds at `0.4.9` until this activates end to end — the jump to `0.5.0` is reserved for when it does. The root-key KDF construction (§6.1) is now fully specified; chain-key derivation and the rest of the Double Ratchet remain a separate, not-yet-scoped design session (see `Roadmap.md`).
+**Status: root-key establishment implemented and meshdev-verified for both contact pairs and self-pairs; the fixed-initiator trigger (§13.3) is wired and confirmed firing live for both; full replay/staleness hardening beyond the single sessionEpoch-match guard remains open.** `sendX4DHPropose`/`handleX4DHPropose`/`handleX4DHAck` work end to end — verified on `meshdev` with two live identities converging on byte-identical `RK1` over a real relay round trip, and, separately, between two devices sharing one identity (the `isFixedInitiator` self-tiebreak, §13.1) over the same relay. `maybeTriggerX4DHPropose` runs on every `recordKnownDevice()` call — every message receipt for contacts, and every self-sync backup accept/push for self — and proposes the instant the fixed-initiator side has both no existing session for that device and a known `endpointId` for it (§13.3's precondition). Confirmed live and unprompted (no manual `sendX4DHPropose`/`maybeTriggerX4DHPropose` call in the causal chain) in three shapes: a brand-new contact pair, a new device added to an already-established contact pair, and a self-pair discovering the sibling device's endpoint fresh via an ordinary self-chat message. Replay/staleness hardening beyond the single sessionEpoch-match guard (§13.2) — notably the dropped-`session:ack` 2DH-downgrade gap — is still deferred. Client/protocol version is `0.5.0` as of this work — bumped as a development-cycle marker (this branch stays on `meshdev`, not pushed to the public repo, until the cycle is finished) rather than a claim that X4DH is feature-complete. The root-key KDF construction (§6.1) is fully specified; chain-key derivation and the rest of the Double Ratchet remain a separate, not-yet-scoped design session (see `Roadmap.md`).
 
 ---
 
@@ -856,7 +856,7 @@ X4DH can be summarized in one diagram:
                    │                            │
                    │       DH3 + DH4            │
                    │            │               │
-                   │           RK₁               │
+                   │           RK₁              │
                    │            │               │
                    └────────────┴───────────────┘
                                 │

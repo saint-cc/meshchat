@@ -13,7 +13,7 @@
 
    Load order: meshchat-lib.js → meshchat-gui.js → meshchat.js → statemachine.js
 ═══════════════════════════════════════════════════════════════ */
-const CLIENT_VERSION = "0.4.9";
+const CLIENT_VERSION = "0.5.0";
 
 const POLL_INTERVAL_MS        	= 30_000;			// base interval between presence polls
 const POLL_JITTER_MS          	= 10_000;			// ± random jitter added to poll interval
@@ -180,6 +180,13 @@ function markOnline(id) {
   state.online.add(id);
   touchDot(id);   // gui.js — fading-dot timestamp
   if (!wasOnline) mlog.info(`● ONLINE       ${pid(id)}`);
+  // X4DH.md §13.2 — presence is the observation point Roadmap.md flags
+  // for this: id is DEMONSTRABLY online right now (that's what got us
+  // called), so any of its sessions still sitting at RK0 well past the
+  // original handshake's own window is worth a human noticing. See
+  // checkStuckX4DHSessions's own comment for what this deliberately
+  // does NOT do yet (retry).
+  checkStuckX4DHSessions(id);
 }
 
 function pruneOnline() {
@@ -577,6 +584,13 @@ function recordKnownDevice(identityId, deviceId, n, endpointId) {
     endpointId: endpointId || prevRoutingId || null
   };
   saveDeviceRegistry();
+  // X4DH.md §13.3 — every call here is a chance the endpointId
+  // precondition just got satisfied for a device we haven't
+  // bootstrapped a session with yet. No-op the overwhelming majority
+  // of the time (session already exists, we're not the fixed
+  // initiator, or no endpoint yet) — see maybeTriggerX4DHPropose's own
+  // comment for the full guard chain.
+  maybeTriggerX4DHPropose(identityId, deviceId);
 }
 
 function loadSendCounters() {
@@ -806,22 +820,29 @@ function isFixedInitiator(contactId, theirDeviceId) {
 // currently-undetected gap — see Roadmap.md's per-device-encryption
 // section for why closing it folds into the session-reset mechanism
 // rather than needing its own retry system.
-const pendingX4DHProposals = new Map();   // "contactId:theirDeviceId:sessionEpoch" -> { ekPriv, createdAt }
+const pendingX4DHProposals = new Map();   // "contactId:theirDeviceId:sessionEpoch" -> { ekPriv, createdAt, timeoutHandle }
 
 function pendingX4DHKey(contactId, theirDeviceId, sessionEpoch) {
   return `${contactId}:${theirDeviceId}:${sessionEpoch}`;
 }
 
-function sweepPendingX4DHProposals() {
-  const now = Date.now();
-  for (const [key, entry] of pendingX4DHProposals) {
-    if (now - entry.createdAt > X4DH_PROPOSAL_TIMEOUT_MS) {
-      pendingX4DHProposals.delete(key);
+// Per-entry setTimeout, NOT a shared periodic sweep — confirmed live on
+// meshdev that a single setInterval(..., X4DH_PROPOSAL_TIMEOUT_MS)
+// started once at page load has no relationship to any individual
+// entry's own creation time: a proposal created partway through the
+// interval's current cycle survives past that cycle's tick (still under
+// the threshold at that check) and isn't re-checked until the NEXT tick
+// a full period later — observed letting an ack land ~94s after a
+// proposal meant to expire at 60s complete normally. Tying the timer to
+// the entry itself makes the deadline exact regardless of when in any
+// shared schedule it happens to fall.
+function schedulePendingX4DHExpiry(key) {
+  return setTimeout(() => {
+    if (pendingX4DHProposals.delete(key)) {
       mlog.debug(`X4DH       proposal expired, ephemeral discarded  key=${key}`);
     }
-  }
+  }, X4DH_PROPOSAL_TIMEOUT_MS);
 }
-setInterval(sweepPendingX4DHProposals, X4DH_PROPOSAL_TIMEOUT_MS);
 
 /* ── session storage ──
    meshchat_x4dh_sessions_v1_<publicId> — local-only, identity-scoped,
@@ -924,10 +945,170 @@ function verifyX4DHPacket(obj, contactSignPublicKey) {
   return verifyBlob({ type, from, to, sessionEpoch, ekPub, deviceId: deviceId || null, ts }, obj.sig, contactSignPublicKey);
 }
 
+/* ── automatic trigger (X4DH.md §13.3) ──
+   Passive discovery, not a poll: this piggybacks on recordKnownDevice()
+   rather than scanning contacts on a timer, because §13.3's whole point
+   is that the precondition (theirDeviceId's endpointId known) already
+   gets satisfied for free by ordinary traffic — there is no dedicated
+   discovery packet to wait on, so there's nothing to poll for either.
+   Every call to recordKnownDevice() re-checks whether IT just satisfied
+   the precondition for a device we haven't bootstrapped with yet.
+
+   Covers self-pairs now, not just contacts — isFixedInitiator's
+   deviceId tiebreak (§13.1) for contactId === state.publicId was
+   implemented but unverified when the contact-only version of this
+   function first landed; now that the contact-facing path is
+   confirmed live (see the X4DH meshdev handoff), self is wired in the
+   same way rather than getting its own parallel mechanism.
+   recordKnownDevice() gets called for self the same passive way it
+   does for contacts — mainly via the self-sync backup accept/push
+   handlers (handleBackupAccept/handleBackupPush), which is how a
+   sibling device's endpointId ordinarily becomes known in the first
+   place. Sending yourself a message in the "(me)" chat reaches this
+   too, but isn't the expected common path — self-sync's periodic/
+   threshold-triggered backup push (BACKUP_INTERVAL_MS / BACKUP_
+   THRESHOLD) is what actually carries endpointId between siblings.
+
+   x4dhProposeInFlight guards a real race, not a theoretical one:
+   recordKnownDevice() can fire twice in quick succession for the same
+   device (e.g. two messages arriving back to back), and sendX4DHPropose
+   doesn't actually WRITE the new session into state.x4dhSessions until
+   after its own await (ephemeral generation + HKDF) completes — so two
+   back-to-back calls here could both see "no session yet" and both
+   fire, generating two different ephemerals toward the same device. The
+   guard is populated synchronously the instant this function decides to
+   fire, closing the window before either proposal's own async work has
+   a chance to run.
+── */
+const x4dhProposeInFlight = new Set();   // "contactId:theirDeviceId" — see comment above
+
+function maybeTriggerX4DHPropose(contactId, theirDeviceId) {
+  if (!theirDeviceId) return;
+  // Only real exclusion left: never propose toward our OWN current
+  // device. recordKnownDevice(state.publicId, state.deviceId) fires at
+  // login (see getOrCreateDeviceSeed's call site), which would
+  // otherwise reach every check below — isFixedInitiator's self-
+  // tiebreak treats an exact deviceId match as "not lower"
+  // (state.deviceId < state.deviceId is false), so this happens to be
+  // safe by coincidence already, but it's cheap enough to make
+  // explicit rather than lean on that coincidence holding forever.
+  if (contactId === state.publicId && theirDeviceId === state.deviceId) return;
+  const contact = state.contacts[contactId];
+  if (!contact || contact.blocked || !contact.x25519PublicKey) return;
+  // Every bail below is mlog.debug — console-only (see mlog's own
+  // definition), deliberately not the in-page 20-line ring buffer.
+  // This runs on EVERY recordKnownDevice() call, i.e. every message
+  // received from every contact — logging these at info level would
+  // drown the in-page log in "skipped" lines for the overwhelmingly
+  // common case (a session already exists, or we're not the
+  // initiator). Check the browser console, not the in-page widget,
+  // when tracing why a specific device pair isn't proposing.
+  if (!isFixedInitiator(contactId, theirDeviceId)) {
+    mlog.debug(`X4DH       trigger skipped — not fixed initiator  ${pid(contactId, { deviceId: theirDeviceId })}`);
+    return;
+  }
+  const existingSession = getX4DHSession(contactId, theirDeviceId);
+  if (existingSession) {
+    mlog.debug(`X4DH       trigger skipped — session already exists (stage=${existingSession.stage})  ${pid(contactId, { deviceId: theirDeviceId })}`);
+    return;
+  }
+  const theirEndpoint = state.knownDevices[contactId]?.[theirDeviceId]?.endpointId;
+  if (!theirEndpoint) {
+    mlog.debug(`X4DH       trigger skipped — no known endpoint yet  ${pid(contactId, { deviceId: theirDeviceId })}`);
+    return;
+  }
+
+  const key = `${contactId}:${theirDeviceId}`;
+  if (x4dhProposeInFlight.has(key)) {
+    mlog.debug(`X4DH       trigger skipped — already in flight  ${pid(contactId, { deviceId: theirDeviceId })}`);
+    return;
+  }
+  x4dhProposeInFlight.add(key);
+  mlog.debug(`X4DH       trigger firing  ${pid(contactId, { deviceId: theirDeviceId, endpointId: theirEndpoint })}`);
+  sendX4DHPropose(contactId, theirDeviceId).finally(() => x4dhProposeInFlight.delete(key));
+}
+
+/* ── stuck-at-RK0 detection (X4DH.md §13.2) ──
+   DETECTION ONLY — does not retry, reset, or re-propose anything. The
+   Roadmap's own framing: a dropped session:ack causes a silent,
+   permanent 2DH downgrade with nothing today that notices. Full
+   recovery folds into the not-yet-designed session-reset mechanism
+   (Roadmap.md, "Session bootstrap and session reset are likely the
+   same mechanism") — this is deliberately narrower: surface the stuck
+   state so a human can see it, nothing more, until that design
+   actually happens.
+
+   "Stuck" needs a real signal, not just elapsed time — a session sitting
+   at RK0 because the OTHER side has simply been offline the whole time
+   is completely normal (that's the entire point of the async 2DH
+   bootstrap, X4DH.md §5). The signal used here is presence:
+   checkStuckX4DHSessions only ever runs from inside markOnline(), i.e.
+   only when id has JUST been confirmed online (a sig:seen hit, an
+   incoming message, an X4DH packet itself). "Stuck" is then just
+   "online right now, AND still at RK0 well past the point the original
+   handshake attempt could still be waiting on its own."
+
+   Covers both stuck shapes, distinguished by session.initiator:
+     - initiator === true  — we sent session:propose and never got
+       session:ack back. The classic dropped-ack case.
+     - initiator === false — we received a propose but didn't know the
+       sender's endpointId yet, so handleX4DHPropose's own defensive
+       branch never sent an ack in the first place (see its "no known
+       endpoint to ack back to" warning, logged once at the time).
+       Re-flagging this here on every subsequent online sighting is
+       genuinely useful — nothing else ever revisits that decision.
+
+   Threshold is 2× X4DH_PROPOSAL_TIMEOUT_MS, not 1×: at 1× the
+   pendingX4DHProposals entry has JUST expired (schedulePendingX4DHExpiry
+   fires at exactly that mark) — doubling it gives clean separation from
+   that boundary rather than racing it, at the cost of being that much
+   slower to flag a genuinely stuck session. Either side's own EK_A/EK_B
+   is long discarded by the time this ever fires either way — this is
+   purely a "tell someone" check, it never touches session state.
+
+   X4DH_STUCK_LOG_COOLDOWN_MS is a SEPARATE throttle from the staleness
+   threshold above — it governs how often the SAME already-stuck session
+   gets re-logged, not how stale counts as stuck in the first place.
+   Without it, a contact who stays online for an extended stretch with a
+   genuinely stuck session would get re-flagged on every single
+   markOnline() call for them — every poll response, every message —
+   flooding the in-page log's 20-line ring buffer with repeats of the
+   same fact.
+
+   Logged at mlog.warn deliberately, unlike the trigger's own
+   mlog.debug bail lines above — this represents a genuine anomaly worth
+   a human seeing in the in-page log, not routine bookkeeping worth
+   checking the console for.
+── */
+const X4DH_STUCK_RK0_THRESHOLD_MS = 2 * X4DH_PROPOSAL_TIMEOUT_MS;   // 120s — see comment above for why 2×, not 1×
+const X4DH_STUCK_LOG_COOLDOWN_MS  = 5 * 60 * 1000;                  // don't re-flag the same stuck session more than once per 5 min
+const _lastStuckX4DHFlag = new Map();   // "contactId:theirDeviceId" -> last-flagged timestamp
+
+function checkStuckX4DHSessions(id) {
+  const devices = state.x4dhSessions[id];
+  if (!devices) return;
+  const now = Date.now();
+  for (const [deviceId, session] of Object.entries(devices)) {
+    if (session.stage !== "rk0") continue;   // already upgraded, or a shape this doesn't need to care about
+    const stuckForMs = now - (session.establishedAt || 0);
+    if (stuckForMs < X4DH_STUCK_RK0_THRESHOLD_MS) continue;   // still within the original handshake's own window — not suspicious yet
+
+    const key = `${id}:${deviceId}`;
+    const lastFlagged = _lastStuckX4DHFlag.get(key);
+    if (lastFlagged && (now - lastFlagged) < X4DH_STUCK_LOG_COOLDOWN_MS) continue;
+    _lastStuckX4DHFlag.set(key, now);
+
+    const role = session.initiator
+      ? "we proposed, never got session:ack back"
+      : "we received a propose but never sent our own ack (endpoint unknown at the time)";
+    mlog.warn(`X4DH       stuck at RK0  ${pid(id, { deviceId })}  epoch=${pid(session.sessionEpoch)}  stuck_for=${Math.round(stuckForMs/1000)}s  (${role}) — detection only, no retry yet, see Roadmap.md`);
+  }
+}
+
 /* ── send side ──
    sendX4DHPropose(contactId, theirDeviceId) — X4DH.md §3/§4. Only ever
    valid to call when isFixedInitiator(contactId, theirDeviceId) is true;
-   the eventual trigger logic (Roadmap.md, not this pass) is responsible
+   the automatic trigger (maybeTriggerX4DHPropose, above) is responsible
    for that decision, but this function re-checks and refuses rather
    than trusting every future call site to get it right.
 
@@ -957,8 +1138,9 @@ async function sendX4DHPropose(contactId, theirDeviceId) {
   const rk0 = await deriveX4DHRootStage1(dh1, dh2);
 
   const sessionEpoch = crypto.randomUUID();
-  pendingX4DHProposals.set(pendingX4DHKey(contactId, theirDeviceId, sessionEpoch), {
-    ekPriv, createdAt: Date.now(),
+  const pendingKey   = pendingX4DHKey(contactId, theirDeviceId, sessionEpoch);
+  pendingX4DHProposals.set(pendingKey, {
+    ekPriv, createdAt: Date.now(), timeoutHandle: schedulePendingX4DHExpiry(pendingKey),
   });
   await storeX4DHSessionRK0(contactId, theirDeviceId, sessionEpoch, rk0, true);
 
@@ -982,11 +1164,33 @@ async function sendX4DHPropose(contactId, theirDeviceId) {
    folding in DH3/DH4 — cheap (two ECDH calls with material already in
    hand), not skippable under the incremental construction this project
    settled on.
+
+   Reprocessing the SAME propose twice is a real, confirmed-live-on-
+   meshdev desync risk, not a theoretical one: session:propose is
+   durably buffered even when live delivery succeeds (same class as
+   app:migrate/app:burn), so a brief reconnect shortly after can re-flush
+   an already-handled propose. Each reprocessing would generate a FRESH
+   EK_B and therefore a DIFFERENT RK1, silently overwriting this side's
+   stored session with whichever attempt processed last — a real
+   divergence risk even though the far side is separately protected
+   (its pending-proposal entry is consumed by the first ack it accepts,
+   so a second one is dropped there). Guarded here the same way the
+   backup/restore handshake family already guards against its own
+   near-simultaneous redelivery: isDuplicateInbound/DEDUP_WINDOW_MS.
+   sessionEpoch is a fresh UUID per genuine sendX4DHPropose call, so two
+   packets sharing one are BY DEFINITION the same original send, never a
+   legitimate distinct re-propose — an ideal dedup key, no endpointId/
+   deviceId disambiguation dance needed the way the softer-verified
+   backup family requires.
 ── */
 async function handleX4DHPropose(msg) {
   if (!msg.from || !msg.to || !msg.sessionEpoch || !msg.ekPub || parseAddress(msg.to).id !== state.publicId) return;
   const contact = state.contacts[msg.from];
   if (!contact || contact.blocked || !contact.x25519PublicKey) return;
+  if (isDuplicateInbound(`x4dh_propose:${msg.from}:${msg.deviceId}:${msg.sessionEpoch}`)) {
+    mlog.debug(`← X4DH_PROPOSE from ${pid(msg.from, { deviceId: msg.deviceId })} — duplicate within ${DEDUP_WINDOW_MS}ms, suppressed`);
+    return;
+  }
   if (!verifyX4DHPacket(msg, contact.signPublicKey)) {
     mlog.warn(`← X4DH_PROPOSE from ${pid(msg.from)} — signature invalid, dropped`);
     return;
@@ -1057,6 +1261,7 @@ async function handleX4DHAck(msg) {
   const session = getX4DHSession(msg.from, theirDeviceId);
   if (!session || session.sessionEpoch !== msg.sessionEpoch) {
     mlog.warn(`← X4DH_ACK     from ${pid(msg.from, { deviceId: theirDeviceId })} — no matching rk0 session on file, dropped`);
+    clearTimeout(pending.timeoutHandle);
     pendingX4DHProposals.delete(key);
     return;
   }
@@ -1069,7 +1274,8 @@ async function handleX4DHAck(msg) {
   await upgradeX4DHSessionToRK1(msg.from, theirDeviceId, msg.sessionEpoch, rk1);
 
   // Ephemeral private key's job is done — discard it now rather than
-  // waiting for the timeout sweep.
+  // waiting for its scheduled expiry.
+  clearTimeout(pending.timeoutHandle);
   pendingX4DHProposals.delete(key);
   mlog.info(`← X4DH_ACK     from ${pid(msg.from, { deviceId: theirDeviceId })}  epoch=${pid(msg.sessionEpoch)} — session upgraded to RK1`);
 }
