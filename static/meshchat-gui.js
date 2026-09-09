@@ -484,6 +484,22 @@ function toggleShowBlocked() {
   renderContactList();
 }
 
+// X4DH.md — per-device status dot, reused verbatim for both contact rows
+// and the self row (state.x4dhSessions is keyed by contactId including
+// state.publicId itself, no special-casing needed). Threshold mirrors
+// checkStuckX4DHSessions (meshchat.js) exactly — same constant, so the
+// popover and the in-page stuck-session warning can never silently
+// disagree about what counts as "stuck."
+function x4dhDotInfo(contactId, deviceId) {
+  const session = state.x4dhSessions[contactId]?.[deviceId];
+  if (!session) return { color: "var(--muted)", title: "X4DH: no session yet" };
+  if (session.stage === "rk1") return { color: "var(--online)", title: "X4DH: upgraded (RK1)" };
+  const stuck = (Date.now() - (session.establishedAt || 0)) > X4DH_STUCK_RK0_THRESHOLD_MS;
+  return stuck
+    ? { color: "var(--danger)", title: "X4DH: stuck at RK0" }
+    : { color: "var(--accent)", title: "X4DH: RK0, handshake in progress" };
+}
+
 function toggleDevicePopover(id, li) {
   const pop = li.querySelector('.devicePopover[data-pop="' + id + '"]');
   if (!pop) return;
@@ -493,12 +509,14 @@ function toggleDevicePopover(id, li) {
   const devices = Object.entries(state.knownDevices[id] || {})
     .sort(([, a], [, b]) => b.lastSeen - a.lastSeen);   // most recent first
   pop.innerHTML = devices.length
-    ? devices.map(([devId, info]) =>
-        `<div class="devicePopoverRow">` +
+    ? devices.map(([devId, info]) => {
+        const x4dh = x4dhDotInfo(id, devId);
+        return `<div class="devicePopoverRow">` +
+          `<span class="x4dhDot" style="background:${x4dh.color}" title="${esc(x4dh.title)}"></span>` +
           `<span>${esc(pid(devId))}</span>` +
           `<span class="devicePopoverDate">${relativeDate(info.lastSeen)}${info.lastN ? " · n:" + info.lastN : ""}</span>` +
-        `</div>`
-      ).join("")
+        `</div>`;
+      }).join("")
     : '<div class="devicePopoverRow unknown">unknown</div>';
   pop.classList.add("open");
 }

@@ -585,6 +585,13 @@
   white-space: nowrap;
   gap: 10px;
 }
+.x4dhDot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  display: inline-block;
+}
 .devicePopoverDate {
   font-size: 9px;
   color: var(--muted);

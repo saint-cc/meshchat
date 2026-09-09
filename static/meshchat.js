@@ -898,11 +898,23 @@ function getX4DHSession(contactId, theirDeviceId) {
   return state.x4dhSessions?.[contactId]?.[theirDeviceId] || null;
 }
 
-async function storeX4DHSessionRK0(contactId, theirDeviceId, sessionEpoch, rk0Bytes, initiator) {
+async function storeX4DHSessionRK0(contactId, theirDeviceId, sessionEpoch, rk0Bytes, initiator, proposeTs) {
   if (!state.x4dhSessions[contactId]) state.x4dhSessions[contactId] = {};
   state.x4dhSessions[contactId][theirDeviceId] = {
+    // proposeTs — the ORIGINATING session:propose packet's own signed
+    // `ts` field (the sender's clock), kept separate from establishedAt
+    // below (OUR OWN Date.now() at storage time, a different clock
+    // entirely) — see handleX4DHPropose's stale-propose guard (X4DH.md
+    // §13.2), which deliberately compares sender-clock-to-sender-clock
+    // rather than sender-clock-to-our-clock, so ordinary cross-device
+    // clock skew can never masquerade as a replay. Defaults to our own
+    // clock when the caller is the initiator side (sendX4DHPropose
+    // storing the propose WE just sent — "the sender's clock" and "our
+    // clock" are the same thing there); the receiving side
+    // (handleX4DHPropose) always passes the real msg.ts explicitly.
     sessionEpoch, stage: "rk0", rootKey: rawToBase64(rk0Bytes),
     initiator, establishedAt: Date.now(), upgradedAt: null,
+    proposeTs: proposeTs ?? Date.now(),
   };
   await saveX4DHSessions();
   mlog.info(`X4DH       RK0 established  ${pid(contactId, { deviceId: theirDeviceId })}  epoch=${pid(sessionEpoch)}`);
@@ -1138,15 +1150,16 @@ async function sendX4DHPropose(contactId, theirDeviceId) {
   const rk0 = await deriveX4DHRootStage1(dh1, dh2);
 
   const sessionEpoch = crypto.randomUUID();
+  const proposeTs    = Date.now();   // one value, used for both storage and the outgoing packet's signed `ts` — see storeX4DHSessionRK0's own comment
   const pendingKey   = pendingX4DHKey(contactId, theirDeviceId, sessionEpoch);
   pendingX4DHProposals.set(pendingKey, {
     ekPriv, createdAt: Date.now(), timeoutHandle: schedulePendingX4DHExpiry(pendingKey),
   });
-  await storeX4DHSessionRK0(contactId, theirDeviceId, sessionEpoch, rk0, true);
+  await storeX4DHSessionRK0(contactId, theirDeviceId, sessionEpoch, rk0, true, proposeTs);
 
   const obj = {
     type: "session:propose", from: state.publicId, to: buildAddress(contactId, theirEndpoint),
-    sessionEpoch, ekPub: Array.from(ekPub), deviceId: state.deviceId, ts: Date.now(),
+    sessionEpoch, ekPub: Array.from(ekPub), deviceId: state.deviceId, ts: proposeTs,
   };
   obj.sig = signX4DHPacket(obj);
   const viaRelay = sendToRelay(contactId, obj, true);
@@ -1206,11 +1219,34 @@ async function handleX4DHPropose(msg) {
   }
   markOnline(msg.from);
 
+  // X4DH.md §13.2 — refuse a propose that isn't STRICTLY newer than
+  // whatever we already adopted for this device. Without this,
+  // storeX4DHSessionRK0 below overwrites unconditionally — including an
+  // already-upgraded RK1 session — and session:propose is durably
+  // buffered even after live delivery succeeds (same class as
+  // app:migrate/app:burn, see server.py), so a relay that replays an
+  // old, validly-signed propose (deliberately, or via a buffer bug)
+  // would silently regress the session with nothing noticing. `ts` is
+  // part of the signed payload (signX4DHPacket), so a replayed packet
+  // can't have its ts bumped without invalidating the signature — a
+  // genuinely fresher propose from the real sender always carries a
+  // genuinely fresher signed ts. Compared against the stored
+  // proposeTs (the sender's own clock), not establishedAt (our clock)
+  // — see storeX4DHSessionRK0's comment for why that split matters.
+  // No existing session, or one predating this guard with no
+  // proposeTs on file, simply has nothing to compare against — proceeds
+  // exactly as before.
+  const existingSession = getX4DHSession(msg.from, theirDeviceId);
+  if (existingSession && existingSession.proposeTs != null && msg.ts <= existingSession.proposeTs) {
+    mlog.warn(`← X4DH_PROPOSE from ${pid(msg.from, { deviceId: theirDeviceId })} — stale (ts=${msg.ts} <= existing proposeTs=${existingSession.proposeTs}), refusing to regress session (stage=${existingSession.stage}), dropped`);
+    return;
+  }
+
   const ekAPub = new Uint8Array(msg.ekPub);
   const dh1 = x25519.getSharedSecret(state.x25519Seed, contact.x25519PublicKey);
   const dh2 = x25519.getSharedSecret(state.x25519Seed, ekAPub);
   const rk0 = await deriveX4DHRootStage1(dh1, dh2);
-  await storeX4DHSessionRK0(msg.from, theirDeviceId, msg.sessionEpoch, rk0, false);
+  await storeX4DHSessionRK0(msg.from, theirDeviceId, msg.sessionEpoch, rk0, false, msg.ts);
 
   const theirEndpoint = state.knownDevices[msg.from]?.[theirDeviceId]?.endpointId;
   if (!theirEndpoint) {

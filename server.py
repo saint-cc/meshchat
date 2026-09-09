@@ -1568,6 +1568,30 @@ async def handler(ws):
                     reached = await deliver(to_id, msg, exclude=ws)
                 log.info("%-16s from=%s  to=%s  reached=%d",
                          kind.upper()[:16], short_addr(frm), short_addr(msg.get("to")), reached)
+                # sync:backup_push is the one type in this branch that
+                # actually carries data rather than just negotiating
+                # (backup_offer/accept, restore_ack) or signaling
+                # (call:*/shell:*) — a missed live delivery here is a
+                # silently lost backup/mini-backup, not something that
+                # self-heals via a retry the way a handshake step does.
+                # Buffered at the SAME tier as an ordinary app:message
+                # (buf_write only, no push_notify — nobody should be
+                # woken up for a backup sync) — deliberately NOT the
+                # DURABLE_KINDS tier app:migrate/app:burn get (buffer
+                # even when reached), since that exists for the
+                # stale-session-mid-migration race, which doesn't apply
+                # here. Also deliberately no overwrite-per-sender: a
+                # sender's mini-backup pushes are scoped per-contact
+                # (one blob = one contact's slice), so overwriting by
+                # sender alone would silently drop every push but the
+                # last if several land while the recipient is offline.
+                # The accepted cost of skipping overwrite is redundant
+                # queued blobs, not lost ones — mergeMessages/
+                # mergeContactMeta already dedup harmlessly on replay.
+                if kind == "sync:backup_push" and not reached:
+                    await buf_write(to_id, msg, to_endpoint)
+                    log.info("BUF Q      from=%s  to=%s  (offline)  type=%s",
+                             short_addr(frm), short_addr(msg.get("to")), kind)
 
             elif kind == "sig:relay_req":
                 await send_to(ws, {

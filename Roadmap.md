@@ -4,16 +4,78 @@ Working notes on what's done, what's next, and what still needs a real design
 conversation before it gets touched. Not a promise of order or timing — just
 so the list lives somewhere other than someone's head.
 
-Current version: `0.4.5`. See `protocol.md` for the authoritative wire spec
-and `known-limitations.md` for permanent, by-design tradeoffs (no TURN, no
-real revocation, etc.) — those aren't roadmap items, they're not going to
-change.
+Current version: `0.4.8` per `protocol.md`'s formal wire spec — this file's
+own "0.4.5" was already stale before this update, independent of anything
+below. `0.5.0` is a separate, active `meshdev`-only development-cycle marker
+for the X4DH work (see `X4DH.md`) — it isn't reflected in `protocol.md`'s
+changelog yet since that cycle hasn't wrapped (not pushed to the public repo).
+See `protocol.md` for the authoritative wire spec and `known-limitations.md`
+for permanent, by-design tradeoffs (no TURN, no real revocation, etc.) —
+those aren't roadmap items, they're not going to change.
 
 ---
 
 ## Done
 
 Recent, for context on where "next" picks up from:
+
+- **X4DH root-key establishment is now fully automatic, both directions.**
+  `maybeTriggerX4DHPropose` fires from `recordKnownDevice()` itself — no
+  manual call needed anywhere — the instant the fixed-initiator side
+  (§13.1) has a known `endpointId` for a device and no existing session
+  with it yet (§13.3). Confirmed live and unprompted on meshdev for
+  contact pairs (a brand-new pair, and a new device added to an already-
+  established pair) and, separately, for self-pairs — `isFixedInitiator`'s
+  `deviceId` tiebreak was implemented but untested when this cycle's own
+  handoff was written; now confirmed via a sibling device discovering the
+  other's endpoint through an ordinary self-chat message, with no manual
+  call anywhere in the causal chain.
+- **Two pieces of §13.2 replay/staleness hardening landed**, deliberately
+  scoped to detection rather than retry (see the dropped-`session:ack` item
+  under Planned, below, for what's still open). A stuck-at-RK0 detector
+  (`checkStuckX4DHSessions`, hooked into `markOnline()`) flags a session
+  sitting at RK0 past 2× the proposal timeout while presence confirms the
+  peer is actually online — confirmed for both roles it covers: a
+  manufactured stuck initiator session, and a genuine, unprompted stuck
+  responder session hit during unrelated testing. A propose-freshness
+  guard in `handleX4DHPropose` refuses a `session:propose` whose signed
+  `ts` isn't strictly newer than the session's own stored `proposeTs`
+  (compared sender-clock-to-sender-clock, not against the receiver's local
+  clock, so ordinary skew can't read as a replay) — confirmed against a
+  live forged-but-validly-signed stale propose, and again when that exact
+  packet came back out of the relay's own durable buffer later.
+- **Manual X4DH session-reset retry, confirmed live twice.**
+  `retryX4DHPropose(contactId, theirDeviceId)` — a console-only helper, not
+  wired into any automatic call site — re-runs `sendX4DHPropose` against a
+  session already confirmed stuck at `RK0` by the existing detector,
+  refusing outright if the session doesn't exist, isn't at `RK0`, or we're
+  not the fixed initiator for the pair. This is the first real use of the
+  "session bootstrap and session reset are the same mechanism" framing
+  below — no new packet type or crypto construction needed, just
+  permission to call the existing propose path a second time. Confirmed
+  live against two independently-occurring (not manufactured) stuck
+  sessions on meshdev; both re-established a fresh `sessionEpoch` and
+  converged to `RK1` cleanly. A small per-device status dot was also added
+  to the existing device popover (contact rows and the self row alike,
+  since both go through the same `isFixedInitiator` machinery) —
+  muted/blue/red/green for no-session / RK0-fresh / RK0-stuck / RK1, red
+  threshold reusing `X4DH_STUCK_RK0_THRESHOLD_MS` verbatim so the UI can
+  never silently disagree with the log-level detector.
+- **`sync:backup_push` now buffers on missed live delivery** (`server.py`),
+  closing a real data-loss gap: it was live-only (`sendSignal`, no
+  relay-side buffer) with no retry, unlike the periodic full self-sync
+  push. Concretely fixes `pushMiniBackup`'s one-shot-per-message sends
+  silently vanishing if the sibling device was offline at that exact
+  instant — previously the message would only ever arrive via the next
+  10-minute periodic full push, and only then if the sibling happened to
+  be online at that later moment either. Buffered at the same tier as
+  `app:message` (buffer-on-miss only, no push-notify); deliberately not
+  given `app:migrate`/`app:burn`'s "always buffer even when reached" tier
+  or their overwrite-per-sender treatment — each push is scoped to one
+  contact's slice, not an identity-wide fact, so overwriting by sender
+  alone would silently drop every push but the last if several land while
+  the recipient is offline. Implemented and syntax-validated; not yet
+  independently confirmed live (no captured before/after test run yet).
 
 - **Fixed: reactions silently disappearing on merge.** `mergeMessages`'
   `byId` dedup was positional last-write-wins (`for (const m of [...a,
@@ -274,21 +336,24 @@ before implementation starts, not just during it.
       one, same as the full backup push above. Bonus: self-sync packets
       carry no `sig` at all today (unlike `app:message`) — riding inside
       a real ratchet session fixes that for free, not as a separate task.
-  - **External review flagged a real gap: a dropped `session:ack` causes
-    a silent, undetected 2DH downgrade.** If the relay (or an active
-    attacker) drops `session:ack`, the session simply stays at `RK0`
-    (X4DH.md §7.1's timeout only governs how long the ephemeral is held
-    waiting for a reply — nothing retries or surfaces "still on 2DH"
-    afterward). Not fully closable against a relay that consistently
-    drops the ack specifically — no client-side signal distinguishes
-    "genuinely offline" from "online, but the ack keeps vanishing" — so
-    part of this is a `known-limitations.md`-shaped admission, not purely
-    an implementation gap. What IS closable: this reduces to the same
-    "propose a fresh root key with this endpoint" mechanism the
-    bootstrap/reset item above already needs — a stuck-at-RK0 session
-    observed via presence (reusing the same `sig:seen`/`markOnline` path
-    `sendRestoreRequest` already piggybacks on) past some cooldown is
-    just another reset trigger, not a separate retry system to design.
+  - **A dropped `session:ack` causes a silent 2DH downgrade — detection
+    now exists, reset does not.** If the relay (or an active attacker)
+    drops `session:ack`, the session simply stays at `RK0` (X4DH.md
+    §7.1's timeout only governs how long the ephemeral is held waiting
+    for a reply — nothing retried or surfaced "still on 2DH" afterward,
+    until now). **Update:** the presence-based observation described
+    below is implemented and confirmed live — `checkStuckX4DHSessions`
+    (see Done) flags a stuck-at-RK0 session via `mlog.warn` the next time
+    presence confirms the peer is online, past a cooldown. What's still
+    missing is turning that flag into an actual fix: it still reduces to
+    the same "propose a fresh root key with this endpoint" mechanism the
+    bootstrap/reset item above needs, and nothing calls that
+    automatically yet — today's detector deliberately only logs. Also
+    still true: not fully closable against a relay that consistently and
+    selectively drops the ack — no client-side signal distinguishes
+    "genuinely offline" from "online, but the ack keeps vanishing," so
+    part of this remains a `known-limitations.md`-shaped admission, not
+    purely an implementation gap.
   - **A worked Double Ratchet sketch matching this shape already exists**
     (from an external cross-model design discussion) — session state
     keyed by `(networkID, deviceID, sessionEpoch)`, a symmetric ratchet
@@ -302,6 +367,53 @@ before implementation starts, not just during it.
     landed so far — useful input for the competitive-research pass
     above, not a substitute for it, since Signal's is only one of the
     four systems that pass is meant to weigh.
+
+### Automatic X4DH retry — needs a design pass before wiring
+`retryX4DHPropose` (see Done) is confirmed correct as a manual,
+human-triggered action, but promoting it to something
+`checkStuckX4DHSessions` calls on its own needs real design first, not
+just a call-site change — calling it unconditionally on every stuck-session
+sighting would spam fresh proposals at a permanently offline peer forever.
+Open questions carried into next session:
+- **A retry budget, not unlimited retries.** Rough shape floated: cap
+  attempts (~10) gated on discrete online-transition events for that
+  identity (a genuine `false → true` edge in presence, the same one
+  `markOnline`'s own `● ONLINE` log line already distinguishes from a
+  routine poll re-confirmation) rather than on elapsed time or the
+  existing 5-minute stuck-log cooldown alone — retrying every single
+  re-poll of an already-known-online peer would burn through the budget
+  in one sitting for no reason.
+- **What "give up" looks like.** Once the budget's exhausted, detection
+  should keep flagging (probably a quieter, distinguishable log line —
+  "stuck, retries exhausted" vs. today's plain "stuck") rather than going
+  silent, so a permanently wedged session doesn't just quietly stop being
+  visible.
+- **What re-arms it.** Leaning toward: only a *new* online-transition
+  after exhaustion (not "still online," a fresh edge) resets the attempt
+  budget — meaning a peer that reconnects via a different path, comes
+  back after being genuinely offline, etc. gets a clean shot rather than
+  staying permanently locked out by an old exhausted counter.
+- **Where the counter lives.** Most natural as a new field on the
+  existing `x4dhSessions` entry itself (e.g. `retryAttempts`,
+  `retryExhaustedAt`) rather than a separate map — keeps it colocated
+  with the session it describes, consistent with how `proposeTs` was
+  added to the same shape earlier.
+- **Dev-facing tooling, deferred alongside this.** A small console-only
+  `x4dhDebug` namespace (`list()` — dump every session across every
+  contact with stage/age/initiator at a glance; `retry(contactId,
+  deviceId)` — thin wrapper over the existing manual helper) was
+  proposed as a fast way to survey session state without hand-walking
+  `state.x4dhSessions`, and as a natural home for a future
+  `forceStuck()` test helper. Not built yet — bundling it with the
+  automatic-retry design pass since both are "better visibility into
+  this system" work.
+- **Still unconfirmed, carried from the Done entry above**: whether a
+  stale ack for a superseded epoch is correctly dropped by
+  `upgradeX4DHSessionToRK1`'s epoch guard in practice, not just by code
+  inspection. Worth deliberately trying to produce this case (e.g.
+  retry, then let the *original* far side's in-flight ack arrive late)
+  during the same session, since it's cheap to check once the harness
+  exists.
 
 ### Sync / backup device-smartness (for later, no urgency)
 - Self-device backup targeting is now done — see Done above. What's left
