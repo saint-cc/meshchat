@@ -184,9 +184,11 @@ function markOnline(id) {
   // for this: id is DEMONSTRABLY online right now (that's what got us
   // called), so any of its sessions still sitting at RK0 well past the
   // original handshake's own window is worth a human noticing. See
-  // checkStuckX4DHSessions's own comment for what this deliberately
-  // does NOT do yet (retry).
-  checkStuckX4DHSessions(id);
+  // checkStuckX4DHSessions's own comment for what this does with that
+  // signal — logging fires on every call regardless, but automatic
+  // retry only ever fires on a genuine false→true transition, never on
+  // routine re-confirmation of an already-known-online peer.
+  checkStuckX4DHSessions(id, !wasOnline);
 }
 
 function pruneOnline() {
@@ -866,7 +868,8 @@ function schedulePendingX4DHExpiry(key) {
      "<contactId>": {
        "<theirDeviceId>": {
          sessionEpoch, stage: "rk0"|"rk1", rootKey (base64),
-         initiator, establishedAt, upgradedAt
+         initiator, establishedAt, upgradedAt,
+         retryAttempts, retryExhaustedAt, lastRetryAt
        }
      }
    }
@@ -898,8 +901,18 @@ function getX4DHSession(contactId, theirDeviceId) {
   return state.x4dhSessions?.[contactId]?.[theirDeviceId] || null;
 }
 
+// storeX4DHSessionRK0 fully replaces the session object on every propose
+// (both a first-ever bootstrap AND a later retry — see retryX4DHPropose,
+// which is just sendX4DHPropose called again). retryAttempts/
+// retryExhaustedAt/lastRetryAt are carried forward from whatever was
+// already on file rather than reset here — they're per-(contact,device)
+// budget bookkeeping, not per-epoch, so a retry that successfully
+// re-establishes RK0 must NOT silently zero its own attempt count. A
+// brand-new device pair simply has nothing to carry forward (existing
+// is undefined), so it starts clean.
 async function storeX4DHSessionRK0(contactId, theirDeviceId, sessionEpoch, rk0Bytes, initiator, proposeTs) {
   if (!state.x4dhSessions[contactId]) state.x4dhSessions[contactId] = {};
+  const existing = state.x4dhSessions[contactId][theirDeviceId];
   state.x4dhSessions[contactId][theirDeviceId] = {
     // proposeTs — the ORIGINATING session:propose packet's own signed
     // `ts` field (the sender's clock), kept separate from establishedAt
@@ -915,6 +928,12 @@ async function storeX4DHSessionRK0(contactId, theirDeviceId, sessionEpoch, rk0By
     sessionEpoch, stage: "rk0", rootKey: rawToBase64(rk0Bytes),
     initiator, establishedAt: Date.now(), upgradedAt: null,
     proposeTs: proposeTs ?? Date.now(),
+    // Retry-budget fields (Roadmap.md's automatic-retry design pass) —
+    // per-(contact,device), not per-epoch. Carried forward across every
+    // overwrite of this object, including a retry's own fresh RK0.
+    retryAttempts:    existing?.retryAttempts    || 0,
+    retryExhaustedAt: existing?.retryExhaustedAt || null,
+    lastRetryAt:      existing?.lastRetryAt      || null,
   };
   await saveX4DHSessions();
   mlog.info(`X4DH       RK0 established  ${pid(contactId, { deviceId: theirDeviceId })}  epoch=${pid(sessionEpoch)}`);
@@ -934,6 +953,12 @@ async function upgradeX4DHSessionToRK1(contactId, theirDeviceId, sessionEpoch, r
   existing.stage      = "rk1";
   existing.rootKey    = rawToBase64(rk1Bytes);
   existing.upgradedAt = Date.now();
+  // A session that reaches RK1 isn't stuck anymore — clear whatever
+  // retry bookkeeping it was carrying so a FUTURE unrelated episode of
+  // this same device pair getting stuck (post-reset, down the line)
+  // starts with a clean budget rather than inheriting an old exhaustion.
+  existing.retryAttempts    = 0;
+  existing.retryExhaustedAt = null;
   await saveX4DHSessions();
   mlog.info(`X4DH       RK1 upgrade complete  ${pid(contactId, { deviceId: theirDeviceId })}  epoch=${pid(sessionEpoch)}`);
   return true;
@@ -1041,14 +1066,12 @@ function maybeTriggerX4DHPropose(contactId, theirDeviceId) {
 }
 
 /* ── stuck-at-RK0 detection (X4DH.md §13.2) ──
-   DETECTION ONLY — does not retry, reset, or re-propose anything. The
-   Roadmap's own framing: a dropped session:ack causes a silent,
-   permanent 2DH downgrade with nothing today that notices. Full
-   recovery folds into the not-yet-designed session-reset mechanism
-   (Roadmap.md, "Session bootstrap and session reset are likely the
-   same mechanism") — this is deliberately narrower: surface the stuck
-   state so a human can see it, nothing more, until that design
-   actually happens.
+   Logging is unconditional (subject only to its own cooldown, below);
+   AUTOMATIC RETRY is gated separately, on genuine online-transitions
+   only — see maybeAutoRetryX4DH. The Roadmap's own framing: a dropped
+   session:ack causes a silent, permanent 2DH downgrade with nothing
+   today that notices on its own. This function is what notices; the
+   retry budget below is what (bounded-ly) does something about it.
 
    "Stuck" needs a real signal, not just elapsed time — a session sitting
    at RK0 because the OTHER side has simply been offline the whole time
@@ -1062,7 +1085,9 @@ function maybeTriggerX4DHPropose(contactId, theirDeviceId) {
 
    Covers both stuck shapes, distinguished by session.initiator:
      - initiator === true  — we sent session:propose and never got
-       session:ack back. The classic dropped-ack case.
+       session:ack back. The classic dropped-ack case. This is the ONLY
+       shape maybeAutoRetryX4DH ever acts on — see its own comment for
+       why the responder shape is untouched.
      - initiator === false — we received a propose but didn't know the
        sender's endpointId yet, so handleX4DHPropose's own defensive
        branch never sent an ack in the first place (see its "no known
@@ -1080,12 +1105,12 @@ function maybeTriggerX4DHPropose(contactId, theirDeviceId) {
 
    X4DH_STUCK_LOG_COOLDOWN_MS is a SEPARATE throttle from the staleness
    threshold above — it governs how often the SAME already-stuck session
-   gets re-logged, not how stale counts as stuck in the first place.
-   Without it, a contact who stays online for an extended stretch with a
-   genuinely stuck session would get re-flagged on every single
-   markOnline() call for them — every poll response, every message —
-   flooding the in-page log's 20-line ring buffer with repeats of the
-   same fact.
+   gets re-logged, not how stale counts as stuck in the first place, and
+   is now ALSO independent of the retry gate below: a peer that's been
+   online for a long, continuous stretch won't get re-logged more than
+   once per cooldown window, but that's purely about log spam — it has
+   no bearing on whether a retry fires, which only ever depends on
+   whether THIS call represents a genuine presence transition.
 
    Logged at mlog.warn deliberately, unlike the trigger's own
    mlog.debug bail lines above — this represents a genuine anomaly worth
@@ -1096,7 +1121,11 @@ const X4DH_STUCK_RK0_THRESHOLD_MS = 2 * X4DH_PROPOSAL_TIMEOUT_MS;   // 120s — 
 const X4DH_STUCK_LOG_COOLDOWN_MS  = 5 * 60 * 1000;                  // don't re-flag the same stuck session more than once per 5 min
 const _lastStuckX4DHFlag = new Map();   // "contactId:theirDeviceId" -> last-flagged timestamp
 
-function checkStuckX4DHSessions(id) {
+// Retry budget — Roadmap.md's "cap attempts (~10), gated on discrete
+// online-transition events, not elapsed time." See maybeAutoRetryX4DH.
+const MAX_X4DH_RETRY_ATTEMPTS = 10;
+
+function checkStuckX4DHSessions(id, isTransition = false) {
   const devices = state.x4dhSessions[id];
   if (!devices) return;
   const now = Date.now();
@@ -1107,15 +1136,166 @@ function checkStuckX4DHSessions(id) {
 
     const key = `${id}:${deviceId}`;
     const lastFlagged = _lastStuckX4DHFlag.get(key);
-    if (lastFlagged && (now - lastFlagged) < X4DH_STUCK_LOG_COOLDOWN_MS) continue;
-    _lastStuckX4DHFlag.set(key, now);
+    if (!lastFlagged || (now - lastFlagged) >= X4DH_STUCK_LOG_COOLDOWN_MS) {
+      _lastStuckX4DHFlag.set(key, now);
+      const role = session.initiator
+        ? "we proposed, never got session:ack back"
+        : "we received a propose but never sent our own ack (endpoint unknown at the time)";
+      mlog.warn(`X4DH       stuck at RK0  ${pid(id, { deviceId })}  epoch=${pid(session.sessionEpoch)}  stuck_for=${Math.round(stuckForMs/1000)}s  (${role})`);
+    }
 
-    const role = session.initiator
-      ? "we proposed, never got session:ack back"
-      : "we received a propose but never sent our own ack (endpoint unknown at the time)";
-    mlog.warn(`X4DH       stuck at RK0  ${pid(id, { deviceId })}  epoch=${pid(session.sessionEpoch)}  stuck_for=${Math.round(stuckForMs/1000)}s  (${role}) — detection only, no retry yet, see Roadmap.md`);
+    // Retry is gated on the transition itself, independent of the log
+    // cooldown just above — a peer that's been online the whole time
+    // doesn't get repeated retries just because five minutes passed and
+    // the log line fired again; a peer that drops and reconnects gets a
+    // fresh shot immediately even if we only just logged the stuck state
+    // moments before disconnecting.
+    if (isTransition) maybeAutoRetryX4DH(id, deviceId, session);
   }
 }
+
+/* ── automatic retry, gated on online-transitions (Roadmap.md) ──
+   Only ever called from checkStuckX4DHSessions on a genuine false→true
+   presence edge for the contact (never on routine re-confirmation of an
+   already-known-online peer, and never on a raw timer). Responder-side
+   stuck sessions (session.initiator === false) are deliberately left
+   untouched — there is nothing THIS device can do about that shape;
+   the fix is the OTHER side re-proposing, which is its own initiator-
+   side retry on their end, not something we can drive from here.
+
+   Budget accounting: retryAttempts counts REAL fired retries (a
+   successful call into retryX4DHPropose), not attempts blocked by
+   retryX4DHPropose's own internal refusal (no session / wrong stage /
+   not the fixed initiator) — a refusal there means nothing was actually
+   sent, so it doesn't cost anything from this budget. Boundary: attempts
+   0 through MAX_X4DH_RETRY_ATTEMPTS-1 (10 total) each fire a real retry
+   and bump the counter to match; the check that runs AFTER the 10th
+   successful retry (i.e. attempts already at 10) is what flips to
+   exhausted — the 10th attempt itself is not suppressed.
+
+   Re-arm rule: a transition arriving while retryExhaustedAt is set is
+   itself the re-arm event — it clears exhaustion and immediately spends
+   the first attempt of the new budget in this same call, rather than
+   merely clearing the flag and waiting for a second, separate transition
+   to actually retry.
+── */
+async function maybeAutoRetryX4DH(contactId, theirDeviceId, session) {
+  if (!session.initiator) return;
+
+  if (session.retryExhaustedAt) {
+    mlog.info(`X4DH       auto-retry re-armed by online-transition  ${pid(contactId, { deviceId: theirDeviceId })} — budget reset`);
+    session.retryAttempts    = 0;
+    session.retryExhaustedAt = null;
+  }
+
+  const attempts = session.retryAttempts || 0;
+  if (attempts >= MAX_X4DH_RETRY_ATTEMPTS) {
+    if (!session.retryExhaustedAt) {
+      session.retryExhaustedAt = Date.now();
+      await saveX4DHSessions();
+      mlog.warn(`X4DH       stuck at RK0, retries exhausted (${attempts}x)  ${pid(contactId, { deviceId: theirDeviceId })} — will retry again after this peer's next reconnect`);
+    }
+    return;
+  }
+
+  mlog.info(`X4DH       auto-retry firing (attempt ${attempts + 1}/${MAX_X4DH_RETRY_ATTEMPTS})  ${pid(contactId, { deviceId: theirDeviceId })}`);
+  const ok = await retryX4DHPropose(contactId, theirDeviceId);
+  if (!ok) return;   // retryX4DHPropose already logs its own refusal reason (console-level mlog.debug/warn) — no budget spent
+
+  // retryX4DHPropose → sendX4DHPropose → storeX4DHSessionRK0 has already
+  // replaced the session object by this point (preserving retryAttempts/
+  // retryExhaustedAt per storeX4DHSessionRK0's own carry-forward) — bump
+  // the counter on the FRESH object via a fresh lookup, not the stale
+  // `session` reference this function was called with.
+  const updated = getX4DHSession(contactId, theirDeviceId);
+  if (updated) {
+    updated.retryAttempts = attempts + 1;
+    updated.lastRetryAt   = Date.now();
+    await saveX4DHSessions();
+  }
+}
+
+/* ── x4dhDebug — console-only, not wired into any UI or automatic path.
+   Exists purely to let retry-budget logic (and, later, the epoch-guard
+   replay test flagged in Roadmap.md) be exercised without waiting on
+   real handshake timing. See the X4DH auto-retry handoff for the
+   intended test sequence. ── */
+window.x4dhDebug = {
+  // console.table dump across every contact/device this identity has an
+  // X4DH session with — stage, age, initiator role, retry bookkeeping.
+  list() {
+    const rows = [];
+    for (const [contactId, devices] of Object.entries(state.x4dhSessions)) {
+      for (const [deviceId, s] of Object.entries(devices)) {
+        rows.push({
+          contact: pid(contactId), device: pid(deviceId),
+          stage: s.stage, initiator: s.initiator,
+          ageSec: Math.round((Date.now() - (s.establishedAt || 0)) / 1000),
+          retryAttempts: s.retryAttempts || 0,
+          exhausted: !!s.retryExhaustedAt,
+          epoch: pid(s.sessionEpoch),
+        });
+      }
+    }
+    console.table(rows);
+    return rows;
+  },
+  // Thin wrapper over the existing manual helper — uncapped, unaffected
+  // by the retry budget above (that budget only gates the AUTOMATIC
+  // caller, maybeAutoRetryX4DH).
+  retry(contactId, theirDeviceId) {
+    return retryX4DHPropose(contactId, theirDeviceId);
+  },
+  // Manufactures a session sitting at RK0, stuck_for comfortably past
+  // X4DH_STUCK_RK0_THRESHOLD_MS, with a chosen starting retryAttempts/
+  // exhausted state — same manufacture pattern already used to test the
+  // original stuck detector. Deliberately does NOT fake
+  // state.knownDevices[contactId][theirDeviceId].endpointId or override
+  // isFixedInitiator's real (publicId/deviceId-based) comparison — both
+  // of those are read live from actual identity material by
+  // sendX4DHPropose/retryX4DHPropose, and forcing a session object alone
+  // cannot make either of those checks pass if they wouldn't for real.
+  // Run x4dhDebug.check() against the SAME pair first to confirm both
+  // preconditions actually hold before expecting a retry to fire.
+  forceStuck(contactId, theirDeviceId, { retryAttempts = 0, exhausted = false } = {}) {
+    if (!state.x4dhSessions[contactId]) state.x4dhSessions[contactId] = {};
+    state.x4dhSessions[contactId][theirDeviceId] = {
+      sessionEpoch: crypto.randomUUID(), stage: "rk0",
+      rootKey: rawToBase64(crypto.getRandomValues(new Uint8Array(32))),
+      initiator: true,
+      establishedAt: Date.now() - (X4DH_STUCK_RK0_THRESHOLD_MS + 5000),
+      upgradedAt: null, proposeTs: Date.now() - (X4DH_STUCK_RK0_THRESHOLD_MS + 5000),
+      retryAttempts, retryExhaustedAt: exhausted ? Date.now() : null,
+      lastRetryAt: null,
+    };
+    saveX4DHSessions();
+    mlog.info(`X4DH       forceStuck  ${pid(contactId, { deviceId: theirDeviceId })}  retryAttempts=${retryAttempts}  exhausted=${exhausted}`);
+  },
+  // Drives checkStuckX4DHSessions directly with isTransition=true,
+  // without needing a real presence signal (sig:seen / incoming
+  // message) to arrive first. This is the piece that makes forceStuck
+  // actually usable on demand rather than waiting for the next natural
+  // markOnline() call for that contact.
+  simulateTransition(contactId) {
+    checkStuckX4DHSessions(contactId, true);
+  },
+  // Diagnostic: surfaces the actual live preconditions retryX4DHPropose/
+  // sendX4DHPropose will check, in one call, instead of requiring manual
+  // cross-referencing of isFixedInitiator + state.knownDevices + DevTools
+  // "Verbose" console level to catch a silent mlog.debug refusal. Run
+  // this against a (contactId, theirDeviceId) pair BEFORE forceStuck +
+  // simulateTransition if a retry doesn't seem to be firing — a false
+  // isFixedInitiator or a null endpointKnown explains it immediately.
+  check(contactId, theirDeviceId) {
+    const result = {
+      isFixedInitiator: isFixedInitiator(contactId, theirDeviceId),
+      endpointKnown: state.knownDevices[contactId]?.[theirDeviceId]?.endpointId || null,
+      session: getX4DHSession(contactId, theirDeviceId),
+    };
+    console.table([result]);
+    return result;
+  },
+};
 
 /* ── send side ──
    sendX4DHPropose(contactId, theirDeviceId) — X4DH.md §3/§4. Only ever
@@ -1314,6 +1494,32 @@ async function handleX4DHAck(msg) {
   clearTimeout(pending.timeoutHandle);
   pendingX4DHProposals.delete(key);
   mlog.info(`← X4DH_ACK     from ${pid(msg.from, { deviceId: theirDeviceId })}  epoch=${pid(msg.sessionEpoch)} — session upgraded to RK1`);
+}
+
+// retryX4DHPropose(contactId, theirDeviceId) — Roadmap.md's "session
+// bootstrap and session reset are the same mechanism" framing: this is
+// just sendX4DHPropose called a second time, with a guard in front
+// refusing anything that isn't a genuinely stuck initiator-side RK0
+// session. Uncapped and manual — the retry BUDGET (MAX_X4DH_RETRY_
+// ATTEMPTS) lives entirely in maybeAutoRetryX4DH, the automatic caller;
+// this function itself has no memory of how many times it's been
+// called and never refuses on that basis.
+async function retryX4DHPropose(contactId, theirDeviceId) {
+  const session = getX4DHSession(contactId, theirDeviceId);
+  if (!session) {
+    mlog.warn(`X4DH       retry refused — no session on file  ${pid(contactId, { deviceId: theirDeviceId })}`);
+    return false;
+  }
+  if (session.stage !== "rk0") {
+    mlog.warn(`X4DH       retry refused — session not at rk0 (stage=${session.stage})  ${pid(contactId, { deviceId: theirDeviceId })}`);
+    return false;
+  }
+  if (!isFixedInitiator(contactId, theirDeviceId)) {
+    mlog.warn(`X4DH       retry refused — not the fixed initiator  ${pid(contactId, { deviceId: theirDeviceId })}`);
+    return false;
+  }
+  mlog.info(`X4DH       retrying propose  ${pid(contactId, { deviceId: theirDeviceId })}  (was stuck at epoch=${pid(session.sessionEpoch)})`);
+  return sendX4DHPropose(contactId, theirDeviceId);
 }
 
 /* ══════════════════════════════════════════
