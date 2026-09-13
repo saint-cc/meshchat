@@ -343,8 +343,12 @@ async function encryptMessage(recipientEncKey, payload) {
 // Static-static means this same key is reused for every message between
 // this pair, forever (barring a passphrase change) — this fixes the
 // pairwise-separation bug (every contact no longer shares one AES key),
-// it does NOT add forward secrecy. That's a separate, later piece of
-// work (Double Ratchet), not something this function claims to solve.
+// it does NOT add forward secrecy by itself. As of the X4DH wire-key
+// work below, this is now the FALLBACK key for a device pair that hasn't
+// (yet, or ever) completed an X4DH session — it is no longer necessarily
+// the key actual traffic rides on once a session exists. See
+// deriveX4DHWireKey below and meshchat.js's sendFannedX4DH/
+// decryptIncomingMessage for what supersedes it per device pair.
 async function deriveSharedAesKey(myX25519Seed, theirX25519PublicKey) {
   const shared = x25519.getSharedSecret(myX25519Seed, theirX25519PublicKey);
   const hkdfKey = await crypto.subtle.importKey("raw", shared, { name: "HKDF" }, false, ["deriveBits"]);
@@ -369,8 +373,8 @@ function verifyBlob(blob,sig,contactSignPublicKey){
    Session establishment's root-key derivation. Pure functions only, same
    rule as the rest of this file — no state access, no network. The
    state-touching half (signing, pending-proposal tracking, session
-   storage, send/receive handlers) lives in meshchat.js's own X4DH
-   section.
+   storage, send/receive handlers, and now the wire-key cache) lives in
+   meshchat.js's own X4DH section.
 ══════════════════════════════════════════ */
 
 // Generic HKDF (Extract-then-Expand, one crypto.subtle.deriveBits call) —
@@ -390,6 +394,12 @@ async function hkdfBits(saltBytes, ikmBytes, infoStr, lengthBits = 256) {
 
 const X4DH_INFO_ROOT    = "MeshChat-X4DH-v1/root";
 const X4DH_INFO_ROOT_V2 = "MeshChat-X4DH-v1/root-v2";
+// New — wire-message key domain separation. Distinct label from both root
+// stages above, same "fixed, ASCII-only literal" rule X4DH.md §6.1 already
+// states for every HKDF info string in this codebase (a label that has to
+// byte-for-byte match across implementations is the wrong place for
+// anything that could silently mis-encode).
+const X4DH_INFO_WIRE    = "MeshChat-X4DH-v1/wire-message";
 
 // X4DH.md §6.1 — Stage 1, offline-usable. Salted with 32 zero bytes,
 // same "no prior shared secret yet" convention deriveSharedAesKey above
@@ -412,6 +422,39 @@ async function deriveX4DHRootStage2(rk0, dh3, dh4) {
   ikm.set(dh3, 0);
   ikm.set(dh4, dh3.length);
   return hkdfBits(rk0, ikm, X4DH_INFO_ROOT_V2);
+}
+
+// X4DH wire-message key — derives the AES-256-GCM key that actually
+// encrypts app:message traffic for one specific (contact, device) pair,
+// once that pair has an X4DH session. HKDF over the session's CURRENT
+// root key bytes (RK0 or RK1 — the caller passes whichever the session
+// is actually at; this function doesn't need to know or care which
+// stage produced them) under its own domain-separation label, distinct
+// from both root-derivation stages above.
+//
+// Deliberately NOT a ratchet — the same derived key is reused for every
+// message under a given session, exactly like deriveSharedAesKey's old
+// identity-level key, until the underlying X4DH session itself is reset
+// or upgraded (X4DH.md's "session bootstrap and session reset are the
+// same mechanism" framing — see meshchat.js's retryX4DHPropose). Real
+// per-message key evolution is the separate, later Double Ratchet work
+// (Roadmap.md).
+//
+// This IS a real improvement over the old scheme even run statically,
+// though: forward secrecy is now scoped per DEVICE PAIR rather than
+// shared identity-wide, and a session that completes the live 4DH
+// upgrade (stage "rk1") carries DH4's protection against a future
+// identity-key compromise (X4DH.md §10) automatically, the next time
+// this function is called with that session's rootKey — no separate
+// code path needed here for "which stage is this."
+//
+// Caching/invalidation is meshchat.js's responsibility (see
+// x4dhWireKeyCache / getOrDeriveWireKey) — this function is pure and
+// re-derives every time it's called, same as every other function in
+// this file.
+async function deriveX4DHWireKey(rootKeyBytes) {
+  const bits = await hkdfBits(new Uint8Array(32), rootKeyBytes, X4DH_INFO_WIRE);
+  return importEncKey(bits);
 }
 
 // Fresh, one-time X25519 ephemeral keypair (EK). Generated the same way

@@ -152,11 +152,11 @@ function markRestorePushAccepted(id, endpointId) {
    answering the same broadcast) delivers the functionally same packet
    twice within the same second or two — mergeMessages() etc. already
    make RE-PROCESSING harmless, this is purely about not doing the
-   redundant work (re-sending an accept, a doubled log line) in the first
-   place. A few seconds is enough to catch "two sessions answered in the
-   same tick," nowhere near enough to ever suppress a genuinely later
-   occurrence of the same packet type from the same sender (e.g. the next
-   ~10-minute backup cycle).
+   redundant work (a doubled log line, a redundant re-send, a repeat
+   merge) in the first place. A few seconds is enough to catch "two
+   sessions answered in the same tick," nowhere near enough to ever
+   suppress a genuinely later occurrence of the same packet type from the
+   same sender (e.g. the next ~10-minute backup cycle).
 ══════════════════════════════════════════ */
 const DEDUP_WINDOW_MS = 3000;
 const _recentInbound  = new Map();   // "kind:senderId" → last-seen timestamp
@@ -247,6 +247,10 @@ async function computeBackupFingerprint() {
 // ECDH secret is DIFFERENT per contact, so the caller must resolve which
 // contact.encKey applies (self-targeted packets still work uniformly here,
 // since state.contacts[state.publicId].encKey IS state.encKey — self-ECDH).
+// This helper stays generic — it takes whatever key the caller resolves,
+// legacy identity-level OR (as of this pass) an X4DH per-device wire key.
+// See decryptIncomingMessage below for how app:message's receive path
+// now resolves WHICH key to hand this.
 async function decryptMessage(blob, key) {
   // v missing = v0 (legacy unversioned), v:1 = AES-256-GCM explicit
   if (blob.v !== undefined && blob.v > 1) throw new Error(`unsupported message version v${blob.v}`);
@@ -399,6 +403,8 @@ async function deserialiseContacts(raw){
     // ECDH(ourX25519Seed, theirX25519PublicKey) every load. Works identically
     // for the self entry (id === state.publicId): X25519 against our own
     // public key is a well-defined DH operation, same result every device.
+    // This remains the LEGACY/fallback key even after the X4DH wire-key
+    // work below — nothing here changes.
     const encKey=await deriveSharedAesKey(state.x25519Seed,x25519PublicKey);
     out[id]={...c,encKey,x25519PublicKey,signPublicKey};
   }
@@ -635,7 +641,7 @@ function nextSendCounter(contactId) {
 // against: lastSeen is bumped by EVERY incoming packet from a device,
 // including a bare RECEIVED-ack reaction (deviceId present, no n) — and
 // since reactions are now fanned to every known device of a contact (see
-// sendFanned above), a contact running two-plus devices means BOTH ack
+// sendFannedX4DH below), a contact running two-plus devices means BOTH ack
 // every message you send, independently, in whatever order their acks
 // happen to race in. lastSeen stopped meaning "which device am I
 // actually talking to" the moment that became true — it started meaning
@@ -676,45 +682,25 @@ function getAckPointer(contactId) {
 }
 
 /* ══════════════════════════════════════════
-   CONTACT-FACING PER-DEVICE FANOUT (0.4.9)
-   Same shape as pushBackupToContacts' self-branch targeting, applied to
-   contacts instead of self. Crypto is UNCHANGED — same static pairwise
-   key, same blob, same sig — this only changes ADDRESSING: one copy per
-   known device (to = buildAddress(contactId, endpointId)) instead of one
-   bare-`to` broadcast the relay fans out to every live session.
+   CONTACT-FACING PER-DEVICE FANOUT
+   resolveDeviceTargets(contactId) splits a contact's known devices into
+   "targeted" (endpointId known AND seen within FANOUT_STALE_MS) and a
+   single "needsBroadcast" flag: true whenever at least one known device
+   is unresolved (no endpointId on file yet — an older client, or one
+   that hasn't sent us anything this session) OR stale, OR there are no
+   known devices at all (a fresh contact — today's only case, unchanged).
+   Staleness never excludes a device — it only demotes it from "gets its
+   own targeted send" to "gets the broadcast fallback like everyone
+   else." Nothing is ever silently dropped by this function.
 
-   Fixes a real gap, not just prep: today, if a contact has two offline
-   devices, a message lands in the identity-level buffer ONCE — whichever
-   device reconnects first drains and deletes it, the second device never
-   sees it directly (only recovers it later via the next periodic
-   self-sync backup push on THEIR end, reconstructing it from
-   contact.messages). Per-device fanout closes that for real.
-
-   FANOUT_STALE_MS is deliberately its OWN, shorter window — separate from
-   loadDeviceRegistry's 90-day/20-device prune (a bookkeeping/display
-   question: "do we still remember this device existed"). "Should I spend
-   a dedicated targeted send on this device right now" is a different,
-   more conservative tradeoff and shouldn't share a number just because
-   both involve staleness. A stale device is NEVER excluded outright —
-   see resolveDeviceTargets below — only demoted to the same broadcast
-   fallback an unresolved (no endpointId yet) device already gets.
-
-   Self-sync is deliberately NOT touched by this — it has its own,
-   session-based ("heard from this session or not") targeting logic
-   already, a different axis than calendar-day staleness. Giving it this
-   same treatment is a separate pass, not folded in here.
+   This ADDRESSING split (targeted vs broadcast, who gets their own copy
+   at all) is unchanged by the X4DH wire-key work below — what changed is
+   ENCRYPTION: sendFannedX4DH (further down) now picks a per-device key
+   for each TARGETED entry this function returns, rather than reusing one
+   shared ciphertext across all of them the way the old sendFanned did.
 ══════════════════════════════════════════ */
-const FANOUT_STALE_MS = 7 * 24 * 60 * 60 * 1000;   // 7 days — see block comment above for why this differs from the registry's own 90-day prune
+const FANOUT_STALE_MS = 7 * 24 * 60 * 60 * 1000;   // 7 days — deliberately its own, shorter window than loadDeviceRegistry's 90-day/20-device prune — see block comment above for why
 
-// resolveDeviceTargets(contactId) — splits contactId's known devices into
-// "targeted" (endpointId known AND seen within FANOUT_STALE_MS) and a
-// single "needsBroadcast" flag: true whenever at least one known device
-// is unresolved (no endpointId on file yet — an older client, or one
-// that hasn't sent us anything this session) OR stale, OR there are no
-// known devices at all (a fresh contact — today's only case, unchanged).
-// Staleness never excludes a device — it only demotes it from "gets its
-// own targeted send" to "gets the broadcast fallback like everyone
-// else." Nothing is ever silently dropped by this function.
 function resolveDeviceTargets(contactId) {
   const devices = state.knownDevices[contactId] || {};
   const entries = Object.entries(devices);
@@ -734,58 +720,30 @@ function resolveDeviceTargets(contactId) {
   return { targeted, needsBroadcast };
 }
 
-// sendFanned(contactId, obj) — obj is a fully-built, already-signed
-// envelope ({ type: "app:message", from, to: <placeholder>, blob, sig }
-// or similar). Sends one copy per targeted device (to =
-// buildAddress(contactId, endpointId)), plus one bare-`to` broadcast copy
-// if needsBroadcast is set. blob/sig are IDENTICAL across every copy —
-// sig covers blob, not to, so re-signing per copy is never needed; only
-// the outer `to` field varies.
-//
-// Returns { sent, targetedCount, broadcastSent } rather than a bare
-// boolean so each call site can build its own type-tagged summary log
-// line (→ MSG / → IMAGE / → REACTION / etc.) instead of this function
-// logging per-device, which would otherwise dominate the in-page log's
-// 20-line ring buffer the moment a contact has more than one or two
-// known devices.
-function sendFanned(contactId, obj) {
-  const { targeted, needsBroadcast } = resolveDeviceTargets(contactId);
-  let sent = false;
-
-  for (const { endpointId } of targeted) {
-    const targetedObj = { ...obj, to: buildAddress(contactId, endpointId) };
-    const viaRelay = sendToRelay(contactId, targetedObj, true);
-    if (!viaRelay) sendSignal(targetedObj);
-    sent = sent || viaRelay || state.ws?.readyState === WebSocket.OPEN;
-  }
-
-  if (needsBroadcast) {
-    const broadcastObj = { ...obj, to: contactId };
-    const viaRelay = sendToRelay(contactId, broadcastObj, true);
-    if (!viaRelay) sendSignal(broadcastObj);
-    sent = sent || viaRelay || state.ws?.readyState === WebSocket.OPEN;
-  }
-
-  return { sent, targetedCount: targeted.length, broadcastSent: needsBroadcast };
-}
-
 /* ══════════════════════════════════════════
    X4DH — SESSION ESTABLISHMENT (see X4DH.md)
-   Root-key establishment only — NOT yet wired to fire automatically
-   (no caller invokes sendX4DHPropose() from anywhere in the app yet),
-   and NOT yet consumed by any send/receive path (sendMessage etc. are
-   untouched — this is dormant infrastructure, same pattern
-   endpoint-keyed buffering and per-device fanout landed under before
-   either was wired live). Two things still deliberately missing, by
-   design, not oversight:
-     - WHEN to call sendX4DHPropose (the fixed-initiator trigger logic,
-       hooked off passive endpoint discovery per X4DH.md §13.3) —
-       Roadmap.md's own "next session" item.
-     - Full replay/staleness hardening beyond the single sessionEpoch-
-       match guard below (X4DH.md §13.2) — also deferred.
-   Requires server.py to recognize "session:propose"/"session:ack" in
-   its routing switch (added alongside this) — without that, these
-   packets would silently vanish into the relay's UNKNOWN-type drop path.
+   Root-key establishment, automatic bootstrap/retry, AND (as of this
+   pass) the actual wire-message key used for real app:message traffic
+   once a device pair has a session. See the design discussion this
+   pass came out of for the full reasoning; summary of what's live now:
+     - X4DH.md §3-§7: RK0/RK1 derivation, session:propose/session:ack
+     - §13.1/§13.3: fixed initiator, passive endpoint-discovery trigger
+     - §13.2 + Roadmap's automatic-retry pass: stuck-at-RK0 detection,
+       a bounded (10-attempt) auto-retry gated on genuine online-
+       transitions, re-arming on the next transition after exhaustion
+     - THIS PASS: the session's root key (RK0 OR RK1 — either stage is
+       eligible; see the design discussion for why RK0 was accepted
+       despite its narrower forward-secrecy property, X4DH.md §10) is
+       now used to derive a real AES-256-GCM key per (contact, device)
+       pair, which sendFannedX4DH/decryptIncomingMessage use in place of
+       the old identity-level static key for any device that has one.
+       Deliberately NOT a ratchet — the derived key is static per session,
+       renegotiated only when the underlying session itself resets (the
+       existing reactive stuck-detection retry, nothing new added for
+       this pass — periodic/count-based rotation was explicitly deferred).
+       A device with no session yet (or one that never bootstraps one)
+       falls back to the legacy identity-level key exactly as before —
+       this is graceful degradation, not a hard cutover.
 ══════════════════════════════════════════ */
 
 // X4DH.md §13.1 — fixed initiator per pair, eliminating proposal glare
@@ -817,11 +775,7 @@ function isFixedInitiator(contactId, theirDeviceId) {
 // same as any other buffered packet — it just won't get the DH3/DH4
 // upgrade unless a fresh propose is sent while both sides are actually
 // online together. 60s mirrors BACKUP_OFFER_TTL's existing "how long is
-// a live handshake still fresh" precedent in this file. A dropped ack
-// specifically (as opposed to Bob genuinely being offline) is a known,
-// currently-undetected gap — see Roadmap.md's per-device-encryption
-// section for why closing it folds into the session-reset mechanism
-// rather than needing its own retry system.
+// a live handshake still fresh" precedent in this file.
 const pendingX4DHProposals = new Map();   // "contactId:theirDeviceId:sessionEpoch" -> { ekPriv, createdAt, timeoutHandle }
 
 function pendingX4DHKey(contactId, theirDeviceId, sessionEpoch) {
@@ -855,13 +809,6 @@ function schedulePendingX4DHExpiry(key) {
    send-counter storage, this is encrypted at rest with state.cryptoKey
    (the same key protecting contacts/messages), via the existing
    encryptObject/decryptObject helpers.
-
-   Deliberately NOT using saveContacts()'s promise-chained write mutex
-   for this first pass — concurrent writes across DIFFERENT contacts/
-   devices don't collide (each is its own top-level key), and same-
-   session writes are already sequential in practice (one propose, later
-   one ack). Worth revisiting once this is wired to fire automatically
-   (Roadmap.md's trigger-logic item), not before.
 
    Shape:
    {
@@ -935,6 +882,14 @@ async function storeX4DHSessionRK0(contactId, theirDeviceId, sessionEpoch, rk0By
     retryExhaustedAt: existing?.retryExhaustedAt || null,
     lastRetryAt:      existing?.lastRetryAt      || null,
   };
+  // Wire key is derived from rootKey, which just changed (a fresh RK0 —
+  // whether this is a first-ever bootstrap or a reset/retry with a brand
+  // new epoch). Drop any cached key for this device pair so the next
+  // send/receive re-derives from the NEW root instead of silently
+  // continuing to encrypt/decrypt under a superseded one. See
+  // x4dhWireKeyCache's own comment for why this is keyed on
+  // (contactId, deviceId) alone, not sessionEpoch.
+  x4dhWireKeyCache.delete(`${contactId}:${theirDeviceId}`);
   await saveX4DHSessions();
   mlog.info(`X4DH       RK0 established  ${pid(contactId, { deviceId: theirDeviceId })}  epoch=${pid(sessionEpoch)}`);
 }
@@ -959,9 +914,50 @@ async function upgradeX4DHSessionToRK1(contactId, theirDeviceId, sessionEpoch, r
   // starts with a clean budget rather than inheriting an old exhaustion.
   existing.retryAttempts    = 0;
   existing.retryExhaustedAt = null;
+  // Root key material just changed (RK0 -> RK1) even though the epoch
+  // is UNCHANGED across this upgrade — an epoch-keyed cache would keep
+  // serving the stale RK0-derived key forever after. MUST evict here,
+  // keyed on (contactId, deviceId) alone. This is the one place in the
+  // whole X4DH lifecycle where rootKey changes without sessionEpoch
+  // changing alongside it, which is exactly why the cache below can't
+  // be keyed on epoch.
+  x4dhWireKeyCache.delete(`${contactId}:${theirDeviceId}`);
   await saveX4DHSessions();
   mlog.info(`X4DH       RK1 upgrade complete  ${pid(contactId, { deviceId: theirDeviceId })}  epoch=${pid(sessionEpoch)}`);
   return true;
+}
+
+/* ── wire-message key cache ──
+   In-memory only, NEVER persisted or written to localStorage under any
+   key — same sensitivity tier as pendingX4DHProposals' ekPriv above.
+   Keyed by "contactId:deviceId", deliberately NOT by sessionEpoch:
+   upgradeX4DHSessionToRK1 mutates rootKey/stage IN PLACE on the same
+   epoch (RK0 -> RK1 is not a new epoch), so an epoch-keyed cache would
+   silently keep serving the pre-upgrade key after a live upgrade
+   completed underneath it — exactly the kind of bug that would quietly
+   under-deliver the security property this pass exists to provide.
+   storeX4DHSessionRK0 and upgradeX4DHSessionToRK1 are the ONLY two
+   places rootKey ever changes, and both explicitly evict their own
+   entry here — nothing else needs to know this cache exists.
+── */
+const x4dhWireKeyCache = new Map();   // "contactId:deviceId" -> CryptoKey (AES-256-GCM)
+
+// getOrDeriveWireKey(contactId, theirDeviceId) — returns the AES-256-GCM
+// key for that device pair's CURRENT X4DH session (rk0 or rk1, whichever
+// it's at — see the design discussion for why rk0 is eligible), or null
+// if no session exists for that device at all. Lazily derives+caches on
+// first use per (contactId, deviceId); storeX4DHSessionRK0/
+// upgradeX4DHSessionToRK1 evict the cache entry whenever rootKey changes,
+// so a cache HIT here is always guaranteed current, never stale.
+async function getOrDeriveWireKey(contactId, theirDeviceId) {
+  const session = getX4DHSession(contactId, theirDeviceId);
+  if (!session) return null;
+  const cacheKey = `${contactId}:${theirDeviceId}`;
+  const cached = x4dhWireKeyCache.get(cacheKey);
+  if (cached) return cached;
+  const wireKey = await deriveX4DHWireKey(base64ToRaw(session.rootKey));
+  x4dhWireKeyCache.set(cacheKey, wireKey);
+  return wireKey;
 }
 
 /* ── packet signing ──
@@ -991,20 +987,9 @@ function verifyX4DHPacket(obj, contactSignPublicKey) {
    Every call to recordKnownDevice() re-checks whether IT just satisfied
    the precondition for a device we haven't bootstrapped with yet.
 
-   Covers self-pairs now, not just contacts — isFixedInitiator's
-   deviceId tiebreak (§13.1) for contactId === state.publicId was
-   implemented but unverified when the contact-only version of this
-   function first landed; now that the contact-facing path is
-   confirmed live (see the X4DH meshdev handoff), self is wired in the
-   same way rather than getting its own parallel mechanism.
-   recordKnownDevice() gets called for self the same passive way it
-   does for contacts — mainly via the self-sync backup accept/push
-   handlers (handleBackupAccept/handleBackupPush), which is how a
-   sibling device's endpointId ordinarily becomes known in the first
-   place. Sending yourself a message in the "(me)" chat reaches this
-   too, but isn't the expected common path — self-sync's periodic/
-   threshold-triggered backup push (BACKUP_INTERVAL_MS / BACKUP_
-   THRESHOLD) is what actually carries endpointId between siblings.
+   Covers self-pairs too (isFixedInitiator's deviceId tiebreak, §13.1) —
+   recordKnownDevice() gets called for self the same passive way it does
+   for contacts, mainly via the self-sync backup accept/push handlers.
 
    x4dhProposeInFlight guards a real race, not a theoretical one:
    recordKnownDevice() can fire twice in quick succession for the same
@@ -1068,54 +1053,28 @@ function maybeTriggerX4DHPropose(contactId, theirDeviceId) {
 /* ── stuck-at-RK0 detection (X4DH.md §13.2) ──
    Logging is unconditional (subject only to its own cooldown, below);
    AUTOMATIC RETRY is gated separately, on genuine online-transitions
-   only — see maybeAutoRetryX4DH. The Roadmap's own framing: a dropped
-   session:ack causes a silent, permanent 2DH downgrade with nothing
-   today that notices on its own. This function is what notices; the
-   retry budget below is what (bounded-ly) does something about it.
-
-   "Stuck" needs a real signal, not just elapsed time — a session sitting
-   at RK0 because the OTHER side has simply been offline the whole time
-   is completely normal (that's the entire point of the async 2DH
-   bootstrap, X4DH.md §5). The signal used here is presence:
-   checkStuckX4DHSessions only ever runs from inside markOnline(), i.e.
-   only when id has JUST been confirmed online (a sig:seen hit, an
-   incoming message, an X4DH packet itself). "Stuck" is then just
-   "online right now, AND still at RK0 well past the point the original
-   handshake attempt could still be waiting on its own."
+   only — see maybeAutoRetryX4DH. "Stuck" needs a real signal, not just
+   elapsed time — a session sitting at RK0 because the OTHER side has
+   simply been offline the whole time is completely normal (that's the
+   entire point of the async 2DH bootstrap, X4DH.md §5). The signal used
+   here is presence: checkStuckX4DHSessions only ever runs from inside
+   markOnline(), i.e. only when id has JUST been confirmed online.
+   "Stuck" is then just "online right now, AND still at RK0 well past
+   the point the original handshake attempt could still be waiting on
+   its own."
 
    Covers both stuck shapes, distinguished by session.initiator:
      - initiator === true  — we sent session:propose and never got
-       session:ack back. The classic dropped-ack case. This is the ONLY
-       shape maybeAutoRetryX4DH ever acts on — see its own comment for
-       why the responder shape is untouched.
+       session:ack back. This is the ONLY shape maybeAutoRetryX4DH ever
+       acts on.
      - initiator === false — we received a propose but didn't know the
-       sender's endpointId yet, so handleX4DHPropose's own defensive
-       branch never sent an ack in the first place (see its "no known
-       endpoint to ack back to" warning, logged once at the time).
-       Re-flagging this here on every subsequent online sighting is
-       genuinely useful — nothing else ever revisits that decision.
+       sender's endpointId yet. Re-flagging this here on every
+       subsequent online sighting is genuinely useful — nothing else
+       ever revisits that decision.
 
    Threshold is 2× X4DH_PROPOSAL_TIMEOUT_MS, not 1×: at 1× the
-   pendingX4DHProposals entry has JUST expired (schedulePendingX4DHExpiry
-   fires at exactly that mark) — doubling it gives clean separation from
-   that boundary rather than racing it, at the cost of being that much
-   slower to flag a genuinely stuck session. Either side's own EK_A/EK_B
-   is long discarded by the time this ever fires either way — this is
-   purely a "tell someone" check, it never touches session state.
-
-   X4DH_STUCK_LOG_COOLDOWN_MS is a SEPARATE throttle from the staleness
-   threshold above — it governs how often the SAME already-stuck session
-   gets re-logged, not how stale counts as stuck in the first place, and
-   is now ALSO independent of the retry gate below: a peer that's been
-   online for a long, continuous stretch won't get re-logged more than
-   once per cooldown window, but that's purely about log spam — it has
-   no bearing on whether a retry fires, which only ever depends on
-   whether THIS call represents a genuine presence transition.
-
-   Logged at mlog.warn deliberately, unlike the trigger's own
-   mlog.debug bail lines above — this represents a genuine anomaly worth
-   a human seeing in the in-page log, not routine bookkeeping worth
-   checking the console for.
+   pendingX4DHProposals entry has JUST expired — doubling it gives
+   clean separation from that boundary rather than racing it.
 ── */
 const X4DH_STUCK_RK0_THRESHOLD_MS = 2 * X4DH_PROPOSAL_TIMEOUT_MS;   // 120s — see comment above for why 2×, not 1×
 const X4DH_STUCK_LOG_COOLDOWN_MS  = 5 * 60 * 1000;                  // don't re-flag the same stuck session more than once per 5 min
@@ -1156,12 +1115,10 @@ function checkStuckX4DHSessions(id, isTransition = false) {
 
 /* ── automatic retry, gated on online-transitions (Roadmap.md) ──
    Only ever called from checkStuckX4DHSessions on a genuine false→true
-   presence edge for the contact (never on routine re-confirmation of an
-   already-known-online peer, and never on a raw timer). Responder-side
-   stuck sessions (session.initiator === false) are deliberately left
-   untouched — there is nothing THIS device can do about that shape;
-   the fix is the OTHER side re-proposing, which is its own initiator-
-   side retry on their end, not something we can drive from here.
+   presence edge for the contact. Responder-side stuck sessions
+   (session.initiator === false) are deliberately left untouched — there
+   is nothing THIS device can do about that shape; the fix is the OTHER
+   side re-proposing, not something we can drive from here.
 
    Budget accounting: retryAttempts counts REAL fired retries (a
    successful call into retryX4DHPropose), not attempts blocked by
@@ -1175,9 +1132,7 @@ function checkStuckX4DHSessions(id, isTransition = false) {
 
    Re-arm rule: a transition arriving while retryExhaustedAt is set is
    itself the re-arm event — it clears exhaustion and immediately spends
-   the first attempt of the new budget in this same call, rather than
-   merely clearing the flag and waiting for a second, separate transition
-   to actually retry.
+   the first attempt of the new budget in this same call.
 ── */
 async function maybeAutoRetryX4DH(contactId, theirDeviceId, session) {
   if (!session.initiator) return;
@@ -1200,7 +1155,7 @@ async function maybeAutoRetryX4DH(contactId, theirDeviceId, session) {
 
   mlog.info(`X4DH       auto-retry firing (attempt ${attempts + 1}/${MAX_X4DH_RETRY_ATTEMPTS})  ${pid(contactId, { deviceId: theirDeviceId })}`);
   const ok = await retryX4DHPropose(contactId, theirDeviceId);
-  if (!ok) return;   // retryX4DHPropose already logs its own refusal reason (console-level mlog.debug/warn) — no budget spent
+  if (!ok) return;   // retryX4DHPropose already logs its own refusal reason — no budget spent
 
   // retryX4DHPropose → sendX4DHPropose → storeX4DHSessionRK0 has already
   // replaced the session object by this point (preserving retryAttempts/
@@ -1218,8 +1173,7 @@ async function maybeAutoRetryX4DH(contactId, theirDeviceId, session) {
 /* ── x4dhDebug — console-only, not wired into any UI or automatic path.
    Exists purely to let retry-budget logic (and, later, the epoch-guard
    replay test flagged in Roadmap.md) be exercised without waiting on
-   real handshake timing. See the X4DH auto-retry handoff for the
-   intended test sequence. ── */
+   real handshake timing. ── */
 window.x4dhDebug = {
   // console.table dump across every contact/device this identity has an
   // X4DH session with — stage, age, initiator role, retry bookkeeping.
@@ -1248,14 +1202,11 @@ window.x4dhDebug = {
   },
   // Manufactures a session sitting at RK0, stuck_for comfortably past
   // X4DH_STUCK_RK0_THRESHOLD_MS, with a chosen starting retryAttempts/
-  // exhausted state — same manufacture pattern already used to test the
-  // original stuck detector. Deliberately does NOT fake
+  // exhausted state. Deliberately does NOT fake
   // state.knownDevices[contactId][theirDeviceId].endpointId or override
-  // isFixedInitiator's real (publicId/deviceId-based) comparison — both
-  // of those are read live from actual identity material by
-  // sendX4DHPropose/retryX4DHPropose, and forcing a session object alone
-  // cannot make either of those checks pass if they wouldn't for real.
-  // Run x4dhDebug.check() against the SAME pair first to confirm both
+  // isFixedInitiator's real comparison — both are read live from actual
+  // identity material by sendX4DHPropose/retryX4DHPropose. Run
+  // x4dhDebug.check() against the SAME pair first to confirm both
   // preconditions actually hold before expecting a retry to fire.
   forceStuck(contactId, theirDeviceId, { retryAttempts = 0, exhausted = false } = {}) {
     if (!state.x4dhSessions[contactId]) state.x4dhSessions[contactId] = {};
@@ -1268,24 +1219,17 @@ window.x4dhDebug = {
       retryAttempts, retryExhaustedAt: exhausted ? Date.now() : null,
       lastRetryAt: null,
     };
+    x4dhWireKeyCache.delete(`${contactId}:${theirDeviceId}`);
     saveX4DHSessions();
     mlog.info(`X4DH       forceStuck  ${pid(contactId, { deviceId: theirDeviceId })}  retryAttempts=${retryAttempts}  exhausted=${exhausted}`);
   },
   // Drives checkStuckX4DHSessions directly with isTransition=true,
-  // without needing a real presence signal (sig:seen / incoming
-  // message) to arrive first. This is the piece that makes forceStuck
-  // actually usable on demand rather than waiting for the next natural
-  // markOnline() call for that contact.
+  // without needing a real presence signal to arrive first.
   simulateTransition(contactId) {
     checkStuckX4DHSessions(contactId, true);
   },
   // Diagnostic: surfaces the actual live preconditions retryX4DHPropose/
-  // sendX4DHPropose will check, in one call, instead of requiring manual
-  // cross-referencing of isFixedInitiator + state.knownDevices + DevTools
-  // "Verbose" console level to catch a silent mlog.debug refusal. Run
-  // this against a (contactId, theirDeviceId) pair BEFORE forceStuck +
-  // simulateTransition if a retry doesn't seem to be firing — a false
-  // isFixedInitiator or a null endpointKnown explains it immediately.
+  // sendX4DHPropose will check, in one call.
   check(contactId, theirDeviceId) {
     const result = {
       isFixedInitiator: isFixedInitiator(contactId, theirDeviceId),
@@ -1349,32 +1293,18 @@ async function sendX4DHPropose(contactId, theirDeviceId) {
 }
 
 /* ── receive side ──
-   handleX4DHPropose(msg) — X4DH.md §6/§7. Always replies immediately:
-   unlike a voice/shell invite there is no human decision here (Roadmap's
-   "manual accept new device gate dropped... passive system notice"
-   precedent applies even more so — there's nothing for a person to even
-   look at). Per §6.1/§7.1, the receiving side computes RK0 too before
-   folding in DH3/DH4 — cheap (two ECDH calls with material already in
-   hand), not skippable under the incremental construction this project
-   settled on.
+   handleX4DHPropose(msg) — X4DH.md §6/§7. Always replies immediately.
+   Per §6.1/§7.1, the receiving side computes RK0 too before folding in
+   DH3/DH4 — cheap (two ECDH calls with material already in hand), not
+   skippable under the incremental construction this project settled on.
 
    Reprocessing the SAME propose twice is a real, confirmed-live-on-
    meshdev desync risk, not a theoretical one: session:propose is
    durably buffered even when live delivery succeeds (same class as
    app:migrate/app:burn), so a brief reconnect shortly after can re-flush
-   an already-handled propose. Each reprocessing would generate a FRESH
-   EK_B and therefore a DIFFERENT RK1, silently overwriting this side's
-   stored session with whichever attempt processed last — a real
-   divergence risk even though the far side is separately protected
-   (its pending-proposal entry is consumed by the first ack it accepts,
-   so a second one is dropped there). Guarded here the same way the
-   backup/restore handshake family already guards against its own
-   near-simultaneous redelivery: isDuplicateInbound/DEDUP_WINDOW_MS.
-   sessionEpoch is a fresh UUID per genuine sendX4DHPropose call, so two
-   packets sharing one are BY DEFINITION the same original send, never a
-   legitimate distinct re-propose — an ideal dedup key, no endpointId/
-   deviceId disambiguation dance needed the way the softer-verified
-   backup family requires.
+   an already-handled propose. Guarded here the same way the backup/
+   restore handshake family already guards against its own near-
+   simultaneous redelivery: isDuplicateInbound/DEDUP_WINDOW_MS.
 ── */
 async function handleX4DHPropose(msg) {
   if (!msg.from || !msg.to || !msg.sessionEpoch || !msg.ekPub || parseAddress(msg.to).id !== state.publicId) return;
@@ -1400,22 +1330,7 @@ async function handleX4DHPropose(msg) {
   markOnline(msg.from);
 
   // X4DH.md §13.2 — refuse a propose that isn't STRICTLY newer than
-  // whatever we already adopted for this device. Without this,
-  // storeX4DHSessionRK0 below overwrites unconditionally — including an
-  // already-upgraded RK1 session — and session:propose is durably
-  // buffered even after live delivery succeeds (same class as
-  // app:migrate/app:burn, see server.py), so a relay that replays an
-  // old, validly-signed propose (deliberately, or via a buffer bug)
-  // would silently regress the session with nothing noticing. `ts` is
-  // part of the signed payload (signX4DHPacket), so a replayed packet
-  // can't have its ts bumped without invalidating the signature — a
-  // genuinely fresher propose from the real sender always carries a
-  // genuinely fresher signed ts. Compared against the stored
-  // proposeTs (the sender's own clock), not establishedAt (our clock)
-  // — see storeX4DHSessionRK0's comment for why that split matters.
-  // No existing session, or one predating this guard with no
-  // proposeTs on file, simply has nothing to compare against — proceeds
-  // exactly as before.
+  // whatever we already adopted for this device.
   const existingSession = getX4DHSession(msg.from, theirDeviceId);
   if (existingSession && existingSession.proposeTs != null && msg.ts <= existingSession.proposeTs) {
     mlog.warn(`← X4DH_PROPOSE from ${pid(msg.from, { deviceId: theirDeviceId })} — stale (ts=${msg.ts} <= existing proposeTs=${existingSession.proposeTs}), refusing to regress session (stage=${existingSession.stage}), dropped`);
@@ -1454,8 +1369,7 @@ async function handleX4DHPropose(msg) {
 
 // handleX4DHAck(msg) — X4DH.md §6/§7.1. Looks up the pending proposal
 // this ack answers; a miss means stale/duplicate/already-upgraded/
-// timed-out and is dropped rather than guessed at (full replay/
-// staleness hardening beyond this is §13.2, deliberately not this pass).
+// timed-out and is dropped rather than guessed at.
 async function handleX4DHAck(msg) {
   if (!msg.from || !msg.to || !msg.sessionEpoch || !msg.ekPub || parseAddress(msg.to).id !== state.publicId) return;
   const contact = state.contacts[msg.from];
@@ -1523,6 +1437,69 @@ async function retryX4DHPropose(contactId, theirDeviceId) {
 }
 
 /* ══════════════════════════════════════════
+   PER-DEVICE FANOUT — X4DH-AWARE SEND (this pass)
+   Replaces the old "encrypt once, sendFanned(obj)" pattern that used to
+   live here — every ordinary message-send path (text/audio/image/
+   reaction/system call notice) now goes through this instead. Reuses
+   resolveDeviceTargets' existing targeted/broadcast split UNCHANGED —
+   only what happens to EACH targeted device is new: a device with ANY
+   X4DH session on file (rk0 or rk1 — see the design discussion this
+   pass came out of for why rk0 is included) gets its OWN ciphertext,
+   encrypted with that device's own wire key (getOrDeriveWireKey),
+   addressed directly. A device with no session yet falls back to the
+   legacy identity-level contact.encKey — still addressed directly if
+   its endpoint is known, so per-device ROUTING is unaffected either
+   way; only KEY SELECTION is new, and only once a session exists.
+
+   The broadcast fallback (bare `to`, unresolved/no-known-devices case)
+   always uses the legacy key — there's no single device to derive an
+   X4DH key FOR when addressing "every live session under this identity"
+   at once, so this path is unchanged from before X4DH existed.
+
+   blob/sig now legitimately DIFFER per destination (unlike the old
+   sendFanned, where one blob/sig pair was reused verbatim everywhere)
+   — this is the actual point of moving to per-device keys, not an
+   oversight. Callers cache only fanned.envelopes[0] in packetCache for
+   the ⓘ inspector — the payload is identical across every copy, so one
+   representative envelope is enough to inspect wire shape/sig format;
+   showing all N per-device ciphertexts wasn't judged worth the extra
+   UI complexity for a debug feature.
+══════════════════════════════════════════ */
+async function sendFannedX4DH(contactId, payload) {
+  const contact = state.contacts[contactId];
+  const { targeted, needsBroadcast } = resolveDeviceTargets(contactId);
+  let sent = false;
+  let x4dhCount = 0, legacyCount = 0;
+  const envelopes = [];
+
+  for (const { deviceId, endpointId } of targeted) {
+    const wireKey = await getOrDeriveWireKey(contactId, deviceId);
+    const key = wireKey || contact.encKey;
+    const blob = await encryptMessage(key, payload);
+    const sig  = await signBlob(blob);
+    const obj  = { type: "app:message", from: state.publicId, to: buildAddress(contactId, endpointId), blob, sig };
+    const viaRelay = sendToRelay(contactId, obj, true);
+    if (!viaRelay) sendSignal(obj);
+    sent = sent || viaRelay || state.ws?.readyState === WebSocket.OPEN;
+    if (wireKey) x4dhCount++; else legacyCount++;
+    envelopes.push(obj);
+  }
+
+  if (needsBroadcast) {
+    const blob = await encryptMessage(contact.encKey, payload);
+    const sig  = await signBlob(blob);
+    const obj  = { type: "app:message", from: state.publicId, to: contactId, blob, sig };
+    const viaRelay = sendToRelay(contactId, obj, true);
+    if (!viaRelay) sendSignal(obj);
+    sent = sent || viaRelay || state.ws?.readyState === WebSocket.OPEN;
+    legacyCount++;
+    envelopes.push(obj);
+  }
+
+  return { sent, targetedCount: targeted.length, broadcastSent: needsBroadcast, x4dhCount, legacyCount, envelopes };
+}
+
+/* ══════════════════════════════════════════
    PEER BACKUP DISTRIBUTION
    Protocol (non-self peers):
      1. sender → backup_offer  { from, to, size, ts, sig }
@@ -1558,6 +1535,12 @@ async function retryX4DHPropose(contactId, theirDeviceId) {
    an ACTIVELY WRONG signature (sig present, sender's key on file, doesn't
    check out — i.e. tampered in transit by the untrusted relay) is treated
    as tampering and dropped, logged either way.
+
+   NOTE: self-sync/backup traffic is deliberately OUT OF SCOPE for the
+   X4DH wire-key work above — it stays on state.cryptoKey (the backup
+   key) exactly as before. That's a different key hierarchy protecting
+   different content (encrypted contact-store snapshots, not live
+   message transit) and was never part of what this pass touches.
 
    Reused (not backup-specific despite the name history) by sync:restore_ack
    and sync:restore_push — both reachable from a non-mutual/unknown sender
@@ -1620,10 +1603,6 @@ async function pushBackupToContacts(blob) {
 		// OTHER device — accepted redundancy for now: merging the same
 		// backup blob twice is a no-op (mergeContactMeta/mergeMessages are
 		// idempotent), just wasted bandwidth, not a correctness problem.
-		// Excluding already-targeted sockets from the broadcast would need
-		// either a multi-exclude on deliver() or one broadcast per gap,
-		// neither of which earns its complexity yet — revisit once this is
-		// proven out on real traffic.
 		try {
 			const fingerprint = await computeBackupFingerprint();
 			const knownIds    = Object.keys(state.knownDeviceFingerprints);
@@ -2918,7 +2897,11 @@ const imageCache = {};
 // audioCache/imageCache above: a message from before this session (page
 // reload, or restored via backup/sync rather than sent/received live)
 // simply has no entry, and the inspector says so rather than fabricating
-// one.
+// one. As of the per-device X4DH wire-key pass, `envelope` here is only
+// ONE representative copy out of potentially several genuinely different
+// per-device ciphertexts (see sendFannedX4DH) — good enough to inspect
+// the payload/sig shape, not a claim that every device received this
+// exact blob.
 const packetCache = {};
 
 let mediaRecorder = null;
@@ -2983,19 +2966,15 @@ async function sendImageMessage(file) {
 
         sentN = nextSendCounter(state.currentChat);
         ackPointer = getAckPointer(state.currentChat) || {};
-        const payload   = { id, type: "image", data: base64, mimeType, ts, deviceId: state.deviceId, endpointId: state.endpointId, n: sentN, ...ackPointer, ...(relay ? { relay } : {}) };
-        const encrypted = await encryptMessage(contact.encKey, payload);
-        const sig       = await signBlob(encrypted);
+        const payload = { id, type: "image", data: base64, mimeType, ts, deviceId: state.deviceId, endpointId: state.endpointId, n: sentN, ...ackPointer, ...(relay ? { relay } : {}) };
 
         const encBlob = await encryptObject(state.encKey, { data: base64, mimeType });
         imageCache[id] = { encBlob, mimeType };
 
-        const imgMsgObj  = { type: "app:message", from: state.publicId,
-                   to: state.currentChat, blob: encrypted, sig };
-        packetCache[id] = { envelope: imgMsgObj, payload };
-        const fanned = sendFanned(state.currentChat, imgMsgObj);
+        const fanned = await sendFannedX4DH(state.currentChat, payload);
+        packetCache[id] = { envelope: fanned.envelopes[0] || null, payload };
         status = fanned.sent ? "sent" : "failed";
-        mlog.info(`→ IMAGE        to   ${pid(state.currentChat)}  ${w}×${h}  ${fanned.targetedCount} targeted${fanned.broadcastSent ? " + broadcast" : ""}${!fanned.sent ? " — nowhere, no open socket" : ""}`);
+        mlog.info(`→ IMAGE        to   ${pid(state.currentChat)}  ${w}×${h}  ${fanned.targetedCount} targeted (${fanned.x4dhCount} x4dh, ${fanned.legacyCount} legacy)${fanned.broadcastSent ? " + broadcast" : ""}${!fanned.sent ? " — nowhere, no open socket" : ""}`);
       } catch(e) {
         mlog.err(`→ IMAGE        to   ${pid(state.currentChat)} — send failed: ${e.message}`);
       }
@@ -3029,23 +3008,18 @@ async function sendAudioMessage(blob) {
       const me       = state.contacts[state.publicId];
       const relay    = me?.lastRelay ? { wss: me.lastRelay } : undefined;
 
-      // encrypt for transit
       sentN = nextSendCounter(state.currentChat);
       ackPointer = getAckPointer(state.currentChat) || {};
-      const payload   = { id, type: "audio", data: base64, mimeType, ts, deviceId: state.deviceId, endpointId: state.endpointId, n: sentN, ...ackPointer, ...(relay ? { relay } : {}) };
-      const encrypted = await encryptMessage(contact.encKey, payload);
-      const sig       = await signBlob(encrypted);
+      const payload = { id, type: "audio", data: base64, mimeType, ts, deviceId: state.deviceId, endpointId: state.endpointId, n: sentN, ...ackPointer, ...(relay ? { relay } : {}) };
 
       // store encrypted in memory cache — never raw
       const encBlob = await encryptObject(state.encKey, { data: base64, mimeType });
       audioCache[id] = { encBlob, mimeType };
 
-      const audioMsgObj = { type: "app:message", from: state.publicId,
-               to: state.currentChat, blob: encrypted, sig };
-      packetCache[id] = { envelope: audioMsgObj, payload };
-      const fanned = sendFanned(state.currentChat, audioMsgObj);
+      const fanned = await sendFannedX4DH(state.currentChat, payload);
+      packetCache[id] = { envelope: fanned.envelopes[0] || null, payload };
       status = fanned.sent ? "sent" : "failed";
-      mlog.info(`→ AUDIO        to   ${pid(state.currentChat)}  size=${blob.size}b  ${fanned.targetedCount} targeted${fanned.broadcastSent ? " + broadcast" : ""}${!fanned.sent ? " — nowhere, no open socket" : ""}`);
+      mlog.info(`→ AUDIO        to   ${pid(state.currentChat)}  size=${blob.size}b  ${fanned.targetedCount} targeted (${fanned.x4dhCount} x4dh, ${fanned.legacyCount} legacy)${fanned.broadcastSent ? " + broadcast" : ""}${!fanned.sent ? " — nowhere, no open socket" : ""}`);
     } catch(e) {
       mlog.err(`→ AUDIO        to   ${pid(state.currentChat)} — send failed: ${e.message}`);
     }
@@ -3186,23 +3160,86 @@ async function togglePushPref(enabled) {
 /* ══════════════════════════════════════════
    MESSAGING
 ══════════════════════════════════════════ */
+
+/* ── trial decryption across candidate keys (X4DH-aware) ──
+   deviceId — the piece of information that would tell us WHICH key to
+   use — lives INSIDE the encrypted payload by deliberate design (see
+   protocol.md's Device Identity section: moved there specifically so
+   the relay can never see or rewrite it). That means the recipient
+   can't know which key applies before decrypting, the same chicken-
+   and-egg any per-device-keyed scheme built this way runs into — there
+   is no relay-visible field we can safely reuse for this without
+   reopening exactly the exposure that move was meant to close.
+
+   Resolved by trying every candidate key held for this sender until one
+   succeeds. AES-GCM's auth tag makes a wrong-key attempt fail cleanly
+   and immediately (a rejected crypto.subtle.decrypt, not a corrupted
+   result), so this costs a handful of failed decrypt calls at worst —
+   bounded by how many devices a contact runs, typically 1-3 — never a
+   false positive. Order: every X4DH session held for this contact (any
+   stage — rk0 is eligible, see the design discussion this pass came out
+   of for why), most-recently-established first as a cheap "most likely
+   still active" heuristic, then the legacy identity-level key last,
+   since a device that's completed X4DH bootstrap no longer sends under
+   the old key at all.
+
+   Returns { plain, viaX4DH, theirDeviceId } — theirDeviceId is set only
+   when an X4DH candidate was the one that worked. Throws if every
+   candidate fails, same failure shape decryptMessage itself already
+   has — callers catch this exactly as before.
+── */
+async function decryptIncomingMessage(fromId, blob) {
+  const contact  = state.contacts[fromId];
+  const sessions = state.x4dhSessions[fromId] || {};
+  const candidates = Object.entries(sessions)
+    .sort(([, a], [, b]) => (b.establishedAt || 0) - (a.establishedAt || 0));
+
+  for (const [theirDeviceId] of candidates) {
+    const wireKey = await getOrDeriveWireKey(fromId, theirDeviceId);
+    if (!wireKey) continue;
+    try {
+      const plain = await decryptMessage(blob, wireKey);
+      return { plain, viaX4DH: true, theirDeviceId };
+    } catch(e) { /* wrong key for this device — try the next candidate */ }
+  }
+
+  // legacy identity-level key — last resort, covers any device that
+  // hasn't bootstrapped an X4DH session yet (or never will)
+  const plain = await decryptMessage(blob, contact.encKey);
+  return { plain, viaX4DH: false, theirDeviceId: null };
+}
+
 async function receiveMessage(msg) {
   if (!msg.from || !msg.blob) return;
   const contact = state.contacts[msg.from];
   if (!contact || contact.blocked) return;
   markOnline(msg.from);
   try {
-    let plain, valid;
-    plain = await decryptMessage(msg.blob, contact.encKey);
+    let plain, valid, viaX4DH, matchedDeviceId;
+    ({ plain, viaX4DH, theirDeviceId: matchedDeviceId } = await decryptIncomingMessage(msg.from, msg.blob));
     valid = msg.sig && contact.signPublicKey
       ? verifyBlob(msg.blob, msg.sig, contact.signPublicKey)
       : false;
 
+    // Belt-and-suspenders consistency check: a successful decrypt under
+    // a specific device's X4DH session key means that ciphertext was
+    // genuinely produced by whoever holds THAT session's key (AES-GCM's
+    // auth tag rules out a wrong-key false positive) — so plain.deviceId,
+    // the sender's own claim about which device sent this, should always
+    // agree with matchedDeviceId. A mismatch shouldn't be reachable in
+    // practice; treated the same as a bad signature (flagged, not
+    // dropped) rather than silently trusted, since it would mean
+    // something is wrong with session bookkeeping worth a human seeing.
+    if (viaX4DH && valid && matchedDeviceId && plain.deviceId && matchedDeviceId !== plain.deviceId) {
+      mlog.warn(`← MSG          from ${pid(msg.from)} — decrypted under ${pid(matchedDeviceId)}'s X4DH key but payload claims deviceId=${pid(plain.deviceId)} — mismatch, treating as unverified`);
+      valid = false;
+    }
+
     // Duplicate-delivery guard (0.4.9) — a targeted send and the
     // identity-level broadcast fallback are NOT mutually exclusive: a
     // device resolved enough to get its own targeted copy (see
-    // resolveDeviceTargets/sendFanned above) is still a live member of
-    // its identity's broadcast set, so it can legitimately receive the
+    // resolveDeviceTargets/sendFannedX4DH above) is still a live member
+    // of its identity's broadcast set, so it can legitimately receive the
     // SAME message twice — once via deliver_to_endpoint, once via
     // deliver() — whenever any OTHER device of the same contact is
     // unresolved/stale and forces the broadcast fallback too.
@@ -3246,7 +3283,7 @@ async function receiveMessage(msg) {
     // isn't safe to trust even for display, since the outer envelope's
     // deviceId doesn't exist anymore (it moved inside the signed payload).
     const fromDisp = valid ? pid(msg.from, { deviceId: plain.deviceId, endpointId: plain.endpointId }) : pid(msg.from);
-    mlog.info(`← MSG          from ${fromDisp}  sig:${valid ? "✓" : "✗"}`);
+    mlog.info(`← MSG          from ${fromDisp}  sig:${valid ? "✓" : "✗"}  key:${viaX4DH ? "x4dh" : "legacy"}`);
 
     const msgObj = { id: plain.id, from: msg.from, ts: plain.ts || Date.now(), valid };
     // persist the sender's per-device send counter locally too, not just
@@ -3341,9 +3378,13 @@ async function receiveMessage(msg) {
    Decryption is identical to a regular message — always state.encKey,
    regardless of sender, since this scheme is symmetric (a contact who
    has your shareableKey already holds the same key you decrypt with).
-   Signature is verified the same way receiveMessage does it — this packet
-   redirects routing, so unlike most other packet types it must NOT be
-   trusted on decryption success alone. The relay is untrusted
+   Deliberately OUT OF SCOPE for the X4DH wire-key pass — app:migrate is
+   never device-targeted by protocol design (see server.py/protocol.md),
+   so there is no single device pair to derive an X4DH key against;
+   this stays on the legacy identity-level key permanently, not just for
+   now. Signature is verified the same way receiveMessage does it — this
+   packet redirects routing, so unlike most other packet types it must
+   NOT be trusted on decryption success alone. The relay is untrusted
    infrastructure; cryptographic proof is the only trust boundary.
    The two branches below only diverge in what happens AFTER decrypt:
      - from a contact  → same passive learning already used for relay
@@ -3433,10 +3474,13 @@ async function handleMigrate(msg) {
    BURN NOTICE — receive side
    Packet: { type: "app:burn", from, to, blob: encrypted{ts}, sig }
    Decryption is identical to a regular message/migrate — always
-   state.encKey, symmetric scheme. Signature verification is NOT
-   optional here, same rule as app:migrate and the call:* group:
-   this packet drives an irreversible action, so an unsigned or
-   invalid one is dropped outright rather than flagged and shown.
+   state.encKey, symmetric scheme. Same "OUT OF SCOPE for X4DH wire keys,
+   permanently" reasoning as app:migrate above — never device-targeted
+   by protocol design, so there's no per-device key to switch to.
+   Signature verification is NOT optional here, same rule as app:migrate
+   and the call:* group: this packet drives an irreversible action, so
+   an unsigned or invalid one is dropped outright rather than flagged
+   and shown.
  
    Two branches:
      - from self        → another of our own devices burned (or we
@@ -3530,7 +3574,10 @@ async function burnBlockContact(id) {
    (deliberately — see chat discussion: a "this identity was burned
    here" notice was considered and dropped, since credentials are
    credentials and we can't actually stop a re-login anyway, only
-   pretend to).
+   pretend to). X4DH session state (rootKeys, retry bookkeeping) lives
+   under X4DH_SESSION_KEY, wiped here same as everything else — the
+   in-memory x4dhWireKeyCache simply becomes garbage on reload, nothing
+   extra needed for it.
 ══════════════════════════════════════════ */
 function selfDestruct() {
   const suffix = "_" + state.publicId;
@@ -3701,14 +3748,11 @@ async function sendMessage() {
     sentN = nextSendCounter(state.currentChat);
     ackPointer = getAckPointer(state.currentChat) || {};
     const payload = { id, text, ts, deviceId: state.deviceId, endpointId: state.endpointId, n: sentN, ...ackPointer, ...(relay ? { relay } : {}) };
-    const blob   = await encryptMessage(contact.encKey, payload);
-    const sig    = await signBlob(blob);
 
-    const msgObj = { type: "app:message", from: fromId, to: contact.publicId, blob, ...(sig ? { sig } : {}) };
-    packetCache[id] = { envelope: msgObj, payload };
-    const fanned = sendFanned(state.currentChat, msgObj);
+    const fanned = await sendFannedX4DH(state.currentChat, payload);
+    packetCache[id] = { envelope: fanned.envelopes[0] || null, payload };
     status = fanned.sent ? "sent" : "failed";
-    mlog.info(`→ MSG          to   ${pid(state.currentChat)}  ${fanned.targetedCount} targeted${fanned.broadcastSent ? " + broadcast" : ""}${!fanned.sent ? " — nowhere, no open socket" : ""}`);
+    mlog.info(`→ MSG          to   ${pid(state.currentChat)}  ${fanned.targetedCount} targeted (${fanned.x4dhCount} x4dh, ${fanned.legacyCount} legacy)${fanned.broadcastSent ? " + broadcast" : ""}${!fanned.sent ? " — nowhere, no open socket" : ""}`);
     mlog.debug(`MSG content: "${text.slice(0,40)}${text.length>40?"…":""}"  id=${id}`);
   } catch(e) {
     mlog.err(`→ MSG          to   ${pid(state.currentChat)} — send failed: ${e.message}`);
@@ -3737,23 +3781,18 @@ async function sendReaction(targetMsgId, emoji, contactId = state.currentChat) {
   const ts  = Date.now();
   const me    = state.contacts[state.publicId];
   const relay = me?.lastRelay ? { wss: me.lastRelay } : undefined;
-  const payload  = { id, type: "reaction", targetId: targetMsgId, emoji, ts, deviceId: state.deviceId, endpointId: state.endpointId, ...(relay ? { relay } : {}) };
-  const blob     = await encryptMessage(contact.encKey, payload);
-  const sig      = await signBlob(blob);
+  const payload = { id, type: "reaction", targetId: targetMsgId, emoji, ts, deviceId: state.deviceId, endpointId: state.endpointId, ...(relay ? { relay } : {}) };
 
-  const reactMsgObj = { type: "app:message", from: state.publicId, to: contactId, blob, sig };
-  const fanned = sendFanned(contactId, reactMsgObj);
+  const fanned = await sendFannedX4DH(contactId, payload);
   const msgObj = { id, from: state.publicId, type: "reaction", targetId: targetMsgId, emoji, ts, valid: true, deviceId: state.deviceId };
   contact.messages = mergeMessages(contact.messages, [msgObj]);
-  // Fanned deliberately, same as the four message-send paths above — a
-  // RECEIVED auto-ack (emoji:null) reaching only ONE of the sender's own
-  // devices would leave their OTHER devices stuck showing "sent" (✔️)
-  // forever for a message that genuinely was delivered, since nothing
-  // else would ever flip that status on those devices. A real emoji pick
-  // gets the same treatment for consistency, though the stakes there are
-  // lower (a missing emoji on a sibling device self-corrects on the next
-  // periodic self-sync backup push either way).
-  mlog.info(`→ REACTION     to   ${pid(contactId)}  target=${pid(targetMsgId)}  emoji=${emoji || "nil"}  ${fanned.targetedCount} targeted${fanned.broadcastSent ? " + broadcast" : ""}`);
+  // Fanned deliberately, same as the other send paths — a RECEIVED
+  // auto-ack (emoji:null) reaching only ONE of the sender's own devices
+  // would leave their OTHER devices stuck showing "sent" (✔️) forever for
+  // a message that genuinely was delivered, since nothing else would
+  // ever flip that status on those devices. A real emoji pick gets the
+  // same treatment for consistency.
+  mlog.info(`→ REACTION     to   ${pid(contactId)}  target=${pid(targetMsgId)}  emoji=${emoji || "nil"}  ${fanned.targetedCount} targeted (${fanned.x4dhCount} x4dh, ${fanned.legacyCount} legacy)${fanned.broadcastSent ? " + broadcast" : ""}`);
   await saveContacts();
   // only the currently-open chat needs a re-render — an auto-ack fired
   // for some other contact shouldn't repaint whatever chat is on screen
@@ -3772,6 +3811,14 @@ async function sendReaction(targetMsgId, emoji, contactId = state.currentChat) {
    rejection lives HERE, not in statemachine.js — by the time
    transition() is called, the "is this for the call in flight, or from
    one of our own devices, or stale" question has already been resolved.
+
+   call:offer/answer/ice DO carry an encrypted blob (SDP/ICE), but this
+   is deliberately OUT OF SCOPE for the X4DH wire-key pass — rtcConns is
+   keyed by contactId, not deviceId (a call target isn't currently
+   device-aware the way ordinary messages are), so there's no single
+   device pair to derive a key against here yet. Stays on the legacy
+   identity-level key; folding calls into per-device keying is its own
+   follow-on scope (see the earlier design discussion).
 ══════════════════════════════════════════ */
 
 function signCallPacket(obj) {
@@ -3806,7 +3853,7 @@ function sendCallPacket(toId, type, callId) {
 /* ── call notice — a real, encrypted app:message artifact left in the
    chat at the moment a call is attempted. Unlike call:invite (signed
    only, never buffered, live-only delivery), this rides the SAME channel
-   as a normal text message — same encryption, same auto-ack, same
+   as a normal text message — same X4DH-aware fanout, same auto-ack, same
    offline-buffer + push-notify path server-side. That's the whole point:
    a callee who's offline gets a push for this the same way they'd get
    one for any other message, and both sides keep a visible record of the
@@ -3845,14 +3892,11 @@ async function sendCallNotice(id) {
     ackPointer = getAckPointer(id) || {};
     const payload = { id: msgId, type: "system", kind: "call", text, ts,
                        deviceId: state.deviceId, endpointId: state.endpointId, n: sentN, ...ackPointer, ...(relay ? { relay } : {}) };
-    const blob    = await encryptMessage(contact.encKey, payload);
-    const sig     = await signBlob(blob);
 
-    const noticeObj = { type: "app:message", from: state.publicId, to: id, blob, sig };
-    packetCache[msgId] = { envelope: noticeObj, payload };
-    const fanned = sendFanned(id, noticeObj);
+    const fanned = await sendFannedX4DH(id, payload);
+    packetCache[msgId] = { envelope: fanned.envelopes[0] || null, payload };
     status = fanned.sent ? "sent" : "failed";
-    mlog.info(`→ CALL_NOTICE  to   ${pid(id)}  ${fanned.targetedCount} targeted${fanned.broadcastSent ? " + broadcast" : ""}${!fanned.sent ? " — nowhere, no open socket" : ""}`);
+    mlog.info(`→ CALL_NOTICE  to   ${pid(id)}  ${fanned.targetedCount} targeted (${fanned.x4dhCount} x4dh, ${fanned.legacyCount} legacy)${fanned.broadcastSent ? " + broadcast" : ""}${!fanned.sent ? " — nowhere, no open socket" : ""}`);
   } catch(e) {
     mlog.err(`→ CALL_NOTICE  to   ${pid(id)} — send failed: ${e.message}`);
   }
@@ -4543,7 +4587,10 @@ async function addContact(name,shareableKey,save=true,type="human"){
   // encKey is derived via ECDH, not imported off the wire — this contact's
   // x25519PublicKey is public by design (it's what's in the QR code), but
   // the AES key it produces is the shared secret only WE and THEY can
-  // compute, not anyone else holding this same shareable address.
+  // compute, not anyone else holding this same shareable address. This
+  // remains the LEGACY/fallback identity-level key even after the X4DH
+  // wire-key work — see its own section further up for what supersedes
+  // it per device pair once a session exists.
   const encKey=await deriveSharedAesKey(state.x25519Seed,x25519PublicKey);
   state.contacts[publicId]={name,publicId,shareableKey,encKey,x25519PublicKey,signPublicKey,messages:[],
     lastRelay:relayWss||null, type: type==="agent"?"agent":"human"};
