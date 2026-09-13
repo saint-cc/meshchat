@@ -4,15 +4,21 @@
 >
 > It establishes a usable session immediately when the recipient is offline, and opportunistically upgrades that session when both devices are online.
 
-**Status: root-key establishment, the fixed-initiator trigger (§13.3, both contact and self-pairs), a stuck-at-RK0 detector, a propose-freshness/downgrade guard (both §13.2), and a manual re-propose retry for the detector's initiator-side stuck case are implemented and confirmed live on meshdev. The retry is console-only (`retryX4DHPropose`), not yet wired to fire automatically — no cap, backoff, or re-arm-on-reconnect logic exists yet, so it must not be called repeatedly against a peer that stays unreachable. The responder-side stuck case (endpoint unknown at propose time) remains detection-only.**
+**Status: root-key establishment, the fixed-initiator trigger (§13.3, both contact and self-pairs), a stuck-at-RK0 detector, a propose-freshness/downgrade guard (both §13.2), and both manual and automatic re-propose retry for the detector's initiator-side stuck case are implemented and confirmed live on meshdev. Automatic retry is bounded (10 attempts), gated strictly on genuine online-transitions for the affected contact (never on routine re-confirmation of an already-known-online peer, never on a raw timer), and re-arms its budget on the next transition after exhaustion — confirmed live, including a full stuck → automatic-retry → real `session:ack` → RK1 convergence against a genuinely-occurring stuck session, not a manufactured one. The one piece of this specific mechanism not yet directly observed is the exhausted → re-armed transition itself in isolation (see the note at the end of this Status block). The responder-side stuck case (endpoint unknown at propose time) remains detection-only by design — nothing on the responder's own device can fix it — and has been separately confirmed to self-heal via ordinary passive endpoint discovery (§13.3) once traffic teaches it the missing endpoint, independent of any retry mechanism.**
+
+**As of the same work cycle: the session's root key (RK0 or RK1, whichever a device pair's session currently holds) is now the actual encryption key for real `app:message` traffic on that device pair — see §16 for the full mechanism. This replaces the old identity-level static key as the default for any device pair with an established session, with graceful per-device fallback to the legacy key everywhere a session doesn't yet exist. This is implemented, live, and is now the sole encryption path `app:message` sends go through (the previous identity-only fanout code was removed, not left as a parallel path) — every text/audio/image/reaction/system-notice send since this pass landed has exercised it.**
 
 `sendX4DHPropose`/`handleX4DHPropose`/`handleX4DHAck` work end to end — verified on `meshdev` with two live identities converging on byte-identical `RK1` over a real relay round trip, and, separately, between two devices sharing one identity (the `isFixedInitiator` self-tiebreak, §13.1) over the same relay. `maybeTriggerX4DHPropose` runs on every `recordKnownDevice()` call — every message receipt for contacts, and every self-sync backup accept/push for self — and proposes the instant the fixed-initiator side has both no existing session for that device and a known `endpointId` for it (§13.3's precondition). Confirmed live and unprompted in three shapes: a brand-new contact pair, a new device added to an already-established contact pair, and a self-pair discovering the sibling device's endpoint fresh via an ordinary self-chat message.
 
-Two pieces of §13.2 hardening have since landed. **Stuck-at-RK0 detection** (`checkStuckX4DHSessions`, hooked into `markOnline()`) flags a session sitting at `RK0` for more than 2× the proposal timeout while presence confirms the other side is actually online — detection only, no retry. Confirmed on both roles it's meant to cover: the initiator case (never got `session:ack` back) via a manufactured stuck session written directly into `state.x4dhSessions`, and the responder case (never learned the sender's `endpointId` in time to ack) via a genuine, unprompted occurrence during unrelated testing — a real device pair actually hit this state and the detector caught it on its own, with no test scaffolding involved. **A propose-freshness guard** in `handleX4DHPropose` now refuses to adopt a `session:propose` whose signed `ts` isn't strictly newer than the session's own stored `proposeTs` (a new field, deliberately compared sender-clock-to-sender-clock rather than against the receiver's local `establishedAt`, so ordinary cross-device clock skew can never read as a replay) — closing the silent-downgrade gap a durably-buffered (`DURABLE_KINDS`) `session:propose` otherwise leaves open. Confirmed against a live forged-but-validly-signed stale propose, and again, separately, when that exact same packet came back out of the relay's own durable buffer later — arguably the more realistic version of the replay this guard exists to stop, and not something that was deliberately engineered for the test.
+Two pieces of §13.2 hardening have since landed. **Stuck-at-RK0 detection** (`checkStuckX4DHSessions`, hooked into `markOnline()`) flags a session sitting at `RK0` for more than 2× the proposal timeout while presence confirms the other side is actually online — logging always fires on this signal; automatic retry is gated separately (see below). Confirmed on both roles it's meant to cover: the initiator case (never got `session:ack` back) via both a manufactured stuck session and multiple genuinely-occurring ones, and the responder case (never learned the sender's `endpointId` in time to ack) via a genuine, unprompted occurrence during unrelated testing — a real device pair actually hit this state and the detector caught it on its own, with no test scaffolding involved. **A propose-freshness guard** in `handleX4DHPropose` now refuses to adopt a `session:propose` whose signed `ts` isn't strictly newer than the session's own stored `proposeTs` (a new field, deliberately compared sender-clock-to-sender-clock rather than against the receiver's local `establishedAt`, so ordinary cross-device clock skew can never read as a replay) — closing the silent-downgrade gap a durably-buffered (`DURABLE_KINDS`) `session:propose` otherwise leaves open. Confirmed against a live forged-but-validly-signed stale propose, and again, separately, when that exact same packet came back out of the relay's own durable buffer later — arguably the more realistic version of the replay this guard exists to stop, and not something that was deliberately engineered for the test.
 
-**A manual retry for the initiator-side stuck case has since been confirmed live, twice, against two independently-occurring stuck sessions on meshdev** (not manufactured — both surfaced naturally via `checkStuckX4DHSessions`' own `mlog.warn`, one after ~140s, timing consistent with §13.2's threshold). `retryX4DHPropose(contactId, theirDeviceId)` — console-only, not wired into any automatic trigger — refuses outright unless a session exists, is genuinely at `stage: "rk0"`, and we're the fixed initiator for the pair; otherwise it calls `sendX4DHPropose` again exactly as if it were a fresh bootstrap. Confirmed both times: a new `sessionEpoch` establishes a new `RK0` cleanly (`storeX4DHSessionRK0`'s unconditional overwrite, already relied on for the normal handshake, behaves identically here), the old epoch's `pendingX4DHProposals` entry doesn't interfere, and a subsequent `session:ack` upgrades to `RK1` normally. **Not yet observed**: whether a stray late `ack` for the *superseded* epoch ever arrives and gets correctly dropped by `upgradeX4DHSessionToRK1`'s epoch-match guard — neither test happened to produce one, so this remains a reasoned expectation from the code, not an observed result.
+**Retry — both manual and automatic — has since been confirmed live against real stuck sessions.** `retryX4DHPropose(contactId, theirDeviceId)` — console-only, callable directly or invoked by the automatic path below — refuses outright unless a session exists, is genuinely at `stage: "rk0"`, and we're the fixed initiator for the pair; otherwise it calls `sendX4DHPropose` again exactly as if it were a fresh bootstrap. The manual path was confirmed twice against independently-occurring stuck sessions (not manufactured), each time re-establishing a new `sessionEpoch` cleanly and converging to `RK1` normally on the subsequent `session:ack`.
 
-Still open: no retry or reset exists for a session the detector flags as stuck — that's explicitly deferred to the not-yet-designed session-reset mechanism (see `Roadmap.md`). Client/protocol version is `0.5.0` as of this work — bumped as a development-cycle marker (this branch stays on `meshdev`, not pushed to the public repo, until the cycle is finished) rather than a claim that X4DH is feature-complete. The root-key KDF construction (§6.1) is fully specified; chain-key derivation and the rest of the Double Ratchet remain a separate, not-yet-scoped design session (see `Roadmap.md`).
+**Automatic retry** (`maybeAutoRetryX4DH`, called only from `checkStuckX4DHSessions` on a genuine `false→true` presence transition for the affected contact) wraps the same manual mechanism with a bounded budget: up to `MAX_X4DH_RETRY_ATTEMPTS` (10) real fired retries per (contact, device) session, tracked as `retryAttempts`/`retryExhaustedAt`/`lastRetryAt` fields on the session object itself, carried forward across every session overwrite (a retry's own fresh `RK0` does not reset the counter). A retry that internally refuses (no session / wrong stage / not the fixed initiator) costs nothing from the budget, since nothing was actually sent. Reaching the budget sets `retryExhaustedAt` and switches the log line to a distinguishable "retries exhausted" warning rather than going silent; a fresh online-transition arriving after exhaustion is itself the re-arm event, clearing the flag and immediately spending the first attempt of a new budget in the same call. **Confirmed live**: an automatic retry fired against a genuinely stuck initiator-side session, completed a real `sendX4DHPropose` → `session:ack` round trip once the target endpoint became known through ordinary traffic, and converged to `RK1` with the retry counter correctly reset to zero on success — end to end, no manual intervention beyond the presence transition itself. **Not yet directly observed in isolation**: the exhausted-budget → re-armed transition sequence on its own. This is a reasoned-not-observed gap, not a suspected bug — the console-only `x4dhDebug.forceStuck()` helper used for earlier detector testing cannot fake a genuinely live peer relationship (it doesn't know a real `endpointId`), so exercising the full exhaustion path requires either a peer that will provably never respond (a fabricated, unroutable endpoint) or patience with a real one; this remains open for a dedicated test rather than something inferred as broken.
+
+`window.x4dhDebug` (console-only, not wired into any UI or automatic path) provides `list()` (session/stage/age/retry-state dump across every contact/device), `retry(contactId, deviceId)` (thin wrapper over the manual path, unaffected by the automatic budget), `forceStuck(contactId, deviceId, opts)` (manufactures an RK0 session sitting past the stuck threshold, with a chosen starting `retryAttempts`/`exhausted` state — does **not** fake `endpointId` or override the real `isFixedInitiator` comparison, both of which are read live from actual identity material), `simulateTransition(contactId)` (drives the detector with `isTransition=true` without waiting for a real presence signal), and `check(contactId, deviceId)` (surfaces the live `isFixedInitiator`/`endpointKnown`/session state in one call — the fastest way to see *why* a forced test isn't progressing, e.g. a null `endpointKnown` explains a silent `sendX4DHPropose` refusal that would otherwise only show up as a console-level `mlog.debug` line).
+
+Client/protocol version is `0.5.0` as of this work — bumped as a development-cycle marker (this branch stays on `meshdev`, not pushed to the public repo, until the cycle is finished) rather than a claim that X4DH is feature-complete. The root-key KDF construction (§6.1) and the wire-message key derivation built on top of it (§16) are both fully specified and live; chain-key derivation and the rest of the Double Ratchet remain a separate, not-yet-scoped design session (see `Roadmap.md`).
 
 ---
 
@@ -339,7 +345,7 @@ Using `RK0` itself as Stage 2's **salt** — rather than concatenating all four 
 
 Both `info` strings are fixed, ASCII-only literals, matching every other domain-separation label already in this codebase (`meshchat-v1:x25519`, `meshchat-v1:pairwise`, `meshchat-v1:device-endpoint`) — no non-ASCII characters, since a label that has to byte-for-byte match across two independent implementations is exactly the wrong place for anything that could silently mis-encode. They're versioned (`/root` vs. `/root-v2`) purely to keep the two stages cryptographically distinguishable from one another; `sessionEpoch` and device identifiers are deliberately **not** mixed into either string — see §11 for why domain separation and session freshness are being kept as two separate concerns here.
 
-**Deliberately out of scope here: chain keys.** Deriving `CK_A→B`/`CK_B→A` directly from `RK0`/`RK1` at handshake time is tempting but premature — X4DH stops at the root key (§15). Symmetrically deriving both directions' chain keys from one shared root before any real ratchet step exists would also be a materially *weaker* construction than an actual Double Ratchet, not a simplified version of one: in Signal's design, the first sending chain key exists on only one side until the other side's first DH-ratchet reply arrives, and that asymmetry is precisely where the self-healing property against a one-time key compromise comes from. How chain keys get seeded from `RK0`/`RK1` is a decision for the dedicated ratchet-design session flagged in `Roadmap.md` (which deliberately wants Signal Sesame, Matrix Olm/Megolm, Session, and SimpleX surveyed fresh before committing to a shape), not something to pre-empt here.
+**Deliberately out of scope here: chain keys.** Deriving `CK_A→B`/`CK_B→A` directly from `RK0`/`RK1` at handshake time is tempting but premature — X4DH stops at the root key (§15). Symmetrically deriving both directions' chain keys from one shared root before any real ratchet step exists would also be a materially *weaker* construction than an actual Double Ratchet, not a simplified version of one: in Signal's design, the first sending chain key exists on only one side until the other side's first DH-ratchet reply arrives, and that asymmetry is precisely where the self-healing property against a one-time key compromise comes from. How chain keys get seeded from `RK0`/`RK1` is a decision for the dedicated ratchet-design session flagged in `Roadmap.md` (which deliberately wants Signal Sesame, Matrix Olm/Megolm, Session, and SimpleX surveyed fresh before committing to a shape), not something to pre-empt here. §16 below is a deliberate, scoped-down interim step in the meantime — a static per-session wire key, not a ratchet — see that section for the full reasoning on why it's acceptable to ship ahead of the ratchet work rather than a shortcut around it.
 
 ---
 
@@ -377,7 +383,7 @@ IK_A                                       IK_B
   └────────── Double Ratchet ────────────────┘
 ```
 
-(See §6.1 for the exact two-stage HKDF construction both sides run to reach `RK₀`/`RK₁`.)
+(See §6.1 for the exact two-stage HKDF construction both sides run to reach `RK₀`/`RK₁`, and §16 for what a device pair's session key is actually used for once established.)
 
 The important distinction is:
 
@@ -469,6 +475,8 @@ Double Ratchet
    └── ...
 ```
 
+Note: as of §16, the diagram's bottom half ("Double Ratchet" deriving per-message keys) is still aspirational — the real, shipped state today is Root Key → one static wire key per session, reused for every message under it. §16 is explicit about this being an interim step, not a claim that the Double Ratchet box above is already built.
+
 ---
 
 # 10. The Initial Asymmetry
@@ -508,7 +516,9 @@ gap the live upgrade below closes, symmetrically, for both sides.
 
 Consequently, the initial 2DH state should **not** be described as having
 the full forward-secrecy properties of a completed ephemeral-to-ephemeral
-handshake.
+handshake. This is the specific property §16.2 refers to when it explains
+why RK0 is accepted for wire encryption anyway — a deliberate, disclosed
+trade-off, not an unnoticed gap.
 
 The live upgrade adds Bob's fresh ephemeral key:
 
@@ -586,6 +596,8 @@ This value distinguishes independent attempts to establish sessions between the 
 `sessionEpoch`, `deviceId`, and both identities instead live where they're actually enforced: inside the **signed** fields of `session:propose`/`session:ack` (§4, §13). The signature is what binds a given root key to a specific claimed session/device pair; the KDF's job is only to turn DH outputs into key bytes, with `info` providing fixed domain separation between the root key and any other future purpose this HKDF chain might need to serve (see §6.1) — not per-session uniqueness, which the ephemeral keys already guarantee on their own.
 
 This still prevents otherwise identical key material from being interpreted as the same protocol session — the guarantee just comes from freshness plus authentication, rather than from the KDF's `info` string carrying session metadata directly.
+
+Note for §16: the wire-message key inherits this same property indirectly. Since it's derived from whichever root key a session currently holds, and a session reset (retry) always produces a fresh `sessionEpoch` with fresh ephemerals, a superseded session's wire key can never be silently reproduced by a later reset — the two epochs' root keys, and therefore their wire keys, are unrelated values.
 
 ---
 
@@ -697,6 +709,8 @@ session's own establishment time for that device — a cheap, sufficient
 guard against a delayed duplicate regressing an already-upgraded
 session.
 
+**Stuck-at-RK0 detection and retry** (implemented, confirmed live — see the Status block at the top of this document) are what turn this section's replay-hardening rules into a self-correcting system rather than a purely defensive one: a session that ends up stuck despite the guards above (a dropped `session:ack`, most commonly) is now flagged automatically the next time presence confirms the peer is online, and — for the initiator-side shape specifically — automatically re-proposed within a bounded retry budget. See the Status block and Roadmap.md for the full mechanics; this subsection remains the specification of *why* staleness matters, not the retry logic itself.
+
 ## 13.3 Precondition: `to`'s endpoint must already be known
 
 `session:propose` is addressed `to = "<publicId>::<endpointId>"` — a
@@ -719,6 +733,14 @@ blocked waiting on this — ordinary messages continue over the static
 key for as long as no session exists for the target device, and
 transparently start riding the session the moment 13.1's proposal
 completes.
+
+This same passive-discovery mechanism is also what lets a responder-side
+stuck session (§13.2, the "endpoint unknown at propose time" shape)
+self-heal on its own — confirmed live: a session flagged as stuck in
+this shape reached `RK1` cleanly once ordinary traffic taught the
+missing `endpointId`, with no retry mechanism involved at all. The
+detector for this shape exists to make the *symptom* visible, not
+because the underlying gap has no path to recovery.
 
 ---
 
@@ -810,9 +832,61 @@ A conceptual session therefore looks like:
           message keys
 ```
 
+**This diagram describes the eventual target shape, not what's shipped today.** As of §16, the box actually in production between "Root Key" and real wire traffic is a single static per-session key derivation — not the Double Ratchet pictured above. §16 documents exactly what stands in for the Double Ratchet's box in the meantime, and why that's an accepted, disclosed interim state rather than an oversight.
+
 ---
 
-# 16. Why Not X3DH?
+# 16. Wire-Message Encryption (Interim, Pre-Ratchet)
+
+**Status: implemented and confirmed live**, landed in the same work cycle as automatic retry (see the Status block at the top of this document). This section documents what actually encrypts real `app:message` traffic today, sitting in the gap between §15's root key and the not-yet-built Double Ratchet.
+
+## 16.1 What changed
+
+Before this pass, `app:message` traffic (text, audio, image, reaction, system notices) encrypted under one static identity-level key — X25519 static-static ECDH between the two full identities, unchanged since `protocol.md`'s `0.4.0` (see that document's Encryption section) — fanned out as a single shared ciphertext to every device address a contact resolved to. That key never varied by device pair, and never used any X4DH material at all.
+
+As of this pass, whichever root key a given device pair's session currently holds — `RK0` or `RK1` — is used to derive the actual AES-256-GCM key that encrypts real message traffic for that specific device pair:
+
+```text
+wireKey = HKDF( salt = zero32, ikm = rootKeyBytes, info = "MeshChat-X4DH-v1/wire-message", length = 32 )
+```
+
+Same "32 zero bytes, no prior shared secret" salting convention as §6.1's own root-key stages, and its own domain-separation `info` label, distinct from `/root` and `/root-v2` — the third and, for now, final consumer of the shared HKDF-over-raw-bytes pattern already used throughout this protocol.
+
+This key is genuinely used — it is not a side channel or a validation-only artifact. Every text, audio, image, reaction, and system-notice send in the shipped client goes through this derivation for any device pair that has a session; the old identity-only sending code path was removed outright, not kept as a parallel option.
+
+## 16.2 Why RK0 is eligible, not just RK1
+
+§10 already establishes that an `RK0`-only session lacks the specific forward-secrecy property `DH4` provides — a future compromise of Bob's identity key can still reconstruct an `RK0`-only session's root key in full.
+
+Using `RK0` for wire encryption anyway is a deliberate, disclosed trade-off, not an oversight. Per-device-pair separation is itself a real improvement over the identity-level static key it replaces, which has *zero* device granularity and *zero* protection against a future identity-key compromise either. `RK0` delivers that improvement the instant a session bootstraps, without waiting for a live round trip that may never happen — the offline peer is the ordinary case X4DH is built around (§5), not an edge case. A session that does complete the live upgrade gains `DH4`'s stronger property automatically, the moment `upgradeX4DHSessionToRK1` fires — no separate code path, migration, or re-keying event is needed on the wire-key side; the next call to derive the wire key simply picks up the new root.
+
+## 16.3 Fallback and coexistence
+
+A device pair with no X4DH session yet — or one that never bootstraps one, such as an older client — falls back to the legacy identity-level key exactly as it worked before this pass. This is graceful degradation *per device*, not a hard cutover: within a single fanout to one contact, some of that contact's devices may be encrypted under X4DH wire keys while others are simultaneously on the legacy key, depending on which devices have completed session establishment.
+
+The broadcast fallback — reached when a device is unresolved (no known `endpointId` yet) or when no devices are known for a contact at all — always uses the legacy key. There is no single device pair to derive an X4DH key *for* when addressing "every live session under this identity" at once; this path is unchanged from before X4DH existed.
+
+`app:migrate`, `app:burn`, and the `call:*`/`shell:*` signaling groups are **permanently** out of scope for this mechanism, not just deferred. The first two are never device-targeted by protocol design (`protocol.md`'s Compound Addressing section — a compound `to` is rejected outright for both types), so there is no single device pair to key against. Calls and shell escalation aren't device-aware infrastructure yet — their `RTCPeerConnection` state is keyed by contact, not device — and folding them into per-device keying is its own, separate follow-on scope.
+
+## 16.4 Receive-side key resolution — trial decryption
+
+`deviceId` — the field that would tell a recipient which key applies — lives *inside* the encrypted payload by deliberate design (`protocol.md`'s Device Identity section: moved there specifically so the relay can never see or rewrite it). This creates an unavoidable chicken-and-egg for any per-device-keyed scheme built this way: the recipient cannot know which key to try before decrypting, because which device sent the message is exactly what's still encrypted.
+
+This is resolved by trial decryption on receipt: every X4DH session held for that sender is tried, most-recently-established first as a cheap "most likely still active" heuristic, followed by the legacy identity-level key as a final fallback. AES-GCM's authentication tag makes a wrong-key attempt fail cleanly and immediately — a rejected `crypto.subtle.decrypt` call, never a corrupted or ambiguous result — so this costs at most a handful of failed attempts, bounded by how many devices a contact actually runs (typically one to three in practice), and never produces a false positive.
+
+A successful decrypt under a specific device's session key is then cross-checked against `plain.deviceId` — the sender's own claim, now visible inside the decrypted payload. The two should always agree: a decrypt can only succeed under the key belonging to the specific device pair that session was established with, so `plain.deviceId` disagreeing with which session actually decrypted it would mean something is wrong with session bookkeeping, not a normal occurrence. This case is treated the same as an invalid signature — flagged, message marked unverified, never silently trusted — rather than assumed benign.
+
+## 16.5 Renegotiation
+
+Deliberately reactive only, for this phase — no time-based or message-count-based rotation trigger exists, and none is currently planned as part of this interim design. A device pair's wire key is genuinely static — the same key encrypts every message under that session — until the underlying X4DH session itself resets, and today that only happens via the existing stuck-at-RK0 detection → retry mechanism (§13.2, and the Status block at the top of this document for the full retry-budget mechanics). There is no scheduled key-rotation feature to layer on top of a healthy, non-stuck session; "run static until something knocks it loose" is the accepted shape for this phase.
+
+## 16.6 What this explicitly is not
+
+Still not a ratchet, and not meant to be mistaken for one. A device pair's wire key is reused for every message under that session, identically in spirit to how the old identity-level key was reused for every message under an entire identity pair — the structural improvements here are the *granularity* (per device pair, not per identity) and the *rotation trigger* (a session reset via retry, rather than effectively never). Real per-message key evolution — a genuine forward ratchet, where compromising today's key does not compromise tomorrow's — remains the separate, later Double Ratchet work this document has scoped itself away from since §6.1 and §15. See `Roadmap.md`'s Double Ratchet section for how that later work is expected to build on top of the session infrastructure this section relies on, rather than replace it outright.
+
+---
+
+# 17. Why Not X3DH?
 
 X3DH solves an important problem: asynchronous session establishment when the responder is offline.
 
@@ -840,7 +914,7 @@ If Bob is unavailable:
 
 ---
 
-# 17. Summary
+# 18. Summary
 
 X4DH can be summarized in one diagram:
 
@@ -882,3 +956,5 @@ The first two DH operations provide an immediately usable asynchronous session.
 When both endpoints are available, two additional DH operations incorporate fresh key material from Bob and upgrade the same session.
 
 The result is a session-establishment mechanism designed specifically around MeshChat's existing decentralized, buffered relay architecture.
+
+As of §16, that root key is also doing real work today, ahead of the Double Ratchet's arrival: it's the direct source of the AES-256-GCM key actually encrypting live `app:message` traffic, per device pair, with graceful fallback to the legacy identity-level key wherever a session doesn't yet exist. The "message keys" box at the bottom of the diagram above is still the eventual target — what ships today is a single static key per session standing in its place, an accepted and disclosed interim step rather than the finished design.
