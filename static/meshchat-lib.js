@@ -606,7 +606,22 @@ function mergeMessages(a, b) {
     // auto-ack). >= means the incoming copy wins an exact ts tie, matching
     // the old positional behavior for the (effectively never-occurring)
     // case of two genuinely different actions on the identical millisecond.
-    if (!existing || (m.ts || 0) >= (existing.ts || 0)) byId[m.id] = m;
+    if (!existing || (m.ts || 0) >= (existing.ts || 0)) {
+      // ackTrusted is sticky across a same-id collision. It marks a
+      // message whose ackDeviceId/ackN was established by composing or
+      // receiving it LIVE on some device (see sendMessage/receiveMessage,
+      // meshchat.js) — never serialized (see serialiseContacts's
+      // stripLocalOnly param, and getLast — meshchat.js), so it can never
+      // simply arrive over the wire. A later-iterated, untrusted copy of
+      // the SAME immutable-content id — e.g. this exact message coming
+      // back around via a self-sync/backup/restore merge or an app:sync
+      // batch — must not erase a trust fact that already genuinely
+      // happened on this device. No-op for reaction ids: they never carry
+      // ackDeviceId/ackN/ackTrusted at all, so nothing here changes their
+      // existing collide-and-replace behavior.
+      const trusted = !!(m.ackTrusted || existing?.ackTrusted);
+      byId[m.id] = trusted ? { ...m, ackTrusted: true } : m;
+    }
   }
 
   const baseline = Object.values(byId)
@@ -628,7 +643,30 @@ function mergeMessages(a, b) {
   // simply stays at its baseline position.
   const parentOf = new Map();   // childId -> targetId
   for (const m of baseline) {
-    if (!m.ackDeviceId || m.ackN == null) continue;
+    // Trust gate — a message only participates as a SPLICE CHILD if its
+    // ackDeviceId/ackN was established live: composed on this device
+    // (sendMessage et al., meshchat.js) or received+verified here
+    // (receiveMessage). It is deliberately NOT enough for the field to
+    // merely be present — a message arriving via a self-sync/backup/
+    // restore merge, or an app:sync batch, never carries ackTrusted at
+    // all (see serialiseContacts's stripLocalOnly param and getLast,
+    // meshchat.js), so it always fails this check and falls back to its
+    // plain (ts, id) baseline position instead of being spliced.
+    //
+    // This is the fix for the multi-device-switch symptom where a
+    // message got inserted mid-history: a stale or foreign device's own
+    // causal claim about "what I'd most recently seen" got trusted and
+    // used to splice a locally-composed message into the wrong spot.
+    // Requiring live provenance closes that without giving up the splice
+    // entirely for the case it actually works well — a straight live
+    // send/receive exchange between two devices that are actually
+    // talking to each other right now.
+    //
+    // A message failing this gate can still be a valid PARENT target for
+    // someone else's trusted pointer — byDeviceN above indexes on
+    // deviceId/n, stable content facts, not a claim about ordering — it
+    // just never becomes a child itself.
+    if (!m.ackDeviceId || m.ackN == null || !m.ackTrusted) continue;
     const targetId = byDeviceN.get(`${m.ackDeviceId}:${m.ackN}`);
     if (targetId && targetId !== m.id) parentOf.set(m.id, targetId);
   }
