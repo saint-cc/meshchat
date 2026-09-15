@@ -236,12 +236,7 @@ async function getOrCreateDeviceId(seed) {
 
 async function computeBackupFingerprint() {
   const enc  = new TextEncoder();
-  // stripLocalOnly=true — ackTrusted is inherently different per device
-  // (each device only trusts its OWN live activity), so including it here
-  // would make two devices' fingerprints of otherwise-identical content
-  // almost never match, defeating the entire "skip if already current"
-  // optimization this fingerprint exists for.
-  const hash = await crypto.subtle.digest("SHA-256", enc.encode(JSON.stringify(serialiseContacts(true))));
+  const hash = await crypto.subtle.digest("SHA-256", enc.encode(JSON.stringify(serialiseContacts())));
   return btoa(String.fromCharCode(...new Uint8Array(hash).slice(0, 12))).replace(/\+/g,'-').replace(/\//g,'_').replace(/=/g,'');
 }
 // key MUST be the caller's ECDH-derived key for the specific sender
@@ -268,14 +263,7 @@ function signBlob(blob){
   return Array.from(sig);
 }
 
-// ackTrusted is local-only provenance metadata (see mergeMessages' trust
-// gate, lib.js) — app:sync is the one wire path that reads
-// state.contacts directly rather than through serialiseContacts() (see
-// its stripLocalOnly param), so it needs its own stripping here.
-function getLast(contactId, n = EXCHANGE_COUNT) {
-  return selectRetainedMessages(state.contacts[contactId]?.messages || [], n)
-    .map(({ ackTrusted, ...rest }) => rest);
-}
+function getLast(contactId, n = EXCHANGE_COUNT) { return selectRetainedMessages(state.contacts[contactId]?.messages || [], n); }
 
 function pollBatchSize() {
   return Math.min(10, Math.max(3, Math.round(Object.keys(state.contacts).length * 0.1)));
@@ -391,26 +379,11 @@ function dismissMissingWarning(contactId) {
    the conversation timeline stays intact.
    Raw audio lives in audioCache (memory only).
 ══════════════════════════════════════════ */
-// stripLocalOnly — false (default), used by saveContacts() for LOCAL
-// STORAGE: keeps ackTrusted so a page reload doesn't lose provenance for
-// messages genuinely composed/received live moments earlier. true for
-// every WIRE-BOUND use (self-sync push, peer backup, restore push, file
-// export): strips ackTrusted so a device can never simply INHERIT
-// another device's trust designation through backup/restore/export — it
-// must earn it independently through its own live traffic (see
-// mergeMessages' ackTrusted gate, meshchat-lib.js). getLast() (app:sync's
-// own wire path) strips the same field on its own, since it reads
-// state.contacts directly rather than going through this function.
-function serialiseContacts(stripLocalOnly = false) {
+function serialiseContacts() {
   const out = {};
   for (const [id,c] of Object.entries(state.contacts))
     out[id] = { name: c.name, publicId: c.publicId, shareableKey: c.shareableKey,
-                messages: selectRetainedMessages(c.messages, RETENTION_COUNT).map(m => {
-                  const clean = m.type === "audio" ? {...m, data:null, expired:true} : m;
-                  if (!stripLocalOnly) return clean;
-                  const { ackTrusted, ...wireOnly } = clean;
-                  return wireOnly;
-                }),
+                messages: selectRetainedMessages(c.messages, RETENTION_COUNT).map(m => m.type === "audio" ? {...m, data:null, expired:true} : m),
                 blocked: c.blocked || false,
                 type:            c.type            || "human",
                 lastStateChange: c.lastStateChange || 0,
@@ -485,22 +458,11 @@ let messagesSinceBackup = 0;
 
 async function saveContactsBackup(force = false) {
   if (!state.cryptoKey) return;
-  await saveContacts();
+  const encrypted = await saveContacts();
   messagesSinceBackup++;
   if (!force && messagesSinceBackup < BACKUP_THRESHOLD) return;
   messagesSinceBackup = 0;
-  // Deliberately a SEPARATE encrypt from saveContacts() above, not a
-  // reuse of its output the way this used to work — that blob preserves
-  // ackTrusted for local storage (see serialiseContacts' stripLocalOnly
-  // param), and THIS one is handed to a contact to hold as our
-  // disaster-recovery backup. If ackTrusted ever round-tripped back to
-  // us through a future restore_push, mergeMessages would trust an ack
-  // pointer that arrived via exactly the channel it's supposed to never
-  // trust — quietly defeating the fix the moment we restore our own
-  // data. Extra encrypt call, but this only runs on the
-  // BACKUP_THRESHOLD/periodic cadence, not per message.
-  const distBlob = await encryptObject(state.cryptoKey, serialiseContacts(true));
-  pushBackupToContacts(distBlob);
+  pushBackupToContacts(encrypted);
 }
 
 setInterval(() => {
@@ -1667,11 +1629,7 @@ async function pushBackupToContacts(blob) {
 			// socket, just worth being honest it's not an identical guarantee.
 			const freshBlob = await encryptObject(state.cryptoKey, {
 				deviceId: state.deviceId, endpointId: state.endpointId, fingerprint,
-				// stripLocalOnly=true — self-sync between siblings is
-				// exactly the "backup/restore merge" path ackTrusted must
-				// never survive (see serialiseContacts' own comment and
-				// mergeMessages' trust gate, lib.js).
-				contacts: serialiseContacts(true),
+				contacts: serialiseContacts(),
 			});
 			const selfDevices = state.knownDevices[state.publicId] || {};
 
@@ -2187,10 +2145,7 @@ async function handleRestoreAck(msg) {
 
   if (fromId === state.publicId) {
     const pushTs    = Date.now();
-    // stripLocalOnly=true — this IS a restore push, the exact channel
-    // ackTrusted must never travel through (see serialiseContacts' own
-    // comment and mergeMessages' trust gate, lib.js).
-    const freshBlob = await encryptObject(state.cryptoKey, serialiseContacts(true));
+    const freshBlob = await encryptObject(state.cryptoKey, serialiseContacts());
     const pushObj   = { type: "sync:restore_push", from: buildAddress(state.publicId, state.endpointId), to: fromId, blob: freshBlob, ts: pushTs };
     pushObj.sig = signHandshakePacket(pushObj);
     sendSignal(pushObj);
@@ -3024,8 +2979,7 @@ async function sendImageMessage(file) {
         mlog.err(`→ IMAGE        to   ${pid(state.currentChat)} — send failed: ${e.message}`);
       }
 
-      // ackTrusted — see sendMessage's matching comment.
-      contact.messages = mergeMessages(contact.messages, [{ id, from: state.publicId, type: "image", mimeType, ts, valid: true, status, deviceId: state.deviceId, n: sentN, ...ackPointer, ackTrusted: !!ackPointer.ackDeviceId }]);
+      contact.messages = mergeMessages(contact.messages, [{ id, from: state.publicId, type: "image", mimeType, ts, valid: true, status, deviceId: state.deviceId, n: sentN, ...ackPointer }]);
       await saveContacts();
       renderMessages();
       updateContactPreview();   // sidebar preview otherwise only ever updates on incoming traffic
@@ -3071,8 +3025,7 @@ async function sendAudioMessage(blob) {
     }
 
     // stub in messages — data stays in audioCache only
-    // ackTrusted — see sendMessage's matching comment.
-    contact.messages = mergeMessages(contact.messages, [{ id, from: state.publicId, type: "audio", mimeType, ts, valid: true, status, deviceId: state.deviceId, n: sentN, ...ackPointer, ackTrusted: !!ackPointer.ackDeviceId }]);
+    contact.messages = mergeMessages(contact.messages, [{ id, from: state.publicId, type: "audio", mimeType, ts, valid: true, status, deviceId: state.deviceId, n: sentN, ...ackPointer }]);
     await saveContacts();
     renderMessages();
     updateContactPreview();   // sidebar preview otherwise only ever updates on incoming traffic
@@ -3347,18 +3300,8 @@ async function receiveMessage(msg) {
     // whatever's there" treatment as n/deviceId above. Consumed later by
     // mergeMessages to splice this message directly after whatever it's
     // acknowledging, instead of trusting ts alone.
-    // ackTrusted — this device is trusting the SENDER's own live claim
-    // about what it composed after, gated on the same signature-verified
-    // `valid` recordKnownDevice already requires for plain.deviceId just
-    // above. This is a LIVE receipt (this exact function, this exact
-    // call) — precisely the provenance mergeMessages' trust gate
-    // requires (lib.js). Never set when a message instead arrives via a
-    // backup/restore merge or an app:sync batch — neither carries this
-    // field at all (see serialiseContacts' stripLocalOnly param and
-    // getLast).
     if (plain.ackDeviceId) msgObj.ackDeviceId = plain.ackDeviceId;
     if (plain.ackN != null) msgObj.ackN = plain.ackN;
-    if (valid && plain.ackDeviceId) msgObj.ackTrusted = true;
 
     if (plain.type === "audio") {
       const encBlob = await encryptObject(state.encKey, { data: plain.data, mimeType: plain.mimeType });
@@ -3776,10 +3719,7 @@ async function commitBurn() {
 async function pushMiniBackup(contactId) {
   const contact = state.contacts[contactId];
   if (!contact) return;
-  // stripLocalOnly=true — this is self-sync traffic between siblings,
-  // exactly the channel ackTrusted must never ride (see serialiseContacts'
-  // own comment and mergeMessages' trust gate, lib.js).
-  const slim = { [contactId]: { ...serialiseContacts(true)[contactId] } };
+  const slim = { [contactId]: { ...serialiseContacts()[contactId] } };
   const blob = await encryptObject(state.cryptoKey, slim);
   sendSignal({ type: "sync:backup_push", from: state.publicId, to: state.publicId, blob });
   mlog.info(`→ MINI_BACKUP  to self  contact=${pid(contactId)}`);
@@ -3818,11 +3758,7 @@ async function sendMessage() {
     mlog.err(`→ MSG          to   ${pid(state.currentChat)} — send failed: ${e.message}`);
   }
 
-  // ackTrusted — this device just computed ackPointer itself, live,
-  // against its own current local state (getAckPointer above) — exactly
-  // the provenance mergeMessages' trust gate requires (lib.js). See
-  // receiveMessage's matching comment for the receive-side half of this.
-  contact.messages = mergeMessages(contact.messages, [{ id, from: fromId, text, ts, valid: true, status, deviceId: state.deviceId, n: sentN, ...ackPointer, ackTrusted: !!ackPointer.ackDeviceId }]);
+  contact.messages = mergeMessages(contact.messages, [{ id, from: fromId, text, ts, valid: true, status, deviceId: state.deviceId, n: sentN, ...ackPointer }]);
   await saveContacts();
   input.value = "";
   renderMessages();
@@ -3836,6 +3772,52 @@ async function sendMessage() {
    so mergeMessages naturally replaces, never duplicates.
    emoji: ":)" | ":(" | null  (null = cleared)
 ══════════════════════════════════════════ */
+
+/* ── reaction targeting — ONE device, not a fan ──
+   A reaction (a real emoji, or the RECEIVED auto-ack — see protocol.md's
+   Delivery Acknowledgement section) is about ONE specific message, sent
+   by ONE specific device. Routing it through sendFannedX4DH's full
+   resolveDeviceTargets fanout — the same path an ordinary text/audio/
+   image send uses, correctly, because THOSE are genuinely addressed to
+   "the contact" and have to reach whichever device is looking — wastes
+   work in a way that scales badly here: a receiver running M devices,
+   acking a sender running N devices, produced M×N ack packets when only
+   M were ever meaningful (one ack per receiving device, each properly
+   addressed at the specific device that sent the original message).
+   Since the auto-ack fires on every single incoming message, this was
+   the dominant contributor to server-side fanout load, not the ordinary
+   message fanout itself.
+
+   The target device is already knowable: every received message stamps
+   msgObj.deviceId (see receiveMessage) with whichever device actually
+   sent it. resolveReactionTarget looks that up and checks whether the
+   device currently resolves — known endpointId, not stale — using the
+   exact same test resolveDeviceTargets already applies to every device
+   it considers, so this can never be MORE permissive than the existing
+   fanout logic, just narrower.
+
+   Returns null (falls back to sendFannedX4DH's full broadcast) when:
+     - the target message isn't found, or has no deviceId on record
+       (older message, predates this field)
+     - the target message is one of OUR OWN — its deviceId belongs to
+       US, not the contact, so it's simply absent from
+       state.knownDevices[contactId] and the lookup naturally misses.
+       No special-casing needed for this case.
+     - the device's endpointId hasn't been learned yet, or is stale
+   Falling back to broadcast rather than dropping is deliberate — same
+   safety net X4DH bootstrap itself relies on: broadcast is what lets
+   endpointId discovery happen in the first place (§13.3), so a bare
+   "give up" here would leave a real, non-self-healing gap.
+── */
+function resolveReactionTarget(contactId, targetMsgId) {
+  const targetMsg = state.contacts[contactId]?.messages?.find(m => m.id === targetMsgId);
+  if (!targetMsg?.deviceId) return null;
+  const info = state.knownDevices[contactId]?.[targetMsg.deviceId];
+  if (!info?.endpointId) return null;
+  if ((Date.now() - (info.lastSeen || 0)) > FANOUT_STALE_MS) return null;
+  return { deviceId: targetMsg.deviceId, endpointId: info.endpointId };
+}
+
 async function sendReaction(targetMsgId, emoji, contactId = state.currentChat) {
   if (!contactId) return;
   const contact = state.contacts[contactId];
@@ -3847,16 +3829,33 @@ async function sendReaction(targetMsgId, emoji, contactId = state.currentChat) {
   const relay = me?.lastRelay ? { wss: me.lastRelay } : undefined;
   const payload = { id, type: "reaction", targetId: targetMsgId, emoji, ts, deviceId: state.deviceId, endpointId: state.endpointId, ...(relay ? { relay } : {}) };
 
-  const fanned = await sendFannedX4DH(contactId, payload);
+  // Try the single-device target first; only fall back to the full
+  // resolveDeviceTargets fanout (sendFannedX4DH) when it doesn't resolve.
+  const target = resolveReactionTarget(contactId, targetMsgId);
+  let sent, targetedCount, broadcastSent, x4dhCount, legacyCount, viaFallback = false;
+
+  if (target) {
+    const wireKey = await getOrDeriveWireKey(contactId, target.deviceId);
+    const key  = wireKey || contact.encKey;
+    const blob = await encryptMessage(key, payload);
+    const sig  = await signBlob(blob);
+    const obj  = { type: "app:message", from: state.publicId, to: buildAddress(contactId, target.endpointId), blob, sig };
+    const viaRelay = sendToRelay(contactId, obj, true);
+    if (!viaRelay) sendSignal(obj);
+    sent          = viaRelay || state.ws?.readyState === WebSocket.OPEN;
+    targetedCount = 1;
+    broadcastSent = false;
+    x4dhCount     = wireKey ? 1 : 0;
+    legacyCount   = wireKey ? 0 : 1;
+  } else {
+    const fanned = await sendFannedX4DH(contactId, payload);
+    ({ sent, targetedCount, broadcastSent, x4dhCount, legacyCount } = fanned);
+    viaFallback = true;
+  }
+
   const msgObj = { id, from: state.publicId, type: "reaction", targetId: targetMsgId, emoji, ts, valid: true, deviceId: state.deviceId };
   contact.messages = mergeMessages(contact.messages, [msgObj]);
-  // Fanned deliberately, same as the other send paths — a RECEIVED
-  // auto-ack (emoji:null) reaching only ONE of the sender's own devices
-  // would leave their OTHER devices stuck showing "sent" (✔️) forever for
-  // a message that genuinely was delivered, since nothing else would
-  // ever flip that status on those devices. A real emoji pick gets the
-  // same treatment for consistency.
-  mlog.info(`→ REACTION     to   ${pid(contactId)}  target=${pid(targetMsgId)}  emoji=${emoji || "nil"}  ${fanned.targetedCount} targeted (${fanned.x4dhCount} x4dh, ${fanned.legacyCount} legacy)${fanned.broadcastSent ? " + broadcast" : ""}`);
+  mlog.info(`→ REACTION     to   ${pid(contactId, target ? { deviceId: target.deviceId, endpointId: target.endpointId } : {})}  target=${pid(targetMsgId)}  emoji=${emoji || "nil"}  ${viaFallback ? `${targetedCount} targeted (${x4dhCount} x4dh, ${legacyCount} legacy)${broadcastSent ? " + broadcast" : ""} — fallback, target device unresolved` : `targeted (1, ${x4dhCount ? "x4dh" : "legacy"})`}${!sent ? " — nowhere, no open socket" : ""}`);
   await saveContacts();
   // only the currently-open chat needs a re-render — an auto-ack fired
   // for some other contact shouldn't repaint whatever chat is on screen
@@ -3965,8 +3964,7 @@ async function sendCallNotice(id) {
     mlog.err(`→ CALL_NOTICE  to   ${pid(id)} — send failed: ${e.message}`);
   }
 
-  // ackTrusted — see sendMessage's matching comment.
-  contact.messages = mergeMessages(contact.messages, [{ id: msgId, from: state.publicId, type: "system", kind: "call", text, ts, valid: true, status, deviceId: state.deviceId, n: sentN, ...ackPointer, ackTrusted: !!ackPointer.ackDeviceId }]);
+  contact.messages = mergeMessages(contact.messages, [{ id: msgId, from: state.publicId, type: "system", kind: "call", text, ts, valid: true, status, deviceId: state.deviceId, n: sentN, ...ackPointer }]);
   await saveContacts();
   if (state.currentChat === id) renderMessages();
   updateContactPreview();
@@ -4673,10 +4671,7 @@ async function exportBackup(passphrase) {
   const master    = await deriveMasterSecret(state.user, passphrase);
   const keys      = await hkdfExpand(master);
   const exportKey = await importEncKey(keys.backupKey);
-  // stripLocalOnly=true — an exported file is, by definition, a future
-  // restore/import target, possibly onto a different device entirely
-  // (see serialiseContacts' own comment).
-  const blob      = await encryptObject(exportKey, serialiseContacts(true));
+  const blob      = await encryptObject(exportKey, serialiseContacts());
   const a         = Object.assign(document.createElement("a"), {
     href:     "data:application/json," + encodeURIComponent(JSON.stringify({ v: 2, user: state.user, blob })),
     download: "meshchat-backup-" + Date.now() + ".json"
