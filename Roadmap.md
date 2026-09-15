@@ -187,6 +187,31 @@ Recent, for context on where "next" picks up from:
 
 Things with a rough shape already, not blocked on a bigger design call:
 
+- **Reaction/ack fanout narrowed to the single target device — implemented,
+  not yet confirmed live.** X4DH's per-device wire encryption turned
+  `sendReaction`'s fanout (shared with the RECEIVED auto-ack, which fires
+  on every single incoming message) into the dominant source of server-
+  side load: routing it through the same `resolveDeviceTargets` fanout an
+  ordinary message correctly uses meant a receiver running M devices,
+  acking a sender running N devices, produced M×N ack packets when only M
+  were ever meaningful — one ack per receiving device, each properly
+  addressed at the *specific* device that sent the original message
+  (already known — every received message stamps `deviceId`). New
+  `resolveReactionTarget(contactId, targetMsgId)` looks that device up
+  and, when it resolves (known `endpointId`, not stale — same test
+  `resolveDeviceTargets` already applies), `sendReaction` sends a single
+  targeted packet instead of fanning. Falls back to the full broadcast
+  fanout unchanged whenever it doesn't resolve — an own-message target
+  (deviceId is ours, not the contact's — no special-casing needed, the
+  lookup simply misses), an unlearned `endpointId`, or a stale one —
+  same safety net X4DH bootstrap itself already relies on for endpoint
+  discovery. `node --check`-validated; not yet exercised on meshdev, so
+  not yet promoted to a `protocol.md`/`X4DH.md`-confirmed fact per this
+  file's own documentation-discipline rule. Next step once confirmed
+  live: pull `server.py`'s `STATS` log (`buf_rate_rejected`/
+  `buf_cap_rejected`/`buf_endpoint_cap_rejected`) to see how much of the
+  original throughput pressure this alone accounts for, before deciding
+  whether server-side limits need raising at all.
 - **Keep `protocol.md` from drifting again.** No process yet beyond "notice
   it during unrelated work," which is how the `deviceId` envelope drift sat
   unnoticed for a while. Worth a lightweight habit at minimum (docs pass
