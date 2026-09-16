@@ -28,6 +28,35 @@ const BACKUP_OFFER_TTL   		= 60_000;
 const RELAY_IDLE_MS  			= 30_000;
 const RETENTION_COUNT 			= 15;   			// per-contact local persistence cap — see selectRetainedMessages
 const X4DH_PROPOSAL_TIMEOUT_MS 	= 60_000;			// how long EK_A_priv is held awaiting session:ack — see X4DH.md §7.1
+
+/* ══════════════════════════════════════════
+   DEVICE REGISTRY — retention tuning
+   Was 90 days / 20 devices, checked only inside loadDeviceRegistry()
+   (i.e. once, at login). In practice a contact's registry can grow well
+   past the cap mid-session — every app:message receipt and every
+   self-sync accept/push calls recordKnownDevice(), which writes
+   unconditionally and never trims — so a chatty session (or a contact
+   who churns through one-off/incognito devices that never reconnect)
+   could badly overshoot 20 entries for hours before the next reload
+   ever swept it back down.
+   Lowered to 30 days (devices that vanish — incognito windows, etc. —
+   were sitting in the list for a full quarter before aging out, well
+   past the point they were ever useful) and now enforced periodically
+   via pruneDeviceRegistry()/DEVICE_PRUNE_INTERVAL_MS below, not just at
+   load. Deliberately independent of FANOUT_STALE_MS (7 days, further
+   down) — that one governs whether a device still gets its own X4DH-
+   targeted send; this one governs whether it's kept in the registry at
+   all. A device can fall out of fanout-freshness (7d) well before it's
+   actually pruned from the list (30d) — that's intentional, not a bug
+   to reconcile: fanout staleness is about not wasting a targeted
+   encrypt+send on a probably-dead device, while registry retention is
+   about not letting the popover/storage grow unbounded. The two don't
+   need to share a number.
+══════════════════════════════════════════ */
+const DEVICE_REGISTRY_CUTOFF_MS  = 30 * 24 * 60 * 60 * 1000;   // was 90 days
+const MAX_DEVICES_PER_IDENTITY   = 20;
+const DEVICE_PRUNE_INTERVAL_MS   = 10 * 60 * 1000;   // periodic sweep, piggybacked on its own timer rather than only running at login
+
 /* ══════════════════════════════════════════
    STATE
 ══════════════════════════════════════════ */
@@ -516,11 +545,48 @@ function savePeerTokens() {
   catch(e) {}
 }
 
+/* ══════════════════════════════════════════
+   DEVICE REGISTRY — load / prune / save
+   pruneDeviceRegistry() is the reusable trim step (cutoff + per-identity
+   cap, see DEVICE_REGISTRY_CUTOFF_MS/MAX_DEVICES_PER_IDENTITY above).
+   Split out of loadDeviceRegistry() so it can ALSO run periodically (see
+   the setInterval below) — previously this only ever ran once, at
+   login, which let a churny session badly overshoot the cap for hours
+   before the next reload swept it back down.
+   loadDeviceRegistry() still separately handles one-time SHAPE migration
+   (bare-timestamp entries → { lastSeen, lastN }, missing[] backfill) —
+   that's a load-time upgrade of old data, not a repeated retention
+   policy, so it deliberately stays out of the periodic sweep.
+══════════════════════════════════════════ */
+function pruneDeviceRegistry() {
+  const cutoff = Date.now() - DEVICE_REGISTRY_CUTOFF_MS;
+  let changed = false;
+  for (const identityId of Object.keys(state.knownDevices)) {
+    const devs = state.knownDevices[identityId];
+    let entries = Object.entries(devs).filter(([, v]) => v.lastSeen > cutoff);
+    if (entries.length !== Object.keys(devs).length) changed = true;
+    if (entries.length > MAX_DEVICES_PER_IDENTITY) {
+      entries = entries.sort(([, a], [, b]) => b.lastSeen - a.lastSeen).slice(0, MAX_DEVICES_PER_IDENTITY);
+      changed = true;
+    }
+    state.knownDevices[identityId] = Object.fromEntries(entries);
+  }
+  if (changed) saveDeviceRegistry();
+  return changed;
+}
+// Periodic sweep — same "don't wait for a reload" reasoning as
+// pruneOnline's own setInterval just above. 10 minutes is deliberately
+// coarse: this is bookkeeping hygiene, not a correctness-critical path,
+// and piggybacking on a tighter interval (e.g. PRUNE_INTERVAL_MS's 30s)
+// would just mean re-scanning every identity's device map far more often
+// than the underlying data could plausibly have changed.
+setInterval(pruneDeviceRegistry, DEVICE_PRUNE_INTERVAL_MS);
+
 function loadDeviceRegistry() {
   try {
     state.knownDevices = JSON.parse(localStorage.getItem(DEVICE_REGISTRY_KEY + "_" + state.publicId) || "{}");
-    // soft prune — 90 days, max 20 devices per identity
-    const cutoff = Date.now() - 90 * 24 * 60 * 60 * 1000;
+    // one-time SHAPE migration only — retention (cutoff/cap) is now
+    // pruneDeviceRegistry()'s job, called below and periodically thereafter.
     for (const identityId of Object.keys(state.knownDevices)) {
       const devs = state.knownDevices[identityId];
       // migrate pre-n entries: a bare lastSeen timestamp becomes
@@ -533,12 +599,8 @@ function loadDeviceRegistry() {
         // simply has no gap tracking yet; start empty rather than guess.
         if (devs[devId] && !Array.isArray(devs[devId].missing)) devs[devId].missing = [];
       }
-      let entries = Object.entries(devs).filter(([, v]) => v.lastSeen > cutoff);
-      if (entries.length > 20) {
-        entries = entries.sort(([, a], [, b]) => b.lastSeen - a.lastSeen).slice(0, 20);
-      }
-      state.knownDevices[identityId] = Object.fromEntries(entries);
     }
+    pruneDeviceRegistry();
     saveDeviceRegistry();
     mlog.debug(`STORAGE    device registry loaded: ${Object.keys(state.knownDevices).length} identity(ies)`);
   } catch(e) { state.knownDevices = {}; }
@@ -699,7 +761,7 @@ function getAckPointer(contactId) {
    for each TARGETED entry this function returns, rather than reusing one
    shared ciphertext across all of them the way the old sendFanned did.
 ══════════════════════════════════════════ */
-const FANOUT_STALE_MS = 7 * 24 * 60 * 60 * 1000;   // 7 days — deliberately its own, shorter window than loadDeviceRegistry's 90-day/20-device prune — see block comment above for why
+const FANOUT_STALE_MS = 7 * 24 * 60 * 60 * 1000;   // 7 days — deliberately its own, shorter window than DEVICE_REGISTRY_CUTOFF_MS's 30-day retention (see that constant's comment for why the two don't need to match)
 
 function resolveDeviceTargets(contactId) {
   const devices = state.knownDevices[contactId] || {};
@@ -3772,52 +3834,6 @@ async function sendMessage() {
    so mergeMessages naturally replaces, never duplicates.
    emoji: ":)" | ":(" | null  (null = cleared)
 ══════════════════════════════════════════ */
-
-/* ── reaction targeting — ONE device, not a fan ──
-   A reaction (a real emoji, or the RECEIVED auto-ack — see protocol.md's
-   Delivery Acknowledgement section) is about ONE specific message, sent
-   by ONE specific device. Routing it through sendFannedX4DH's full
-   resolveDeviceTargets fanout — the same path an ordinary text/audio/
-   image send uses, correctly, because THOSE are genuinely addressed to
-   "the contact" and have to reach whichever device is looking — wastes
-   work in a way that scales badly here: a receiver running M devices,
-   acking a sender running N devices, produced M×N ack packets when only
-   M were ever meaningful (one ack per receiving device, each properly
-   addressed at the specific device that sent the original message).
-   Since the auto-ack fires on every single incoming message, this was
-   the dominant contributor to server-side fanout load, not the ordinary
-   message fanout itself.
-
-   The target device is already knowable: every received message stamps
-   msgObj.deviceId (see receiveMessage) with whichever device actually
-   sent it. resolveReactionTarget looks that up and checks whether the
-   device currently resolves — known endpointId, not stale — using the
-   exact same test resolveDeviceTargets already applies to every device
-   it considers, so this can never be MORE permissive than the existing
-   fanout logic, just narrower.
-
-   Returns null (falls back to sendFannedX4DH's full broadcast) when:
-     - the target message isn't found, or has no deviceId on record
-       (older message, predates this field)
-     - the target message is one of OUR OWN — its deviceId belongs to
-       US, not the contact, so it's simply absent from
-       state.knownDevices[contactId] and the lookup naturally misses.
-       No special-casing needed for this case.
-     - the device's endpointId hasn't been learned yet, or is stale
-   Falling back to broadcast rather than dropping is deliberate — same
-   safety net X4DH bootstrap itself relies on: broadcast is what lets
-   endpointId discovery happen in the first place (§13.3), so a bare
-   "give up" here would leave a real, non-self-healing gap.
-── */
-function resolveReactionTarget(contactId, targetMsgId) {
-  const targetMsg = state.contacts[contactId]?.messages?.find(m => m.id === targetMsgId);
-  if (!targetMsg?.deviceId) return null;
-  const info = state.knownDevices[contactId]?.[targetMsg.deviceId];
-  if (!info?.endpointId) return null;
-  if ((Date.now() - (info.lastSeen || 0)) > FANOUT_STALE_MS) return null;
-  return { deviceId: targetMsg.deviceId, endpointId: info.endpointId };
-}
-
 async function sendReaction(targetMsgId, emoji, contactId = state.currentChat) {
   if (!contactId) return;
   const contact = state.contacts[contactId];
@@ -3829,33 +3845,16 @@ async function sendReaction(targetMsgId, emoji, contactId = state.currentChat) {
   const relay = me?.lastRelay ? { wss: me.lastRelay } : undefined;
   const payload = { id, type: "reaction", targetId: targetMsgId, emoji, ts, deviceId: state.deviceId, endpointId: state.endpointId, ...(relay ? { relay } : {}) };
 
-  // Try the single-device target first; only fall back to the full
-  // resolveDeviceTargets fanout (sendFannedX4DH) when it doesn't resolve.
-  const target = resolveReactionTarget(contactId, targetMsgId);
-  let sent, targetedCount, broadcastSent, x4dhCount, legacyCount, viaFallback = false;
-
-  if (target) {
-    const wireKey = await getOrDeriveWireKey(contactId, target.deviceId);
-    const key  = wireKey || contact.encKey;
-    const blob = await encryptMessage(key, payload);
-    const sig  = await signBlob(blob);
-    const obj  = { type: "app:message", from: state.publicId, to: buildAddress(contactId, target.endpointId), blob, sig };
-    const viaRelay = sendToRelay(contactId, obj, true);
-    if (!viaRelay) sendSignal(obj);
-    sent          = viaRelay || state.ws?.readyState === WebSocket.OPEN;
-    targetedCount = 1;
-    broadcastSent = false;
-    x4dhCount     = wireKey ? 1 : 0;
-    legacyCount   = wireKey ? 0 : 1;
-  } else {
-    const fanned = await sendFannedX4DH(contactId, payload);
-    ({ sent, targetedCount, broadcastSent, x4dhCount, legacyCount } = fanned);
-    viaFallback = true;
-  }
-
+  const fanned = await sendFannedX4DH(contactId, payload);
   const msgObj = { id, from: state.publicId, type: "reaction", targetId: targetMsgId, emoji, ts, valid: true, deviceId: state.deviceId };
   contact.messages = mergeMessages(contact.messages, [msgObj]);
-  mlog.info(`→ REACTION     to   ${pid(contactId, target ? { deviceId: target.deviceId, endpointId: target.endpointId } : {})}  target=${pid(targetMsgId)}  emoji=${emoji || "nil"}  ${viaFallback ? `${targetedCount} targeted (${x4dhCount} x4dh, ${legacyCount} legacy)${broadcastSent ? " + broadcast" : ""} — fallback, target device unresolved` : `targeted (1, ${x4dhCount ? "x4dh" : "legacy"})`}${!sent ? " — nowhere, no open socket" : ""}`);
+  // Fanned deliberately, same as the other send paths — a RECEIVED
+  // auto-ack (emoji:null) reaching only ONE of the sender's own devices
+  // would leave their OTHER devices stuck showing "sent" (✔️) forever for
+  // a message that genuinely was delivered, since nothing else would
+  // ever flip that status on those devices. A real emoji pick gets the
+  // same treatment for consistency.
+  mlog.info(`→ REACTION     to   ${pid(contactId)}  target=${pid(targetMsgId)}  emoji=${emoji || "nil"}  ${fanned.targetedCount} targeted (${fanned.x4dhCount} x4dh, ${fanned.legacyCount} legacy)${fanned.broadcastSent ? " + broadcast" : ""}`);
   await saveContacts();
   // only the currently-open chat needs a re-render — an auto-ack fired
   // for some other contact shouldn't repaint whatever chat is on screen
