@@ -87,11 +87,17 @@ Message contents remain end-to-end encrypted.
 
 ---
 
-## No forward secrecy
+## Forward secrecy is partial, not absent, and does not cover everything
 
-Identity keys are static.
+Identity keys are static, and the identity-level pairwise key derived from them provides none of the protection described here — see `protocol.md`'s Encryption section. As of `0.5.0`, a device pair that has completed X4DH session establishment (`X4DH.md`) uses that session's root key to encrypt real message traffic instead, which changes this picture, but only partially:
 
-If an attacker records encrypted traffic today and later compromises your identity, previously recorded messages may become decryptable.
+- A session still sitting at `RK0` (the asynchronous bootstrap stage, before a live round trip has completed) protects only the *initiator's* identity key against a future compromise — not the responder's. See `X4DH.md` §10 for why the asymmetry runs that direction.
+- A session that has completed the live upgrade to `RK1` closes that gap for both sides, for that specific device pair, going forward from the point the upgrade happened.
+- None of this is a full ratchet yet — a device pair's session key is reused for every message under it until the session itself resets (X4DH.md §16.5/§16.6). Per-message forward secrecy (a real Double Ratchet) is separate, later work.
+- Any device pair that hasn't (yet, or ever) completed X4DH bootstrap still falls back to the identity-level static key, with none of the above.
+- Calls, shell escalation, relay migration notices, and burn notices are permanently out of scope for this — they aren't device-targeted infrastructure, so there's no session for them to ride on.
+
+In short: if an attacker records encrypted traffic today and later compromises your identity, previously recorded traffic on any device pair without a completed X4DH session — and any non-message traffic regardless — may become decryptable. A device pair with a completed `RK1` session is protected against exactly that scenario for the messages sent after the upgrade; a device pair still at `RK0` is protected only against a future compromise of the initiator's key.
 
 ---
 

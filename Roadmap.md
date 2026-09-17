@@ -4,11 +4,19 @@ Working notes on what's done, what's next, and what still needs a real design
 conversation before it gets touched. Not a promise of order or timing — just
 so the list lives somewhere other than someone's head.
 
-Current version: `0.4.8` per `protocol.md`'s formal wire spec — this file's
-own "0.4.5" was already stale before this update, independent of anything
-below. `0.5.0` is a separate, active `meshdev`-only development-cycle marker
-for the X4DH work (see `X4DH.md`) — it isn't reflected in `protocol.md`'s
-changelog yet since that cycle hasn't wrapped (not pushed to the public repo).
+Current version: `0.5.0` per `protocol.md`'s formal wire spec, as of this
+update — the X4DH session-establishment work (root-key bootstrap/upgrade,
+per-device wire encryption, targeted ack routing, and the tightened device
+registry retention) has now been witnessed firing correctly live and
+unprompted enough times to graduate from this file's own tracking into
+`protocol.md` itself, per this project's documentation discipline. `X4DH.md`
+remains the authoritative document for the cryptographic design and the
+live-confirmation status of pieces still in progress (automatic retry,
+self-sync forward secrecy, etc.) — `protocol.md` only carries the wire
+shapes and relay-visible behavior, not the DH derivations. One piece of the
+`0.5.0` cycle has NOT graduated: the `sync:backup_push` offline-buffering fix
+(see Done, below) is implemented but still not independently confirmed live,
+so it stays here rather than in `protocol.md` until that changes.
 See `protocol.md` for the authoritative wire spec and `known-limitations.md`
 for permanent, by-design tradeoffs (no TURN, no real revocation, etc.) —
 those aren't roadmap items, they're not going to change.
@@ -18,6 +26,45 @@ those aren't roadmap items, they're not going to change.
 ## Done
 
 Recent, for context on where "next" picks up from:
+
+- **Reaction/ack fanout narrowed to the single target device — confirmed
+  live, now documented in `protocol.md`.** X4DH's per-device wire encryption
+  had turned `sendReaction`'s fanout (shared with the RECEIVED auto-ack,
+  which fires on every single incoming message) into the dominant source of
+  server-side load: routing it through the same `resolveDeviceTargets`
+  fanout an ordinary message correctly uses meant a receiver running M
+  devices, acking a sender running N devices, produced M×N ack packets when
+  only M were ever meaningful. `resolveReactionTarget(contactId,
+  targetMsgId)` now looks up the specific device that sent the original
+  message and, when it resolves (known `endpointId`, not stale — same test
+  `resolveDeviceTargets` already applies), sends a single targeted packet
+  instead of fanning; falls back to the full broadcast fanout unchanged
+  whenever it doesn't resolve. Exercised live on meshdev and graduated into
+  `protocol.md`'s own [Delivery Acknowledgement](protocol.md#delivery-acknowledgement-received)
+  section — this file no longer needs to track it. Next step: pull
+  `server.py`'s `STATS` log (`buf_rate_rejected`/`buf_cap_rejected`/
+  `buf_endpoint_cap_rejected`) to see how much of the original throughput
+  pressure this alone accounted for, before deciding whether server-side
+  limits still need raising at all.
+- **X4DH session establishment, per-device wire encryption, and the
+  tightened device registry retention — all confirmed live and now
+  documented in `protocol.md`.** Everything below in this file that
+  describes root-key bootstrap/upgrade (§3–§7 of `X4DH.md`), the fixed-
+  initiator rule (§13.1), the propose-freshness/stuck-RK0/retry hardening
+  (§13.2 and the Status block at the top of `X4DH.md`), and the wire-key
+  derivation (`X4DH.md` §16) is still accurate and still the right place
+  for the cryptographic detail — `X4DH.md` remains authoritative there.
+  What changed with this pass is that the wire-visible shapes and
+  relay-visible behavior (the `session:propose`/`session:ack` packet types,
+  their durable-buffering/overwrite treatment, and the per-device wire key
+  as the thing that actually encrypts `app:message` traffic today) are now
+  also written into `protocol.md` itself, per this project's
+  documentation-discipline rule: a feature graduates out of Roadmap-only
+  tracking once it's been witnessed firing correctly live and unprompted.
+  The device registry's 30-day cutoff and periodic prune sweep
+  (`pruneDeviceRegistry()`/`DEVICE_PRUNE_INTERVAL_MS`, described further
+  down under Done) is documented the same way now, in `protocol.md`'s
+  [Device Registry](protocol.md#device-registry) section.
 
 - **X4DH root-key establishment is now fully automatic, both directions.**
   `maybeTriggerX4DHPropose` fires from `recordKnownDevice()` itself — no
@@ -187,31 +234,6 @@ Recent, for context on where "next" picks up from:
 
 Things with a rough shape already, not blocked on a bigger design call:
 
-- **Reaction/ack fanout narrowed to the single target device — implemented,
-  not yet confirmed live.** X4DH's per-device wire encryption turned
-  `sendReaction`'s fanout (shared with the RECEIVED auto-ack, which fires
-  on every single incoming message) into the dominant source of server-
-  side load: routing it through the same `resolveDeviceTargets` fanout an
-  ordinary message correctly uses meant a receiver running M devices,
-  acking a sender running N devices, produced M×N ack packets when only M
-  were ever meaningful — one ack per receiving device, each properly
-  addressed at the *specific* device that sent the original message
-  (already known — every received message stamps `deviceId`). New
-  `resolveReactionTarget(contactId, targetMsgId)` looks that device up
-  and, when it resolves (known `endpointId`, not stale — same test
-  `resolveDeviceTargets` already applies), `sendReaction` sends a single
-  targeted packet instead of fanning. Falls back to the full broadcast
-  fanout unchanged whenever it doesn't resolve — an own-message target
-  (deviceId is ours, not the contact's — no special-casing needed, the
-  lookup simply misses), an unlearned `endpointId`, or a stale one —
-  same safety net X4DH bootstrap itself already relies on for endpoint
-  discovery. `node --check`-validated; not yet exercised on meshdev, so
-  not yet promoted to a `protocol.md`/`X4DH.md`-confirmed fact per this
-  file's own documentation-discipline rule. Next step once confirmed
-  live: pull `server.py`'s `STATS` log (`buf_rate_rejected`/
-  `buf_cap_rejected`/`buf_endpoint_cap_rejected`) to see how much of the
-  original throughput pressure this alone accounts for, before deciding
-  whether server-side limits need raising at all.
 - **Keep `protocol.md` from drifting again.** No process yet beyond "notice
   it during unrelated work," which is how the `deviceId` envelope drift sat
   unnoticed for a while. Worth a lightweight habit at minimum (docs pass

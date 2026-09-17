@@ -28,6 +28,7 @@ Messages are encrypted with AES-256-GCM using a per-contact key agreed via X2551
 
 - End-to-end encrypted text, image and audio messages
 - Message signing and verification
+- Per-device session establishment (X4DH) with opportunistic, partial forward secrecy — see `known-limitations.md` for exactly what this does and doesn't cover
 - No accounts, email addresses or phone numbers
 - Roaming identities — move freely between relay servers
 - No central directory or identity provider
@@ -201,7 +202,7 @@ while remaining reachable.
 ### Important limitations
 
 * Passphrase security is everything.
-* Static identities mean there is currently **no forward secrecy**.
+* Forward secrecy is **partial**: device pairs that have completed X4DH session establishment (see `protocol.md`/`X4DH.md`) get real, per-device-pair protection once the session upgrades live — but a device pair without a completed session still falls back to a static identity-level key with none, and nothing here is a full per-message ratchet yet. See `known-limitations.md` for the complete picture.
 * Relay operators can observe IP addresses.
 * MeshChat is **not** an anonymity network and is not a replacement for Tor.
 
