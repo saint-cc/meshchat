@@ -239,6 +239,17 @@ Things with a rough shape already, not blocked on a bigger design call:
   unnoticed for a while. Worth a lightweight habit at minimum (docs pass
   whenever a wire-format or storage-shape change lands), even without
   tooling.
+- **Verify the epoch guard against a genuinely stale `session:ack` in
+  practice, not just by code inspection.** `upgradeX4DHSessionToRK1`
+  refuses to apply an ack whose `sessionEpoch` doesn't match the session's
+  current one — this should mean a stale ack for a superseded epoch (e.g.
+  the original far side's in-flight reply arriving late after a retry
+  already re-proposed and moved the session on) is silently dropped rather
+  than regressing anything. Worth deliberately producing this case (retry,
+  then let the original ack arrive late) since it's cheap to check once
+  the harness exists — distinct from, and not yet covered by, the
+  exhausted-retry-budget re-arm gap tracked in `X4DH.md`'s own Status
+  block.
 
 ---
 
@@ -254,17 +265,23 @@ before implementation starts, not just during it.
 - Open question is as much product as protocol: per-conversation opt-out,
   or not implemented at all
 
-### Device-layer routing (`networkID::deviceID`)
-- Goal: routing addressed to a specific device, not just an identity,
-  while keeping "no deviceID" as a valid per-identity local broadcast
-- Real tension: `deviceId` currently lives *inside* the encrypted payload
-  specifically so the relay can't see or rewrite it (deliberate fix, see
-  `protocol.md`). Routing by device means the relay needs to know which
-  device a socket represents before decryption — a small, deliberate step
-  toward exposing device identity to relay infrastructure, at roughly the
-  same metadata tier the relay already sees (`from`/`to` publicIds), just
-  more granular
-- Directly enables the sync/backup device-smartness ideas below
+### Device-layer routing — resolved, differently than originally framed
+This item originally asked for routing addressed to a specific device via
+`networkID::deviceID`, and flagged the real tension that would create:
+`deviceId` lives *inside* the encrypted payload specifically so the relay
+can't see or rewrite it, so routing by device would mean handing the relay
+something it currently never sees. What actually shipped avoids that
+trade-off entirely rather than accepting it: `endpointId` (see
+`protocol.md`'s [Device Endpoint ID](protocol.md#device-endpoint-id)) is a
+second, deliberately unlinkable identifier derived from the same device
+seed, presented to the relay instead of `deviceId` — the relay learns only
+which live socket to route to, never which physical device a contact would
+recognise from their own device popover. Compound addressing
+(`"id::endpointId"`, see `protocol.md`'s
+[Compound Addressing](protocol.md#compound-addressing)) is live for
+`app:message`, the `sync:*` self-targeting paths, and `session:propose`/
+`session:ack`. This directly enabled the sync/backup device-smartness work
+below — no further design pass needed on the routing mechanism itself.
 
 ### Passphrase KDF iteration count (PBKDF2 → possibly Argon2id)
 - Flagged by external review: `masterSecret` derivation (see
@@ -291,176 +308,87 @@ before implementation starts, not just during it.
   ratchet work; the two are unrelated axes of the same broader "how
   strong are our guarantees really" question.
 
-### Per-device encryption & relay-stored messages
-- Flagged as the hardest open item, not a simple loose end
-- Today's identity-level pairwise key means multi-device "just works" —
-  every device re-derives the same ECDH secret independently
-- Real forward secrecy (an actual ratchet) breaks that for free: a ratchet
-  chain needs one authoritative sequence, and two devices of the same
-  identity can't independently advance one chain without coordinating
-  (same fork already noted in the `nextSendCounter` code comments)
-- Two directions on the table:
-  - **Full per-device fanout** (Signal's approach) — sender maintains a
-    separate ratchet session per recipient device, no self-sync of crypto
-    state needed, but N-way ciphertext fanout per message
-  - Single-device-relays-to-self-via-existing-sync — architecturally
-    cheaper, reuses Phase 1 self-sync machinery, but means one device
-    holds plaintext on behalf of the others and gives up per-device
-    forward secrecy
-- **Agreed: full per-device fanout is the likely direction.** This gets
-  its own dedicated deep-dive conversation before any of it starts —
-  too large and too foundational to fold into general cleanup. Next
-  session opens with competitive research first (Signal Sesame, Matrix
-  Olm/Megolm, Session, SimpleX — current specifics pulled fresh rather
-  than from memory) to feed that conversation rather than run parallel
-  to it. Signal's own model assumes a server willing to hold prekey
-  state, which the relay deliberately doesn't do — worth weighing
-  SimpleX/Session's server-holds-nothing constraints at least as
-  heavily as Signal's, rather than treating Signal as the default
-  answer to diverge from only where forced to.
+### Real per-message forward secrecy (the Double Ratchet, on top of X4DH)
+This item used to be flagged as "the hardest open item" and framed as a
+single big decision ("full per-device fanout vs. self-relays-to-self")
+still to be made. That decision has effectively already been made and
+shipped, just via a different route than originally pictured: X4DH session
+establishment (`X4DH.md`) gives every device pair its own root key and its
+own derived wire-message key (`protocol.md`'s
+[Encryption](protocol.md#encryption) section), with graceful per-device
+fallback to the legacy identity-level key — that *is* per-device
+separation, Signal-shaped, without ever needing the "single device relays
+to self" alternative. Several of the sub-items this section used to carry
+forward are resolved along with it, not just theorized:
+- **The offline buffer is device-keyed** — done. The endpoint-keyed buffer
+  (`BUF_DIR/<publicId>/_endpoints/<endpointId>/`, see Done above and
+  `protocol.md`'s [Offline Delivery](protocol.md#offline-delivery)) shipped
+  ahead of and independent of the ratchet work, and X4DH's `session:propose`/
+  `session:ack` already route and buffer through it.
+- **Session bootstrap and session reset are the same mechanism** — done.
+  `retryX4DHPropose` is exactly `sendX4DHPropose` called again against an
+  already-established (but stuck) session; no separate reset packet type
+  was needed.
+- **Self-devices get a session too, no special-casing** — done. Self-pairs
+  use the `deviceId` tiebreak (`X4DH.md` §13.1) instead of comparing
+  `publicId` against itself, and are otherwise indistinguishable from any
+  contact pair.
+- **A dropped `session:ack` causing a silent 2DH downgrade** — no longer
+  just detected, now also retried. `checkStuckX4DHSessions` flags it and
+  `maybeAutoRetryX4DH` re-proposes automatically within a bounded budget
+  (see Done and `X4DH.md`'s Status block). What's still genuinely
+  unresolved: this is not closable against a relay that consistently and
+  selectively drops the ack while otherwise behaving normally — no
+  client-side signal distinguishes "genuinely offline" from "online, but
+  the ack keeps vanishing," so a session under sustained selective
+  interference can still exhaust its retry budget and stay stuck until a
+  fresh online-transition re-arms it. That remains a
+  `known-limitations.md`-shaped admission, not an implementation gap to
+  close.
 
-  **Two things carried forward from an earlier chat, not yet decided,
-  just flagged so they aren't lost before that session starts:**
-  - **The offline buffer must become device-keyed before fanout ships —
-    this is a hard blocker, not a nice-to-have.** `buf_dir`/`buf_write`/
-    `buf_deliver` in `server.py` are identity-level today, which is fine
-    under the current static pairwise key (any device sharing the seed
-    can decrypt whatever's buffered). It stops being fine under a real
-    ratchet: a fanned-out ciphertext is bound to one specific device's
-    chain, so a buffered packet handed to whichever device reconnects
-    first is either undecryptable by that device or never reaches the
-    one it was actually meant for. The `endpointId` plumbing (see
-    `protocol.md`'s [Device Endpoint ID](protocol.md#device-endpoint-id))
-    makes the mechanical part straightforward when it's time — keying
-    `BUF_DIR` by `(publicId, endpointId)` instead of just `publicId` —
-    but it needs to land as part of this work, not after.
-  - **Session bootstrap and session reset are likely the same
-    mechanism, not two.** Bootstrapping a never-before-seen device and
-    recovering a desynced/corrupted session with a known device both
-    reduce to "agree a fresh root key with this specific endpoint,
-    discarding whatever chain state exists" — bootstrap is just the
-    case where that state happens to be empty. Leaning toward one
-    signed "propose new root key" packet type for both, mandatory
-    signature (same trust tier as `app:migrate`/`app:burn` — this
-    drives crypto state, not just display), with the manual "accept
-    this device?" confirmation gating only the *never-seen-endpoint*
-    case — resetting an already-trusted endpoint's session likely
-    doesn't need the same friction, though it should still be visible
-    (log line / quiet system notice) rather than silent. Detection of
-    "this session needs a reset" (repeated AEAD failures, skipped-key
-    cache overflow) probably wants to surface a prompt rather than
-    auto-fire, at least until there's real usage data on false-positive
-    rate. Design bootstrap and reset together — don't build bootstrap
-    first and bolt reset on as an afterthought.
-  - **Self-devices get a ratchet session too, same as any other
-    peer — no special-casing.** Resolved during the self-device-backup-
-    targeting session: self was never special-cased for encryption
-    (`X25519(myPriv, myPub)` just falls out of the general pairwise ECDH
-    function — see [Encryption](protocol.md#encryption)), and there's no
-    reason the ratchet should be different. Each pair of a user's own
-    devices establishes its own session exactly like a session with a
-    contact would. This directly answers the open question under "Sync /
-    backup device-smartness" below about what happens to self-sync once
-    device-layer routing lands: it stops being a special case entirely.
-    Two consequences worth carrying forward to that design session:
-    - **The `backupKey`-encrypted backup blob itself does NOT ratchet.**
-      It stays deterministic across every device holding the same
-      passphrase, on purpose — that determinism is what makes an
-      exported backup file, or a freshly-recovered identity with no
-      session state at all, restorable in the first place. Ratcheting it
-      would break that property for no gain. What ratchets is the
-      *transport* the already-encrypted blob rides inside — the blob
-      becomes opaque payload inside a per-device-pair session, the same
-      way image/audio bytes already ride as opaque payload inside an
-      ordinary pairwise `app:message` today.
-    - **`pushMiniBackup`'s purpose survives, its plumbing doesn't.** It
-      exists to keep siblings live-current on conversation after every
-      outgoing message, not just periodically reconciled — a real need,
-      worth keeping. But it works today only because self-sync shares one
-      static, coordination-free key across every device; that's exactly
-      the property a real ratchet removes. Once per-device sessions
-      exist, mini-backup's payload just becomes whatever rides inside
-      one, same as the full backup push above. Bonus: self-sync packets
-      carry no `sig` at all today (unlike `app:message`) — riding inside
-      a real ratchet session fixes that for free, not as a separate task.
-  - **A dropped `session:ack` causes a silent 2DH downgrade — detection
-    now exists, reset does not.** If the relay (or an active attacker)
-    drops `session:ack`, the session simply stays at `RK0` (X4DH.md
-    §7.1's timeout only governs how long the ephemeral is held waiting
-    for a reply — nothing retried or surfaced "still on 2DH" afterward,
-    until now). **Update:** the presence-based observation described
-    below is implemented and confirmed live — `checkStuckX4DHSessions`
-    (see Done) flags a stuck-at-RK0 session via `mlog.warn` the next time
-    presence confirms the peer is online, past a cooldown. What's still
-    missing is turning that flag into an actual fix: it still reduces to
-    the same "propose a fresh root key with this endpoint" mechanism the
-    bootstrap/reset item above needs, and nothing calls that
-    automatically yet — today's detector deliberately only logs. Also
-    still true: not fully closable against a relay that consistently and
-    selectively drops the ack — no client-side signal distinguishes
-    "genuinely offline" from "online, but the ack keeps vanishing," so
-    part of this remains a `known-limitations.md`-shaped admission, not
-    purely an implementation gap.
-  - **A worked Double Ratchet sketch matching this shape already exists**
-    (from an external cross-model design discussion) — session state
-    keyed by `(networkID, deviceID, sessionEpoch)`, a symmetric ratchet
-    (`MK = HMAC(CK, "message")`, `CK' = HMAC(CK, "chain")`) with
-    independent send/recv chains, and an 11-step DH-ratchet transition
-    (reject stale `dhGen` → fold incoming DH into `RK` → reseed
-    `CK_recv` → generate new local ephemeral → fold the complementary DH
-    into `RK` → reseed `CK_send` → destroy the old ephemeral → advance
-    `dhGen`) that deliberately doesn't disturb the old sending chain
-    mid-transition. Textbook Signal-shape and consistent with everything
-    landed so far — useful input for the competitive-research pass
-    above, not a substitute for it, since Signal's is only one of the
-    four systems that pass is meant to weigh.
-
-### Automatic X4DH retry — needs a design pass before wiring
-`retryX4DHPropose` (see Done) is confirmed correct as a manual,
-human-triggered action, but promoting it to something
-`checkStuckX4DHSessions` calls on its own needs real design first, not
-just a call-site change — calling it unconditionally on every stuck-session
-sighting would spam fresh proposals at a permanently offline peer forever.
-Open questions carried into next session:
-- **A retry budget, not unlimited retries.** Rough shape floated: cap
-  attempts (~10) gated on discrete online-transition events for that
-  identity (a genuine `false → true` edge in presence, the same one
-  `markOnline`'s own `● ONLINE` log line already distinguishes from a
-  routine poll re-confirmation) rather than on elapsed time or the
-  existing 5-minute stuck-log cooldown alone — retrying every single
-  re-poll of an already-known-online peer would burn through the budget
-  in one sitting for no reason.
-- **What "give up" looks like.** Once the budget's exhausted, detection
-  should keep flagging (probably a quieter, distinguishable log line —
-  "stuck, retries exhausted" vs. today's plain "stuck") rather than going
-  silent, so a permanently wedged session doesn't just quietly stop being
-  visible.
-- **What re-arms it.** Leaning toward: only a *new* online-transition
-  after exhaustion (not "still online," a fresh edge) resets the attempt
-  budget — meaning a peer that reconnects via a different path, comes
-  back after being genuinely offline, etc. gets a clean shot rather than
-  staying permanently locked out by an old exhausted counter.
-- **Where the counter lives.** Most natural as a new field on the
-  existing `x4dhSessions` entry itself (e.g. `retryAttempts`,
-  `retryExhaustedAt`) rather than a separate map — keeps it colocated
-  with the session it describes, consistent with how `proposeTs` was
-  added to the same shape earlier.
-- **Dev-facing tooling, deferred alongside this.** A small console-only
-  `x4dhDebug` namespace (`list()` — dump every session across every
-  contact with stage/age/initiator at a glance; `retry(contactId,
-  deviceId)` — thin wrapper over the existing manual helper) was
-  proposed as a fast way to survey session state without hand-walking
-  `state.x4dhSessions`, and as a natural home for a future
-  `forceStuck()` test helper. Not built yet — bundling it with the
-  automatic-retry design pass since both are "better visibility into
-  this system" work.
-- **Still unconfirmed, carried from the Done entry above**: whether a
-  stale ack for a superseded epoch is correctly dropped by
-  `upgradeX4DHSessionToRK1`'s epoch guard in practice, not just by code
-  inspection. Worth deliberately trying to produce this case (e.g.
-  retry, then let the *original* far side's in-flight ack arrive late)
-  during the same session, since it's cheap to check once the harness
-  exists.
+**What's actually still open, and still needs the dedicated deep-dive this
+item originally asked for:** real per-message forward secrecy — a genuine
+Double Ratchet layered on top of the root key X4DH now establishes.
+`X4DH.md` §15/§16 are explicit that what ships today stops at a single
+static wire key per session, not a ratchet; deriving symmetric send/recv
+chain keys from `RK0`/`RK1` and stepping them per message (or per DH
+ratchet turn) is genuinely not started. The competitive-research framing
+still applies before committing to a shape — Signal Sesame, Matrix
+Olm/Megolm, Session, and SimpleX pulled fresh rather than from memory —
+since the relay's own "holds no prekey state" constraint diverges from
+Signal's model and is worth weighing SimpleX/Session's server-holds-nothing
+approach against at least as heavily as Signal's, rather than treating
+Signal as the default to diverge from only where forced to. Two things
+worth carrying into that session:
+- **The `backupKey`-encrypted backup blob itself must not ratchet.** It
+  needs to stay deterministic across every device holding the same
+  passphrase — that determinism is what makes an exported backup file, or
+  a freshly-recovered identity with no session state at all, restorable at
+  all. What ratchets is the *transport* the already-encrypted blob rides
+  inside, not the blob itself — same as how image/audio bytes already ride
+  as opaque payload inside an ordinary `app:message` today.
+- **`pushMiniBackup`'s purpose survives a ratchet, its plumbing doesn't.**
+  It exists to keep siblings live-current after every outgoing message,
+  not just periodically reconciled — worth keeping. It works today only
+  because self-sync shares one static, coordination-free key across every
+  device; a real per-message ratchet removes that coordination-free
+  property. Once chain keys exist, mini-backup's payload just becomes
+  whatever rides inside one, same as the full backup push. Bonus: self-sync
+  packets carry no `sig` at all today (unlike `app:message`) — riding
+  inside a real ratchet session fixes that for free, not as a separate
+  task.
+- **A worked Double Ratchet sketch matching this shape already exists**
+  (from an external cross-model design discussion) — session state keyed
+  by `(networkID, deviceID, sessionEpoch)`, a symmetric ratchet
+  (`MK = HMAC(CK, "message")`, `CK' = HMAC(CK, "chain")`) with independent
+  send/recv chains, and an 11-step DH-ratchet transition (reject stale
+  `dhGen` → fold incoming DH into `RK` → reseed `CK_recv` → generate new
+  local ephemeral → fold the complementary DH into `RK` → reseed `CK_send`
+  → destroy the old ephemeral → advance `dhGen`) that deliberately doesn't
+  disturb the old sending chain mid-transition. Textbook Signal-shape and
+  consistent with everything landed so far — useful input for the
+  competitive-research pass above, not a substitute for it, since Signal's
+  is only one of the four systems that pass is meant to weigh.
 
 ### Sync / backup device-smartness (for later, no urgency)
 - Self-device backup targeting is now done — see Done above. What's left
@@ -472,8 +400,12 @@ Open questions carried into next session:
   under the contact's identity, same as before this pass
 - Backup: if devices reliably merge first, a backup push might be able to
   go out as just "identity," with no contact-device specificity needed —
-  **resolved above**: self-devices get their own ratchet sessions like any
-  other peer, so this stops being a special case once that work lands
+  **partially resolved above**: self-devices already get their own X4DH
+  session like any other peer, so per-device addressing for self-sync is
+  no longer a special case; whether that's enough to simplify backup
+  distribution further still depends on the still-open Double Ratchet
+  work above, not just the session-establishment piece that's already
+  shipped
 
 ### Sync strategy — needs a real rethink, not just the dev2dev slice
 Flagged explicitly during the self-device-backup-targeting session: the
