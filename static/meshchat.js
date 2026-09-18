@@ -307,9 +307,12 @@ function pollContacts() {
   mlog.debug(`POLL       queried ${1 + others.length} id(s)`);
 }
 
+let pollTimer = null;
+
 function schedulePoll() {
+  clearTimeout(pollTimer);
   const jitter = (Math.random() - 0.5) * POLL_JITTER_MS;
-  setTimeout(() => { pollContacts(); schedulePoll(); }, POLL_INTERVAL_MS + jitter);
+  pollTimer = setTimeout(() => { pollContacts(); schedulePoll(); }, POLL_INTERVAL_MS + jitter);
 }
 
 /* ══════════════════════════════════════════
