@@ -118,9 +118,36 @@ MAX_BUF_RECIPIENTS = int(os.environ.get("MAX_BUF_RECIPIENTS", 10000))
 # on unbounded directory growth" reasoning, just a smaller blast radius.
 MAX_ENDPOINTS_PER_RECIPIENT = int(os.environ.get("MAX_ENDPOINTS_PER_RECIPIENT", 20))
 
-# Rate limiter
-RATE_LIMIT_RATE  = 10   # tokens refilled per second
-RATE_LIMIT_BURST = 20   # max burst size
+# Rate limiter — two separate tiers, deliberately not one shared constant
+# pair. Every connection gets its own per-socket RateLimiter (below) *and*
+# every socket from the same source IP shares one additional RateLimiter
+# via ip_limiters[addr] (see handler()) — the per-socket one caps a single
+# misbehaving/bugged connection, the per-IP one caps a flood spread across
+# many sockets from one address. Both used to default from the same two
+# constants, which meant there was no way to give "one connection" a
+# different budget than "everything behind this NAT combined": loosening
+# the shared pair to accommodate several legitimate clients on one IP
+# (a household, a NAT'd office) also loosened the per-socket ceiling for
+# the single-bad-actor case that limiter actually exists for. Split so
+# each can be tuned independently — the per-socket pair stays tight
+# (10/20 is plenty for one real client), the per-IP pair is sized for a
+# small household of concurrent clients sharing an address by default,
+# and either can move without touching the other.
+RATE_LIMIT_RATE  = int(os.environ.get("RATE_LIMIT_RATE",  20))   # per-socket: tokens refilled per second
+RATE_LIMIT_BURST = int(os.environ.get("RATE_LIMIT_BURST", 60))   # per-socket: max burst size
+
+# Per-IP shared budget — defaults to 3x the per-socket pair, a reasonable
+# "small household, not an attacker" assumption rather than a literal
+# per-client multiple (four clients each getting their old individual
+# budget would need 4x; 3x leaves genuine concurrent traffic from several
+# clients some headroom without handing a single-IP flood a proportionally
+# larger allowance just because more sockets happen to share that address).
+# Tune upward if a legitimate deployment still sees per-IP warnings after
+# checking they're not actually MAX_CONNECTIONS_PER_IP or a buffer-side
+# limit instead (see BUF_WRITE_RATE_LIMIT below) — those are separate
+# knobs and bumping this one won't touch them.
+IP_RATE_LIMIT_RATE  = int(os.environ.get("IP_RATE_LIMIT_RATE",  RATE_LIMIT_RATE * 3))
+IP_RATE_LIMIT_BURST = int(os.environ.get("IP_RATE_LIMIT_BURST", RATE_LIMIT_BURST * 3))
 
 # Global auth admission limiter — shared across ALL connections regardless
 # of source IP. Per-IP limiting (rate limiter + MAX_CONNECTIONS_PER_IP)
@@ -1312,13 +1339,17 @@ async def handler(ws):
         return
 
     # Shared across every socket this IP currently has open — without this,
-    # MAX_CONNECTIONS_PER_IP sockets each got their own independent 10/s
-    # budget, so an IP's effective throughput scaled with how many
-    # connections it opened rather than staying capped at one connection's
-    # worth. get-or-create rather than always-new so it persists (and its
-    # token bucket state carries over) across this IP's concurrent sockets.
+    # MAX_CONNECTIONS_PER_IP sockets each got their own independent budget,
+    # so an IP's effective throughput scaled with how many connections it
+    # opened rather than staying capped. Deliberately its own, wider tier
+    # (IP_RATE_LIMIT_RATE/BURST) rather than reusing the per-socket
+    # RateLimiter() defaults — see that pair's own comment near their
+    # definition for why sharing one constant between "one connection" and
+    # "everything behind this NAT" was the wrong call. get-or-create rather
+    # than always-new so it persists (and its token bucket state carries
+    # over) across this IP's concurrent sockets.
     if addr not in ip_limiters:
-        ip_limiters[addr] = RateLimiter()
+        ip_limiters[addr] = RateLimiter(rate=IP_RATE_LIMIT_RATE, burst=IP_RATE_LIMIT_BURST)
     ip_limiter = ip_limiters[addr]
 
     log.info("CONNECT    peer=%s  sessions=%d/%d  from_ip=%d/%d",
@@ -1668,6 +1699,8 @@ async def run_signal_server():
     log.info("Buffer write-rate: %.1f/s per recipient  burst=%.0f  idle_prune=%ds",
              BUF_WRITE_RATE_LIMIT, BUF_WRITE_RATE_BURST, BUF_RATE_LIMITER_IDLE_S)
     log.info("Global auth admission: %.1f/s  burst=%.0f", GLOBAL_AUTH_RATE, GLOBAL_AUTH_BURST)
+    log.info("Rate limits: per-socket=%d/s burst=%d  per-ip=%d/s burst=%d",
+              RATE_LIMIT_RATE, RATE_LIMIT_BURST, IP_RATE_LIMIT_RATE, IP_RATE_LIMIT_BURST)
     log.info("Trusted proxies: %s", ", ".join(str(n) for n in TRUSTED_PROXIES) or "(none)")
     log.info("Push: subs_dir=%s  vapid_key=%s  vapid_pub=%s…  ttl=%ds  subject=%s",
              PUSH_SUBS_DIR, VAPID_KEY_FILE, VAPID_PUBLIC_KEY_B64[:16], PUSH_TTL_SECONDS, VAPID_SUBJECT)
