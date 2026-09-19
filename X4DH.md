@@ -1,5 +1,9 @@
 # X4DH — MeshChat Session Establishment
 
+> **MeshChat X4DH is a MeshChat-specific 2DH/4DH session-establishment construction. It is not Signal's X3DH and does not use signed or one-time prekeys. It has not been formally analysed or independently audited.**
+>
+> **What `RK1` gives you, precisely:** session-level forward secrecy against a *later* compromise of either identity key, for traffic sent *after* the live upgrade completes. It is not per-message forward secrecy, and `RK0` (the async-only stage) does not have it. The exact scope and qualifiers are in §10.2 — read that before quoting this property anywhere.
+
 > **X4DH is MeshChat's asynchronous session-establishment protocol.**
 >
 > It establishes a usable session immediately when the recipient is offline, and opportunistically upgrades that session when both devices are online.
@@ -540,8 +544,10 @@ however that compromise happens. `DH3` alone only mirrors `DH2`'s own
 asymmetry in the other direction (protects against a future leak of
 Bob's key, not Alice's) — it is `DH4` specifically that makes `RK1`
 resistant to a future leak of either identity key. The session
-transitions into this fully ephemeral-inclusive state before ordinary
-messaging begins, whenever Bob happens to be reachable at bootstrap time.
+transitions into this fully ephemeral-inclusive state whenever Bob happens to be
+reachable at bootstrap time. Traffic sent under `RK0` before the upgrade lands
+keeps `RK0`'s weaker property (§16.2) — the upgrade does not retroactively
+strengthen it.
 
 This is an intentional trade-off.
 
@@ -573,6 +579,15 @@ one of those sessions' `RK0` inputs. A session that completed the live
 never involves either identity key (§10) — this is precisely why the
 opportunistic upgrade matters, not just as a "nice to have."
 
+## 10.2 What `RK1`'s forward secrecy does and does not claim
+
+The claim, stated once and precisely: **`RK1` (and the wire key derived from it) cannot be reconstructed from a later compromise of either party's identity key**, because `DH4 = X25519(EK_A, EK_B)` uses only two ephemeral keys that are never derivable from any identity key. This is *session-level forward secrecy against later identity-key compromise*. Qualifiers that must travel with it:
+
+- **Only traffic after the upgrade.** Messages sent under `RK0` in the window before `session:ack` lands (or forever, if it never does) remain exposed to a later leak of the responder's identity key (§10). The upgrade is not retroactive.
+- **Depends on both ephemeral private keys actually being erased.** The initiator holds `EK_A_priv` in memory until the ack lands or times out (§7.1); the responder's `EK_B_priv` is a local variable that goes out of scope. In JavaScript neither is zeroised — they are dropped and left to the garbage collector, so erasure is best-effort, not guaranteed.
+- **Static per session, not per message.** The wire key is the same for every message under a session (§16.6). There is no ratchet, so there is no post-compromise recovery: whoever obtains a session's root key can read that session's traffic until the session resets. This is session-level forward secrecy, not the per-message property a Double Ratchet provides.
+- **The root key is stored on the device.** `RK0`/`RK1` are persisted in the session store, encrypted with a key derived from the passphrase. An attacker who obtains both the device's storage and the passphrase gets the root key directly — no identity-key math needed. That is normal for at-rest state and does not contradict the claim above (which is about *network-recorded* traffic plus a later identity-key leak), but the claim should not be read as broader than that threat model.
+
 ---
 
 # 11. Session Epoch
@@ -593,7 +608,8 @@ This value distinguishes independent attempts to establish sessions between the 
 
 **It is authenticated, not mixed into the root-key KDF.** An earlier draft of this document sketched `sessionEpoch` and both sides' identity/`deviceId` as direct KDF inputs; §6.1's precise construction deliberately doesn't do this. The reasoning: `RK0`/`RK1`'s uniqueness already comes from `EK_A` (and `EK_B`) being freshly generated per session — two different `sessionEpoch` attempts between the same device pair necessarily produce different ephemeral keys, and therefore different DH outputs and different root keys, with no help needed from mixing metadata into the KDF itself.
 
-`sessionEpoch`, `deviceId`, and both identities instead live where they're actually enforced: inside the **signed** fields of `session:propose`/`session:ack` (§4, §13). The signature is what binds a given root key to a specific claimed session/device pair; the KDF's job is only to turn DH outputs into key bytes, with `info` providing fixed domain separation between the root key and any other future purpose this HKDF chain might need to serve (see §6.1) — not per-session uniqueness, which the ephemeral keys already guarantee on their own.
+`sessionEpoch`, `deviceId`, and both identities instead live where they're actually enforced: inside the **signed** fields of `session:propose`/`session:ack` (§4, §13). The signature authenticates the ephemeral key and the session/device metadata from which the root key is derived, thereby binding the resulting session to the claimed identity and device pair; \1
+The device half of that binding is an **identity-authenticated device claim**: `deviceId` is asserted under the *identity* key's signature, not proven with a separate device key. Anyone holding the identity key could sign a propose claiming any `deviceId`. That is inside the trust model (the identity-key holder can already act as the identity), but "device binding" here should not be read as device-key attestation.
 
 This still prevents otherwise identical key material from being interpreted as the same protocol session — the guarantee just comes from freshness plus authentication, rather than from the KDF's `info` string carrying session metadata directly.
 
@@ -706,8 +722,11 @@ provable guarantee against every possible double-delivery ordering,
 so a receiving device should additionally refuse to adopt a
 `session:propose` whose `ts` is older than its currently-active
 session's own establishment time for that device — a cheap, sufficient
-guard against a delayed duplicate regressing an already-upgraded
-session.
+\1
+**What this guard is — and isn't.** It is *state-rollback (downgrade) protection*, not authentication and not replay prevention in the cryptographic sense. Authentication is the signature's job; the guard only stops a validly signed but older `session:propose` from overwriting newer local session state. As implemented it compares the packet's signed `ts` against the stored `proposeTs` (both the sender's clock, deliberately — see `storeX4DHSessionRK0`) and refuses `ts <= proposeTs`. Two consequences worth stating rather than leaving implicit:
+
+- **It is not a replay defence when no session record exists.** It incidentally rejects an exact replay of the *latest* propose, but only while a session record for that device is on file. After a wipe, a burn, or loss of the session store there is nothing to compare against, so a replayed propose would be accepted. The worst case is a desynchronised session (the original initiator no longer holds the matching pending ephemeral, so no upgrade completes) that stuck-at-RK0 detection and retry then repair; it does not yield key material. *Reasoned-not-observed.*
+- **A sender clock set far ahead poisons later proposes.** Because `proposeTs` is the sender's clock, if a propose stamped far in the future is ever adopted, every subsequent legitimate propose from that sender (including automatic retries, which stamp `Date.now()`) is refused as stale until real time catches up with the stored value. The symptom would be a session stuck at `RK0` with retries dropped on the receiving side while the detector keeps flagging it. No plausibility bound on `ts` exists today; adding one is a possible hardening. *Reasoned-not-observed.*
 
 **Stuck-at-RK0 detection and retry** (implemented, confirmed live — see the Status block at the top of this document) are what turn this section's replay-hardening rules into a self-correcting system rather than a purely defensive one: a session that ends up stuck despite the guards above (a dropped `session:ack`, most commonly) is now flagged automatically the next time presence confirms the peer is online, and — for the initiator-side shape specifically — automatically re-proposed within a bounded retry budget. See the Status block and Roadmap.md for the full mechanics; this subsection remains the specification of *why* staleness matters, not the retry logic itself.
 

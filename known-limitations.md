@@ -92,7 +92,11 @@ Message contents remain end-to-end encrypted.
 Identity keys are static, and the identity-level pairwise key derived from them provides none of the protection described here — see `protocol.md`'s Encryption section. As of `0.5.0`, a device pair that has completed X4DH session establishment (`X4DH.md`) uses that session's root key to encrypt real message traffic instead, which changes this picture, but only partially:
 
 - A session still sitting at `RK0` (the asynchronous bootstrap stage, before a live round trip has completed) protects only the *initiator's* identity key against a future compromise — not the responder's. See `X4DH.md` §10 for why the asymmetry runs that direction.
-- A session that has completed the live upgrade to `RK1` closes that gap for both sides, for that specific device pair, going forward from the point the upgrade happened.
+- A session that has completed the live upgrade to `RK1` closes that gap for both sides, for that specific device pair, going forward from the point the upgrade happened. Precisely, this is *session-level forward secrecy against later identity-key compromise*, with these qualifiers:
+  - It covers only traffic sent after the upgrade; anything sent under `RK0` beforehand stays exposed as described above.
+  - It relies on both ephemeral private keys being erased. In JavaScript that is best-effort (dropped and garbage-collected, not zeroised).
+  - The wire key is static per session, so there is no per-message forward secrecy and no post-compromise recovery until the session resets.
+  - The session root key is stored on the device, encrypted with a key derived from the passphrase. An attacker with both the device's storage and the passphrase obtains it directly, without needing any identity-key attack.
 - None of this is a full ratchet yet — a device pair's session key is reused for every message under it until the session itself resets (X4DH.md §16.5/§16.6). Per-message forward secrecy (a real Double Ratchet) is separate, later work.
 - Any device pair that hasn't (yet, or ever) completed X4DH bootstrap still falls back to the identity-level static key, with none of the above.
 - Calls, shell escalation, relay migration notices, and burn notices are permanently out of scope for this — they aren't device-targeted infrastructure, so there's no session for them to ride on.
@@ -149,6 +153,17 @@ Delivery through the underlying push service (Google's, Mozilla's, etc.) is best
 
 # General
 
+## The X4DH freshness guard trusts the sender's clock
+
+The check that stops an older `session:propose` from overwriting a newer session is state-rollback protection, not authentication and not cryptographic replay prevention. It compares timestamps from the sender's own clock, which has two consequences:
+
+- After a wipe, burn or loss of session storage there is no record to compare against, so it does not stop a replayed propose. The likely outcome is a desynchronised session that stuck-session detection and retry later repair, not disclosure of key material.
+- If a sender's clock is ever far ahead when a propose is adopted, its later legitimate proposes (including automatic retries) are refused until real time catches up with the stored value.
+
+Both are reasoned from the code rather than observed live.
+
+---
+
 ## Experimental protocol
 
 MeshChat Protocol v0 is still evolving.
@@ -157,9 +172,8 @@ Packet formats, routing behaviour and synchronisation mechanisms may change betw
 
 ---
 
-## No formal security audit
-
-The protocol has not undergone an independent security review.
+\1
+X4DH in particular is a MeshChat-specific 2DH/4DH construction — not Signal's X3DH, and without signed or one-time prekeys. It has had no formal analysis.
 
 It should be considered experimental software.
 
