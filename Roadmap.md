@@ -25,208 +25,41 @@ those aren't roadmap items, they're not going to change.
 
 ## Done
 
-Recent, for context on where "next" picks up from:
+Full writeups for graduated work now live in `CHANGELOG.md` (what shipped,
+by version) and `protocol.md`/`X4DH.md` (the current spec itself). This
+section only keeps what isn't fully captured there yet, or context specific
+to what "next" picks up from:
 
-- **Reaction/ack fanout narrowed to the single target device — confirmed
-  live, now documented in `protocol.md`.** X4DH's per-device wire encryption
-  had turned `sendReaction`'s fanout (shared with the RECEIVED auto-ack,
-  which fires on every single incoming message) into the dominant source of
-  server-side load: routing it through the same `resolveDeviceTargets`
-  fanout an ordinary message correctly uses meant a receiver running M
-  devices, acking a sender running N devices, produced M×N ack packets when
-  only M were ever meaningful. `resolveReactionTarget(contactId,
-  targetMsgId)` now looks up the specific device that sent the original
-  message and, when it resolves (known `endpointId`, not stale — same test
-  `resolveDeviceTargets` already applies), sends a single targeted packet
-  instead of fanning; falls back to the full broadcast fanout unchanged
-  whenever it doesn't resolve. Exercised live on meshdev and graduated into
-  `protocol.md`'s own [Delivery Acknowledgement](protocol.md#delivery-acknowledgement-received)
-  section — this file no longer needs to track it. Next step: pull
-  `server.py`'s `STATS` log (`buf_rate_rejected`/`buf_cap_rejected`/
-  `buf_endpoint_cap_rejected`) to see how much of the original throughput
-  pressure this alone accounted for, before deciding whether server-side
-  limits still need raising at all.
-- **X4DH session establishment, per-device wire encryption, and the
-  tightened device registry retention — all confirmed live and now
-  documented in `protocol.md`.** Everything below in this file that
-  describes root-key bootstrap/upgrade (§3–§7 of `X4DH.md`), the fixed-
-  initiator rule (§13.1), the propose-freshness/stuck-RK0/retry hardening
-  (§13.2 and the Status block at the top of `X4DH.md`), and the wire-key
-  derivation (`X4DH.md` §16) is still accurate and still the right place
-  for the cryptographic detail — `X4DH.md` remains authoritative there.
-  What changed with this pass is that the wire-visible shapes and
-  relay-visible behavior (the `session:propose`/`session:ack` packet types,
-  their durable-buffering/overwrite treatment, and the per-device wire key
-  as the thing that actually encrypts `app:message` traffic today) are now
-  also written into `protocol.md` itself, per this project's
-  documentation-discipline rule: a feature graduates out of Roadmap-only
-  tracking once it's been witnessed firing correctly live and unprompted.
-  The device registry's 30-day cutoff and periodic prune sweep
-  (`pruneDeviceRegistry()`/`DEVICE_PRUNE_INTERVAL_MS`, described further
-  down under Done) is documented the same way now, in `protocol.md`'s
-  [Device Registry](protocol.md#device-registry) section.
-
-- **X4DH root-key establishment is now fully automatic, both directions.**
-  `maybeTriggerX4DHPropose` fires from `recordKnownDevice()` itself — no
-  manual call needed anywhere — the instant the fixed-initiator side
-  (§13.1) has a known `endpointId` for a device and no existing session
-  with it yet (§13.3). Confirmed live and unprompted on meshdev for
-  contact pairs (a brand-new pair, and a new device added to an already-
-  established pair) and, separately, for self-pairs — `isFixedInitiator`'s
-  `deviceId` tiebreak was implemented but untested when this cycle's own
-  handoff was written; now confirmed via a sibling device discovering the
-  other's endpoint through an ordinary self-chat message, with no manual
-  call anywhere in the causal chain.
-- **Two pieces of §13.2 replay/staleness hardening landed**, deliberately
-  scoped to detection rather than retry (see the dropped-`session:ack` item
-  under Planned, below, for what's still open). A stuck-at-RK0 detector
-  (`checkStuckX4DHSessions`, hooked into `markOnline()`) flags a session
-  sitting at RK0 past 2× the proposal timeout while presence confirms the
-  peer is actually online — confirmed for both roles it covers: a
-  manufactured stuck initiator session, and a genuine, unprompted stuck
-  responder session hit during unrelated testing. A propose-freshness
-  guard in `handleX4DHPropose` refuses a `session:propose` whose signed
-  `ts` isn't strictly newer than the session's own stored `proposeTs`
-  (compared sender-clock-to-sender-clock, not against the receiver's local
-  clock, so ordinary skew can't read as a replay) — confirmed against a
-  live forged-but-validly-signed stale propose, and again when that exact
-  packet came back out of the relay's own durable buffer later.
-- **Manual X4DH session-reset retry, confirmed live twice.**
-  `retryX4DHPropose(contactId, theirDeviceId)` — a console-only helper, not
-  wired into any automatic call site — re-runs `sendX4DHPropose` against a
-  session already confirmed stuck at `RK0` by the existing detector,
-  refusing outright if the session doesn't exist, isn't at `RK0`, or we're
-  not the fixed initiator for the pair. This is the first real use of the
-  "session bootstrap and session reset are the same mechanism" framing
-  below — no new packet type or crypto construction needed, just
-  permission to call the existing propose path a second time. Confirmed
-  live against two independently-occurring (not manufactured) stuck
-  sessions on meshdev; both re-established a fresh `sessionEpoch` and
-  converged to `RK1` cleanly. A small per-device status dot was also added
-  to the existing device popover (contact rows and the self row alike,
-  since both go through the same `isFixedInitiator` machinery) —
-  muted/blue/red/green for no-session / RK0-fresh / RK0-stuck / RK1, red
-  threshold reusing `X4DH_STUCK_RK0_THRESHOLD_MS` verbatim so the UI can
-  never silently disagree with the log-level detector.
-- **`sync:backup_push` now buffers on missed live delivery** (`server.py`),
-  closing a real data-loss gap: it was live-only (`sendSignal`, no
-  relay-side buffer) with no retry, unlike the periodic full self-sync
-  push. Concretely fixes `pushMiniBackup`'s one-shot-per-message sends
-  silently vanishing if the sibling device was offline at that exact
-  instant — previously the message would only ever arrive via the next
-  10-minute periodic full push, and only then if the sibling happened to
-  be online at that later moment either. Buffered at the same tier as
-  `app:message` (buffer-on-miss only, no push-notify); deliberately not
-  given `app:migrate`/`app:burn`'s "always buffer even when reached" tier
-  or their overwrite-per-sender treatment — each push is scoped to one
-  contact's slice, not an identity-wide fact, so overwriting by sender
-  alone would silently drop every push but the last if several land while
-  the recipient is offline. Implemented and syntax-validated; not yet
-  independently confirmed live (no captured before/after test run yet).
-
-- **Fixed: reactions silently disappearing on merge.** `mergeMessages`'
-  `byId` dedup was positional last-write-wins (`for (const m of [...a,
-  ...b]) if (m.id) byId[m.id] = m` — whichever copy landed later in the
-  concatenated array won, full stop). Harmless for text/audio/image/system
-  messages, since a given id's content there never changes after send —
-  but `deriveReactionId(myPublicId, targetMsgId)` deliberately produces
-  the *same* id across every state a (sender, target) pair can be in: a
-  real emoji, a manual clear, and the RECEIVED auto-ack (`emoji: null`,
-  fired automatically on decrypt+verify — see protocol.md's Delivery
-  Acknowledgement section) all collide on one id by design, so an emoji
-  change/clear replaces rather than duplicates on merge. That design was
-  sound; the collision-resolution rule sitting on top of it wasn't. If a
-  stale `emoji:null` auto-ack ever arrived at a `mergeMessages` call
-  *after* a genuinely newer real reaction — a delayed live delivery, a
-  peer/self backup push carrying an older snapshot, a multi-device
-  fingerprint-mismatch resend — the old positional rule let the stale ack
-  silently clobber the real reaction, with no error and no log line. Fix:
-  `byId` collisions now resolve by `ts` (whichever action actually
-  happened later in real time wins), not by which side of the merge
-  concatenation the message happened to land on. No-op for
-  immutable-content ids (same id always carries the same `ts` there), so
-  applied unconditionally in the one shared dedup path rather than
-  special-casing reactions out. See `meshchat-lib.js`'s `mergeMessages`
-  comment and `protocol.md`'s [Message Merging](protocol.md#message-merging)
-  section for the full writeup.
-- X25519 static-static ECDH pairwise message encryption, replacing the old
-  shared-AES-in-the-address scheme (breaking change, `0.4.0`)
-- Burn notice (`app:burn`), two-gate confirmation UI, own buffer/TTL bucket
-- WebRTC data-channel shell escalation for agent contacts (`shell:*`,
-  `agent.py`, two-tier `CONTACTS`/`SHELL_CONTACTS` trust split)
-- **Double Ratchet Phase 1 groundwork:**
-  - per-(device, contact) send counters (`n`), excluding reactions
-  - device registry upgraded to `{ lastSeen, lastN }` per device, with
-    migration from the old bare-timestamp shape
-  - passive gap/dupe/reorder detection, log-only (`mlog.debug`)
-  - packet inspector (ⓘ) on every message bubble
-- Edit-contact UI can now (un)set `contact.type` = agent after the fact
-  (previously add-contact-only)
-- `protocol.md` caught up to the above, plus a real drift fix: `deviceId`
-  was documented as outer-envelope metadata but had already been moved
-  inside the encrypted+signed payload in code — doc now matches reality
-- **Push notifications (`0.4.1`)** — end to end: per-relay VAPID keypair
-  generated on first boot, `sig:push_subscribe`/`sig:push_unsubscribe`,
-  best-effort empty-payload pushes fired only on genuinely-offline
-  `app:message` delivery, per-device opt-in checkbox (edit-contact panel,
-  self only), browser subscribe/resubscribe handled uniformly through
-  `ensurePushSubscription()` (including the post-migration VAPID-key
-  mismatch case), and the service worker's generic `push`/
-  `notificationclick` handling. Full detail lives in `protocol.md`'s
-  [Push Notifications](protocol.md#push-notifications) section — no open
-  design questions left on this one.
-- **Message status — SEND / RECEIVED.** SEND was already implicit; RECEIVED
-  is now live too, riding the existing reaction channel rather than a new
-  packet type — `receiveMessage()` fires an auto-ack (`emoji: null`) back
-  to the sender the moment a message both decrypts and verifies, and the
-  sender flips that message's status to `delivered` on receipt. Rendered
-  client-side as ✔️ (sent) / ✔️✔️ (delivered) / ✗ (failed). READ status is
-  explicitly **not** part of this — see below, still deferred on purpose.
-- **Causal message ordering — both slices done.** Slice 1: all four send
-  paths (`sendMessage`, `sendAudioMessage`, `sendImageMessage`,
-  `sendCallNotice`) now stamp `ackDeviceId`/`ackN` on outgoing
-  text/audio/image/system payloads via `getAckPointer(contactId)` (reads
-  the freshest usable entry straight off the existing device registry, no
-  new storage), and both sides persist `deviceId`/`n`/`ackDeviceId`/`ackN`
-  on the stored message object. Slice 2: `mergeMessages` (`meshchat-lib.js`)
-  resolves a message's `ackDeviceId`/`ackN` against the merged set and
-  splices it in directly after the message it references — recursively, so
-  a reply-to-a-reply nests correctly — instead of trusting `ts`. Anything
-  unresolvable (no ack fields, or a reference outside the merged set) keeps
-  its place in the existing `(ts, id)` sort, unchanged. Deliberately not a
-  full causal/vector-clock reorder — multiple acks on the same target keep
-  their relative `(ts, id)` order rather than being further disambiguated,
-  per the "reordering as the exception, not the norm" framing below.
-  `protocol.md`'s [Message Merging](protocol.md#message-merging) and
-  [Message Payload](protocol.md#message-payload) sections updated to match.
-- **Endpoint-keyed offline buffer.** `server.py`'s `buf_write`/`buf_deliver`
-  now support a per-`(publicId, endpointId)` bucket
-  (`BUF_DIR/<publicId>/_endpoints/<endpointId>/`) alongside the existing
-  identity-level one — the hard blocker flagged under per-device fanout
-  below. A connection presenting `endpoint_id` at auth gets both buckets
-  flushed; one that doesn't only ever gets the identity-level bucket, same
-  as before this existed. Own rate limiter/lock per bucket, own
-  `MAX_ENDPOINTS_PER_RECIPIENT` cap (default 20) independent of
-  `MAX_BUF_RECIPIENTS`, own expiry sweep. `app:migrate`/`app:burn` never
-  touch this — they aren't device-targeted and stay identity-level only.
-  Dormant until something actually sets `toEndpoint` on a message that
-  misses live delivery — see the next line for the first real consumer.
-- **First real per-device fanout: self-sync backup targeting.**
-  `sync:backup_push`/`sync:backup_accept` now carry `endpointId` (learned
-  the same passive "only adopt an explicit value" way as the message path
-  already does), and the relay honors `toEndpoint` on the shared
-  `app:sync`/`sync:*`/`call:*`/`shell:*` delivery branch, not just
-  `app:message`. `pushBackupToContacts`'s self branch went from "broadcast
-  to every live self-session unless ALL of them are current" to targeting
-  each individually-stale, endpoint-known sibling device directly, falling
-  back to broadcast only for genuine discovery (no acks yet this session)
-  or a stale device whose endpoint isn't known yet. Deliberately scoped to
-  self-sync backup/restore only — the contact-facing `backup_offer`/
-  `backup_accept`/`backup_push` path and the manual `app:sync` (SYNC
-  button) exchange are untouched. See the "sync strategy needs a real
-  rethink" note under Planned below — this slice was a deliberately narrow
-  proof of per-device routing working end to end, not a sync-protocol
-  redesign.
+- Reaction/ack fanout narrowed to the single target device (`resolveReactionTarget`)
+  — confirmed live. See `protocol.md`'s [Delivery Acknowledgement](protocol.md#delivery-acknowledgement-received).
+  **Still open**: pull `server.py`'s `STATS` log (`buf_rate_rejected`/
+  `buf_cap_rejected`/`buf_endpoint_cap_rejected`) to see how much of the
+  original throughput pressure this alone accounted for, before deciding
+  whether server-side limits still need raising.
+- X4DH session establishment, per-device wire encryption, automatic
+  bootstrap/retry, and tightened device registry retention — all confirmed
+  live. See `CHANGELOG.md`'s `0.5.0` entry, `protocol.md`, and `X4DH.md`'s
+  Status block (which remains authoritative for the crypto detail).
+- Per-device X4DH status dot on the device popover (contact rows and self
+  row alike) — muted/blue/red/green for no-session / RK0-fresh / RK0-stuck
+  / RK1, threshold shared verbatim with `checkStuckX4DHSessions` so the UI
+  can never disagree with the log-level detector. UI-only, not covered
+  elsewhere in the docs.
+- **`sync:backup_push` now buffers on missed live delivery** (`server.py`)
+  — implemented and syntax-validated, closing a real data-loss gap in
+  `pushMiniBackup`'s one-shot sends. **Not yet independently confirmed
+  live** — no captured before/after test run yet. Once confirmed, this
+  moves to `CHANGELOG.md`/`protocol.md` like everything else above.
+- Fixed: reactions silently disappearing on merge (`mergeMessages`' `byId`
+  dedup resolves by `ts` now, not array position) — see `protocol.md`'s
+  [Message Merging](protocol.md#message-merging).
+- X25519 static-static ECDH pairwise encryption, burn notice, WebRTC shell
+  escalation for agent contacts, Double Ratchet Phase 1 groundwork (send
+  counters, device registry upgrade, passive gap detection, packet
+  inspector), push notifications, SEND/RECEIVED message status, causal
+  message ordering, and the endpoint-keyed offline buffer — all shipped
+  and documented; see `CHANGELOG.md` for which version each landed in and
+  `protocol.md` for current behavior.
 
 ---
 

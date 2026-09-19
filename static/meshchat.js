@@ -2035,7 +2035,17 @@ const pendingRestoreRequest = new Set();
 // verification stance as the rest of this handshake pair: signed
 // unconditionally, verified only when the recipient already has us on
 // file.
+const lastRestoreAckPingSent = {};
+const RESTORE_ACK_PING_COOLDOWN = 60_000; // much shorter than RESTORE_COOLDOWN — this is just "don't spam," not "don't restore"
+
+function canSendRestoreAckPing(id) {
+  const last = lastRestoreAckPingSent[id];
+  return !last || (Date.now() - last) > RESTORE_ACK_PING_COOLDOWN;
+}
+
 function sendRestoreAckPing(toId) {
+  if (!canSendRestoreAckPing(toId)) return;
+  lastRestoreAckPingSent[toId] = Date.now();
   const ts  = Date.now();
   const obj = { type: "sync:restore_ack", from: buildAddress(state.publicId, state.endpointId), to: toId, ts };
   obj.sig = signHandshakePacket(obj);
