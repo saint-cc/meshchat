@@ -1969,9 +1969,71 @@ async function handleBackupPush(msg) {
 
   // token exchange — one time only
   if (!state.peerTokens[fromId]) {
+    // Remember that WE asked — handleTokenResponse only accepts a token
+    // that answers a request still in flight (see TOKEN_REQ_TTL_MS).
+    pendingTokenReq.set(fromId, Date.now());
     sendSignal({ type: "sync:token_req", from: state.publicId, to: fromId });
     mlog.info(`→ TOKEN_REQ    to   ${pid(fromId)} — no token yet`);
   }
+}
+
+/* ══════════════════════════════════════════
+   RESTORE TOKEN — hygiene pass (step 1 of making the token "proper")
+   What a token is: a small record ALICE seals under her own backup key
+   and hands to Bob when he stores her backup. Only her passphrase-derived
+   key can open it, so opening it later proves "I issued this" without
+   any signature. What's inside is Bob's shareableKey as Alice knows it —
+   i.e. everything needed to rebuild Bob (X25519 key, signing key, relay).
+
+   This pass changes only how tokens are ISSUED, STORED and CHECKED. It
+   does not change what a restore does with one (that's the later
+   bootstrap step). Three fixes:
+     1. token_resp is now signed, and only accepted from a known contact
+        while a token_req of ours is still in flight. Before, ANY authed
+        sender could plant a junk token; handleTokenResponse keeps only
+        the first token per sender, so a planted one stuck forever and
+        Alice then dropped every restore_req Bob sent with it (silent,
+        permanent, and worse than having no token at all).
+     2. Issued tokens carry { v: 2, shareableKey } only. `name` was
+        Alice's private label for Bob and `date` was never read by
+        anything — both just leaked into an outer plaintext field. Old
+        tokens (with name/date) still validate: only shareableKey is read.
+     3. A token only counts if the key inside it derives to msg.from
+        (tokenBoundId). Before, any token Alice ever issued to anyone was
+        accepted from anyone who held the bytes. And a bad token no
+        longer aborts the restore for a known contact — it is treated as
+        no token (see handleRestoreRequest).
+══════════════════════════════════════════ */
+const TOKEN_REQ_TTL_MS = 60_000;      // how long a token_req of ours stays "in flight" for handleTokenResponse
+const pendingTokenReq  = new Map();   // contactId → timestamp of our outstanding token_req
+
+// Same shape/pattern as signRestorePacket. `token` is the sealed { v, iv, data }
+// object itself — the ciphertext is INSIDE the signature, so a relay can't
+// swap it. Old clients send no sig/ts at all; those fail verification and
+// are ignored (restore still works between that pair, just without a token).
+function signTokenPacket(obj) {
+  const { type, from, to, ts, token } = obj;
+  return signBlob({ type, from, to, ts, token: token || null });
+}
+function verifyTokenPacket(obj, contactSignPublicKey) {
+  if (!obj.sig || !contactSignPublicKey) return false;
+  const { type, from, to, ts, token } = obj;
+  return verifyBlob({ type, from, to, ts, token: token || null }, obj.sig, contactSignPublicKey);
+}
+
+// Derives the publicId of whoever a decrypted token was issued FOR, from
+// the two public keys inside its shareableKey — the same derivation
+// addContact uses. Throws on anything malformed; callers catch and treat
+// that as "no usable token".
+async function tokenBoundId(tokenPlain) {
+  const key = tokenPlain?.shareableKey;
+  if (typeof key !== "string") throw new Error("missing shareableKey");
+  const parts = key.split(".");
+  if (parts.length < 2) throw new Error("malformed shareableKey");
+  const x25519PublicKey = base64ToRaw(parts[0]);
+  const signPublicKey   = base64ToRaw(parts[1]);
+  if (x25519PublicKey.length !== 32 || signPublicKey.length !== 32) throw new Error("bad key length");
+  return deriveIdentityPublicId(x25519PublicKey, signPublicKey);
 }
 
 async function handleTokenRequest(msg) {
@@ -1980,12 +2042,9 @@ async function handleTokenRequest(msg) {
   if (!contact || contact.blocked) return;
   markOnline(msg.from);
   mlog.info(`← TOKEN_REQ    from ${pid(msg.from)} — generating token`);
-  const token = await encryptObject(state.cryptoKey, {
-    name:        contact.name,
-    shareableKey: contact.shareableKey,
-    date:        Date.now(),
-  });
-  const tokenRespObj = { type: "sync:token_resp", from: state.publicId, to: msg.from, token };
+  const token = await encryptObject(state.cryptoKey, { v: 2, shareableKey: contact.shareableKey });
+  const tokenRespObj = { type: "sync:token_resp", from: state.publicId, to: msg.from, ts: Date.now(), token };
+  tokenRespObj.sig = signTokenPacket(tokenRespObj);
   const viaRelayResp = sendToRelay(msg.from, tokenRespObj, false);
   if (!viaRelayResp) sendSignal(tokenRespObj);
   mlog.info(`→ TOKEN_RESP   to   ${pid(msg.from)}  via=${viaRelayResp ? "relay" : "signal(fallback)"}`);
@@ -1993,13 +2052,28 @@ async function handleTokenRequest(msg) {
 
 async function handleTokenResponse(msg) {
   if (!msg.from || !msg.token) return;
+  const contact = state.contacts[msg.from];
+  if (!contact || contact.blocked) {
+    mlog.warn(`← TOKEN_RESP   from ${pid(msg.from)} — not a contact, ignored`);
+    return;
+  }
+  const askedAt = pendingTokenReq.get(msg.from);
+  if (!askedAt || (Date.now() - askedAt) > TOKEN_REQ_TTL_MS) {
+    mlog.warn(`← TOKEN_RESP   from ${pid(msg.from)} — unsolicited (no token_req in flight), ignored`);
+    return;
+  }
+  if (!verifyTokenPacket(msg, contact.signPublicKey)) {
+    mlog.warn(`← TOKEN_RESP   from ${pid(msg.from)} — signature missing or invalid, ignored`);
+    return;
+  }
+  pendingTokenReq.delete(msg.from);
   if (state.peerTokens[msg.from]) {
     mlog.debug(`TOKEN_RESP     from ${pid(msg.from)} — already have token, ignored`);
     return;
   }
   state.peerTokens[msg.from] = msg.token;
   savePeerTokens();
-  mlog.info(`← TOKEN_RESP   from ${pid(msg.from)} — stored`);
+  mlog.info(`← TOKEN_RESP   from ${pid(msg.from)}  sig:✓ — stored`);
 }
 /* ══════════════════════════════════════════
    RESTORE_REQ — mandatory signature, unlike the handshake pair above
@@ -2132,31 +2206,43 @@ if (contact.blocked) {
 
   const fresh = Object.keys(state.contacts).length <= 1;
 
-  // if token present, validate it — only Alice can decrypt her own token
+  // Token check. A token only counts if it is BOUND to this sender: the key
+  // inside it (issued by us, sealed under our own backup key) must derive
+  // to msg.from. Previously any token we'd ever issued was accepted from
+  // whoever presented the bytes, and a token that failed to open aborted
+  // the whole request — which, combined with the unsigned token_resp,
+  // let a planted junk token silently kill a contact's restore path.
+  // Now a bad/mismatched token is simply "no token": a known contact still
+  // falls through to the ack below (the request itself is already
+  // signature-verified and ECDH-decrypted, which is what actually
+  // authenticates them), and only the `fresh` branch still needs a valid one.
+  let tokenOk = false;
   if (msg.token) {
     try {
       const tokenPlain = await decryptObject(state.cryptoKey, msg.token);
-      if (!tokenPlain.shareableKey) throw new Error("missing shareableKey");
-      mlog.info(`← RESTORE_REQ  from ${pid(msg.from)} — token valid ✓`);
+      const boundId    = await tokenBoundId(tokenPlain);
+      if (boundId !== msg.from) throw new Error("token was not issued for this sender");
+      tokenOk = true;
+      mlog.info(`← RESTORE_REQ  from ${pid(msg.from)} — token valid ✓ (bound)`);
+    } catch(e) {
+      mlog.warn(`← RESTORE_REQ  from ${pid(msg.from, plain.deviceId ? { deviceId: plain.deviceId } : {})} — token ignored (${e.message})`);
+    }
+  }
 
-      // update contact with wss and signPublicKey from blob if we know them
-      if (state.contacts[msg.from]) {
-        if (plain.wss) updateRelay(state.contacts[msg.from], plain.wss, Date.now());
-        if (plain.signPublicKey) {
-          state.contacts[msg.from].signPublicKey = base64ToRaw(plain.signPublicKey);
-        }
+  if (tokenOk) {
+    // update contact with wss and signPublicKey from blob if we know them
+    // (unchanged from before this pass — deliberately not touched here)
+    if (state.contacts[msg.from]) {
+      if (plain.wss) updateRelay(state.contacts[msg.from], plain.wss, Date.now());
+      if (plain.signPublicKey) {
+        state.contacts[msg.from].signPublicKey = base64ToRaw(plain.signPublicKey);
       }
-// token invalid
-} catch(e) {
-  mlog.warn(`← RESTORE_REQ  from ${pid(msg.from, plain.deviceId ? { deviceId: plain.deviceId } : {})} — token invalid, dropped`);
-  return;
-}
-	
-// fresh client, no token
-} else if (fresh) {
-  mlog.info(`← RESTORE_REQ  from ${pid(msg.from, plain.deviceId ? { deviceId: plain.deviceId } : {})} — fresh client, no token, ignored`);
-  return;
-}
+    }
+  } else if (fresh) {
+    // fresh client, no valid token
+    mlog.info(`← RESTORE_REQ  from ${pid(msg.from, plain.deviceId ? { deviceId: plain.deviceId } : {})} — fresh client, no valid token, ignored`);
+    return;
+  }
   // else: no token, not fresh — an already-known contact re-requesting
   // without a token. Nothing further to validate; falls through to the
   // ack below same as the token-valid path does.
@@ -2233,10 +2319,22 @@ async function handleRestoreAck(msg) {
     mlog.info(`← RESTORE_ACK  from ${fromDisp} — no backup stored, nothing sent`);
     return;
   }
-  mlog.info(`← RESTORE_ACK  from ${fromDisp} — sending restore_push`);
+  // Token attach (step 3). Only when the ack's signature VERIFIED: the token
+  // is a sealed record only the ack sender can open, so it's only worth
+  // handing to someone we've just confirmed is that identity — never to an
+  // unsigned/unverifiable ack. It rides as an outer field and is
+  // deliberately NOT part of signHandshakePacket's signed set: adding it
+  // there would make older clients that already know this sender compute a
+  // different signature and drop the push. Stripping it in transit only
+  // downgrades the receiver to today's unverified path; it can't forge one
+  // (the receiver binds the token's key to `from` and verifies the push
+  // signature with it — see handleRestorePush).
+  const token = verified ? state.peerTokens[fromId] : null;
+  mlog.info(`← RESTORE_ACK  from ${fromDisp} — sending restore_push${token ? "  +token" : ""}`);
   const pushTs  = Date.now();
   const pushObj = { type: "sync:restore_push", from: buildAddress(state.publicId, state.endpointId), to: fromId, blob: backup, ts: pushTs };
   pushObj.sig = signHandshakePacket(pushObj);
+  if (token) pushObj.token = token;
   sendSignal(pushObj);
 }
 
@@ -2253,12 +2351,38 @@ async function handleRestorePush(msg) {
   // as the rest of this handshake: unverifiable (no sig, or sender not
   // yet a contact) proceeds exactly as this has always worked; only an
   // ACTIVE verification failure is dropped.
-  const contact    = state.contacts[fromId];
-  const verifiable = !!(msg.sig && contact?.signPublicKey);
-  const verified   = verifiable && verifyHandshakePacket(msg, contact.signPublicKey);
+  const contact = state.contacts[fromId];
+  // Token path (step 3): a device that has lost its contacts can't verify
+  // this push — it has no signPublicKey for the sender. If the holder
+  // attached the token WE issued for them, opening it (passphrase key only)
+  // gives us that key: the sender's shareableKey, sealed by us earlier. The
+  // key must derive to `from` (tokenBoundId) or the token is ignored, and the
+  // push signature is then verified with the key from the token. When we
+  // already know the sender we keep using the contact's key as before —
+  // the token adds nothing there.
+  let verifyKey = contact?.signPublicKey || null;
+  let viaToken  = false;
+  if (!verifyKey && msg.token) {
+    try {
+      const tokenPlain = await decryptObject(state.cryptoKey, msg.token);
+      const boundId    = await tokenBoundId(tokenPlain);
+      if (boundId !== fromId) throw new Error("token was not issued for this sender");
+      verifyKey = base64ToRaw(tokenPlain.shareableKey.split(".")[1]);
+      viaToken  = true;
+    } catch(e) {
+      mlog.warn(`← RESTORE_PUSH from ${pid(fromId)} — token ignored (${e.message})`);
+    }
+  }
+  const verifiable = !!(msg.sig && verifyKey);
+  const verified   = verifiable && verifyHandshakePacket(msg, verifyKey);
   if (verifiable && !verified) {
-    mlog.warn(`← RESTORE_PUSH from ${pid(fromId)} — signature invalid, dropped`);
+    mlog.warn(`← RESTORE_PUSH from ${pid(fromId)} — signature invalid${viaToken ? " (via token)" : ""}, dropped`);
     return;
+  }
+  if (viaToken && !verified) {
+    // token opened fine but the push carried no signature — nothing to
+    // verify, so this is exactly today's unverified path.
+    mlog.info(`← RESTORE_PUSH from ${pid(fromId)} — token ✓ bound, but push unsigned — unverified`);
   }
   const fromDisp = pid(fromId, verified ? { endpointId: fromEndpoint } : {});
   // Only trust the endpoint suffix for cooldown-keying once signed+verified
@@ -2311,7 +2435,7 @@ async function handleRestorePush(msg) {
     await saveContacts();
     renderContactList();
 	if (state.currentChat) renderMessages();
-    mlog.info(`← RESTORE_PUSH from ${fromDisp} — +${added} contacts  +${msgsMerged} msgs`);
+    mlog.info(`← RESTORE_PUSH from ${fromDisp} — +${added} contacts  +${msgsMerged} msgs  sig:${verified ? (viaToken ? "✓ (via token)" : "✓") : "·"}`);
     setSyncStatus("restored from network ✓");
     if (state.contacts[state.publicId]?.lastRelay !== prevSelfRelay) {
       mlog.info(`RESTORE_PUSH   self relay changed via other device — rebooting signal`);
