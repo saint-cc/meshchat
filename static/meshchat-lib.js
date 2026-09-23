@@ -456,6 +456,45 @@ async function deriveX4DHWireKey(rootKeyBytes) {
   const bits = await hkdfBits(new Uint8Array(32), rootKeyBytes, X4DH_INFO_WIRE);
   return importEncKey(bits);
 }
+// One-shot restore-push wrap key (meshchat.js's restore-token work, step
+// 4) — HKDF over a single ephemeral-to-ephemeral X25519 DH output, its own
+// domain-separation label, distinct from every other HKDF info string in
+// this file. Deliberately NOT an X4DH session key: there is no root key,
+// no epoch, nothing persisted anywhere. The caller derives this once per
+// restore attempt from a DH it just computed, uses it to wrap or unwrap
+// exactly one blob, then both sides' ephemeral private keys go out of
+// scope. See meshchat.js's pendingRestoreEk section for the protocol this
+// supports — a just-wiped device has a brand-new deviceId and can't have
+// bootstrapped a real X4DH session for this pair yet, and this only ever
+// needs to protect one exchange, not stand up a reusable one.
+async function deriveRestoreWrapKey(sharedSecret) {
+  const hkdfKey = await crypto.subtle.importKey("raw", sharedSecret, { name: "HKDF" }, false, ["deriveBits"]);
+  const bits = await crypto.subtle.deriveBits(
+    { name: "HKDF", hash: "SHA-256", salt: new Uint8Array(32), info: new TextEncoder().encode("meshchat-v1:restore-wrap") },
+    hkdfKey, 256
+  );
+  return importEncKey(new Uint8Array(bits));
+}
+// One-shot ephemeral wrap key — HKDF over a single ephemeral-to-ephemeral
+// X25519 DH output, its own domain-separation label, distinct from every
+// other HKDF info string in this file. Deliberately NOT an X4DH session
+// key: there is no root key, no epoch, nothing persisted anywhere. The
+// caller derives this once per handshake attempt from a DH it just
+// computed, uses it to wrap or unwrap exactly one blob, then both sides'
+// ephemeral private keys go out of scope. Shared by two independent
+// meshchat.js mechanisms that otherwise have nothing to do with each
+// other — the restore-push wrap (pendingRestoreEk) and the contact
+// backup-push wrap (pendingBackupEk) — since the primitive itself (wrap
+// one blob under a fresh, disposable ephemeral DH) is identical between
+// them; only which handshake generates the ephemerals differs.
+async function deriveEphemeralWrapKey(sharedSecret) {
+  const hkdfKey = await crypto.subtle.importKey("raw", sharedSecret, { name: "HKDF" }, false, ["deriveBits"]);
+  const bits = await crypto.subtle.deriveBits(
+    { name: "HKDF", hash: "SHA-256", salt: new Uint8Array(32), info: new TextEncoder().encode("meshchat-v1:ephemeral-wrap") },
+    hkdfKey, 256
+  );
+  return importEncKey(new Uint8Array(bits));
+}
 
 // Fresh, one-time X25519 ephemeral keypair (EK). Generated the same way
 // device seeds already are (crypto.getRandomValues(32)) rather than

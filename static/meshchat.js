@@ -13,7 +13,7 @@
 
    Load order: meshchat-lib.js → meshchat-gui.js → meshchat.js → statemachine.js
 ═══════════════════════════════════════════════════════════════ */
-const CLIENT_VERSION = "0.5.0";
+const CLIENT_VERSION = "0.5.1";
 
 const POLL_INTERVAL_MS        	= 30_000;			// base interval between presence polls
 const POLL_JITTER_MS          	= 10_000;			// ± random jitter added to poll interval
@@ -1616,14 +1616,26 @@ async function sendFannedX4DH(contactId, payload) {
    decrypted by an already-mutual contact in the first place.
 ══════════════════════════════════════════ */
 
+// `ek` (step 4 — one-shot restore-push wrap, see pendingRestoreEk below)
+// is included in the signed set ONLY when the object being signed
+// actually carries one. A packet with no `ek` field produces the exact
+// same signed payload as before this pass — old clients, and new clients
+// that simply aren't using the wrap this round, stay byte-for-byte
+// compatible in both signing directions. Only two same-version parties,
+// both including `ek`, need to agree on the signed shape — which they do,
+// by construction, since both run this same function.
 function signHandshakePacket(obj) {
-  const { type, from, to, size, ts, blob } = obj;
-  return signBlob({ type, from, to, size: size ?? null, ts, blob: blob || null });
+  const { type, from, to, size, ts, blob, ek } = obj;
+  const payload = { type, from, to, size: size ?? null, ts, blob: blob || null };
+  if (ek !== undefined) payload.ek = ek;
+  return signBlob(payload);
 }
 function verifyHandshakePacket(obj, contactSignPublicKey) {
   if (!obj.sig || !contactSignPublicKey) return false;
-  const { type, from, to, size, ts, blob } = obj;
-  return verifyBlob({ type, from, to, size: size ?? null, ts, blob: blob || null }, obj.sig, contactSignPublicKey);
+  const { type, from, to, size, ts, blob, ek } = obj;
+  const payload = { type, from, to, size: size ?? null, ts, blob: blob || null };
+  if (ek !== undefined) payload.ek = ek;
+  return verifyBlob(payload, obj.sig, contactSignPublicKey);
 }
 
 // tracks which peers we have a pending offer waiting for accept
@@ -1764,6 +1776,7 @@ async function handleBackupOffer(msg) {
   mlog.info(`← BACKUP_OFFER from ${pid(fromId, verified ? { endpointId: fromEndpoint } : {})}  size=${msg.size}  sig:${verified ? "✓" : "·"} — accepting`);
   const acceptTs  = Date.now();
   const acceptObj = { type: "sync:backup_accept", from: buildAddress(state.publicId, state.endpointId), to: fromId, ts: acceptTs };
+  if (verified) attachBackupEk(acceptObj, fromId);
   acceptObj.sig = signHandshakePacket(acceptObj);
   sendSignal(acceptObj);
 }
@@ -1837,12 +1850,36 @@ async function handleBackupAccept(msg) {
     mlog.warn(`BACKUP_ACCEPT  from ${pid(fromId)} — offer expired, ignored`);
     return;
   }
+  // Wrap (same one-shot ephemeral mechanism as the restore-push wrap —
+  // see pendingBackupEk above). Only when the OFFER's ack verified and
+  // carried an ephemeral (handleBackupOffer only attaches one when
+  // `verified` there was true, so msg.ek here already implies that —
+  // this re-check just keeps the gate explicit and self-contained rather
+  // than relying on the sender having done the right thing). Wrap
+  // failure falls back to sending the plain blob rather than dropping it
+  // — the recipient still needs their backup stored, and unwrapped is
+  // exactly today's behavior, not a downgrade below anything working now.
+  let outBlob = pending.blob, ek = null;
+  if (verified && msg.ek) {
+    try {
+      const theirEk = new Uint8Array(msg.ek);
+      const { priv, pub } = generateX25519Ephemeral();
+      const shared  = x25519.getSharedSecret(priv, theirEk);
+      const wrapKey = await deriveEphemeralWrapKey(shared);
+      outBlob = await encryptObject(wrapKey, pending.blob);
+      ek = Array.from(pub);
+    } catch(e) {
+      mlog.warn(`BACKUP_PUSH    wrap failed for ${pid(fromId)}, sending unwrapped: ${e.message}`);
+      outBlob = pending.blob; ek = null;
+    }
+  }
   delete pendingBackupOffer[fromId];
   const pushTs  = Date.now();
-  const pushObj = { type: "sync:backup_push", from: buildAddress(state.publicId, state.endpointId), to: fromId, blob: pending.blob, ts: pushTs };
+  const pushObj = { type: "sync:backup_push", from: buildAddress(state.publicId, state.endpointId), to: fromId, blob: outBlob, ts: pushTs };
+  if (ek) pushObj.ek = ek;
   pushObj.sig = signHandshakePacket(pushObj);
   sendSignal(pushObj);
-  mlog.info(`→ BACKUP_PUSH  to   ${pid(fromId, verified ? { endpointId: fromEndpoint } : {})}  sig:${verified ? "✓" : "·"} — accepted`);
+  mlog.info(`→ BACKUP_PUSH  to   ${pid(fromId, verified ? { endpointId: fromEndpoint } : {})}  sig:${verified ? "✓" : "·"} — accepted${ek ? "  +wrap" : ""}`);
 }
 
 async function handleBackupPush(msg) {
@@ -1963,9 +2000,36 @@ async function handleBackupPush(msg) {
     return;
   }
 
-  state.peerBackups[fromId] = msg.blob;
+  // Unwrap — same one-shot mechanism as the restore-push wrap. What ends
+  // up in peerBackups is always the PLAIN inner blob, exactly as before
+  // this pass: the wrap is transport-only and never touches what's kept
+  // at rest (peerBackups is itself still an opaque blob to us regardless,
+  // encrypted under the SENDER's own key — this unwrap only strips the
+  // outer transport layer we're able to see, not the inner one we can't).
+  let storedBlob = msg.blob;
+  const viaWrap = !!msg.ek;
+  if (viaWrap) {
+    const pending = pendingBackupEk.get(fromId);
+    if (!pending) {
+      mlog.warn(`← BACKUP_PUSH  from ${pid(fromId)} — wrap present but no pending ephemeral for ${pid(fromId)}, dropped`);
+      return;
+    }
+    clearTimeout(pending.timeoutHandle);
+    pendingBackupEk.delete(fromId);
+    try {
+      const theirEk = new Uint8Array(msg.ek);
+      const shared  = x25519.getSharedSecret(pending.priv, theirEk);
+      const wrapKey = await deriveEphemeralWrapKey(shared);
+      storedBlob = await decryptObject(wrapKey, msg.blob);
+    } catch(e) {
+      mlog.warn(`← BACKUP_PUSH  from ${pid(fromId)} — unwrap failed, dropped: ${e.message}`);
+      return;
+    }
+  }
+
+  state.peerBackups[fromId] = storedBlob;
   savePeerBackups();
-  mlog.info(`← BACKUP_PUSH  from ${pid(fromId, verified ? { endpointId: fromEndpoint } : {})}  sig:${verified ? "✓" : "·"} — stored`);
+  mlog.info(`← BACKUP_PUSH  from ${pid(fromId, verified ? { endpointId: fromEndpoint } : {})}  sig:${verified ? "✓" : "·"} — stored${viaWrap ? "  +wrap" : ""}`);
 
   // token exchange — one time only
   if (!state.peerTokens[fromId]) {
@@ -2076,6 +2140,77 @@ async function handleTokenResponse(msg) {
   mlog.info(`← TOKEN_RESP   from ${pid(msg.from)}  sig:✓ — stored`);
 }
 /* ══════════════════════════════════════════
+   RESTORE PUSH WRAP — one-shot ephemeral (step 4 of the restore-token work)
+   Protects the inner passphrase-encrypted backup blob against a passive
+   wire recording that's later paired with a leaked passphrase. The inner
+   blob is untouched — still exactly what it always was (AES-GCM under
+   state.cryptoKey, the thing restore-from-nothing needs to stay
+   decryptable by passphrase alone) — this adds a SECOND layer around it,
+   keyed by a fresh X25519 ephemeral-to-ephemeral DH generated for this
+   one restore attempt and never written to disk. Recording the wrapped
+   wire bytes and later learning the passphrase does not recover them —
+   the ephemeral private keys are gone the moment this exchange completes
+   or times out.
+
+   Sequencing: whoever SENDS a restore_ack (sendRestoreAckPing, or the
+   reply built in handleRestoreRequest) attaches a fresh ephemeral public
+   key as `ek` and holds the matching private key here, keyed by the
+   ack's addressee — that's who's expected to answer with a push.
+   Whoever RECEIVES that ack (handleRestoreAck, peer branch) only wraps
+   when the ack's signature VERIFIED — an `ek` riding on an unverifiable
+   ack could be a relay's own swapped-in key, the same reasoning step 3
+   already applies to attaching the token — and generates its OWN fresh
+   ephemeral to compute the shared secret, attaching that ephemeral's
+   public half to the push as its own `ek`. The push's receiver — the
+   original ack sender — looks its pending ephemeral up by the push's
+   `from`, which is exactly the id it addressed the ack to.
+
+   Deliberately NOT an X4DH session: a just-wiped device has a brand-new
+   deviceId and can't have bootstrapped a real session for this pair yet,
+   and this only ever needs to protect one exchange, not stand up a
+   reusable one. Timeout mirrors X4DH_PROPOSAL_TIMEOUT_MS/BACKUP_OFFER_TTL
+   — restore_ack/restore_push are already live-only (never durably
+   buffered — see protocol.md), so if a push doesn't arrive within this
+   window it isn't coming via this round trip at all; the next poll cycle
+   simply generates a fresh ack with a fresh ek.
+══════════════════════════════════════════ */
+const RESTORE_EK_TIMEOUT_MS = 60_000;
+const pendingRestoreEk = new Map();   // targetId (who we expect to push back) -> { priv, timeoutHandle }
+
+function attachRestoreEk(obj, targetId) {
+  const existing = pendingRestoreEk.get(targetId);
+  if (existing) clearTimeout(existing.timeoutHandle);
+  const { priv, pub } = generateX25519Ephemeral();
+  const timeoutHandle = setTimeout(() => {
+    if (pendingRestoreEk.delete(targetId)) {
+      mlog.debug(`RESTORE_EK ephemeral expired  id=${pid(targetId)}`);
+    }
+  }, RESTORE_EK_TIMEOUT_MS);
+  pendingRestoreEk.set(targetId, { priv, timeoutHandle });
+  obj.ek = Array.from(pub);
+}
+// Same one-shot-ephemeral shape as attachRestoreEk/pendingRestoreEk just
+// above, for the contact BACKUP handshake instead of restore. Kept as a
+// genuinely separate map/constant rather than sharing pendingRestoreEk —
+// a contact could plausibly be mid-restore and mid-backup-exchange at the
+// same time, and the two flows have no reason to be able to clobber each
+// other's pending ephemeral.
+const BACKUP_EK_TIMEOUT_MS = 60_000;   // same "live-only, self-healing" reasoning as RESTORE_EK_TIMEOUT_MS — backup_offer/accept/push are never durably buffered either
+const pendingBackupEk = new Map();     // targetId (who we expect to push back) -> { priv, timeoutHandle }
+
+function attachBackupEk(obj, targetId) {
+  const existing = pendingBackupEk.get(targetId);
+  if (existing) clearTimeout(existing.timeoutHandle);
+  const { priv, pub } = generateX25519Ephemeral();
+  const timeoutHandle = setTimeout(() => {
+    if (pendingBackupEk.delete(targetId)) {
+      mlog.debug(`BACKUP_EK  ephemeral expired  id=${pid(targetId)}`);
+    }
+  }, BACKUP_EK_TIMEOUT_MS);
+  pendingBackupEk.set(targetId, { priv, timeoutHandle });
+  obj.ek = Array.from(pub);
+}
+/* ══════════════════════════════════════════
    RESTORE_REQ — mandatory signature, unlike the handshake pair above
    restore_req is fundamentally different from backup_offer/restore_ack/
    restore_push: it can ONLY ever be successfully processed by a recipient
@@ -2122,6 +2257,7 @@ function sendRestoreAckPing(toId) {
   lastRestoreAckPingSent[toId] = Date.now();
   const ts  = Date.now();
   const obj = { type: "sync:restore_ack", from: buildAddress(state.publicId, state.endpointId), to: toId, ts };
+  attachRestoreEk(obj, toId);
   obj.sig = signHandshakePacket(obj);
   sendSignal(obj);
 }
@@ -2250,6 +2386,7 @@ if (contact.blocked) {
   // send ack — cross domain if we have their wss
   const ackTs  = Date.now();
   const ackObj = { type: "sync:restore_ack", from: buildAddress(state.publicId, state.endpointId), to: msg.from, ts: ackTs };
+  attachRestoreEk(ackObj, msg.from);
   ackObj.sig = signHandshakePacket(ackObj);
   const senderWss = plain.wss || state.contacts[msg.from]?.lastRelay || null;
   let ackSent = false;
@@ -2319,6 +2456,26 @@ async function handleRestoreAck(msg) {
     mlog.info(`← RESTORE_ACK  from ${fromDisp} — no backup stored, nothing sent`);
     return;
   }
+  // Wrap (step 4). Only when the ack's signature VERIFIED and it carried an
+  // ephemeral — see the pendingRestoreEk section above for why both sides
+  // of that gate matter. Wrap failure (malformed ek, etc.) falls back to
+  // sending the backup unwrapped rather than dropping it silently — the
+  // recipient still needs their data, and an unwrapped push is exactly
+  // today's behavior, not a downgrade below anything that currently works.
+  let outBlob = backup, ek = null;
+  if (verified && msg.ek) {
+    try {
+      const theirEk = new Uint8Array(msg.ek);
+      const { priv, pub } = generateX25519Ephemeral();
+      const shared  = x25519.getSharedSecret(priv, theirEk);
+      const wrapKey = await deriveEphemeralWrapKey(shared);
+      outBlob = await encryptObject(wrapKey, backup);
+      ek = Array.from(pub);
+    } catch(e) {
+      mlog.warn(`RESTORE_PUSH   wrap failed for ${fromDisp}, sending unwrapped: ${e.message}`);
+      outBlob = backup; ek = null;
+    }
+  }
   // Token attach (step 3). Only when the ack's signature VERIFIED: the token
   // is a sealed record only the ack sender can open, so it's only worth
   // handing to someone we've just confirmed is that identity — never to an
@@ -2330,9 +2487,10 @@ async function handleRestoreAck(msg) {
   // (the receiver binds the token's key to `from` and verifies the push
   // signature with it — see handleRestorePush).
   const token = verified ? state.peerTokens[fromId] : null;
-  mlog.info(`← RESTORE_ACK  from ${fromDisp} — sending restore_push${token ? "  +token" : ""}`);
+  mlog.info(`← RESTORE_ACK  from ${fromDisp} — sending restore_push${token ? "  +token" : ""}${ek ? "  +wrap" : ""}`);
   const pushTs  = Date.now();
-  const pushObj = { type: "sync:restore_push", from: buildAddress(state.publicId, state.endpointId), to: fromId, blob: backup, ts: pushTs };
+  const pushObj = { type: "sync:restore_push", from: buildAddress(state.publicId, state.endpointId), to: fromId, blob: outBlob, ts: pushTs };
+  if (ek) pushObj.ek = ek;
   pushObj.sig = signHandshakePacket(pushObj);
   if (token) pushObj.token = token;
   sendSignal(pushObj);
@@ -2406,7 +2564,36 @@ async function handleRestorePush(msg) {
   }
 
   try {
-    const plain = await decryptObject(state.cryptoKey, msg.blob);
+    // Unwrap (step 4), before the inner passphrase-key decrypt. `ek`
+    // present means the sender wrapped the backup under a one-shot
+    // ephemeral DH — see the pendingRestoreEk section above. A pending
+    // entry only exists if WE sent them an ack with our own ephemeral
+    // (sendRestoreAckPing / handleRestoreRequest's reply ack); anything
+    // else (no entry, or the unwrap itself failing) is dropped outright
+    // rather than falling through to the inner decrypt with the still-
+    // wrapped ciphertext, which would just fail there anyway with a less
+    // specific log line.
+    let innerBlob = msg.blob;
+    const viaWrap = !!msg.ek;
+    if (viaWrap) {
+      const pending = pendingRestoreEk.get(fromId);
+      if (!pending) {
+        mlog.warn(`← RESTORE_PUSH from ${fromDisp} — wrap present but no pending ephemeral for ${pid(fromId)}, dropped`);
+        return;
+      }
+      clearTimeout(pending.timeoutHandle);
+      pendingRestoreEk.delete(fromId);
+      try {
+        const theirEk = new Uint8Array(msg.ek);
+        const shared  = x25519.getSharedSecret(pending.priv, theirEk);
+        const wrapKey = await deriveEphemeralWrapKey(shared);
+        innerBlob = await decryptObject(wrapKey, msg.blob);
+      } catch(e) {
+        mlog.warn(`← RESTORE_PUSH from ${fromDisp} — unwrap failed, dropped: ${e.message}`);
+        return;
+      }
+    }
+    const plain = await decryptObject(state.cryptoKey, innerBlob);
     if (typeof plain !== "object" || Array.isArray(plain)) {
       mlog.warn(`← RESTORE_PUSH from ${fromDisp} — bad structure, dropped`);
       return;
@@ -2435,7 +2622,7 @@ async function handleRestorePush(msg) {
     await saveContacts();
     renderContactList();
 	if (state.currentChat) renderMessages();
-    mlog.info(`← RESTORE_PUSH from ${fromDisp} — +${added} contacts  +${msgsMerged} msgs  sig:${verified ? (viaToken ? "✓ (via token)" : "✓") : "·"}`);
+    mlog.info(`← RESTORE_PUSH from ${fromDisp} — +${added} contacts  +${msgsMerged} msgs  sig:${verified ? (viaToken ? "✓ (via token)" : "✓") : "·"}${viaWrap ? "  +wrap" : ""}`);
     setSyncStatus("restored from network ✓");
     if (state.contacts[state.publicId]?.lastRelay !== prevSelfRelay) {
       mlog.info(`RESTORE_PUSH   self relay changed via other device — rebooting signal`);
