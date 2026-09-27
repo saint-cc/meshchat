@@ -11,7 +11,138 @@ work, not yet cut as a numbered release.
 
 ---
 
-## Unreleased (meshdev)
+## 0.5.2
+
+Raises the PBKDF2 iteration count used for identity derivation from
+100,000 to 1,000,000, following discussion on GitHub. **Breaking — no
+backward compatibility, and none attempted.**
+
+- **`masterSecret` derivation now uses 1,000,000 PBKDF2 iterations**
+  (`protocol.md`'s Identity and Key Derivation section), up from 100,000.
+  Every key derived from `masterSecret` — the X25519 identity key, the
+  Ed25519 signing key, and the backup key — changes as a result, which in
+  turn changes `publicId` (derived from the two public keys). For any
+  existing identity this has the exact same effect as changing username
+  or passphrase (see `known-limitations.md`'s "Changing your passphrase
+  creates a new identity"): logging back in with the same credentials now
+  derives a completely different identity, with no local data under the
+  new `publicId` and no path back to the old one.
+- **No dual-version detection or migration path was attempted, deliberately.**
+  Same category as the earlier C64/AES128 encryption-key migration, which
+  was painful in practice — this is a hard cutover, not something to
+  soft-migrate. Testing is currently limited to a small number of people,
+  so a clean break was judged acceptable while that's still true.
+- **Practical consequence for anyone testing across this boundary:**
+  every device and contact relationship needs to be re-established from
+  scratch — re-login re-derives a new identity, and contacts must
+  re-exchange keys/QR codes, exactly as if everyone had picked new
+  passphrases at the same time. `meshdev` is incompatible with any
+  pre-bump identity as a result.
+- **Fixed: the restore/backup ephemeral wrap (`0.5.1`) clobbered itself
+  across a contact's own multiple devices.** `pendingRestoreEk`/
+  `pendingBackupEk` (see `protocol.md`'s
+  [Ephemeral Wrap](protocol.md#ephemeral-wrap)) were keyed by the bare
+  contact identity only. Two of a contact's devices online at once each
+  independently trigger their own restore/backup round trip toward us;
+  each attach overwrote the other's pending ephemeral in the same shared
+  slot, so whichever push arrived second either unwrapped under the
+  wrong key or found its entry already deleted — surfacing as `wrap
+  present but no pending ephemeral for <id>, dropped` and a string of
+  spurious unwrap failures on the device that was already online.
+  Not a security issue (AES-GCM simply fails closed on the wrong key,
+  same fail-safe behavior described in `known-limitations.md`) and not
+  data-lossy (the next restore/backup cycle just retries) — a reliability
+  bug, not a correctness one. Fixed by adding a per-device slot
+  (`id::endpointId`, alongside the existing bare-identity slot) whenever
+  the responding device is already known at attach time
+  (`handleRestoreRequest` resolves it from the request's own
+  `plain.deviceId`; `handleBackupOffer` already has it directly from the
+  offer's compound `from`) — consumed the same way on the receiving end,
+  falling back to the bare slot when no device was known yet. Wire
+  format is unchanged; this is local bookkeeping only.
+- **Fixed a second, related race in the same mechanism: a successful
+  unwrap was consuming the pending ephemeral, even though `restore_ack`/
+  `backup_accept` address a bare identity and therefore broadcast to
+  *every* live session under it.** An identity running two-plus devices
+  legitimately produces two-plus independent pushes in reply to one ack —
+  each with its own fresh ephemeral, each validly unwrappable against our
+  one stored private half (X25519 DH is safe to run more than once
+  against the same private scalar paired with a different public key each
+  time). Deleting the slot on the first successful unwrap discarded it
+  before the next, equally legitimate push could ever arrive — reproduced
+  live logging in as a third identity while two others were already
+  online: the first device's push unwrapped fine, the second failed with
+  the same `wrap present but no pending ephemeral` message the fix above
+  was meant to close. The lookup (renamed `peekPendingEk`) now leaves the
+  slot alone on a hit; it's only ever cleared by its own timeout or by a
+  fresh attach superseding it.
+- **Fixed a third, sibling bug in the same family, on the OFFER side of
+  the peer-backup handshake specifically.** `pendingBackupOffer` tracked
+  a single pending offer per bare identity, deleted the instant it
+  satisfied one accept. Since `backup_offer`'s `to` is also a bare
+  identity, one offer broadcasts to every live session under it — an
+  identity running two-plus devices produces two-plus independent
+  accepts (each with its own ek) in reply to a single offer, but only the
+  *first* one to arrive ever got a push generated for it at all; the rest
+  silently found nothing (a debug-only "no pending offer, ignored" line)
+  and never received a working backup for that round — surfaced as one
+  sibling device logging `unwrap failed` for a push that, in this case,
+  genuinely was never wrapped for it. Reproduced live with two devices of
+  one identity both accepting the same incoming offer from a third party,
+  and separately with two devices of a *different* identity both
+  accepting an offer from this one. Self-healing in practice (the next
+  backup cycle gives every device another chance to be first) which is
+  why it looked benign, but a device could go an arbitrary number of
+  cycles without ever winning that race. Fixed the same way as the other
+  two: `pendingBackupOffer[fromId]` is no longer deleted on a successful
+  accept, only by its own TTL expiry or by the next offer replacing it —
+  every accept within that window now gets its own independently-wrapped
+  push.
+
+## 0.5.1
+
+Restore-token hardening and a new one-shot ephemeral wrap for the peer
+backup/restore handshake, landed and confirmed live on meshdev across
+several small, independently-tested steps.
+
+- **Restore token now signed and bound to its sender.** `sync:token_resp`
+  is signed (`signTokenPacket`/`verifyTokenPacket`) and only accepted
+  while a `token_req` of the recipient's own is genuinely outstanding —
+  closing a denial-of-restore where a planted, unsigned token could
+  permanently wedge a contact's restore path (the receiver kept only the
+  first token ever seen per sender, silently ignoring any genuine
+  response after). Every use of a token — on `sync:restore_req`, and now
+  on `sync:restore_push` too, see below — requires the identity it
+  decrypts to (`tokenBoundId`) to match the packet's actual sender; a
+  mismatched or malformed token is treated as no token rather than a hard
+  failure. Issued tokens also shrank to `{ v: 2, shareableKey }` only —
+  `name`/`date` were never read by anything and only ever leaked into an
+  outer plaintext field.
+- **The restore token now actually authenticates a wiped device's
+  restore.** Previously the token only rode on the classic `restore_req`
+  → `ack` → `push` path, which a genuinely wiped device (zero contacts,
+  nothing to send a signed `restore_req` from) can never reach. It now
+  also rides on the `restore_ack` → `restore_push` exchange a wiped
+  device does use (`sendRestoreAckPing`'s proactive hi to an unknown
+  peer): the holder attaches the token it holds for the acker once the
+  ack's own signature verifies, and the wiped device — who issued that
+  token before wiping and can still decrypt it via its own deterministic
+  passphrase-derived key — uses it to recover the sender's signing key
+  and verify the push, rather than accepting it unverified as before.
+  See `protocol.md`'s [Restore Token](protocol.md#restore-token).
+- **New: one-shot ephemeral wrap on `sync:restore_push` and
+  `sync:backup_push`** (contact path; self-sync deliberately deferred). A
+  fresh X25519 ephemeral-to-ephemeral DH, generated per exchange and held
+  only in memory, wraps the existing backup-key-encrypted blob for
+  transport. This is independent of X4DH — it protects a wiped device's
+  very first restore, before any session could exist for its brand-new
+  `deviceId` — and independent of whether the device pair ever
+  bootstraps one. Gated on the preceding ack/accept's signature
+  verifying, same soft-verification stance the rest of this handshake
+  family already has. See `protocol.md`'s
+  [Ephemeral Wrap](protocol.md#ephemeral-wrap) and `known-limitations.md`
+  for what this does and doesn't cover, including the fail-closed
+  behavior once a push has actually been wrapped.
 
 - **Fixed: unbounded polling-loop leak.** `schedulePoll()`'s `setTimeout`
   chain was never tracked or cleared. `handleAuthOk` (fired on every

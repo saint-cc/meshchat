@@ -186,7 +186,7 @@ async function deriveMasterSecret(name, passphrase) {
   const enc      = new TextEncoder();
   const saltData = await crypto.subtle.digest("SHA-256", enc.encode("meshchat-v1:" + name.toLowerCase().trim()));
   const baseKey  = await crypto.subtle.importKey("raw", enc.encode(passphrase), { name: "PBKDF2" }, false, ["deriveBits"]);
-  const bits     = await crypto.subtle.deriveBits({ name: "PBKDF2", salt: saltData, iterations: 100000, hash: "SHA-256" }, baseKey, 256);
+  const bits     = await crypto.subtle.deriveBits({ name: "PBKDF2", salt: saltData, iterations: 1000000, hash: "SHA-256" }, baseKey, 256);
   return new Uint8Array(bits);
 }
 

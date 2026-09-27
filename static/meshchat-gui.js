@@ -553,7 +553,16 @@ function renderContactList() {
     li.onclick    = () => openChat(c.publicId);
     const unread  = state.unread[c.publicId] || 0;
     const msgs    = c.messages || [];
-    const last    = msgs[msgs.length - 1];
+    // Reactions — including the emoji:null RECEIVED auto-ack — are not
+    // conversation content; renderMessages already excludes them the same
+    // way before picking anything to show (they render as an overlay on
+    // their target bubble instead). Left unfiltered here, an ack landing
+    // after our last real message becomes array-last (later ts, no
+    // ackDeviceId/ackN of its own to be causally spliced elsewhere), so
+    // this picked THAT as "last" — a reaction has no .text, so the preview
+    // went blank instead of continuing to show the actual last message.
+    const visibleMsgs = msgs.filter(m => m.type !== "reaction");
+    const last    = visibleMsgs[visibleMsgs.length - 1];
     const preview = last
       ? last.type === "audio"
         ? "🎤 audio message"

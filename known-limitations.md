@@ -103,6 +103,18 @@ Identity keys are static, and the identity-level pairwise key derived from them 
 
 In short: if an attacker records encrypted traffic today and later compromises your identity, previously recorded traffic on any device pair without a completed X4DH session — and any non-message traffic regardless — may become decryptable. A device pair with a completed `RK1` session is protected against exactly that scenario for the messages sent after the upgrade; a device pair still at `RK0` is protected only against a future compromise of the initiator's key.
 
+## Restore and backup traffic have their own, narrower wire protection
+
+The forward-secrecy discussion above is about `app:message` traffic specifically. The peer backup and restore handshake (`protocol.md`'s [Peer Backup Protocol](protocol.md#peer-backup-protocol)) uses a completely separate key hierarchy — the passphrase-derived backup key, not the pairwise/X4DH message key — and as of `0.5.1` has its own, independent wire protection layered on top of it, for the contact path specifically (not self-sync):
+
+- `sync:restore_push` and `sync:backup_push` can carry an additional one-shot X25519 ephemeral-to-ephemeral wrap (`protocol.md`'s [Ephemeral Wrap](protocol.md#ephemeral-wrap)) around the existing backup-key-encrypted blob. This protects against exactly the scenario described above — recorded wire traffic plus a later passphrase compromise — for these two packet types, independent of whether the device pair has ever bootstrapped an X4DH session at all.
+- This is a per-exchange, memory-only ephemeral, not a session — there is no root key, no upgrade path, and nothing persisted. It either happens for a given push or it doesn't; there's no `RK0`/`RK1`-style partial state to reason about.
+- It's gated on the *preceding* ack/accept having a valid signature. An offer or ack from a sender with no established signing key on file (the genuinely-fresh-relationship case) gets no wrap — the same soft-verification stance the rest of this handshake family already has.
+- **Once a push has actually been wrapped, there is no graceful fallback.** A relay that strips the ephemeral in transit (without also invalidating the signature, which covers it) causes that specific restore or backup attempt to fail closed rather than silently downgrading to the unwrapped form. This is deliberate — accepting a stripped wrap would defeat the point of having one — but it does mean an actively hostile relay has a cleaner denial-of-service target here than against an ordinary unwrapped exchange.
+- Self-sync (an identity's own multiple devices exchanging backups) is not covered by any of this yet — the fresh-client bootstrap case there is a distinct, separate piece of work (see `X4DH.md`'s note on self-sync forward secrecy).
+
+Separately: the restore token (`protocol.md`'s [Restore Token](protocol.md#restore-token)) that authenticates a wiped device's restore push is a fixed, unrotated object for as long as the underlying contact relationship exists — the same token bytes travel on the wire every time that specific restore path is exercised, until the storing side re-adds the contact and a fresh one is issued. Its contents are opaque without the issuer's passphrase, but its presence is a stable, linkable fingerprint of that specific contact pair.
+
 ---
 
 ## Stable identities are linkable

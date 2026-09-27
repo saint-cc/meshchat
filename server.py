@@ -46,7 +46,7 @@ RELAY_WSS_URL = os.environ.get("RELAY_WSS_URL", "")   # e.g. wss://yourrelay.exa
 # Protocol version — informational only for now, surfaced in sig:relay_info
 # so client/server version drift shows up in both logs. Not enforced yet;
 # room to add real backwards-compat handling once this is actually needed.
-PROTOCOL_VERSION = os.environ.get("PROTOCOL_VERSION", "0.5.1")
+PROTOCOL_VERSION = os.environ.get("PROTOCOL_VERSION", "0.5.2")
 
 # Connection limits
 MAX_CONNECTIONS        = int(os.environ.get("MAX_CONNECTIONS",        100))   # total WS sessions
@@ -760,7 +760,12 @@ async def route_or_buffer(kind, frm, to_id, to_endpoint, msg, ws):
                       short(frm), short_addr(addr_disp), durable_tag, kind)
         else:
             log.info("BUF Q      from=%s  to=%s  (offline)  type=%s", short(frm), short_addr(addr_disp), kind)
-    if not reached and kind == "app:message":
+    # A self-addressed app:message (frm == to_id) is a client-side "selfsync"
+    # copy of our own outgoing message for another of our devices — never
+    # push-worthy: waking a sibling to say "open the app and check" about
+    # something we ourselves just sent is noise. Ordinary buffering above
+    # still applies to it (that's what lets an offline sibling catch up).
+    if not reached and kind == "app:message" and frm != to_id:
         await push_notify(to_id)
 
 # ══════════════════════════════════════════
@@ -1599,30 +1604,25 @@ async def handler(ws):
                     reached = await deliver(to_id, msg, exclude=ws)
                 log.info("%-16s from=%s  to=%s  reached=%d",
                          kind.upper()[:16], short_addr(frm), short_addr(msg.get("to")), reached)
-                # sync:backup_push is the one type in this branch that
-                # actually carries data rather than just negotiating
-                # (backup_offer/accept, restore_ack) or signaling
-                # (call:*/shell:*) — a missed live delivery here is a
-                # silently lost backup/mini-backup, not something that
-                # self-heals via a retry the way a handshake step does.
-                # Buffered at the SAME tier as an ordinary app:message
-                # (buf_write only, no push_notify — nobody should be
-                # woken up for a backup sync) — deliberately NOT the
-                # DURABLE_KINDS tier app:migrate/app:burn get (buffer
-                # even when reached), since that exists for the
-                # stale-session-mid-migration race, which doesn't apply
-                # here. Also deliberately no overwrite-per-sender: a
-                # sender's mini-backup pushes are scoped per-contact
-                # (one blob = one contact's slice), so overwriting by
-                # sender alone would silently drop every push but the
-                # last if several land while the recipient is offline.
-                # The accepted cost of skipping overwrite is redundant
-                # queued blobs, not lost ones — mergeMessages/
-                # mergeContactMeta already dedup harmlessly on replay.
-                if kind == "sync:backup_push" and not reached:
-                    await buf_write(to_id, msg, to_endpoint)
-                    log.info("BUF Q      from=%s  to=%s  (offline)  type=%s",
-                             short_addr(frm), short_addr(msg.get("to")), kind)
+                # sync:backup_push is deliberately NOT buffered — live delivery
+                # only, same as every other sync:*/call:*/shell:* type in this
+                # branch. History: 0.5.0 buffered it on a missed live
+                # delivery so offline siblings would catch up on mini
+                # backups. That was the wrong tool:
+                #   - contact-path pushes answer a live offer/accept
+                #     handshake and (0.5.1) may be wrapped under an
+                #     ephemeral the receiver holds ~60s in memory. A
+                #     buffered copy flushed on a later reconnect can never
+                #     be unwrapped ("wrap present but no pending ephemeral"),
+                #     and an unwrapped stale one could overwrite a newer
+                #     stored peer backup.
+                #   - the sibling-catch-up job moved to the "selfsync"
+                #     app:message path (client: sendSelfSync/handleSelfSync),
+                #     which gets per-endpoint buffering as an ordinary
+                #     app:message — see route_or_buffer.
+                # Self-sync full backups are therefore online-only again; a
+                # sibling that was offline catches up via the next backup
+                # cycle plus whatever selfsync copies were buffered for it.
 
             elif kind == "sig:relay_req":
                 await send_to(ws, {

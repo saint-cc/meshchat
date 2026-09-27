@@ -13,7 +13,7 @@
 
    Load order: meshchat-lib.js → meshchat-gui.js → meshchat.js → statemachine.js
 ═══════════════════════════════════════════════════════════════ */
-const CLIENT_VERSION = "0.5.1";
+const CLIENT_VERSION = "0.5.2";
 
 const POLL_INTERVAL_MS        	= 30_000;			// base interval between presence polls
 const POLL_JITTER_MS          	= 10_000;			// ± random jitter added to poll interval
@@ -424,6 +424,41 @@ function serialiseContacts() {
   return out;
 }
 
+// Contacts-only variant for the CONTACT-path peer backup (sync:backup_push
+// to someone other than ourselves) — deliberately a separate function, not
+// a flag on serialiseContacts() above. Every other caller of
+// serialiseContacts() (saveContacts' own local-storage write, self-sync's
+// full push/mini-backup, exportBackup, computeBackupFingerprint) needs the
+// real message history and must be completely unaffected by this — a
+// shared function with a strip-messages flag would risk one of those call
+// sites someday passing the wrong flag by accident. This one is only ever
+// called from saveContactsBackup, for the blob handed to
+// pushBackupToContacts' non-self branch.
+//
+// Why: a peer holding your backup is functionally a third party with an
+// encrypted copy of your conversation history sitting on their device
+// indefinitely (peerBackups is never expired or pruned) — useful for
+// restoring your CONTACT LIST after a wipe, but message content never
+// needed to ride along for that to work, and every message you've ever
+// sent that contact was already visible to them anyway, encrypted with
+// their own copy of the pairwise/X4DH key. Metadata a contact needs to
+// restore your contact list — name, shareableKey, blocked, type,
+// lastStateChange, lastRelay/lastRelaySeen — is unaffected; only messages
+// is forced empty. mergeMessages(existing, []) is already a safe no-op on
+// the receiving end, so no wire/receive-side change is needed elsewhere.
+function serialiseContactsForPeers() {
+  const out = {};
+  for (const [id,c] of Object.entries(state.contacts))
+    out[id] = { name: c.name, publicId: c.publicId, shareableKey: c.shareableKey,
+                messages: [],
+                blocked: c.blocked || false,
+                type:            c.type            || "human",
+                lastStateChange: c.lastStateChange || 0,
+                lastRelay:       c.lastRelay       || null,
+                lastRelaySeen:   c.lastRelaySeen    || 0 };
+  return out;
+}
+
 async function deserialiseContacts(raw){
   const out={};
   for(const[id,c]of Object.entries(raw)){
@@ -490,11 +525,16 @@ let messagesSinceBackup = 0;
 
 async function saveContactsBackup(force = false) {
   if (!state.cryptoKey) return;
-  const encrypted = await saveContacts();
+  const encrypted = await saveContacts();   // full data — local storage only, unaffected by the peer-facing change below
   messagesSinceBackup++;
   if (!force && messagesSinceBackup < BACKUP_THRESHOLD) return;
   messagesSinceBackup = 0;
-  pushBackupToContacts(encrypted);
+  // Contacts-only blob for the wire — see serialiseContactsForPeers' own
+  // comment. Self-sync (pushBackupToContacts' id === state.publicId branch)
+  // ignores this parameter entirely and builds its own full blob from
+  // serialiseContacts() directly, so this only ever reaches other contacts.
+  const peerBlob = await encryptObject(state.cryptoKey, serialiseContactsForPeers());
+  pushBackupToContacts(peerBlob);
 }
 
 setInterval(() => {
@@ -768,11 +808,19 @@ const FANOUT_STALE_MS = 7 * 24 * 60 * 60 * 1000;   // 7 days — deliberately it
 
 function resolveDeviceTargets(contactId) {
   const devices = state.knownDevices[contactId] || {};
-  const entries = Object.entries(devices);
+  // Self-fanout (contactId === our own identity, e.g. sendSelfSync or a
+  // self-chat message) must never target THIS device: it's in our own
+  // registry (login calls recordKnownDevice(state.publicId, state.deviceId))
+  // but with no endpointId, so left in it would read as "unresolved" forever
+  // and force a legacy-key broadcast on every single self-send — and would
+  // be a pointless echo to ourselves once an endpointId ever did get filed.
+  // Identical to plain Object.entries() for every non-self contact.
+  const entries = Object.entries(devices)
+    .filter(([deviceId]) => !(contactId === state.publicId && deviceId === state.deviceId));
   const now = Date.now();
 
   const targeted = [];
-  let needsBroadcast = entries.length === 0;   // fresh contact, nothing known yet
+  let needsBroadcast = entries.length === 0;   // fresh contact (or, for self, no sibling known yet)
 
   for (const [deviceId, info] of entries) {
     const isStale = (now - (info.lastSeen || 0)) > FANOUT_STALE_MS;
@@ -782,7 +830,12 @@ function resolveDeviceTargets(contactId) {
       needsBroadcast = true;   // unresolved OR stale — falls back, not dropped
     }
   }
-  return { targeted, needsBroadcast };
+  // knownCount — how many devices (excluding our own, in the self case) we
+  // actually have on file. Lets a caller tell "nothing known at all"
+  // (needsBroadcast true because entries is empty) apart from "known but
+  // unresolved/stale" (needsBroadcast true because of a fallback) —
+  // sendSelfSync needs exactly that distinction, ordinary fanout doesn't.
+  return { targeted, needsBroadcast, knownCount: entries.length };
 }
 
 /* ══════════════════════════════════════════
@@ -1575,6 +1628,16 @@ async function sendFannedX4DH(contactId, payload) {
    Constrained peers (C64 etc.) can simply never
    send backup_accept and they will never receive blobs.
 
+   As of this pass, the blob offered/pushed to a non-self peer carries
+   CONTACTS ONLY — messages: [] on every entry (serialiseContactsForPeers,
+   see its own comment). Self-sync's own blob (below, id === state.publicId)
+   is untouched and still carries full history. A contact restoring after
+   a wipe recovers their contact list from whichever peers still hold a
+   copy of them; recovering message HISTORY still relies on the other
+   half of each conversation existing on the contact's own device (manual
+   SYNC, or normal delivery), same as it always has for a brand-new device
+   with nothing local yet.
+
    `from` on these three types carries our own compound "id::endpointId"
    address (buildAddress) — the ONE deliberate exception to "from always
    stays bare" (see ADDR_SEP's own comment in meshchat-lib.js and
@@ -1638,7 +1701,13 @@ function verifyHandshakePacket(obj, contactSignPublicKey) {
   return verifyBlob(payload, obj.sig, contactSignPublicKey);
 }
 
-// tracks which peers we have a pending offer waiting for accept
+// Tracks which peers we have a pending offer waiting for accept. Bare
+// identity, deliberately NOT per-device — the blob offered is the same
+// regardless of which of that identity's devices ends up accepting it,
+// so there's nothing device-specific to key on at OFFER time. What used
+// to matter (and was the bug) is what happens on ACCEPT: see
+// handleBackupAccept's own comment on why this entry now survives past
+// the first accept it satisfies, for the rest of its TTL.
 const pendingBackupOffer = {};   // id → { blob, ts }
 
 async function pushBackupToContacts(blob) {
@@ -1776,7 +1845,7 @@ async function handleBackupOffer(msg) {
   mlog.info(`← BACKUP_OFFER from ${pid(fromId, verified ? { endpointId: fromEndpoint } : {})}  size=${msg.size}  sig:${verified ? "✓" : "·"} — accepting`);
   const acceptTs  = Date.now();
   const acceptObj = { type: "sync:backup_accept", from: buildAddress(state.publicId, state.endpointId), to: fromId, ts: acceptTs };
-  if (verified) attachBackupEk(acceptObj, fromId);
+  if (verified) attachBackupEk(acceptObj, fromId, fromEndpoint);
   acceptObj.sig = signHandshakePacket(acceptObj);
   sendSignal(acceptObj);
 }
@@ -1873,7 +1942,22 @@ async function handleBackupAccept(msg) {
       outBlob = pending.blob; ek = null;
     }
   }
-  delete pendingBackupOffer[fromId];
+  // Deliberately NOT deleted here anymore. backup_offer's `to` is a bare
+  // identity, so it broadcasts to every live session under it — an
+  // identity running two-plus devices legitimately produces two-plus
+  // independent accepts in reply to the ONE offer, each with its own ek.
+  // Consuming pendingBackupOffer[fromId] on the first accept meant only
+  // ONE of those devices ever got a push generated for it at all; the
+  // rest found nothing here (a debug-only "no pending offer, ignored"
+  // line above) and simply never received a working backup — no crash,
+  // just a device that silently never got backed up until some later
+  // offer cycle happened to have it accept first instead. The blob itself
+  // (`pending.blob`) is identical no matter which device accepts, so
+  // there's no correctness reason to serve only one; each accept within
+  // the TTL window above now gets its own push, wrapped with THAT
+  // accept's own ek. The entry is cleared only by the expiry check above
+  // once BACKUP_OFFER_TTL has genuinely passed, or implicitly replaced
+  // the next time pushBackupToContacts sends a fresh offer.
   const pushTs  = Date.now();
   const pushObj = { type: "sync:backup_push", from: buildAddress(state.publicId, state.endpointId), to: fromId, blob: outBlob, ts: pushTs };
   if (ek) pushObj.ek = ek;
@@ -1896,7 +1980,8 @@ async function handleBackupPush(msg) {
 
 		  // Two self-push shapes share this handler: the periodic full-
 		  // backup push, wrapped as { deviceId, endpointId, fingerprint,
-		  // contacts } (see pushBackupToContacts) — and pushMiniBackup's
+		  // contacts } (see pushBackupToContacts) — and the RETIRED pushMiniBackup's (still
+		  // accepted here so older clients' pushes keep working)
 		  // slim single-contact push, still a bare { contactId: {...} }
 		  // map with no deviceId/fingerprint at all, since it never
 		  // participated in the fingerprint-tracking dance. Disambiguated
@@ -2009,13 +2094,18 @@ async function handleBackupPush(msg) {
   let storedBlob = msg.blob;
   const viaWrap = !!msg.ek;
   if (viaWrap) {
-    const pending = pendingBackupEk.get(fromId);
+    // Device-specific slot first (only trustworthy once verified — an
+    // unverified fromEndpoint could be a relay's own swapped-in value),
+    // falling back to the bare-identity slot — see peekPendingEk/
+    // attachBackupEk's own comments for why a sibling device's push must
+    // not be matched against a DIFFERENT sibling's still-pending ephemeral,
+    // and why a successful match here deliberately doesn't consume it —
+    // more than one sibling can legitimately answer the same accept.
+    const pending = peekPendingEk(pendingBackupEk, fromId, verified ? fromEndpoint : null);
     if (!pending) {
-      mlog.warn(`← BACKUP_PUSH  from ${pid(fromId)} — wrap present but no pending ephemeral for ${pid(fromId)}, dropped`);
+      mlog.warn(`← BACKUP_PUSH  from ${pid(fromId, verified ? { endpointId: fromEndpoint } : {})} — wrap present but no pending ephemeral for ${pid(fromId)}, dropped`);
       return;
     }
-    clearTimeout(pending.timeoutHandle);
-    pendingBackupEk.delete(fromId);
     try {
       const theirEk = new Uint8Array(msg.ek);
       const shared  = x25519.getSharedSecret(pending.priv, theirEk);
@@ -2155,7 +2245,38 @@ async function handleTokenResponse(msg) {
    Sequencing: whoever SENDS a restore_ack (sendRestoreAckPing, or the
    reply built in handleRestoreRequest) attaches a fresh ephemeral public
    key as `ek` and holds the matching private key here, keyed by the
-   ack's addressee — that's who's expected to answer with a push.
+   ack's addressee — that's who's expected to answer with a push. When
+   the addressee's specific responding device is already known (see
+   attachRestoreEk's endpointId param below), the slot is keyed by that
+   device too, not just the bare identity — otherwise two devices of the
+   SAME identity online at once (each independently triggering its own
+   restore_req/ack round trip toward us) silently clobber one another's
+   pending ephemeral, since both attaches would land in one shared slot.
+   Confirmed live: this is exactly the "wrap present but no pending
+   ephemeral" / spurious unwrap-failure symptom seen when a contact runs
+   two devices concurrently. sendRestoreAckPing's broadcast ping has no
+   device to key on at attach time (sig:seen only ever names an identity,
+   never a device) and keeps using the bare-identity slot — see that
+   function's own call site below.
+
+   A second, related race, confirmed live SEPARATELY from the one above:
+   restore_ack's own `to` is a bare identity, so ONE outgoing ack is
+   broadcast (server-side deliver()) to EVERY live session under it —
+   an identity running two-plus devices legitimately produces two-plus
+   independent restore_push replies to that single ack, each carrying
+   its own fresh ephemeral on their side. All of them are genuinely
+   valid: X25519 DH is safe to run more than once against the same
+   stored private half paired with a DIFFERENT public key each time — it
+   is not the kind of key reuse that would matter — so our one stored
+   priv correctly unwraps every one of them, given the chance. The
+   lookup below (peekPendingEk) deliberately does NOT delete the slot on
+   a successful unwrap for exactly this reason — only its own timeout
+   (attachRestoreEk/attachBackupEk's setTimeout) or a fresh attach
+   superseding it ever clears it now. Deleting eagerly on first success
+   was itself a bug: the first of several devices' pushes to arrive
+   consumed the only copy before the others — equally legitimate — could
+   ever be honored, surfacing as the same "wrap present but no pending
+   ephemeral" symptom even after the per-device keying above landed.
    Whoever RECEIVES that ack (handleRestoreAck, peer branch) only wraps
    when the ack's signature VERIFIED — an `ek` riding on an unverifiable
    ack could be a relay's own swapped-in key, the same reasoning step 3
@@ -2167,26 +2288,73 @@ async function handleTokenResponse(msg) {
 
    Deliberately NOT an X4DH session: a just-wiped device has a brand-new
    deviceId and can't have bootstrapped a real session for this pair yet,
-   and this only ever needs to protect one exchange, not stand up a
-   reusable one. Timeout mirrors X4DH_PROPOSAL_TIMEOUT_MS/BACKUP_OFFER_TTL
-   — restore_ack/restore_push are already live-only (never durably
-   buffered — see protocol.md), so if a push doesn't arrive within this
-   window it isn't coming via this round trip at all; the next poll cycle
-   simply generates a fresh ack with a fresh ek.
+   and this only ever needs to protect the handful of exchanges one ack
+   can legitimately draw, not stand up a reusable session. Timeout
+   mirrors X4DH_PROPOSAL_TIMEOUT_MS/BACKUP_OFFER_TTL — restore_ack/
+   restore_push are already live-only (never durably buffered — see
+   protocol.md), so if a push doesn't arrive within this window it isn't
+   coming via this round trip at all; the next poll cycle simply
+   generates a fresh ack with a fresh ek.
 ══════════════════════════════════════════ */
 const RESTORE_EK_TIMEOUT_MS = 60_000;
-const pendingRestoreEk = new Map();   // targetId (who we expect to push back) -> { priv, timeoutHandle }
+// Keyed by targetId alone (a bare identity), OR by targetId+ADDR_SEP+
+// endpointId when the specific responding device was already known at
+// attach time — see pendingEkSlotKey below. Two devices of the same
+// identity online at once each get their OWN slot once their endpoint is
+// known, instead of racing to overwrite one shared per-identity entry
+// (the "wrap present but no pending ephemeral" bug this fixes).
+const pendingRestoreEk = new Map();   // slotKey -> { priv, timeoutHandle }
 
-function attachRestoreEk(obj, targetId) {
-  const existing = pendingRestoreEk.get(targetId);
+// Shared by pendingRestoreEk and pendingBackupEk (see that map's own
+// comment for why the two maps themselves stay separate) — purely a key-
+// shaping helper, no state of its own. Mirrors buildAddress's own
+// "compound when a unit is known, bare otherwise" shape, reusing ADDR_SEP
+// so a slot key reads the same way a wire "id::endpointId" address does.
+function pendingEkSlotKey(targetId, endpointId) {
+  return endpointId ? `${targetId}${ADDR_SEP}${endpointId}` : targetId;
+}
+
+// peekPendingEk(map, targetId, endpointId) — consume-side lookup shared by
+// handleRestorePush/handleBackupPush. Tries the device-specific slot first
+// (only meaningful once the responder's own signature has verified — see
+// each call site), then falls back to the bare-identity slot, since the
+// attach side may have had no device to key on yet (sendRestoreAckPing's
+// broadcast ping, or a first-ever contact).
+//
+// Deliberately does NOT delete the entry on a hit — see this section's own
+// header comment for why: one ack broadcasts to every live session under
+// an identity, so more than one of that identity's devices can legitimately
+// answer it, each with its own fresh ephemeral, each validly unwrappable
+// against our one stored priv. Consuming (deleting) on first success used
+// to discard the shared secret before a second, equally legitimate push
+// could ever arrive. The slot still expires on its own via
+// RESTORE_EK_TIMEOUT_MS/BACKUP_EK_TIMEOUT_MS (attachRestoreEk/
+// attachBackupEk's own setTimeout), and a fresh attach for the same slot
+// still supersedes whatever was there — this only removes the early,
+// first-use deletion.
+function peekPendingEk(map, targetId, endpointId) {
+  const specific = endpointId ? pendingEkSlotKey(targetId, endpointId) : null;
+  const key = (specific && map.has(specific)) ? specific : (map.has(targetId) ? targetId : null);
+  return key ? map.get(key) : null;
+}
+
+// endpointId (optional): the specific device we expect to answer with a
+// push, when already known (handleRestoreRequest has plain.deviceId from
+// the decrypted request and can resolve its endpoint via knownDevices;
+// sendRestoreAckPing's broadcast ping has no device to name at all, since
+// sig:seen only ever identifies the identity, never a device — it keeps
+// using the bare-identity slot, same as before this fix).
+function attachRestoreEk(obj, targetId, endpointId) {
+  const key = pendingEkSlotKey(targetId, endpointId);
+  const existing = pendingRestoreEk.get(key);
   if (existing) clearTimeout(existing.timeoutHandle);
   const { priv, pub } = generateX25519Ephemeral();
   const timeoutHandle = setTimeout(() => {
-    if (pendingRestoreEk.delete(targetId)) {
-      mlog.debug(`RESTORE_EK ephemeral expired  id=${pid(targetId)}`);
+    if (pendingRestoreEk.delete(key)) {
+      mlog.debug(`RESTORE_EK ephemeral expired  id=${pid(targetId, endpointId ? { endpointId } : {})}`);
     }
   }, RESTORE_EK_TIMEOUT_MS);
-  pendingRestoreEk.set(targetId, { priv, timeoutHandle });
+  pendingRestoreEk.set(key, { priv, timeoutHandle });
   obj.ek = Array.from(pub);
 }
 // Same one-shot-ephemeral shape as attachRestoreEk/pendingRestoreEk just
@@ -2194,20 +2362,23 @@ function attachRestoreEk(obj, targetId) {
 // genuinely separate map/constant rather than sharing pendingRestoreEk —
 // a contact could plausibly be mid-restore and mid-backup-exchange at the
 // same time, and the two flows have no reason to be able to clobber each
-// other's pending ephemeral.
+// other's pending ephemeral. Same per-device slot fix as pendingRestoreEk
+// (see pendingEkSlotKey/peekPendingEk above) — backup_offer's `from` is
+// compound already, so handleBackupOffer always has an endpointId to pass.
 const BACKUP_EK_TIMEOUT_MS = 60_000;   // same "live-only, self-healing" reasoning as RESTORE_EK_TIMEOUT_MS — backup_offer/accept/push are never durably buffered either
-const pendingBackupEk = new Map();     // targetId (who we expect to push back) -> { priv, timeoutHandle }
+const pendingBackupEk = new Map();     // slotKey (see pendingEkSlotKey) -> { priv, timeoutHandle }
 
-function attachBackupEk(obj, targetId) {
-  const existing = pendingBackupEk.get(targetId);
+function attachBackupEk(obj, targetId, endpointId) {
+  const key = pendingEkSlotKey(targetId, endpointId);
+  const existing = pendingBackupEk.get(key);
   if (existing) clearTimeout(existing.timeoutHandle);
   const { priv, pub } = generateX25519Ephemeral();
   const timeoutHandle = setTimeout(() => {
-    if (pendingBackupEk.delete(targetId)) {
-      mlog.debug(`BACKUP_EK  ephemeral expired  id=${pid(targetId)}`);
+    if (pendingBackupEk.delete(key)) {
+      mlog.debug(`BACKUP_EK  ephemeral expired  id=${pid(targetId, endpointId ? { endpointId } : {})}`);
     }
   }, BACKUP_EK_TIMEOUT_MS);
-  pendingBackupEk.set(targetId, { priv, timeoutHandle });
+  pendingBackupEk.set(key, { priv, timeoutHandle });
   obj.ek = Array.from(pub);
 }
 /* ══════════════════════════════════════════
@@ -2386,7 +2557,16 @@ if (contact.blocked) {
   // send ack — cross domain if we have their wss
   const ackTs  = Date.now();
   const ackObj = { type: "sync:restore_ack", from: buildAddress(state.publicId, state.endpointId), to: msg.from, ts: ackTs };
-  attachRestoreEk(ackObj, msg.from);
+  // plain.deviceId names exactly which of msg.from's devices sent THIS
+  // request — restore_req itself carries no endpoint (see protocol.md),
+  // but if we already know one for that device from earlier traffic
+  // (recordKnownDevice above only just recorded deviceId, not endpoint),
+  // scope this ack's ephemeral to that specific device rather than the
+  // bare identity. Two devices of the same contact requesting at once
+  // then get their own slot each, instead of racing to overwrite one
+  // shared per-identity ephemeral (see attachRestoreEk's own comment).
+  const knownDeviceEndpoint = plain.deviceId ? state.knownDevices[msg.from]?.[plain.deviceId]?.endpointId : null;
+  attachRestoreEk(ackObj, msg.from, knownDeviceEndpoint);
   ackObj.sig = signHandshakePacket(ackObj);
   const senderWss = plain.wss || state.contacts[msg.from]?.lastRelay || null;
   let ackSent = false;
@@ -2576,13 +2756,22 @@ async function handleRestorePush(msg) {
     let innerBlob = msg.blob;
     const viaWrap = !!msg.ek;
     if (viaWrap) {
-      const pending = pendingRestoreEk.get(fromId);
+      // Device-specific slot first (reuses cooldownEndpoint — already
+      // verified-gated above), falling back to the bare-identity slot —
+      // see peekPendingEk/attachRestoreEk's own comments. A successful
+      // match deliberately doesn't consume the slot: one ack broadcasts
+      // to every live session under an identity, so more than one of a
+      // contact's devices can legitimately answer it, each with its own
+      // fresh ephemeral, each validly unwrappable against our one stored
+      // priv — deleting on first success used to discard it before a
+      // second, equally legitimate push could ever arrive, which was the
+      // "wrap present but no pending ephemeral" symptom seen even with
+      // per-device keying already in place.
+      const pending = peekPendingEk(pendingRestoreEk, fromId, cooldownEndpoint);
       if (!pending) {
         mlog.warn(`← RESTORE_PUSH from ${fromDisp} — wrap present but no pending ephemeral for ${pid(fromId)}, dropped`);
         return;
       }
-      clearTimeout(pending.timeoutHandle);
-      pendingRestoreEk.delete(fromId);
       try {
         const theirEk = new Uint8Array(msg.ek);
         const shared  = x25519.getSharedSecret(pending.priv, theirEk);
@@ -3365,7 +3554,9 @@ async function sendImageMessage(file) {
         mlog.err(`→ IMAGE        to   ${pid(state.currentChat)} — send failed: ${e.message}`);
       }
 
-      contact.messages = mergeMessages(contact.messages, [{ id, from: state.publicId, type: "image", mimeType, ts, valid: true, status, deviceId: state.deviceId, n: sentN, ...ackPointer }]);
+      const stored = { id, from: state.publicId, type: "image", mimeType, ts, valid: true, status, deviceId: state.deviceId, n: sentN, ...ackPointer };
+      contact.messages = mergeMessages(contact.messages, [stored]);
+      if (status !== "failed") sendSelfSync(contact.publicId, stored);   // stub only — see sendSelfSync
       await saveContacts();
       renderMessages();
       updateContactPreview();   // sidebar preview otherwise only ever updates on incoming traffic
@@ -3411,7 +3602,9 @@ async function sendAudioMessage(blob) {
     }
 
     // stub in messages — data stays in audioCache only
-    contact.messages = mergeMessages(contact.messages, [{ id, from: state.publicId, type: "audio", mimeType, ts, valid: true, status, deviceId: state.deviceId, n: sentN, ...ackPointer }]);
+    const stored = { id, from: state.publicId, type: "audio", mimeType, ts, valid: true, status, deviceId: state.deviceId, n: sentN, ...ackPointer };
+    contact.messages = mergeMessages(contact.messages, [stored]);
+    if (status !== "failed") sendSelfSync(contact.publicId, stored);   // stub only — see sendSelfSync
     await saveContacts();
     renderMessages();
     updateContactPreview();   // sidebar preview otherwise only ever updates on incoming traffic
@@ -3595,6 +3788,106 @@ async function decryptIncomingMessage(fromId, blob) {
   return { plain, viaX4DH: false, theirDeviceId: null };
 }
 
+/* ══════════════════════════════════════════
+   SELF-SYNC — receive side (see sendSelfSync for the why)
+   A "selfsync" payload is an ordinary app:message from OUR OWN identity
+   whose plaintext carries { peerId, msg }: a copy of something another
+   device of ours just sent to contact `peerId`. Merged straight into that
+   contact's conversation as one of OUR messages.
+
+   Hard rules, each one closing a specific hole:
+     - msg.from MUST be us. A contact can never sync anything into our
+       conversations — checked here even though the outer decrypt/verify
+       path already resolves `contact` from msg.from.
+     - `valid` MUST be true. receiveMessage normally displays an
+       unverified message with a warning; that leniency is wrong here,
+       since this merges into a DIFFERENT conversation than the sender
+       field suggests. Unverified → dropped, never shown.
+     - Never sends anything back: no delivery ack, no re-fan. The send
+       side is only ever triggered by a local user action, so a received
+       copy can't ping-pong between siblings.
+     - Never bumps unread — these are our own messages.
+     - ackTrusted is deliberately NOT set: provenance here is "a sibling
+       told me", not "composed or received live on this device" (see the
+       trust gate in mergeMessages), so the copy sits at its baseline
+       (ts, id) position.
+     - The embedded n is kept on the stored message but NEVER fed to
+       recordKnownDevice — it's a per-(device, contact) counter for the
+       peer conversation, not a sequence for the self channel.
+     - Whitelisted field copy, not a spread: the inner object is
+       attacker-shaped as far as this function is concerned (a
+       compromised sibling is inside the trust model, but sloppy
+       spreading would still let junk fields land in stored messages).
+══════════════════════════════════════════ */
+async function handleSelfSync(msg, plain, valid) {
+  const fromDisp = pid(state.publicId, { deviceId: plain.deviceId, endpointId: plain.endpointId });
+  if (msg.from !== state.publicId) {
+    mlog.warn(`← SELFSYNC     from ${pid(msg.from)} — not from our own identity, dropped`);
+    return;
+  }
+  if (!valid) {
+    mlog.warn(`← SELFSYNC     from ${fromDisp} — signature invalid, dropped`);
+    return;
+  }
+  if (plain.deviceId === state.deviceId) {
+    mlog.debug(`← SELFSYNC     own echo, ignored`);
+    return;
+  }
+
+  const peerId = plain.peerId;
+  const inner  = plain.msg;
+  const peer   = state.contacts[peerId];
+  if (!peer || peer.blocked || peerId === state.publicId) {
+    mlog.debug(`← SELFSYNC     from ${fromDisp} — peer=${pid(peerId)} unknown/blocked/self, ignored`);
+    return;
+  }
+  if (!inner || typeof inner.id !== "string" || inner.id.length > 64 || !Number.isFinite(inner.ts)) {
+    mlog.warn(`← SELFSYNC     from ${fromDisp} — malformed inner message, dropped`);
+    return;
+  }
+
+  const m = { id: inner.id, from: state.publicId, ts: inner.ts, valid: true, status: "sent" };
+  const t = inner.type || "text";
+  if (t === "text") {
+    if (typeof inner.text !== "string") { mlog.warn(`← SELFSYNC     from ${fromDisp} — text missing, dropped`); return; }
+    m.text = inner.text;
+  } else if (t === "audio" || t === "image") {
+    // stub only — media is transient by design (known-limitations.md), and
+    // renderMessages already shows "(not available)" for a media message
+    // with no cache entry.
+    m.type = t;
+    m.mimeType = typeof inner.mimeType === "string" ? inner.mimeType : null;
+  } else if (t === "reaction") {
+    if (typeof inner.targetId !== "string") { mlog.warn(`← SELFSYNC     from ${fromDisp} — reaction target missing, dropped`); return; }
+    m.type = "reaction"; m.targetId = inner.targetId; m.emoji = inner.emoji || null;
+    delete m.status;
+  } else {
+    mlog.debug(`← SELFSYNC     from ${fromDisp} — unsupported inner type=${t}, ignored`);
+    return;
+  }
+  if (typeof inner.deviceId === "string") m.deviceId = inner.deviceId;
+  if (Number.isFinite(inner.n)) m.n = inner.n;
+  if (typeof inner.ackDeviceId === "string" && Number.isFinite(inner.ackN)) { m.ackDeviceId = inner.ackDeviceId; m.ackN = inner.ackN; }
+
+  // Immutable-content ids (text/audio/image) already on file are left
+  // alone — mergeMessages' same-id rule would let this copy's status:"sent"
+  // replace a local "delivered", and there's nothing to learn from a
+  // duplicate anyway (a targeted copy and a broadcast fallback can both
+  // arrive). Reactions are the exception: same id across states, newer ts
+  // must win — mergeMessages already does that.
+  if (m.type !== "reaction" && peer.messages.some(x => x.id === m.id)) {
+    mlog.debug(`← SELFSYNC     from ${fromDisp} — already have ${pid(m.id)}, skipped`);
+    return;
+  }
+
+  peer.messages = mergeMessages(peer.messages, [m]);
+  reconcileDeliveryStatus(peer);
+  mlog.info(`← SELFSYNC     from ${fromDisp}  peer=${pid(peerId)}  type=${t}  id=${pid(m.id)}`);
+  await saveContacts();
+  if (state.currentChat === peerId) renderMessages();
+  updateContactPreview();
+}
+
 async function receiveMessage(msg) {
   if (!msg.from || !msg.blob) return;
   const contact = state.contacts[msg.from];
@@ -3670,6 +3963,15 @@ async function receiveMessage(msg) {
     // deviceId doesn't exist anymore (it moved inside the signed payload).
     const fromDisp = valid ? pid(msg.from, { deviceId: plain.deviceId, endpointId: plain.endpointId }) : pid(msg.from);
     mlog.info(`← MSG          from ${fromDisp}  sig:${valid ? "✓" : "✗"}  key:${viaX4DH ? "x4dh" : "legacy"}`);
+
+    // Self-sync copies of OUR OWN outgoing messages from a sibling device —
+    // a completely different destination than an ordinary message, so it
+    // branches off here, before any of the contact-conversation handling
+    // below (unread, auto-ack, msgObj construction) could apply to it.
+    if (plain.type === "selfsync") {
+      await handleSelfSync(msg, plain, valid);
+      return;
+    }
 
     const msgObj = { id: plain.id, from: msg.from, ts: plain.ts || Date.now(), valid };
     // persist the sender's per-device send counter locally too, not just
@@ -3747,7 +4049,7 @@ async function receiveMessage(msg) {
     // chat happens to be open. Never fires for an incoming reaction
     // itself — no meta-acking.
     if (msgObj.type !== "reaction" && valid && msg.from !== state.publicId) {
-      sendReaction(plain.id, null, msg.from);
+      sendReaction(plain.id, null, msg.from, true);
     }
 
     if (state.currentChat === msg.from) renderMessages();
@@ -4047,7 +4349,7 @@ async function notifyMigration(newRelay, ts, oldRelay) {
        sendSignal routing, no different from any other message.
      - ourselves — but unlike migrate there's no "old relay" to also
        reach; this isn't a routing change, so a single sendSignal
-       (same pattern pushMiniBackup already uses for self-targeted
+       (same self-targeted pattern the retired pushMiniBackup used for
        packets) is sufficient. It lands on whatever relay our "me"
        contact currently points to, live-delivered to any other
        connected session of ours and durably buffered there for
@@ -4102,13 +4404,86 @@ async function commitBurn() {
   selfDestruct();
 }
 
-async function pushMiniBackup(contactId) {
-  const contact = state.contacts[contactId];
-  if (!contact) return;
-  const slim = { [contactId]: { ...serialiseContacts()[contactId] } };
-  const blob = await encryptObject(state.cryptoKey, slim);
-  sendSignal({ type: "sync:backup_push", from: state.publicId, to: state.publicId, blob });
-  mlog.info(`→ MINI_BACKUP  to self  contact=${pid(contactId)}`);
+/* ══════════════════════════════════════════
+   SELF-SYNC — send side (replaces pushMiniBackup)
+   Problem it solves: a message composed on device A never reaches our other
+   devices — contacts fan THEIR messages to every device of ours, but our own
+   outgoing ones only ever existed on the sending device. An offline sibling
+   coming back online therefore got half the conversation.
+
+   The old fix (pushMiniBackup) rode the backup path: a slice of the last
+   messages, encrypted under the passphrase-derived backup key, unsigned,
+   and — since 0.5.0 — buffered at the relay. That was the wrong channel:
+   the backup path is a live handshake (offer/accept/push, wrap ephemerals
+   that live 60s in memory), and buffering a wrapped push made stale copies
+   surface on reconnect with no ephemeral left to unwrap them.
+
+   This instead uses the ordinary per-device fanout (sendFannedX4DH) to our
+   OWN identity: one small app:message per outgoing message/reaction,
+   payload type "selfsync" wrapping the message plus the target contact id.
+   What that buys over the mini backup:
+     - per-sibling X4DH session keys where a self-session exists (legacy
+       self key otherwise) instead of the static backup key
+     - an Ed25519 signature — self-sync backup traffic carries none
+     - per-endpoint offline buffers: each known sibling gets its OWN copy
+       queued at the relay. An identity-level buffered packet is consumed by
+       whichever device reconnects first, so two offline siblings could not
+       both get it — that is exactly what per-endpoint targeting fixes.
+   Known limits (accepted, the periodic full self-backup is the repair layer):
+     - a sibling with no known endpointId (or stale >7d) falls back to the
+       identity-level broadcast, i.e. first-reconnecting-device-wins
+     - a sibling we have never heard from is not synced to at all: with
+       nothing known there is no one to address. It gets discovered through
+       the self-backup handshake / its own traffic, and later sends target it.
+   Server side: a self-addressed app:message never triggers a push (see
+   route_or_buffer in server.py) — waking a sibling to say "check the app"
+   about our own message would be noise.
+
+   Media goes as a stub (id/type/mimeType), never the payload — it would
+   multiply upload size by the number of siblings, and media is transient
+   anyway. Call notices are not mirrored (system record of an attempt, not
+   conversation content).
+
+   `stored` is the locally stored message object; local-only fields
+   (status, valid, ackTrusted) never go on the wire — fields are copied
+   explicitly, not spread. Fire-and-forget: callers don't await it and a
+   failure only logs.
+══════════════════════════════════════════ */
+async function sendSelfSync(peerId, stored) {
+  if (!state.publicId || !peerId || peerId === state.publicId || !stored?.id) return;   // self chat already fans to siblings as a plain message
+  const peer = state.contacts[peerId];
+  if (!peer || peer.blocked) return;
+
+  const { knownCount } = resolveDeviceTargets(state.publicId);
+  if (knownCount === 0) {
+    mlog.debug(`SELFSYNC   no sibling device known yet — skipped  id=${pid(stored.id)}`);
+    return;
+  }
+
+  const inner = { id: stored.id, type: stored.type || "text", ts: stored.ts };
+  if (inner.type === "text")                         inner.text = stored.text;
+  else if (inner.type === "audio" || inner.type === "image") inner.mimeType = stored.mimeType || null;
+  else if (inner.type === "reaction")                { inner.targetId = stored.targetId; inner.emoji = stored.emoji ?? null; }
+  else return;
+  if (stored.deviceId) inner.deviceId = stored.deviceId;
+  if (stored.n != null) inner.n = stored.n;
+  if (stored.ackDeviceId && stored.ackN != null) { inner.ackDeviceId = stored.ackDeviceId; inner.ackN = stored.ackN; }
+
+  try {
+    const me    = state.contacts[state.publicId];
+    const relay = me?.lastRelay ? { wss: me.lastRelay } : undefined;
+    // Deterministic outer id (and the inner ts): a retry or a second
+    // delivery path of the SAME copy hits receiveMessage's
+    // (id, ts) duplicate guard instead of being processed twice. A
+    // reaction whose state changed has a new ts, so it is never mistaken
+    // for a stale duplicate of the old one.
+    const payload = { id: `ss:${stored.id}`, type: "selfsync", peerId, msg: inner, ts: stored.ts,
+                      deviceId: state.deviceId, endpointId: state.endpointId, ...(relay ? { relay } : {}) };
+    const fanned = await sendFannedX4DH(state.publicId, payload);
+    mlog.info(`→ SELFSYNC     peer=${pid(peerId)}  type=${inner.type}  ${fanned.targetedCount} targeted (${fanned.x4dhCount} x4dh, ${fanned.legacyCount} legacy)${fanned.broadcastSent ? " + broadcast" : ""}${!fanned.sent ? " — nowhere, no open socket" : ""}`);
+  } catch(e) {
+    mlog.warn(`→ SELFSYNC     peer=${pid(peerId)} — send failed: ${e.message}`);
+  }
 }
 
 async function sendMessage() {
@@ -4144,12 +4519,13 @@ async function sendMessage() {
     mlog.err(`→ MSG          to   ${pid(state.currentChat)} — send failed: ${e.message}`);
   }
 
-  contact.messages = mergeMessages(contact.messages, [{ id, from: fromId, text, ts, valid: true, status, deviceId: state.deviceId, n: sentN, ...ackPointer }]);
+  const stored = { id, from: fromId, text, ts, valid: true, status, deviceId: state.deviceId, n: sentN, ...ackPointer };
+  contact.messages = mergeMessages(contact.messages, [stored]);
   await saveContacts();
   input.value = "";
   renderMessages();
   updateContactPreview();   // sidebar preview otherwise only ever updates on incoming traffic
-  pushMiniBackup(contact.publicId);
+  if (status !== "failed") sendSelfSync(contact.publicId, stored);   // mirror to our other devices — see sendSelfSync
 }
 
 /* ══════════════════════════════════════════
@@ -4158,7 +4534,12 @@ async function sendMessage() {
    so mergeMessages naturally replaces, never duplicates.
    emoji: ":)" | ":(" | null  (null = cleared)
 ══════════════════════════════════════════ */
-async function sendReaction(targetMsgId, emoji, contactId = state.currentChat) {
+// isAuto — true only for the RECEIVED auto-ack fired from receiveMessage.
+// A user's own emoji pick (or manual clear) is mirrored to sibling devices
+// via sendSelfSync; the auto-ack is NOT — every sibling receives the
+// original message from the contact itself and acks it on its own, so
+// mirroring acks would just be noise.
+async function sendReaction(targetMsgId, emoji, contactId = state.currentChat, isAuto = false) {
   if (!contactId) return;
   const contact = state.contacts[contactId];
   if (!contact?.encKey) return;
@@ -4172,6 +4553,7 @@ async function sendReaction(targetMsgId, emoji, contactId = state.currentChat) {
   const fanned = await sendFannedX4DH(contactId, payload);
   const msgObj = { id, from: state.publicId, type: "reaction", targetId: targetMsgId, emoji, ts, valid: true, deviceId: state.deviceId };
   contact.messages = mergeMessages(contact.messages, [msgObj]);
+  if (!isAuto) sendSelfSync(contactId, msgObj);
   // Fanned deliberately, same as the other send paths — a RECEIVED
   // auto-ack (emoji:null) reaching only ONE of the sender's own devices
   // would leave their OTHER devices stuck showing "sent" (✔️) forever for
