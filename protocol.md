@@ -2,7 +2,7 @@
 
 A decentralised, encrypted messaging protocol built on WebSocket relay servers. No accounts, no central authority, no plaintext.
 
-Current client/server implementation version: `0.5.1`, surfaced informationally via the `version` field on `sig:relay_info` for drift visibility (not yet enforced). See `CHANGELOG.md` for the full version history — what changed in each release and why. This document describes the protocol as it stands today only; `X4DH.md` remains the authoritative source for the cryptographic design and live-confirmation status of the X4DH work specifically.
+Current client/server implementation version: `0.5.2`, surfaced informationally via the `version` field on `sig:relay_info` for drift visibility (not yet enforced). See `CHANGELOG.md` for the full version history — what changed in each release and why. This document describes the protocol as it stands today only; `X4DH.md` remains the authoritative source for the cryptographic design and live-confirmation status of the X4DH work specifically.
 
 See [Push Notifications](#push-notifications) for that feature's own full picture, including what's deliberately still out of scope.
 
@@ -28,11 +28,13 @@ All keys are derived deterministically from `(username, passphrase)`:
 masterSecret = PBKDF2(
   password   = passphrase,
   salt       = SHA-256("meshchat-v1:" + username.toLowerCase().trim()),
-  iterations = 100000,
+  iterations = 1000000,
   hash       = SHA-256,
   bits       = 256
 )
 ```
+
+The iteration count was raised from 100,000 to 1,000,000 in `0.5.2`. It is an input to `masterSecret`, so — exactly like changing the username or passphrase — it changes every derived key and therefore the `publicId`: an identity derived under the old count cannot be reached with the same credentials under the new one. This was a deliberate hard cutover, with no version detection or migration path; see `CHANGELOG.md`.
 
 Three keys are expanded from the master secret via HKDF-SHA-256:
 
@@ -822,6 +824,8 @@ outerBlob = AES-256-GCM( key = wrapKey, data = <the existing inner blob, untouch
 The inner blob is exactly what it always was — the recipient still decrypts it with their own passphrase-derived key after unwrapping, so restore-from-nothing and ordinary backup storage are unaffected. What the wrap adds: a passive observer who records the wire traffic and later obtains the passphrase cannot decrypt what they recorded, because the ephemeral private keys involved are held only in memory for up to 60 seconds and are never persisted anywhere.
 
 **Sequencing.** Whoever sends a `restore_ack` (`sendRestoreAckPing`, or the reply built inside `handleRestoreRequest`) or a `backup_accept` attaches a fresh ephemeral as `ek` and holds the matching private key in memory, keyed by whoever it addressed the packet to. Whoever receives that packet and is about to answer with a push — `handleRestoreAck`'s peer branch, or `handleBackupAccept`'s contact-offer branch — only generates its own ephemeral and wraps when the *incoming* packet's signature verified. An `ek` riding on an unverifiable ack/accept is not trusted, for the same reason the restore token above isn't handed to an unverified sender: a relay in between could otherwise supply its own ephemeral and read the reply. `ek` is included in the signed payload (`signHandshakePacket`) whenever it's present on the object being signed, and simply omitted from the signed set otherwise — a packet with no `ek` field is byte-identical, and verifies identically, to one from before this mechanism existed.
+
+**Several ephemerals may be live for one peer at once.** A `restore_ack`/`backup_accept` is addressed to a bare identity, so it broadcasts to every live session under it, and an identity running more than one device answers with one push per device — each carrying that device's own fresh ephemeral. Separately, a device can attach more than one ephemeral toward the same peer inside the 60-second window (a presence-driven ping and a request reply, say). The pending store therefore holds a *list* of candidates per peer (keyed by `id::endpointId` when the responding device is known, otherwise by bare identity), the receiver trial-decrypts a push against each candidate (newest first), and a candidate is removed only by its own timeout — never for having matched, since the same private half can legitimately unwrap several different replies. A push wrapped for a sibling device's ephemeral simply fails to match and is dropped; that is expected on a doubled identity, not a fault. The short-window duplicate check on these push types is keyed on the sender's endpoint *and* a fingerprint of the push's `ek`, so a reply meant for a sibling cannot suppress the one meant for this device. None of this changes the wire format.
 
 **Failure is closed, not silently downgraded.** If a receiving client has no pending ephemeral on file for a push that claims one (expired, or the ack it answers was never actually sent by that client), the push is dropped rather than fed to the inner decrypt. If the wrap key itself doesn't check out, same result. This means that once wrapping has actually been attempted, a relay that manages to strip `ek` in transit — without also invalidating the signature, which covers it — breaks that specific restore or backup attempt outright rather than gracefully falling back to the unwrapped form; the graceful fallback only applies where no wrap was ever attempted in the first place (an unverified sender, or a client that predates this mechanism).
 

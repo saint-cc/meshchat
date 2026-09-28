@@ -197,6 +197,23 @@ function isDuplicateInbound(key, windowMs = DEDUP_WINDOW_MS) {
   return last !== undefined && (now - last) < windowMs;
 }
 
+// ekDedupTag(ek) — short fingerprint of a packet's ephemeral public key,
+// for dedup keys on the wrapped push types (restore_push/backup_push).
+// isDuplicateInbound stamps its timestamp on EVERY call, including for a
+// packet that then fails to unwrap — so keying a push's dedup on
+// (sender, endpoint) alone lets a push that was never addressed to us
+// (one broadcast reply meant for a sibling device's ephemeral) poison the
+// window for the genuinely-ours push arriving milliseconds later from the
+// same endpoint, which then got suppressed as a "duplicate" (debug-only
+// line, invisible). Two distinct pushes always carry distinct ek values;
+// a true redelivery of the same push carries the same one — so adding
+// this to the key keeps real duplicate suppression while letting
+// different replies from one endpoint through independently.
+function ekDedupTag(ek) {
+  if (!Array.isArray(ek) || !ek.length) return "";
+  return ":" + ek.slice(0, 6).map(b => (b & 0xff).toString(16).padStart(2, "0")).join("");
+}
+
 /* ══════════════════════════════════════════
    ONLINE PRESENCE — time-based expiry
 ══════════════════════════════════════════ */
@@ -2075,7 +2092,7 @@ async function handleBackupPush(msg) {
   // Endpoint-aware once verified — see handleBackupAccept's dedupKey
   // comment for why bare fromId alone would risk swallowing a second,
   // genuinely distinct sibling device's push.
-  const dedupKey = `backup_push:${fromId}${verified && fromEndpoint ? ":" + fromEndpoint : ""}`;
+  const dedupKey = `backup_push:${fromId}${verified && fromEndpoint ? ":" + fromEndpoint : ""}${ekDedupTag(msg.ek)}`;
   if (isDuplicateInbound(dedupKey)) {
     mlog.debug(`← BACKUP_PUSH  from ${pid(fromId, verified ? { endpointId: fromEndpoint } : {})} — duplicate within ${DEDUP_WINDOW_MS}ms, suppressed`);
     return;
@@ -2751,7 +2768,7 @@ async function handleRestorePush(msg) {
   // most content-independent check goes first, same ordering principle
   // backup_offer's original dedup already established. Reuses
   // cooldownEndpoint rather than computing a separate key.
-  const dedupKey = `restore_push:${fromId}${cooldownEndpoint ? ":" + cooldownEndpoint : ""}`;
+  const dedupKey = `restore_push:${fromId}${cooldownEndpoint ? ":" + cooldownEndpoint : ""}${ekDedupTag(msg.ek)}`;
   if (isDuplicateInbound(dedupKey)) {
     mlog.debug(`← RESTORE_PUSH from ${fromDisp} — duplicate within ${DEDUP_WINDOW_MS}ms, suppressed`);
     return;

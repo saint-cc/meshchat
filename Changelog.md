@@ -38,44 +38,47 @@ backward compatibility, and none attempted.**
   re-exchange keys/QR codes, exactly as if everyone had picked new
   passphrases at the same time. `meshdev` is incompatible with any
   pre-bump identity as a result.
-- **Fixed: the restore/backup ephemeral wrap (`0.5.1`) clobbered itself
-  across a contact's own multiple devices.** `pendingRestoreEk`/
-  `pendingBackupEk` (see `protocol.md`'s
-  [Ephemeral Wrap](protocol.md#ephemeral-wrap)) were keyed by the bare
-  contact identity only. Two of a contact's devices online at once each
-  independently trigger their own restore/backup round trip toward us;
-  each attach overwrote the other's pending ephemeral in the same shared
-  slot, so whichever push arrived second either unwrapped under the
-  wrong key or found its entry already deleted — surfacing as `wrap
-  present but no pending ephemeral for <id>, dropped` and a string of
-  spurious unwrap failures on the device that was already online.
-  Not a security issue (AES-GCM simply fails closed on the wrong key,
-  same fail-safe behavior described in `known-limitations.md`) and not
-  data-lossy (the next restore/backup cycle just retries) — a reliability
-  bug, not a correctness one. Fixed by adding a per-device slot
-  (`id::endpointId`, alongside the existing bare-identity slot) whenever
-  the responding device is already known at attach time
-  (`handleRestoreRequest` resolves it from the request's own
-  `plain.deviceId`; `handleBackupOffer` already has it directly from the
-  offer's compound `from`) — consumed the same way on the receiving end,
-  falling back to the bare slot when no device was known yet. Wire
-  format is unchanged; this is local bookkeeping only.
-- **Fixed a second, related race in the same mechanism: a successful
-  unwrap was consuming the pending ephemeral, even though `restore_ack`/
-  `backup_accept` address a bare identity and therefore broadcast to
-  *every* live session under it.** An identity running two-plus devices
-  legitimately produces two-plus independent pushes in reply to one ack —
-  each with its own fresh ephemeral, each validly unwrappable against our
-  one stored private half (X25519 DH is safe to run more than once
-  against the same private scalar paired with a different public key each
-  time). Deleting the slot on the first successful unwrap discarded it
-  before the next, equally legitimate push could ever arrive — reproduced
-  live logging in as a third identity while two others were already
-  online: the first device's push unwrapped fine, the second failed with
-  the same `wrap present but no pending ephemeral` message the fix above
-  was meant to close. The lookup (renamed `peekPendingEk`) now leaves the
-  slot alone on a hit; it's only ever cleared by its own timeout or by a
-  fresh attach superseding it.
+- **Fixed: the restore/backup ephemeral wrap (`0.5.1`) could silently
+  drop a push for a device pair that legitimately had every right to
+  exchange one.** `pendingRestoreEk`/`pendingBackupEk` (see
+  `protocol.md`'s [Ephemeral Wrap](protocol.md#ephemeral-wrap)) each held
+  exactly one pending ephemeral per contact identity. `restore_ack` and
+  `backup_accept` both address a bare identity, so a single outgoing one
+  broadcasts to *every* live session under it — an identity running two-
+  plus devices legitimately produces two-plus independent replies (each
+  with its own ephemeral) to that one packet, and any given device can
+  independently trigger its own attach toward the same target more than
+  once (`sendRestoreAckPing`'s presence-driven ping and
+  `handleRestoreRequest`'s reply both land on the same fallback slot
+  whenever the responding device's endpoint isn't known yet). All three
+  shapes hit the same one-slot-per-identity ceiling from a different
+  angle, in sequence, live: two attaches racing to overwrite each other;
+  a successful unwrap discarding the shared secret before a second,
+  equally legitimate push could use it; and the two on our own side
+  colliding with each other. None of it was a security issue (AES-GCM
+  simply fails closed on a wrong key) or data-lossy (the next cycle just
+  retries) — a reliability bug, not a correctness one, surfacing as
+  `wrap present but no pending ephemeral` and plain `unwrap failed` in
+  roughly equal measure. Rather than patch each shape as it turned up,
+  each slot now holds a *list* of live ephemerals — every attach appends
+  instead of overwriting (keyed by `id::endpointId` when the responding
+  device is known, alongside a bare-identity fallback slot for when it
+  isn't), and the receiving side trial-decrypts against every current
+  candidate for that slot, newest first, exactly the way X4DH wire-key
+  resolution already does for the same underlying reason
+  (`decryptIncomingMessage`) — a wrong candidate fails cleanly and
+  immediately, so trying a few costs nothing but a handful of failed
+  decrypts. **A candidate is never removed for having matched a push** —
+  an intermediate version of this fix removed the matching candidate on
+  success, on the assumption that a used ephemeral was done; that was
+  wrong, and reintroduced the second shape above one level down (the
+  first of two replies to a broadcast ack to arrive would consume the
+  only listed candidate, leaving the second with nothing). A single
+  attach's ephemeral is exactly what shape #2 already established can
+  legitimately answer more than one incoming push, so matching costs it
+  nothing — the only way any candidate is ever removed now is its own
+  timeout genuinely elapsing with nobody having used it. Wire format is
+  unchanged throughout; this is local bookkeeping only.
 - **Fixed a third, sibling bug in the same family, on the OFFER side of
   the peer-backup handshake specifically.** `pendingBackupOffer` tracked
   a single pending offer per bare identity, deleted the instant it
@@ -98,6 +101,23 @@ backward compatibility, and none attempted.**
   accept, only by its own TTL expiry or by the next offer replacing it —
   every accept within that window now gets its own independently-wrapped
   push.
+- **Fixed: a push not addressed to this device could suppress the one
+  that was.** The short-window duplicate check on `restore_push`/
+  `backup_push` was keyed on `(sender, endpoint)` alone and stamps its
+  timestamp the moment it's consulted — before the unwrap, so even for a
+  packet that then fails to unwrap. With a doubled identity on either
+  side, one broadcast ack/accept draws one reply per ephemeral (ours and
+  our sibling's, both broadcast to both of us), all from the same sender
+  endpoint within milliseconds; whichever arrived first — including the
+  one wrapped for our sibling — claimed the 3s window, and the one
+  actually meant for us was dropped as a "duplicate" on a debug-only log
+  line, leaving only the visible `unwrap failed` from the wrong-for-us
+  one. The dedup key now includes a short fingerprint of the push's own
+  `ek` (`ekDedupTag`): distinct replies always carry distinct ephemerals,
+  a genuine redelivery carries the same one. `unwrap failed against N
+  candidate(s)` on a doubled identity is still expected noise — it's the
+  copy of a broadcast reply meant for a sibling's ephemeral — but it no
+  longer costs the real one.
 
 ## 0.5.1
 
