@@ -2094,25 +2094,34 @@ async function handleBackupPush(msg) {
   let storedBlob = msg.blob;
   const viaWrap = !!msg.ek;
   if (viaWrap) {
-    // Device-specific slot first (only trustworthy once verified — an
-    // unverified fromEndpoint could be a relay's own swapped-in value),
-    // falling back to the bare-identity slot — see peekPendingEk/
-    // attachBackupEk's own comments for why a sibling device's push must
-    // not be matched against a DIFFERENT sibling's still-pending ephemeral,
-    // and why a successful match here deliberately doesn't consume it —
-    // more than one sibling can legitimately answer the same accept.
-    const pending = peekPendingEk(pendingBackupEk, fromId, verified ? fromEndpoint : null);
-    if (!pending) {
+    // Trial-decrypt against every live candidate for this slot (device-
+    // specific ones first, only meaningful once verified, then the bare-
+    // identity fallback ones) — see this map's own header comment for
+    // why a single stored ephemeral isn't enough: more than one sibling
+    // can legitimately answer the same accept, each with its own ek.
+    // AES-GCM's auth tag fails a wrong candidate cleanly, so this costs
+    // at most a handful of failed attempts, never a false positive. A
+    // successful match is deliberately NOT removed here — see the header
+    // comment's note on why a matched candidate must stay usable for
+    // whatever OTHER reply is still in flight to the same broadcast ack.
+    const candidates = pendingEkCandidates(pendingBackupEk, fromId, verified ? fromEndpoint : null);
+    if (!candidates.length) {
       mlog.warn(`← BACKUP_PUSH  from ${pid(fromId, verified ? { endpointId: fromEndpoint } : {})} — wrap present but no pending ephemeral for ${pid(fromId)}, dropped`);
       return;
     }
-    try {
-      const theirEk = new Uint8Array(msg.ek);
-      const shared  = x25519.getSharedSecret(pending.priv, theirEk);
-      const wrapKey = await deriveEphemeralWrapKey(shared);
-      storedBlob = await decryptObject(wrapKey, msg.blob);
-    } catch(e) {
-      mlog.warn(`← BACKUP_PUSH  from ${pid(fromId)} — unwrap failed, dropped: ${e.message}`);
+    const theirEk = new Uint8Array(msg.ek);
+    let matched = false;
+    for (const candidate of candidates) {
+      try {
+        const shared  = x25519.getSharedSecret(candidate.priv, theirEk);
+        const wrapKey = await deriveEphemeralWrapKey(shared);
+        storedBlob = await decryptObject(wrapKey, msg.blob);
+        matched = true;
+        break;
+      } catch(e) { /* wrong candidate — try the next one */ }
+    }
+    if (!matched) {
+      mlog.warn(`← BACKUP_PUSH  from ${pid(fromId)} — unwrap failed against ${candidates.length} candidate(s), dropped`);
       return;
     }
   }
@@ -2230,61 +2239,70 @@ async function handleTokenResponse(msg) {
   mlog.info(`← TOKEN_RESP   from ${pid(msg.from)}  sig:✓ — stored`);
 }
 /* ══════════════════════════════════════════
-   RESTORE PUSH WRAP — one-shot ephemeral (step 4 of the restore-token work)
+   RESTORE PUSH WRAP — ephemeral (step 4 of the restore-token work)
    Protects the inner passphrase-encrypted backup blob against a passive
    wire recording that's later paired with a leaked passphrase. The inner
    blob is untouched — still exactly what it always was (AES-GCM under
    state.cryptoKey, the thing restore-from-nothing needs to stay
    decryptable by passphrase alone) — this adds a SECOND layer around it,
-   keyed by a fresh X25519 ephemeral-to-ephemeral DH generated for this
-   one restore attempt and never written to disk. Recording the wrapped
-   wire bytes and later learning the passphrase does not recover them —
-   the ephemeral private keys are gone the moment this exchange completes
-   or times out.
+   keyed by a fresh X25519 ephemeral-to-ephemeral DH generated per
+   exchange and never written to disk. Recording the wrapped wire bytes
+   and later learning the passphrase does not recover them — the
+   ephemeral private keys are gone the moment they expire.
 
    Sequencing: whoever SENDS a restore_ack (sendRestoreAckPing, or the
    reply built in handleRestoreRequest) attaches a fresh ephemeral public
    key as `ek` and holds the matching private key here, keyed by the
-   ack's addressee — that's who's expected to answer with a push. When
-   the addressee's specific responding device is already known (see
-   attachRestoreEk's endpointId param below), the slot is keyed by that
-   device too, not just the bare identity — otherwise two devices of the
-   SAME identity online at once (each independently triggering its own
-   restore_req/ack round trip toward us) silently clobber one another's
-   pending ephemeral, since both attaches would land in one shared slot.
-   Confirmed live: this is exactly the "wrap present but no pending
-   ephemeral" / spurious unwrap-failure symptom seen when a contact runs
-   two devices concurrently. sendRestoreAckPing's broadcast ping has no
-   device to key on at attach time (sig:seen only ever names an identity,
-   never a device) and keeps using the bare-identity slot — see that
-   function's own call site below.
+   ack's addressee — when the addressee's specific device is already
+   known (attachRestoreEk's endpointId param), keyed by that device too,
+   not just the bare identity. Whoever RECEIVES that ack (handleRestoreAck,
+   peer branch) only wraps when the ack's signature VERIFIED — an `ek`
+   riding on an unverifiable ack could be a relay's own swapped-in key,
+   the same reasoning step 3 already applies to attaching the token — and
+   generates its OWN fresh ephemeral to compute the shared secret,
+   attaching that ephemeral's public half to the push as its own `ek`.
 
-   A second, related race, confirmed live SEPARATELY from the one above:
-   restore_ack's own `to` is a bare identity, so ONE outgoing ack is
-   broadcast (server-side deliver()) to EVERY live session under it —
-   an identity running two-plus devices legitimately produces two-plus
-   independent restore_push replies to that single ack, each carrying
-   its own fresh ephemeral on their side. All of them are genuinely
-   valid: X25519 DH is safe to run more than once against the same
-   stored private half paired with a DIFFERENT public key each time — it
-   is not the kind of key reuse that would matter — so our one stored
-   priv correctly unwraps every one of them, given the chance. The
-   lookup below (peekPendingEk) deliberately does NOT delete the slot on
-   a successful unwrap for exactly this reason — only its own timeout
-   (attachRestoreEk/attachBackupEk's setTimeout) or a fresh attach
-   superseding it ever clears it now. Deleting eagerly on first success
-   was itself a bug: the first of several devices' pushes to arrive
-   consumed the only copy before the others — equally legitimate — could
-   ever be honored, surfacing as the same "wrap present but no pending
-   ephemeral" symptom even after the per-device keying above landed.
-   Whoever RECEIVES that ack (handleRestoreAck, peer branch) only wraps
-   when the ack's signature VERIFIED — an `ek` riding on an unverifiable
-   ack could be a relay's own swapped-in key, the same reasoning step 3
-   already applies to attaching the token — and generates its OWN fresh
-   ephemeral to compute the shared secret, attaching that ephemeral's
-   public half to the push as its own `ek`. The push's receiver — the
-   original ack sender — looks its pending ephemeral up by the push's
-   `from`, which is exactly the id it addressed the ack to.
+   THREE independent races were found live against this mechanism, all
+   the same underlying shape — a bare `to` broadcasts to every live
+   session under an identity, so "one ack" or "one attach" is never
+   actually one-to-one once more than one device (or more than one of
+   OUR OWN code paths targeting the same identity) is involved — fixed
+   incrementally, each fix exposing the next:
+     1. Two attaches for the SAME identity racing to overwrite one
+        shared slot (two of a contact's devices each independently
+        triggering their own restore_req/ack round trip toward us).
+        Fixed by keying attaches by device when the device is known.
+     2. One ack drawing MULTIPLE independent, individually-valid pushes
+        (one per replying device) against what was still only one stored
+        ephemeral, consumed — and thus gone — after the first of them.
+        Fixed by no longer deleting a slot's entry on a successful match.
+     3. The same failure shape as #1, but between our OWN two attach call
+        sites (sendRestoreAckPing and handleRestoreRequest) landing on
+        the same bare-identity fallback slot when the target device's
+        endpoint wasn't yet known to either of them. Fixed by letting a
+        slot hold a LIST of live ephemerals rather than exactly one, so
+        two attaches to the same slot coexist instead of one clobbering
+        the other — the consuming side trial-decrypts every candidate
+        currently in the slot (newest first), the same pattern this
+        codebase already uses for X4DH wire-key resolution (see
+        decryptIncomingMessage): a wrong candidate fails cleanly and
+        immediately against AES-GCM's auth tag, so trying a handful
+        costs nothing but a few failed decrypts, never a false positive.
+
+   Landing #3's list naively also re-added a version of #2's bug: the
+   first version of this trial-decrypt loop still removed whichever
+   candidate matched, on the theory that a "used" ephemeral was done.
+   It isn't — a single attach's ephemeral is exactly what #2 already
+   established can legitimately answer MORE than one incoming push (one
+   ack broadcasting to N devices, each pairing our one stored priv with
+   their OWN distinct ephemeral via ordinary, repeatable X25519 DH) — so
+   removing it after the first match reintroduced #2's exact symptom
+   one level down: the first of two replies to consume a shared, freshly-
+   listed candidate left nothing for the second. A candidate is now
+   NEVER removed for having matched — matching costs it nothing. The
+   only way anything is ever removed is its own timeout
+   (RESTORE_EK_TIMEOUT_MS/BACKUP_EK_TIMEOUT_MS) genuinely elapsing with
+   no one having claimed it by then.
 
    Deliberately NOT an X4DH session: a just-wiped device has a brand-new
    deviceId and can't have bootstrapped a real session for this pair yet,
@@ -2297,13 +2315,16 @@ async function handleTokenResponse(msg) {
    generates a fresh ack with a fresh ek.
 ══════════════════════════════════════════ */
 const RESTORE_EK_TIMEOUT_MS = 60_000;
-// Keyed by targetId alone (a bare identity), OR by targetId+ADDR_SEP+
-// endpointId when the specific responding device was already known at
-// attach time — see pendingEkSlotKey below. Two devices of the same
-// identity online at once each get their OWN slot once their endpoint is
-// known, instead of racing to overwrite one shared per-identity entry
-// (the "wrap present but no pending ephemeral" bug this fixes).
-const pendingRestoreEk = new Map();   // slotKey -> { priv, timeoutHandle }
+// slotKey -> Array<{ priv, timeoutHandle }>. A slot holds every currently
+// live ephemeral generated for it, not just the most recent one — see
+// this section's header comment for the three races that made a single
+// slot-per-key insufficient. pendingEkSlotKey below computes the key
+// (identity, or identity+ADDR_SEP+endpointId when a specific device is
+// known); attachRestoreEk/attachBackupEk always push via appendPendingEk,
+// never overwrite. Entries are read-only from the consuming side's point
+// of view — see pendingEkCandidates — and removed only by their own
+// timeout, never for having matched a push.
+const pendingRestoreEk = new Map();
 
 // Shared by pendingRestoreEk and pendingBackupEk (see that map's own
 // comment for why the two maps themselves stay separate) — purely a key-
@@ -2314,28 +2335,43 @@ function pendingEkSlotKey(targetId, endpointId) {
   return endpointId ? `${targetId}${ADDR_SEP}${endpointId}` : targetId;
 }
 
-// peekPendingEk(map, targetId, endpointId) — consume-side lookup shared by
-// handleRestorePush/handleBackupPush. Tries the device-specific slot first
-// (only meaningful once the responder's own signature has verified — see
-// each call site), then falls back to the bare-identity slot, since the
-// attach side may have had no device to key on yet (sendRestoreAckPing's
-// broadcast ping, or a first-ever contact).
-//
-// Deliberately does NOT delete the entry on a hit — see this section's own
-// header comment for why: one ack broadcasts to every live session under
-// an identity, so more than one of that identity's devices can legitimately
-// answer it, each with its own fresh ephemeral, each validly unwrappable
-// against our one stored priv. Consuming (deleting) on first success used
-// to discard the shared secret before a second, equally legitimate push
-// could ever arrive. The slot still expires on its own via
-// RESTORE_EK_TIMEOUT_MS/BACKUP_EK_TIMEOUT_MS (attachRestoreEk/
-// attachBackupEk's own setTimeout), and a fresh attach for the same slot
-// still supersedes whatever was there — this only removes the early,
-// first-use deletion.
-function peekPendingEk(map, targetId, endpointId) {
-  const specific = endpointId ? pendingEkSlotKey(targetId, endpointId) : null;
-  const key = (specific && map.has(specific)) ? specific : (map.has(targetId) ? targetId : null);
-  return key ? map.get(key) : null;
+// pendingEkCandidates(map, targetId, endpointId) — every entry currently
+// worth trying against an incoming push, newest first, the device-
+// specific slot's entries before the bare-identity fallback slot's (only
+// meaningful once the responder's own signature has verified — see each
+// call site). Read-only in the fullest sense: it never removes anything,
+// and neither does a caller that successfully decrypts against one of
+// these candidates — see this section's header comment for why a match
+// must not consume the entry. The only removal path is a candidate's own
+// timeout (appendPendingEk's setTimeout), completely independent of
+// whether, or how many times, it was ever successfully used first.
+function pendingEkCandidates(map, targetId, endpointId) {
+  const specific = endpointId ? (map.get(pendingEkSlotKey(targetId, endpointId)) || []) : [];
+  const bare     = map.get(targetId) || [];
+  return [...specific].reverse().concat([...bare].reverse());
+}
+
+// appendPendingEk(map, key, targetId, endpointId, timeoutMs, label) —
+// shared by attachRestoreEk/attachBackupEk: push a fresh candidate onto
+// whichever slot `key` names, scheduling its own independent expiry.
+// Never touches any OTHER candidate already sitting in that slot or any
+// other slot. Returns the fresh ephemeral's public half for the caller
+// to attach to its outgoing packet.
+function appendPendingEk(map, key, targetId, endpointId, timeoutMs, label) {
+  const { priv, pub } = generateX25519Ephemeral();
+  const entry = { priv };
+  entry.timeoutHandle = setTimeout(() => {
+    const list = map.get(key);
+    if (!list) return;
+    const idx = list.indexOf(entry);
+    if (idx === -1) return;
+    list.splice(idx, 1);
+    if (list.length === 0) map.delete(key);
+    mlog.debug(`${label} ephemeral expired  id=${pid(targetId, endpointId ? { endpointId } : {})}`);
+  }, timeoutMs);
+  if (!map.has(key)) map.set(key, []);
+  map.get(key).push(entry);
+  return pub;
 }
 
 // endpointId (optional): the specific device we expect to answer with a
@@ -2343,18 +2379,10 @@ function peekPendingEk(map, targetId, endpointId) {
 // the decrypted request and can resolve its endpoint via knownDevices;
 // sendRestoreAckPing's broadcast ping has no device to name at all, since
 // sig:seen only ever identifies the identity, never a device — it keeps
-// using the bare-identity slot, same as before this fix).
+// using the bare-identity slot).
 function attachRestoreEk(obj, targetId, endpointId) {
   const key = pendingEkSlotKey(targetId, endpointId);
-  const existing = pendingRestoreEk.get(key);
-  if (existing) clearTimeout(existing.timeoutHandle);
-  const { priv, pub } = generateX25519Ephemeral();
-  const timeoutHandle = setTimeout(() => {
-    if (pendingRestoreEk.delete(key)) {
-      mlog.debug(`RESTORE_EK ephemeral expired  id=${pid(targetId, endpointId ? { endpointId } : {})}`);
-    }
-  }, RESTORE_EK_TIMEOUT_MS);
-  pendingRestoreEk.set(key, { priv, timeoutHandle });
+  const pub = appendPendingEk(pendingRestoreEk, key, targetId, endpointId, RESTORE_EK_TIMEOUT_MS, "RESTORE_EK");
   obj.ek = Array.from(pub);
 }
 // Same one-shot-ephemeral shape as attachRestoreEk/pendingRestoreEk just
@@ -2362,23 +2390,14 @@ function attachRestoreEk(obj, targetId, endpointId) {
 // genuinely separate map/constant rather than sharing pendingRestoreEk —
 // a contact could plausibly be mid-restore and mid-backup-exchange at the
 // same time, and the two flows have no reason to be able to clobber each
-// other's pending ephemeral. Same per-device slot fix as pendingRestoreEk
-// (see pendingEkSlotKey/peekPendingEk above) — backup_offer's `from` is
-// compound already, so handleBackupOffer always has an endpointId to pass.
+// other's pending ephemeral. backup_offer's `from` is compound already,
+// so handleBackupOffer always has an endpointId to pass.
 const BACKUP_EK_TIMEOUT_MS = 60_000;   // same "live-only, self-healing" reasoning as RESTORE_EK_TIMEOUT_MS — backup_offer/accept/push are never durably buffered either
-const pendingBackupEk = new Map();     // slotKey (see pendingEkSlotKey) -> { priv, timeoutHandle }
+const pendingBackupEk = new Map();     // slotKey (see pendingEkSlotKey) -> Array<{ priv, timeoutHandle }>
 
 function attachBackupEk(obj, targetId, endpointId) {
   const key = pendingEkSlotKey(targetId, endpointId);
-  const existing = pendingBackupEk.get(key);
-  if (existing) clearTimeout(existing.timeoutHandle);
-  const { priv, pub } = generateX25519Ephemeral();
-  const timeoutHandle = setTimeout(() => {
-    if (pendingBackupEk.delete(key)) {
-      mlog.debug(`BACKUP_EK  ephemeral expired  id=${pid(targetId, endpointId ? { endpointId } : {})}`);
-    }
-  }, BACKUP_EK_TIMEOUT_MS);
-  pendingBackupEk.set(key, { priv, timeoutHandle });
+  const pub = appendPendingEk(pendingBackupEk, key, targetId, endpointId, BACKUP_EK_TIMEOUT_MS, "BACKUP_EK");
   obj.ek = Array.from(pub);
 }
 /* ══════════════════════════════════════════
@@ -2756,29 +2775,36 @@ async function handleRestorePush(msg) {
     let innerBlob = msg.blob;
     const viaWrap = !!msg.ek;
     if (viaWrap) {
-      // Device-specific slot first (reuses cooldownEndpoint — already
-      // verified-gated above), falling back to the bare-identity slot —
-      // see peekPendingEk/attachRestoreEk's own comments. A successful
-      // match deliberately doesn't consume the slot: one ack broadcasts
-      // to every live session under an identity, so more than one of a
-      // contact's devices can legitimately answer it, each with its own
-      // fresh ephemeral, each validly unwrappable against our one stored
-      // priv — deleting on first success used to discard it before a
-      // second, equally legitimate push could ever arrive, which was the
-      // "wrap present but no pending ephemeral" symptom seen even with
-      // per-device keying already in place.
-      const pending = peekPendingEk(pendingRestoreEk, fromId, cooldownEndpoint);
-      if (!pending) {
+      // Trial-decrypt against every live candidate for this slot (device-
+      // specific ones first, reusing cooldownEndpoint — already verified-
+      // gated above — then the bare-identity fallback ones) — see this
+      // map's own header comment for why a single stored ephemeral isn't
+      // enough: one ack broadcasts to every live session under an
+      // identity, so more than one of a contact's devices can legitimately
+      // answer it, each with its own fresh ephemeral. AES-GCM's auth tag
+      // fails a wrong candidate cleanly, so this costs at most a handful
+      // of failed attempts, never a false positive. A successful match is
+      // deliberately NOT removed here — see the header comment's note on
+      // why a matched candidate must stay usable for whatever OTHER reply
+      // is still in flight to the same broadcast ack.
+      const candidates = pendingEkCandidates(pendingRestoreEk, fromId, cooldownEndpoint);
+      if (!candidates.length) {
         mlog.warn(`← RESTORE_PUSH from ${fromDisp} — wrap present but no pending ephemeral for ${pid(fromId)}, dropped`);
         return;
       }
-      try {
-        const theirEk = new Uint8Array(msg.ek);
-        const shared  = x25519.getSharedSecret(pending.priv, theirEk);
-        const wrapKey = await deriveEphemeralWrapKey(shared);
-        innerBlob = await decryptObject(wrapKey, msg.blob);
-      } catch(e) {
-        mlog.warn(`← RESTORE_PUSH from ${fromDisp} — unwrap failed, dropped: ${e.message}`);
+      const theirEk = new Uint8Array(msg.ek);
+      let matched = false;
+      for (const candidate of candidates) {
+        try {
+          const shared  = x25519.getSharedSecret(candidate.priv, theirEk);
+          const wrapKey = await deriveEphemeralWrapKey(shared);
+          innerBlob = await decryptObject(wrapKey, msg.blob);
+          matched = true;
+          break;
+        } catch(e) { /* wrong candidate — try the next one */ }
+      }
+      if (!matched) {
+        mlog.warn(`← RESTORE_PUSH from ${fromDisp} — unwrap failed against ${candidates.length} candidate(s), dropped`);
         return;
       }
     }
