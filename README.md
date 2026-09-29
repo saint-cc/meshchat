@@ -29,6 +29,8 @@ Messages are encrypted with AES-256-GCM using a per-contact key agreed via X2551
 - End-to-end encrypted text, image and audio messages
 - Message signing and verification
 - Per-device session establishment (X4DH) with opportunistic, partial forward secrecy — see `known-limitations.md` for exactly what this does and doesn't cover
+- Peer-to-peer voice calling over WebRTC (STUN only, no TURN, by design — see `known-limitations.md`)
+- Agent contacts: a bounded command whitelist over ordinary encrypted messages, plus interactive shell access over a WebRTC data channel for contacts on a separate, stricter allowlist
 - No accounts, email addresses or phone numbers
 - Roaming identities — move freely between relay servers
 - No central directory or identity provider
@@ -41,6 +43,14 @@ Messages are encrypted with AES-256-GCM using a per-contact key agreed via X2551
 - Progressive Web App (PWA)
 - Installable and offline-capable for reading conversations
 - Opt-in push notifications (per device, content-free — a push only ever means "open the app and check")
+
+---
+
+## Built for humans and agents
+
+MeshChat identities are derived from a name and passphrase — no registration, API key, or phone number required. That statelessness is what makes the protocol a natural fit for AI agents, not just people.
+
+Agent contacts already work today: a contact can be given a bounded command whitelist over ordinary encrypted messages, or — on a separate, stricter allowlist — an interactive shell over a WebRTC data channel. Looking further ahead, an agent doesn't need any of that client machinery to talk to MeshChat at all — just the ability to run the same handshake a human client does (derive keys, authenticate, encrypt, send). A lightweight skill/tool (e.g. a `SKILL.md`) that lets an agent join as a MeshChat contact this way — talking to a human, or in principle to another agent, since the protocol itself draws no distinction between the two — is planned but not yet built; see `Roadmap.md`.
 
 ---
 
