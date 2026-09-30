@@ -13,7 +13,7 @@
 
    Load order: meshchat-lib.js → meshchat-gui.js → meshchat.js → statemachine.js
 ═══════════════════════════════════════════════════════════════ */
-const CLIENT_VERSION = "0.5.2";
+const CLIENT_VERSION = "0.5.3";
 
 const POLL_INTERVAL_MS        	= 30_000;			// base interval between presence polls
 const POLL_JITTER_MS          	= 10_000;			// ± random jitter added to poll interval
@@ -1834,16 +1834,34 @@ async function pushBackupToContacts(blob) {
   }
 }
 
+// replyAddress(fromId, fromEndpoint, verified) — where a REPLY in the
+// backup/restore handshake family should be addressed.
+//
+// These handshakes open with a packet addressed to a bare identity, which
+// the relay fans out to every live session under it. Everything that
+// answers it used to be addressed bare too, so with two devices under one
+// identity every reply also fanned out — and each reply is wrapped for ONE
+// specific one-shot ephemeral, so the copy landing on the wrong device (or
+// arriving at a slot keyed for a different device) could never unwrap.
+// The opening packet's `from` already names the exact device that sent it
+// ("id::endpointId"), so once its signature has verified, answer that one
+// device only: one packet in, one reply out, one matching ephemeral.
+//
+// Falls back to the bare identity when the sender's endpoint is unknown
+// (older client) or the packet couldn't be verified (fresh/not-yet-mutual
+// sender) — an unverified endpoint suffix isn't trusted for anything, same
+// rule the log annotation already follows. Bare fallback keeps bootstrap
+// working exactly as before; multiple responders are unavoidable there, and
+// pendingEkCandidates' broad search is what covers that case.
+function replyAddress(fromId, fromEndpoint, verified) {
+  return (verified && fromEndpoint) ? buildAddress(fromId, fromEndpoint) : fromId;
+}
+
 async function handleBackupOffer(msg) {
   if (!msg.from || !msg.size) return;
   const { id: fromId, endpoint: fromEndpoint } = parseAddress(msg.from);
   if (!fromId) { mlog.warn(`← BACKUP_OFFER  bad 'from' address, dropped`); return; }
   if (state.contacts[fromId]?.blocked) return;
-  if (isDuplicateInbound(`backup_offer:${fromId}`)) {
-    mlog.debug(`← BACKUP_OFFER from ${pid(fromId)} — duplicate within ${DEDUP_WINDOW_MS}ms, suppressed`);
-    return;
-  }
-  markOnline(fromId);
 
   // Verification is only possible once we already have this sender as a
   // contact (their signPublicKey) — a genuinely fresh/not-yet-mutual
@@ -1858,10 +1876,24 @@ async function handleBackupOffer(msg) {
     return;
   }
 
+  // Dedup AFTER verification, keyed on the sender's endpoint once verified.
+  // Accepts are now targeted at the one device that offered (see
+  // replyAddress), so a second, genuinely distinct sibling device offering
+  // within the same few seconds MUST get its own accept — an identity-level
+  // key here would swallow it as a "duplicate" and that device would never
+  // receive an accept at all (before targeting, the first device's
+  // broadcast accept happened to cover it by accident).
+  const offerDedupKey = `backup_offer:${fromId}${verified && fromEndpoint ? ":" + fromEndpoint : ""}`;
+  if (isDuplicateInbound(offerDedupKey)) {
+    mlog.debug(`← BACKUP_OFFER from ${pid(fromId, verified ? { endpointId: fromEndpoint } : {})} — duplicate within ${DEDUP_WINDOW_MS}ms, suppressed`);
+    return;
+  }
+  markOnline(fromId);
+
   // accept unconditionally — a constrained peer would simply not implement this handler
   mlog.info(`← BACKUP_OFFER from ${pid(fromId, verified ? { endpointId: fromEndpoint } : {})}  size=${msg.size}  sig:${verified ? "✓" : "·"} — accepting`);
   const acceptTs  = Date.now();
-  const acceptObj = { type: "sync:backup_accept", from: buildAddress(state.publicId, state.endpointId), to: fromId, ts: acceptTs };
+  const acceptObj = { type: "sync:backup_accept", from: buildAddress(state.publicId, state.endpointId), to: replyAddress(fromId, fromEndpoint, verified), ts: acceptTs };
   if (verified) attachBackupEk(acceptObj, fromId, fromEndpoint);
   acceptObj.sig = signHandshakePacket(acceptObj);
   sendSignal(acceptObj);
@@ -1976,7 +2008,7 @@ async function handleBackupAccept(msg) {
   // once BACKUP_OFFER_TTL has genuinely passed, or implicitly replaced
   // the next time pushBackupToContacts sends a fresh offer.
   const pushTs  = Date.now();
-  const pushObj = { type: "sync:backup_push", from: buildAddress(state.publicId, state.endpointId), to: fromId, blob: outBlob, ts: pushTs };
+  const pushObj = { type: "sync:backup_push", from: buildAddress(state.publicId, state.endpointId), to: replyAddress(fromId, fromEndpoint, verified), blob: outBlob, ts: pushTs };
   if (ek) pushObj.ek = ek;
   pushObj.sig = signHandshakePacket(pushObj);
   sendSignal(pushObj);
@@ -2363,9 +2395,23 @@ function pendingEkSlotKey(targetId, endpointId) {
 // timeout (appendPendingEk's setTimeout), completely independent of
 // whether, or how many times, it was ever successfully used first.
 function pendingEkCandidates(map, targetId, endpointId) {
-  const specific = endpointId ? (map.get(pendingEkSlotKey(targetId, endpointId)) || []) : [];
-  const bare     = map.get(targetId) || [];
-  return [...specific].reverse().concat([...bare].reverse());
+  const specificKey = endpointId ? pendingEkSlotKey(targetId, endpointId) : null;
+  const specific    = specificKey ? (map.get(specificKey) || []) : [];
+  const bare        = map.get(targetId) || [];
+  // Safety net: every OTHER slot held for this identity (other devices'
+  // endpoints). Replies are now addressed one-to-one (replyAddress), so a
+  // push normally lands in exactly its own slot — but the bare-addressed
+  // bootstrap ping still draws replies from any of a peer's devices, and a
+  // slot mismatch must never cost a valid push. Trial decryption against an
+  // extra candidate or two is free: AES-GCM fails a wrong key cleanly, never
+  // a false positive.
+  const prefix = targetId + ADDR_SEP;
+  const others = [];
+  for (const [key, list] of map) {
+    if (key === specificKey || !key.startsWith(prefix)) continue;
+    others.push(...[...list].reverse());
+  }
+  return [...[...specific].reverse(), ...[...bare].reverse(), ...others];
 }
 
 // appendPendingEk(map, key, targetId, endpointId, timeoutMs, label) —
@@ -2592,7 +2638,17 @@ if (contact.blocked) {
 
   // send ack — cross domain if we have their wss
   const ackTs  = Date.now();
-  const ackObj = { type: "sync:restore_ack", from: buildAddress(state.publicId, state.endpointId), to: msg.from, ts: ackTs };
+  // plain.deviceId names exactly which of msg.from's devices sent THIS
+  // request. restore_req itself carries no endpoint, but if we already know
+  // one for that device from earlier traffic, answer that device ONLY — the
+  // ack's ephemeral slot is keyed by that same endpoint (attachRestoreEk
+  // below), so ack addressing and slot keying now agree. Before this, the
+  // ack went to the bare identity: a sibling device also received it and
+  // pushed a perfectly valid wrapped reply that found no slot at its own
+  // endpoint ("wrap present but no pending ephemeral"). Endpoint unknown
+  // -> bare ack + bare slot, as before.
+  const knownDeviceEndpoint = plain.deviceId ? state.knownDevices[msg.from]?.[plain.deviceId]?.endpointId : null;
+  const ackObj = { type: "sync:restore_ack", from: buildAddress(state.publicId, state.endpointId), to: knownDeviceEndpoint ? buildAddress(msg.from, knownDeviceEndpoint) : msg.from, ts: ackTs };
   // plain.deviceId names exactly which of msg.from's devices sent THIS
   // request — restore_req itself carries no endpoint (see protocol.md),
   // but if we already know one for that device from earlier traffic
@@ -2601,7 +2657,6 @@ if (contact.blocked) {
   // bare identity. Two devices of the same contact requesting at once
   // then get their own slot each, instead of racing to overwrite one
   // shared per-identity ephemeral (see attachRestoreEk's own comment).
-  const knownDeviceEndpoint = plain.deviceId ? state.knownDevices[msg.from]?.[plain.deviceId]?.endpointId : null;
   attachRestoreEk(ackObj, msg.from, knownDeviceEndpoint);
   ackObj.sig = signHandshakePacket(ackObj);
   const senderWss = plain.wss || state.contacts[msg.from]?.lastRelay || null;
@@ -2660,7 +2715,7 @@ async function handleRestoreAck(msg) {
   if (fromId === state.publicId) {
     const pushTs    = Date.now();
     const freshBlob = await encryptObject(state.cryptoKey, serialiseContacts());
-    const pushObj   = { type: "sync:restore_push", from: buildAddress(state.publicId, state.endpointId), to: fromId, blob: freshBlob, ts: pushTs };
+    const pushObj   = { type: "sync:restore_push", from: buildAddress(state.publicId, state.endpointId), to: replyAddress(fromId, fromEndpoint, verified), blob: freshBlob, ts: pushTs };
     pushObj.sig = signHandshakePacket(pushObj);
     sendSignal(pushObj);
     mlog.info(`← RESTORE_ACK  from self  ${fromDisp} — sending fresh data`);
@@ -2705,7 +2760,7 @@ async function handleRestoreAck(msg) {
   const token = verified ? state.peerTokens[fromId] : null;
   mlog.info(`← RESTORE_ACK  from ${fromDisp} — sending restore_push${token ? "  +token" : ""}${ek ? "  +wrap" : ""}`);
   const pushTs  = Date.now();
-  const pushObj = { type: "sync:restore_push", from: buildAddress(state.publicId, state.endpointId), to: fromId, blob: outBlob, ts: pushTs };
+  const pushObj = { type: "sync:restore_push", from: buildAddress(state.publicId, state.endpointId), to: replyAddress(fromId, fromEndpoint, verified), blob: outBlob, ts: pushTs };
   if (ek) pushObj.ek = ek;
   pushObj.sig = signHandshakePacket(pushObj);
   if (token) pushObj.token = token;
@@ -3134,7 +3189,7 @@ function handleSignal(msg) {
 function sendSignal(obj) {
   if (state.ws?.readyState === WebSocket.OPEN) state.ws.send(JSON.stringify(obj));
   // piggyback protocol traffic on open relay connections — never opens one, never resets timer
-  if (obj.to && obj.type !== "app:message") sendToRelay(obj.to, obj, false);
+  if (obj.to && obj.type !== "app:message") sendToRelay(parseAddress(obj.to).id || obj.to, obj, false);
 }
 
 /* ══════════════════════════════════════════

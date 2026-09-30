@@ -285,6 +285,26 @@ because there's a plan yet.
   the fuller manifest/hook-point design with shell as the reference
   implementation. Undecided — flagged in chat, not yet a decision.
 
+### Agent access without a full client (a MeshChat skill/tool)
+- Idea, not yet built: a lightweight skill/tool (e.g. a `SKILL.md`) that
+  lets an agent act as a MeshChat contact directly — derive keys, run the
+  auth handshake, encrypt/decrypt, send — without pulling in the full JS
+  client (WebRTC, multi-device sync, X4DH session bookkeeping, UI). The
+  core crypto (PBKDF2/HKDF, X25519, Ed25519, AES-GCM) is all standard
+  primitives, so a minimal implementation is plausible; it just wouldn't
+  get X4DH's per-device forward secrecy for free and would likely fall
+  back to the legacy pairwise key (see `protocol.md`'s Encryption section).
+- Distinct from, and doesn't depend on, the existing agent-contact
+  mechanism (bounded command whitelist + shell escalation — see
+  `protocol.md`'s Agent Contacts & Shell Escalation section). That's
+  already a real client talking to another real client. This idea is
+  about an agent *being* the client, with no GUI at all.
+- Agent-to-agent messaging would fall out of this for free, since the
+  protocol draws no distinction between a human's device and an agent's
+  one — not tested, not a current goal, just a consequence of the design
+  if the skill ever gets built.
+- Currently just README/marketing framing; no design pass has started.
+
 ---
 
 ## Deliberately not doing (yet or ever)
