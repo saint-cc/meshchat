@@ -46,7 +46,7 @@ RELAY_WSS_URL = os.environ.get("RELAY_WSS_URL", "")   # e.g. wss://yourrelay.exa
 # Protocol version — informational only for now, surfaced in sig:relay_info
 # so client/server version drift shows up in both logs. Not enforced yet;
 # room to add real backwards-compat handling once this is actually needed.
-PROTOCOL_VERSION = os.environ.get("PROTOCOL_VERSION", "0.5.3")
+PROTOCOL_VERSION = os.environ.get("PROTOCOL_VERSION", "0.5.4")
 
 # Connection limits
 MAX_CONNECTIONS        = int(os.environ.get("MAX_CONNECTIONS",        100))   # total WS sessions
@@ -523,7 +523,7 @@ def _send_web_push_sync(endpoint: str) -> tuple[bool, int | None]:
 
 # ══════════════════════════════════════════
 #   PUSH SUBSCRIPTION STORAGE
-#   Layout: PUSH_SUBS_DIR/<publicId>/<deviceId>.json — one file per
+#   Layout: PUSH_SUBS_DIR/<publicId>/<endpointId>.json — one file per
 #   (identity, device) pair, mirrors BUF_DIR's per-recipient directory
 #   shape. No locking: writes are whole-file replacements keyed by a
 #   caller-controlled deviceId, so concurrent writes to the SAME file
@@ -537,7 +537,12 @@ def push_sub_dir(to_id):
         raise ValueError(f"path traversal attempt: {to_id!r}")
     return path
 
-def _push_sub_write_sync(to_id, device_id, subscription):
+def _push_sub_write_sync(to_id, endpoint_id, subscription):
+    """Files are keyed by endpointId, NOT deviceId. deviceId is the value
+    contacts recognise from their own device popover; endpointId is the one
+    the relay already sees at auth. Storing push state under deviceId let the
+    relay join the two views — exactly the correlation the split exists to
+    prevent. See deriveDeviceEndpointId (meshchat-lib.js)."""
     try:
         d = push_sub_dir(to_id)
     except ValueError as e:
@@ -545,27 +550,44 @@ def _push_sub_write_sync(to_id, device_id, subscription):
         return
     try:
         os.makedirs(d, exist_ok=True)
-        with open(os.path.join(d, f"{device_id}.json"), "w") as f:
+        fname = f"{endpoint_id}.json"
+        # Same browser endpoint URL under a different filename is a stale
+        # duplicate of this subscription — most importantly the old
+        # <deviceId>.json files from before this keying change, which would
+        # otherwise double-push the same browser forever (and, holding a
+        # deviceId filename, keep the old correlation on disk). Drop them.
+        for fpath in glob.glob(os.path.join(d, "*.json")):
+            if os.path.basename(fpath) == fname:
+                continue
+            try:
+                with open(fpath) as f:
+                    old = json.load(f)
+                if old.get("endpoint") == subscription.get("endpoint"):
+                    os.remove(fpath)
+                    log.info("PUSH_SUB   dropped stale duplicate  id=%s  file=%s", short(to_id), os.path.basename(fpath)[:12])
+            except Exception:
+                continue
+        with open(os.path.join(d, fname), "w") as f:
             json.dump(subscription, f)
-        log.info("PUSH_SUB   subscribed  id=%s  device=%s", short(to_id), short(device_id))
+        log.info("PUSH_SUB   subscribed  id=%s  endpoint=%s", short(to_id), short(endpoint_id))
     except Exception as e:
         log.warning("PUSH_SUB   write failed  to=%s  err=%s", short(to_id), e)
 
-def _push_sub_delete_sync(to_id, device_id):
+def _push_sub_delete_sync(to_id, endpoint_id):
     try:
         d = push_sub_dir(to_id)
     except ValueError:
         return
     try:
-        os.remove(os.path.join(d, f"{device_id}.json"))
-        log.info("PUSH_SUB   unsubscribed  id=%s  device=%s", short(to_id), short(device_id))
+        os.remove(os.path.join(d, f"{endpoint_id}.json"))
+        log.info("PUSH_SUB   unsubscribed  id=%s  endpoint=%s", short(to_id), short(endpoint_id))
     except FileNotFoundError:
         pass
     except Exception as e:
         log.warning("PUSH_SUB   unsubscribe failed  to=%s  err=%s", short(to_id), e)
 
 def _push_subs_list_sync(to_id):
-    """Returns [(deviceId, subscriptionDict), ...] for every subscription
+    """Returns [(endpointId, subscriptionDict), ...] for every subscription
     on file for to_id. Corrupt/unreadable entries are skipped rather than
     aborting the whole read — one bad file shouldn't silence pushes to a
     recipient's other devices."""
@@ -580,8 +602,8 @@ def _push_subs_list_sync(to_id):
         try:
             with open(fpath) as f:
                 sub = json.load(f)
-            device_id = os.path.basename(fpath)[:-len(".json")]
-            out.append((device_id, sub))
+            endpoint_id = os.path.basename(fpath)[:-len(".json")]
+            out.append((endpoint_id, sub))
         except Exception:
             continue
     return out
@@ -596,22 +618,22 @@ async def push_notify(to_id):
     subs = await asyncio.to_thread(_push_subs_list_sync, to_id)
     if not subs:
         return
-    for device_id, sub in subs:
+    for endpoint_id, sub in subs:
         endpoint = sub.get("endpoint")
         if not endpoint:
             continue
         dead, status = await asyncio.to_thread(_send_web_push_sync, endpoint)
         if dead:
-            await asyncio.to_thread(_push_sub_delete_sync, to_id, device_id)
+            await asyncio.to_thread(_push_sub_delete_sync, to_id, endpoint_id)
             stats["push_pruned"] += 1
-            log.info("PUSH       subscription dead (status=%s) — pruned  id=%s  device=%s",
-                      status, short(to_id), short(device_id))
+            log.info("PUSH       subscription dead (status=%s) — pruned  id=%s  endpoint=%s",
+                      status, short(to_id), short(endpoint_id))
         elif status is not None and 200 <= status < 300:
             stats["push_sent"] += 1
-            log.debug("PUSH       sent  id=%s  device=%s  status=%s", short(to_id), short(device_id), status)
+            log.debug("PUSH       sent  id=%s  endpoint=%s  status=%s", short(to_id), short(endpoint_id), status)
         else:
             stats["push_failed"] += 1
-            log.debug("PUSH       transient failure  id=%s  device=%s  status=%s", short(to_id), short(device_id), status)
+            log.debug("PUSH       transient failure  id=%s  endpoint=%s  status=%s", short(to_id), short(endpoint_id), status)
 
 # ══════════════════════════════════════════
 #   ROUTING HELPERS
@@ -1483,15 +1505,15 @@ async def handler(ws):
             #    do, it's "start/stop sending pushes to this endpoint",
             #    same trust tier as the sync:* group. ──
             elif kind == "sig:push_subscribe":
-                frm       = msg.get("from", "?")
-                device_id = msg.get("deviceId")
-                sub       = msg.get("subscription")
+                frm         = msg.get("from", "?")
+                endpoint_id = msg.get("endpointId")
+                sub         = msg.get("subscription")
                 if frm not in client_ids:
                     log.warning("PUSH_SUB   from=%s  not authed  peer=%s  dropped", short(frm), addr)
                     await send_to(ws, {"type": "error", "reason": "not_authenticated"})
                     continue
-                if not valid_id(device_id):
-                    log.warning("PUSH_SUB   from=%s  bad deviceId, dropped", short(frm))
+                if not valid_id(endpoint_id):
+                    log.warning("PUSH_SUB   from=%s  bad/missing endpointId, dropped", short(frm))
                     continue
                 if not isinstance(sub, dict):
                     log.warning("PUSH_SUB   from=%s  bad subscription shape, dropped", short(frm))
@@ -1508,23 +1530,23 @@ async def handler(ws):
                 if not keys.get("p256dh") or not keys.get("auth"):
                     log.warning("PUSH_SUB   from=%s  missing keys.p256dh/auth, dropped", short(frm))
                     continue
-                await asyncio.to_thread(_push_sub_write_sync, frm, device_id, {
+                await asyncio.to_thread(_push_sub_write_sync, frm, endpoint_id, {
                     "endpoint": endpoint,
                     "p256dh":   keys["p256dh"],
                     "auth":     keys["auth"],
                 })
 
             elif kind == "sig:push_unsubscribe":
-                frm       = msg.get("from", "?")
-                device_id = msg.get("deviceId")
+                frm         = msg.get("from", "?")
+                endpoint_id = msg.get("endpointId")
                 if frm not in client_ids:
                     log.warning("PUSH_UNSUB from=%s  not authed  peer=%s  dropped", short(frm), addr)
                     await send_to(ws, {"type": "error", "reason": "not_authenticated"})
                     continue
-                if not valid_id(device_id):
-                    log.warning("PUSH_UNSUB from=%s  bad deviceId, dropped", short(frm))
+                if not valid_id(endpoint_id):
+                    log.warning("PUSH_UNSUB from=%s  bad/missing endpointId, dropped", short(frm))
                     continue
-                await asyncio.to_thread(_push_sub_delete_sync, frm, device_id)
+                await asyncio.to_thread(_push_sub_delete_sync, frm, endpoint_id)
 
             elif kind == "sig:announce":
                 ids = msg.get("ids", [])
