@@ -3069,13 +3069,38 @@ async function handleRestorePush(msg) {
 
    Old clients send plaintext `msgs` with no blob; those are dropped. Hard
    cutover, same stance as the other recent wire changes — the only real
-   consequence is that SYNC between a new and an old client does nothing. */
+   consequence is that SYNC between a new and an old client does nothing.
+
+   EPHEMERAL WRAP (the messages themselves). The pairwise key above is
+   static-static ECDH — deterministic — so a recorded batch plus a later
+   identity-key compromise would expose every message text in it. The
+   message batch therefore never rides under that key alone:
+     - the REQUEST carries no messages at all, only a fresh X25519 ephemeral
+       public key `ek` (inside the encrypted+signed payload, so a relay can
+       neither strip nor swap it);
+     - the REPLY carries its own fresh ephemeral `ek` plus `wrapped` — the
+       batch encrypted under HKDF(X25519(replier ephemeral, requester
+       ephemeral)). The requester's ephemeral private half lives only in
+       pendingSyncs, in memory, until SYNC_PENDING_TTL_MS expires.
+   Same one-shot ephemeral-to-ephemeral construction (and the same
+   deriveEphemeralWrapKey) as the restore/backup push wraps. The outer
+   pairwise layer stays: it is what authenticates and binds from/to/syncId.
+   Consequence: SYNC is one-directional — the side that presses SYNC
+   receives the other side's recent messages; it no longer also pushes its
+   own. Press it on both sides for a two-way exchange. A request with no
+   valid `ek` is dropped (hard cutover, no unwrapped fallback). */
 const MAX_SYNC_MSGS        = 50;       // inbound cap per batch — EXCHANGE_COUNT is 10, this is just a sanity ceiling
 const SYNC_PENDING_TTL_MS  = 60_000;   // how long a reply to our own request stays acceptable
-const pendingSyncs = new Map();        // syncId -> { contactId, createdAt }
+const pendingSyncs = new Map();        // syncId -> { contactId, createdAt, ekPriv } — ekPriv is memory-only, same tier as pendingX4DHProposals
 
-async function buildSyncPacket(contact, { syncId, reply, msgs }) {
-  const blob = await encryptMessage(contact.encKey, { from: state.publicId, to: contact.publicId, syncId, reply, msgs });
+const validSyncEk = (ek) => Array.isArray(ek) && ek.length === 32 && ek.every(b => Number.isInteger(b) && b >= 0 && b <= 255);
+
+// request: { syncId, reply:false, ek }
+// reply:   { syncId, reply:true,  ek, wrapped }   (wrapped = encryptObject(ephemeralWrapKey, msgs))
+async function buildSyncPacket(contact, { syncId, reply, ek, wrapped }) {
+  const payload = { from: state.publicId, to: contact.publicId, syncId, reply, ek };
+  if (wrapped) payload.wrapped = wrapped;
+  const blob = await encryptMessage(contact.encKey, payload);
   const sig  = signBlob(blob);
   return { type: "app:sync", from: state.publicId, to: contact.publicId, blob, sig };
 }
@@ -3132,9 +3157,14 @@ async function initiateExchange(contactId) {
   const syncId = crypto.randomUUID();
   const now = Date.now();
   for (const [id, p] of pendingSyncs) if (now - p.createdAt > SYNC_PENDING_TTL_MS) pendingSyncs.delete(id);   // no leak across a long session
-  pendingSyncs.set(syncId, { contactId, createdAt: now });
+  const { priv: ekPriv, pub: ekPub } = generateX25519Ephemeral();
+  pendingSyncs.set(syncId, { contactId, createdAt: now, ekPriv });
+  // Exact deadline per entry (same reasoning as schedulePendingX4DHExpiry):
+  // the lazy sweep above only runs on the NEXT sync, which could leave a
+  // private key sitting in memory long after its window closed.
+  setTimeout(() => pendingSyncs.delete(syncId), SYNC_PENDING_TTL_MS);
   try {
-    sendSignal(await buildSyncPacket(contact, { syncId, reply: false, msgs: getLast(contactId) }));
+    sendSignal(await buildSyncPacket(contact, { syncId, reply: false, ek: Array.from(ekPub) }));
     mlog.info(`\u2192 SYNC         to   ${pid(contactId)}  id=${pid(syncId)}`);
     setSyncStatus("syncing\u2026");
   } catch(e) {
@@ -3174,36 +3204,56 @@ async function handleMsgExchange(msg) {
   markOnline(msg.from);   // only now \u2014 handleSignal used to do this before any verification
 
   if (!plain.reply) {
+    if (!validSyncEk(plain.ek)) {
+      mlog.warn(`\u2190 SYNC_REQ     from ${pid(msg.from)} \u2014 no valid ephemeral key (legacy sync request), dropped`);
+      return;
+    }
     if (isDuplicateInbound(`app_sync:${msg.from}:${plain.syncId}`)) {
       mlog.debug(`\u2190 SYNC_REQ     from ${pid(msg.from)} \u2014 duplicate within ${DEDUP_WINDOW_MS}ms, suppressed`);
       return;
     }
-    mlog.info(`\u2190 SYNC_REQ     from ${pid(msg.from)}  id=${pid(plain.syncId)} \u2014 replying`);
+    mlog.info(`\u2190 SYNC_REQ     from ${pid(msg.from)}  id=${pid(plain.syncId)} \u2014 replying (wrapped)`);
     try {
-      sendSignal(await buildSyncPacket(contact, { syncId: plain.syncId, reply: true, msgs: getLast(msg.from) }));
+      const { priv, pub } = generateX25519Ephemeral();
+      const wrapKey = await deriveEphemeralWrapKey(x25519.getSharedSecret(priv, new Uint8Array(plain.ek)));
+      const wrapped = await encryptObject(wrapKey, getLast(msg.from));
+      sendSignal(await buildSyncPacket(contact, { syncId: plain.syncId, reply: true, ek: Array.from(pub), wrapped }));
     } catch(e) {
       mlog.warn(`\u2192 SYNC_REPLY   to   ${pid(msg.from)} \u2014 send failed: ${e.message}`);
     }
-  } else {
-    const pending = pendingSyncs.get(plain.syncId);
-    if (!pending || pending.contactId !== msg.from || (Date.now() - pending.createdAt) > SYNC_PENDING_TTL_MS) {
-      mlog.debug(`\u2190 SYNC_REPLY   from ${pid(msg.from)} \u2014 no matching pending request, ignored`);
-      return;
-    }
+    return;   // the request carries no messages — nothing to merge on this side
   }
 
-  const incoming = sanitizeSyncedMessages(plain.msgs, msg.from, contact.messages);
+  const pending = pendingSyncs.get(plain.syncId);
+  if (!pending || pending.contactId !== msg.from || (Date.now() - pending.createdAt) > SYNC_PENDING_TTL_MS) {
+    mlog.debug(`\u2190 SYNC_REPLY   from ${pid(msg.from)} \u2014 no matching pending request, ignored`);
+    return;
+  }
+  if (!validSyncEk(plain.ek) || !plain.wrapped || typeof plain.wrapped !== "object") {
+    mlog.warn(`\u2190 SYNC_REPLY   from ${pid(msg.from)} \u2014 missing ephemeral key or wrapped batch, dropped`);
+    return;
+  }
+  // Trial-free: this reply answers a request whose ephemeral WE hold. A
+  // second device of the contact answering the same broadcast request
+  // brings its own ek and unwraps against the same pending ekPriv, which
+  // is why the pending entry is not consumed here.
+  let msgs;
+  try {
+    const wrapKey = await deriveEphemeralWrapKey(x25519.getSharedSecret(pending.ekPriv, new Uint8Array(plain.ek)));
+    msgs = await decryptObject(wrapKey, plain.wrapped);
+  } catch(e) {
+    mlog.warn(`\u2190 SYNC_REPLY   from ${pid(msg.from)} \u2014 unwrap failed, dropped`);
+    return;
+  }
+
+  const incoming = sanitizeSyncedMessages(msgs, msg.from, contact.messages);
   const before = contact.messages.length;
   contact.messages = mergeMessages(contact.messages, incoming);
   reconcileDeliveryStatus(contact);
   reconcileMissingDevices(contact);
   const added = contact.messages.length - before;
-  if (plain.reply) {
-    mlog.info(`\u2190 SYNC_REPLY   from ${pid(msg.from)} \u2014 +${added} msgs`);
-    setSyncStatus("synced with " + contact.name + " \u2713");
-  } else {
-    mlog.debug(`SYNC merge +${added} msgs from ${pid(msg.from)}`);
-  }
+  mlog.info(`\u2190 SYNC_REPLY   from ${pid(msg.from)} \u2014 +${added} msgs  +wrap`);
+  setSyncStatus("synced with " + contact.name + " \u2713");
   await saveContacts();
   if (state.currentChat === msg.from) renderMessages();
 }
