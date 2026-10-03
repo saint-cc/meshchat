@@ -120,11 +120,7 @@
   #chatMessages::-webkit-scrollbar { width: 4px; }
   #chatMessages::-webkit-scrollbar-thumb { background: var(--border); }
   .message { position: relative; max-width: 65%; padding: 9px 14px 22px 14px; font-size: 13px; line-height: 1.5; word-break: break-word; white-space: pre-wrap;}
-.message.no-reaction-pad { padding-bottom: 9px; align-self: flex-start;}
   .message.mine    { background: var(--mine);   align-self: flex-end;   color: var(--accent); }
-  .message.mine.no-reaction-pad {
-    align-self: flex-start;
-}
   .message.theirs  { background: var(--theirs); align-self: flex-start; border: 1px solid var(--border); }
   .message.invalid { border-color: var(--danger) !important; opacity: 0.6; }
   .msgMeta { font-size: 10px; color: var(--muted); margin-top: 3px; display: flex; align-items: center; gap: 6px; }
@@ -635,31 +631,3 @@
 }
 #answerCallBtn  { background: var(--online); color: #000; border-color: var(--online); font-weight: bold; }
 #declineCallBtn { background: none; color: var(--danger); border-color: var(--danger); }
-
-#shellBtn {
-  background: none; border: 1px solid var(--border); color: var(--accent);
-  width: 28px; height: 28px; font-size: 14px; cursor: pointer;
-  display: none; align-items: center; justify-content: center;
-  transition: border-color 0.2s, color 0.2s, background 0.2s;
-  flex-shrink: 0; margin-right: 8px;
-}
-#shellBtn.visible { display: flex; }
-#shellBtn:hover { border-color: var(--accent); background: var(--surface2); }
-#shellBtn.state-calling, #shellBtn.state-negotiating {
-  color: var(--accent); border-color: var(--accent); animation: pulse 1s infinite;
-}
-#shellBtn.state-connected { color: var(--danger); border-color: var(--danger); animation: none; }
-#shellBtn.state-failed    { color: var(--danger); border-color: var(--danger); animation: none; }
-#shellBtn:disabled { opacity: 0.5; cursor: default; animation: none; }
-
-.contactItem.agent-contact .contactAvatar {
-  border-color: var(--accent);
-  color: var(--accent);
-}
-.agentBadge {
-  font-size: 9px;
-  color: var(--accent);
-  letter-spacing: 0.06em;
-  margin-left: 4px;
-  opacity: 0.85;
-}

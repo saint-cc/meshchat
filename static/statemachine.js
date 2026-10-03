@@ -23,17 +23,17 @@
    is entirely on the OTHER side of the fork: onStateEnter (call) vs.
    onShellStateEnter (shell) below have no shared code, because their
    side effects are genuinely different (getUserMedia/addTrack vs.
-   createDataChannel; an audio element vs. a terminal panel; a human
-   who can click "answer" vs. an agent that auto-accepts and never
-   rings). Sharing the table but forking the consequences means a fix
+   createDataChannel; an audio element vs. no media element at all).
+   Sharing the table but forking the consequences means a fix
    to the tricky bits (stale-callId rejection, the multi-device races)
    only has to happen once.
 
-   "ringing" is unreachable via the current shell flow (agent.py always
-   auto-claims — see handle_shell_invite — so a shell session never sits
-   at "ringing" the way an audio call does). It's kept in the shared
-   table anyway rather than special-cased out: if human-to-human shell
-   sharing ever happens, that phase becomes meaningful again for free.
+   "ringing" for the shell kind: an incoming shell:invite does put the
+   contact into "ringing" (handleShellInvite), but this client has no
+   callee-side path yet — showIncomingShellUI is a log-only stub and
+   handleShellOffer ignores offers — so nothing can move it forward from
+   here. Left as-is rather than special-cased out: the callee path is the
+   next piece of work and needs exactly this phase.
 ══════════════════════════════════════════ */
 
 // Lets kind-appropriate event names normalize to the single internal
@@ -164,13 +164,12 @@ function onStateEnter(id, oldPhase, newPhase, role) {
    ON STATE ENTER — shell escalation
    Mirrors onStateEnter's structure exactly (same switch, same "here's
    what happens on entry into each phase" shape) but the hooks it calls
-   are shell-specific: data channels instead of media tracks, a terminal
-   panel instead of an <audio> element, no human to auto-answer for.
-   The hooks themselves (sendShellInvite, shellRtcOffer, shellRtcClose,
-   openShellTerminal, showIncomingShellUI/hideIncomingShellUI) are
-   currently stubs in script.js — see the "SHELL UI/RTC stubs" section
-   there. This function is real; what it calls isn't wired to the
-   network yet.
+   are shell-specific: a data channel instead of media tracks, no <audio>
+   element. The hooks (sendShellInvite, shellRtcOffer, shellRtcClose) live
+   in meshchat.js; showIncomingShellUI/hideIncomingShellUI are log-only
+   stubs in meshchat-gui.js. There is no header button or terminal any
+   more — the connected phase only logs. Transitions are visible in the
+   in-page log via transition()'s own mlog line.
 ══════════════════════════════════════════ */
 function onShellStateEnter(id, oldPhase, newPhase, role) {
   switch (newPhase) {
@@ -180,23 +179,21 @@ function onShellStateEnter(id, oldPhase, newPhase, role) {
       break;
 
     case "ringing":
-      // unreachable against agent.py today (it auto-claims — see the
-      // block comment above) but kept for parity in case a human-to-human
-      // shell ever exists.
+      // no callee-side path yet — see the "ringing" paragraph at the top
       showIncomingShellUI(id);
       break;
 
     case "negotiating":
       if (oldPhase === "ringing") hideIncomingShellUI(id);
       if (role === "caller") shellRtcOffer(id);
-      // callee (the agent, in practice) waits for the offer to arrive —
-      // nothing to do on entry here, same as the call-side comment above
+      // callee waits for the offer to arrive — nothing to do on entry
+      // here, same as the call-side comment above (and, for shell, no
+      // handler for that offer exists yet)
       break;
 
     case "connected":
       mlog.info(`SHELL UP  ${pid(id)}`);
       hideIncomingShellUI(id);
-      openShellTerminal(id);
       break;
 
     case "failed":
@@ -210,5 +207,4 @@ function onShellStateEnter(id, oldPhase, newPhase, role) {
       shellRtcClose(id);   // safe no-op if no pc exists for this contact
       break;
   }
-  updateShellHeaderBtn(id);
 }

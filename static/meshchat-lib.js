@@ -264,8 +264,8 @@ async function deriveDeviceEndpointId(deviceSeed) {
 // same (myPublicId, targetMsgId) pair produces the same id whether the
 // stored payload is a real emoji, a cleared reaction (emoji: null typed
 // by the user), or the RECEIVED auto-ack (emoji: null, sent automatically
-// on decrypt+verify — see protocol.md's Delivery Acknowledgement section
-// and agent.py's send_ack). That's deliberate — it's what lets an emoji
+// on decrypt+verify — see protocol.md's Delivery Acknowledgement section).
+// That's deliberate — it's what lets an emoji
 // change/clear naturally replace the old value on merge instead of
 // duplicating it. But it also means a "collision" on this id is a normal,
 // expected event representing one of several genuinely different
@@ -769,15 +769,6 @@ function mergeContactMeta(local, remote) {
     local.name            = remote.name;
     local.blocked         = remote.blocked;
     local.lastStateChange = remote.lastStateChange;
-    // type deliberately does NOT follow name/blocked's unconditional
-    // overwrite. An older peer that never serialized this field would
-    // send remote.type === undefined, and blindly adopting that on any
-    // newer lastStateChange (e.g. triggered by an unrelated name change)
-    // would silently downgrade a contact you deliberately marked "agent"
-    // back to "human" — quietly hiding the shell button, not a cosmetic
-    // regression the way a stale name would be. Only adopt an explicit
-    // value; otherwise keep whatever's already local.
-    if (remote.type) local.type = remote.type;
   }
   // Backups/restores carry lastRelay too — same timestamp-guarded adoption
   // as updateRelay() already does for relay info embedded in messages.

@@ -250,36 +250,15 @@ function updateCallHeaderBtn(id) {
   const btn = document.getElementById("callBtn");
   if (!btn) return;
   const isMe    = id === state.publicId;
-  const isAgent = state.contacts[id]?.type === "agent";   // agent.py never implements call:* — nothing to show
   const phase  = state.contacts[id]?.call?.phase || "idle";
   const GLYPH  = { idle: "☎", calling: "☎…", ringing: "☎…", negotiating: "☎…", connected: "⏹", failed: "☎" };
   const TITLE  = { idle: "Call", calling: "Calling… (click to cancel)", ringing: "Incoming — use the popup",
                    negotiating: "Connecting… (click to cancel)", connected: "Hang up", failed: "Call failed (click to reset)" };
   btn.className   = "state-" + phase;
-  btn.classList.toggle("visible", !isMe && !isAgent);
+  btn.classList.toggle("visible", !isMe);
   btn.textContent = GLYPH[phase]  || "☎";
   btn.title       = TITLE[phase]  || "Call";
   btn.disabled    = phase === "ringing";   // answer/decline only via the popup, to avoid two conflicting controls
-}
-
-// Mirrors updateCallHeaderBtn now that the shell FSM exists (see
-// statemachine.js) — visibility gate is unchanged from 0.3.5, but phase
-// now drives the glyph/title/state-class the same way it does for calls.
-function updateShellHeaderBtn(id) {
-  if (id !== state.currentChat) return;
-  const btn = document.getElementById("shellBtn");
-  if (!btn) return;
-  const isMe    = id === state.publicId;
-  const isAgent = state.contacts[id]?.type === "agent";
-  const phase   = state.contacts[id]?.shell?.phase || "idle";
-  const GLYPH = { idle: "⌁", calling: "⌁…", ringing: "⌁…", negotiating: "⌁…", connected: "⏹", failed: "⌁" };
-  const TITLE = { idle: "Shell", calling: "Requesting… (click to cancel)", ringing: "Incoming — use the popup",
-                  negotiating: "Connecting… (click to cancel)", connected: "End session", failed: "Session failed (click to reset)" };
-  btn.className   = "state-" + phase;
-  btn.classList.toggle("visible", isAgent && !isMe);
-  btn.textContent = GLYPH[phase] || "⌁";
-  btn.title       = TITLE[phase] || "Shell";
-  btn.disabled    = phase === "ringing";   // parity with callBtn — unreachable against agent.py today, see statemachine.js
 }
 
 document.getElementById("callBtn").onclick = () => {
@@ -295,114 +274,13 @@ document.getElementById("callBtn").onclick = () => {
 document.getElementById("answerCallBtn").onclick  = () => { if (incomingCallContactId) answerCall(incomingCallContactId); };
 document.getElementById("declineCallBtn").onclick = () => { if (incomingCallContactId) cancelCall(incomingCallContactId); };
 
-// Prep only — no shell:invite, no session FSM, no data channels yet.
-// Visible now that agent contacts exist, so it needs to say SOMETHING
-// rather than silently do nothing on click.
-document.getElementById("shellBtn").onclick = () => {
-  const id = state.currentChat;
-  if (!id || id === state.publicId) return;
-  const phase = state.contacts[id]?.shell?.phase || "idle";
-  if (phase === "idle")                                     startShell(id);
-  else if (phase === "calling" || phase === "negotiating")  cancelShell(id);
-  else if (phase === "connected")                           endShell(id);
-  else if (phase === "failed")                               transition(id, { type: "reset" }, "shell");
-};
-
 function showIncomingShellUI(id) {
-  mlog.debug(`SHELL      showIncomingShellUI(${pid(id)}) — stub, unreachable against agent.py today`);
+  mlog.debug(`SHELL      showIncomingShellUI(${pid(id)}) — log-only stub, no callee-side UI yet`);
 }
 
 function hideIncomingShellUI(id) {
   mlog.debug(`SHELL      hideIncomingShellUI(${pid(id)}) — stub`);
 }
-
-/* ══════════════════════════════════════════
-   SHELL TERMINAL — one xterm.js instance per contact, keyed the same
-   way shellConns is. Kept separate from shellConns because a terminal
-   can legitimately outlive a brief data-channel hiccup (not currently
-   exploited, but no reason to couple their lifecycles tighter than
-   necessary).
- 
-   Bytes can start arriving the instant the agent's data channel opens
-   and its pty spawns — which the connected-phase log showed happening
-   right after (not before) openShellTerminal() is invoked, but nothing
-   guarantees that ordering. term.write() called before term.open() is
-   safe — xterm.js buffers writes internally until a renderer exists —
-   so no separate pending-bytes queue is needed here.
-══════════════════════════════════════════ */
-const shellTerminals = {};   // contactId → { term, fitAddon }
-let currentShellContactId = null;
- 
-function ensureShellTerminal(id) {
-  if (shellTerminals[id]) return shellTerminals[id];
-  const term = new Terminal({
-    cursorBlink: true,
-    fontSize: 13,
-    fontFamily: "monospace",
-    theme: { background: "#0a0a0a", foreground: "#c8c8c8" },
-  });
-  const fitAddon = new FitAddon.FitAddon();
-  term.loadAddon(fitAddon);
- 
-  // keystrokes → data channel. Guarded on readyState so typing into a
-  // stale/closed session (e.g. right as it's tearing down) doesn't throw.
-  term.onData((data) => {
-    const conn = shellConns[id];
-    if (conn?.dataCh?.readyState === "open") conn.dataCh.send(data);
-  });
- 
-  const entry = { term, fitAddon };
-  shellTerminals[id] = entry;
-  return entry;
-}
- 
-function fitAndSendResize(id) {
-  const entry = shellTerminals[id];
-  if (!entry) return;
-  entry.fitAddon.fit();
-  sendShellResize(id, entry.term.cols, entry.term.rows);
-}
- 
-// real implementation — replaces the old stub. Called by
-// onShellStateEnter() on entering "connected" (statemachine.js, unchanged).
-function openShellTerminal(id) {
-  const { term } = ensureShellTerminal(id);
-  const contact = state.contacts[id];
-  document.getElementById("shellTerminalName").textContent = (contact?.name || pid(id)) + " — shell";
-  document.getElementById("shellTerminalPanel").classList.add("open");
- 
-  const container = document.getElementById("shellTerminalContainer");
-  if (!term.element) term.open(container);   // only attach once per Terminal instance
- 
-  currentShellContactId = id;
-  // layout isn't settled until the panel's actually visible/painted —
-  // same reason chat scroll positioning elsewhere waits a frame.
-  requestAnimationFrame(() => { fitAndSendResize(id); term.focus(); });
-}
- 
-function closeShellTerminalUI(id) {
-  if (currentShellContactId !== id) return;
-  document.getElementById("shellTerminalPanel").classList.remove("open");
-  currentShellContactId = null;
-}
- 
-// receive-side hook, called from wireShellDataChannel's onmessage
-// (shell-rtc-step3.js, Drop-in C above) with a Uint8Array of raw pty
-// output. Writing straight to term is safe pre-open — see comment above.
-function onShellDataReceived(id, data) {
-  const { term } = ensureShellTerminal(id);
-  term.write(data);
-}
- 
-// window resize — only meaningful while a shell panel is actually open;
-// the guard avoids fitting/resizing a terminal nobody's looking at.
-window.addEventListener("resize", () => {
-  if (currentShellContactId) fitAndSendResize(currentShellContactId);
-});
- 
-document.getElementById("shellTerminalEndBtn").onclick = () => {
-  if (currentShellContactId) endShell(currentShellContactId);
-};
 
 /* ══════════════════════════════════════════
    QR
@@ -543,12 +421,10 @@ function renderContactList() {
     if (c.blocked && !showBlocked) return;
 
     const isMe  = c.publicId === state.publicId;
-    const isAgent = c.type === "agent";
     const li    = document.createElement("li");
     li.className = "contactItem"
       + (state.currentChat === c.publicId ? " active" : "")
-      + (c.blocked ? " blocked" : "")
-      + (isAgent ? " agent-contact" : "");
+      + (c.blocked ? " blocked" : "");
     li.dataset.id = c.publicId;
     li.onclick    = () => openChat(c.publicId);
     const unread  = state.unread[c.publicId] || 0;
@@ -578,7 +454,6 @@ function renderContactList() {
       '<div class="contactInfo">' +
         '<div class="contactName">' + esc(c.name) +
           (isMe ? ' <span style="font-size:9px;color:var(--muted);letter-spacing:0.08em">YOU</span>' : '') +
-          (isAgent ? ' <span class="agentBadge" title="agent contact — shell-capable">⌁ agent</span>' : '') +
           (hasBackup ? ' <span title="backup stored" style="font-size:9px;color:var(--muted);letter-spacing:0.04em">🗄</span>' : '') +
         '</div>' +
         '<div class="contactId">' + c.publicId.slice(0,16) + '…</div>' +
@@ -621,7 +496,6 @@ function openChat(id) {
   idEl.textContent   = c.publicId.slice(0,16) + "…";
   updateChatRelayInfo(id);
   updateCallHeaderBtn(id);
-  updateShellHeaderBtn(id);
   const menuBtn = document.getElementById("contactMenuBtn");
   const isMe    = c.publicId === state.publicId;
   menuBtn.classList.add("visible");
@@ -740,14 +614,6 @@ function renderMessages() {
 
   if (missingBanner) container.appendChild(missingBanner);
 
-  // Agent contacts read more like a terminal session than a conversation —
-  // command and response both flow left, top to bottom, instead of the
-  // normal mine-right/theirs-left bubble split. Colour (mine/theirs class)
-  // still distinguishes what you typed from what came back; only the
-  // positioning changes. Reactions don't mean anything on command output,
-  // so they're skipped entirely for these chats rather than left dangling.
-  const isAgentChat = state.contacts[state.currentChat]?.type === "agent";
-
   visible.forEach(m => {
     if (m.type === "system") {
       const sysWrap = document.createElement("div");
@@ -767,9 +633,9 @@ function renderMessages() {
 
     const mine = m.from === state.publicId;
     const wrap = document.createElement("div");
-    wrap.style.cssText = "display:flex;flex-direction:column;align-items:" + (isAgentChat ? "flex-start" : (mine ? "flex-end" : "flex-start"));
+    wrap.style.cssText = "display:flex;flex-direction:column;align-items:" + (mine ? "flex-end" : "flex-start");
     const bubble = document.createElement("div");
-    bubble.className = "message " + (mine ? "mine" : "theirs") + (m.valid === false ? " invalid" : "") + (isAgentChat ? " no-reaction-pad" : "");
+    bubble.className = "message " + (mine ? "mine" : "theirs") + (m.valid === false ? " invalid" : "");
 
     if (m.type === "audio") {
       if (m.expired || !audioCache[m.id]) {
@@ -852,7 +718,7 @@ function renderMessages() {
     infoPre.className = "packetInfoPre";
     infoPre.style.display = "none";
 
-    if (!isAgentChat) bubble.appendChild(buildReactionRow(m.id, msgs, mine));
+    bubble.appendChild(buildReactionRow(m.id, msgs, mine));
     wrap.appendChild(bubble);
     wrap.appendChild(meta);
     wrap.appendChild(infoPre);
@@ -898,8 +764,6 @@ function openModal() {
   document.getElementById("modalContactName").value   = "";
   document.getElementById("modalContactKey").value    = "";
   document.getElementById("scanResult").textContent   = "";
-  document.getElementById("modalContactIsAgent").checked = false;
-  document.getElementById("agentToggleRow").style.display = "flex";
   buildMyQR(state.shareableKey);
   switchTab("show");
   document.getElementById("modalOverlay").classList.add("open");
@@ -996,8 +860,7 @@ function contactAction(action) {
     relayInput.addEventListener("focus", () => { relayInput.readOnly = false; }, { once: true });
     editForm.appendChild(relayInput);
 
-    // push notification opt-in — self only, mirrors the agent-type
-    // checkbox pattern (self-excluded there, self-only here). Per-device:
+    // push notification opt-in — self only. Per-device:
     // this reflects/controls THIS browser's subscription, not a global
     // setting for the identity — see meshchat.js's loadPushPref/
     // togglePushPref for why that's the deliberate scope.
@@ -1514,9 +1377,8 @@ document.getElementById("exportOverlay").onclick = (e) => { if (e.target === doc
 document.getElementById("modalConfirm").onclick = async () => {
   const name    = document.getElementById("modalContactName").value.trim();
   const key     = document.getElementById("modalContactKey").value.trim();
-  const isAgent = document.getElementById("modalContactIsAgent").checked;
   if (!name || !key) return;
-  const ok = await addContact(name, key, true, isAgent ? "agent" : "human");
+  const ok = await addContact(name, key, true);
   if (ok) closeModal();
 };
 

@@ -434,7 +434,6 @@ function serialiseContacts() {
     out[id] = { name: c.name, publicId: c.publicId, shareableKey: c.shareableKey,
                 messages: selectRetainedMessages(c.messages, RETENTION_COUNT).map(m => m.type === "audio" ? {...m, data:null, expired:true} : m),
                 blocked: c.blocked || false,
-                type:            c.type            || "human",
                 lastStateChange: c.lastStateChange || 0,
                 lastRelay:       c.lastRelay       || null,
                 lastRelaySeen:   c.lastRelaySeen    || 0 };
@@ -469,7 +468,6 @@ function serialiseContactsForPeers() {
     out[id] = { name: c.name, publicId: c.publicId, shareableKey: c.shareableKey,
                 messages: [],
                 blocked: c.blocked || false,
-                type:            c.type            || "human",
                 lastStateChange: c.lastStateChange || 0,
                 lastRelay:       c.lastRelay       || null,
                 lastRelaySeen:   c.lastRelaySeen    || 0 };
@@ -704,10 +702,9 @@ function recordKnownDevice(identityId, deviceId, n, endpointId) {
     lastN = Math.max(prevLastN, n);
   }
   // endpointId is learned passively, the same way deviceId itself is — only
-  // adopt an explicitly-provided value, same "don't let an omitted field
-  // silently blank out what's already known" rule mergeContactMeta uses
-  // for contact.type. Older/other callers that don't pass it (e.g. restore
-  // paths) leave whatever's already on file untouched.
+  // adopt an explicitly-provided value, so an omitted field never silently
+  // blanks out what's already known. Older/other callers that don't pass it
+  // (e.g. restore paths) leave whatever's already on file untouched.
   const prevRoutingId = (existing && typeof existing === "object") ? existing.endpointId : undefined;
   state.knownDevices[identityId][deviceId] = {
     lastSeen: Date.now(), lastN, missing: missing.slice(0, 50),
@@ -4617,9 +4614,9 @@ async function handleBurn(msg) {
    token — deliberately NOT done on a manual block (see contactAction
    "block" below), since manual block is a softer, reversible-in-spirit
    action while burn is explicitly saying "treat this identity as gone
-   for good." blockReason is local-only UI metadata, same trust tier as
-   contact.type — never a security boundary, just lets the edit-contact
-   pane say WHY something is blocked instead of a bare yes/no. */
+   for good." blockReason is local-only UI metadata — never a security
+   boundary, just lets the edit-contact pane say WHY something is blocked
+   instead of a bare yes/no. */
 async function burnBlockContact(id) {
   const contact = state.contacts[id];
   if (!contact) return;
@@ -5034,10 +5031,8 @@ function sendCallPacket(toId, type, callId) {
    state-aware (e.g. update the same id's text as the call phase
    advances) once that's actually wanted; no need to build that now.
 
-   Deliberately only wired for voice calls, never shell escalation — shell
-   targets are always agent contacts, and agent.py's handle_message
-   treats any incoming text as a command to execute. Sending this here
-   would just bounce back "command not allowed" on the agent's side. ── */
+   Deliberately only wired for voice calls, never the shell/data session
+   kind — that one has no conversational surface to leave a notice for. ── */
 async function sendCallNotice(id) {
   const contact = state.contacts[id];
   if (!contact || contact.blocked || !contact.encKey) return;
@@ -5255,11 +5250,10 @@ async function handleShellEnd(msg) {
 }
 
 async function handleShellOffer(msg) {
-  // Client-side is not expected to receive shell:offer today — the human
-  // is always the offerer per the agreed asymmetry, and agent.py never
-  // initiates. Guarded and logged rather than silently ignored, in case
-  // that assumption changes later (human-to-human shell sharing).
-  mlog.debug(`← SHELL OFFER  from ${pid(msg.from)} — unexpected, human client is always offerer, ignored`);
+  // No callee-side path exists yet: this client only ever acts as the
+  // offerer for the shell kind. Logged rather than silently ignored so an
+  // incoming offer is at least visible in a live test.
+  mlog.debug(`← SHELL OFFER  from ${pid(msg.from)} — no callee-side handler yet, ignored`);
 }
  
 async function handleShellAnswer(msg) {
@@ -5546,17 +5540,15 @@ function rtcClose(id) {
 
 /* ══════════════════════════════════════════
    SHELL ESCALATION — user-facing entry points
-   Mirrors startCall/cancelCall/endCall exactly, shell-flavored. Real
-   signing/sending (sendShellInvite etc.) is still a stub — see the
-   "SHELL UI/RTC stubs" section below — so these correctly advance local
-   FSM state and update the header button, but nothing reaches the wire
-   yet. sessionId plays the same role callId does for calls: assigned
-   once here, never touched again by transition() itself.
+   Mirrors startCall/cancelCall/endCall exactly, shell-flavored. No header
+   button calls these any more (the agent layer that gated it is gone), so
+   for now they are only reachable from the console. sessionId plays the
+   same role callId does for calls: assigned once here, never touched
+   again by transition() itself.
 ══════════════════════════════════════════ */
 function startShell(id) {
   const contact = state.contacts[id];
   if (!contact || contact.blocked) return;
-  if (contact.type !== "agent") return;   // shell only makes sense for agent contacts — mirrors the header button's own gate
   if (contact.shell && contact.shell.phase !== "idle") return;
   contact.shell = { sessionId: crypto.randomUUID(), phase: "idle", role: null };
   transition(id, { type: "session_started" }, "shell");
@@ -5577,19 +5569,14 @@ function endShell(id) {
 }
 
 /* ══════════════════════════════════════════
-   SHELL UI/RTC stubs — statemachine.js's onShellStateEnter already calls
-   these unconditionally, same pattern the original "RTC/UI stubs" used
-   for calls: visible no-ops so entering negotiating/connected/failed
-   doesn't throw before that work happens. Each one names the piece of
-   work it's standing in for:
-     sendShellInvite / sendShellPacket — real signing (signShellPacket,
-       mirroring agent.py's already-tested version) + wire send
-     showIncomingShellUI / hideIncomingShellUI — unreachable against
-       agent.py today (it auto-claims), kept for human-to-human parity
-     shellRtcOffer / shellRtcClose — RTCPeerConnection + the two data
-       channels (shell-data, shell-ctrl), mirrors rtcOffer/rtcClose but
-       createDataChannel instead of getUserMedia/addTrack
-     openShellTerminal — the xterm.js panel, the actual visible payoff
+   SHELL signalling + RTC — statemachine.js's onShellStateEnter calls
+   these. Despite the name this section used to carry ("stubs"), everything
+   here is real except showIncomingShellUI/hideIncomingShellUI, which are
+   still log-only stubs in meshchat-gui.js — there is no callee-side path.
+     sendShellInvite / sendShellPacket — signing (signShellPacket) + send
+     shellRtcOffer / shellRtcClose — RTCPeerConnection + one data channel
+       (shell-data); mirrors rtcOffer/rtcClose but createDataChannel
+       instead of getUserMedia/addTrack
 ══════════════════════════════════════════ */
 function sendShellPacket(id, type, sessionId) {
   const obj = { type, from: state.publicId, to: id, sessionId, ts: Date.now(), deviceId: state.deviceId };
@@ -5605,7 +5592,7 @@ function sendShellInvite(id) {
   sendShellPacket(id, "shell:invite", contact.shell.sessionId);
 }
 
-const shellConns = {};   // contactId → { pc, dataCh, ctrlCh, iceQueue: [] }
+const shellConns = {};   // contactId → { pc, dataCh, iceQueue: [] }
  
 async function sendShellSDP(id, type, sdp) {
   const contact = state.contacts[id];
@@ -5634,7 +5621,7 @@ async function sendShellIce(id, candidate) {
 function createShellPeerConnection(id) {
   if (shellConns[id]?.pc) return shellConns[id].pc;
   const pc = new RTCPeerConnection(RTC_CONFIG);   // reuse the same STUN-only config as calls
-  const entry = { pc, dataCh: null, ctrlCh: null, iceQueue: [] };
+  const entry = { pc, dataCh: null, iceQueue: [] };
   shellConns[id] = entry;
  
   pc.onicecandidate = (e) => { if (e.candidate) sendShellIce(id, e.candidate); };
@@ -5659,18 +5646,15 @@ async function flushShellIceQueue(id) {
   entry.iceQueue = [];
 }
  
-// real implementation — replaces the old stub. Human is always the
-// offerer (mirrors rtcOffer for calls), but unlike calls there is media
-// to acquire — this creates the two data channels up front instead.
+// Offerer side only (mirrors rtcOffer for calls), but unlike calls there is
+// no media to acquire — this creates the data channel up front instead.
 async function shellRtcOffer(id) {
   try {
     const pc    = createShellPeerConnection(id);
     const entry = shellConns[id];
  
     entry.dataCh = pc.createDataChannel("shell-data");
-    entry.ctrlCh = pc.createDataChannel("shell-ctrl");
     wireShellDataChannel(id, entry.dataCh);
-    wireShellCtrlChannel(id, entry.ctrlCh);
  
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
@@ -5682,56 +5666,35 @@ async function shellRtcOffer(id) {
   }
 }
  
-// real implementation — replaces the old stub
 function shellRtcClose(id) {
   const entry = shellConns[id];
   if (entry) {
     entry.dataCh?.close();
-    entry.ctrlCh?.close();
     entry.pc.close();
     delete shellConns[id];
   }
-  const termEntry = shellTerminals[id];
-  if (termEntry) { termEntry.term.dispose(); delete shellTerminals[id]; }
-  closeShellTerminalUI(id);
   mlog.debug(`SHELL RTC  closed  ${pid(id)}`);
 }
  
-// Wiring for the two data channels — shared by the offerer (channels
-// created locally in shellRtcOffer) so both sides end up with identical
-// message handling once open. The callee-side equivalent doesn't exist
-// yet client-side because the human is always the offerer; this is here
-// purely for the human's own local channels.
+// Wiring for the data channel. The callee-side equivalent doesn't exist
+// yet client-side; this is here purely for the offerer's own local channel.
 function wireShellDataChannel(id, ch) {
   ch.binaryType = "arraybuffer";
   ch.onopen = () => mlog.info(`SHELL RTC  data channel open  ${pid(id)}`);
   ch.onclose = () => mlog.debug(`SHELL RTC  data channel closed  ${pid(id)}`);
   ch.onmessage = (e) => {
-    console.log("SHELL DATA raw", typeof e.data, e.data instanceof ArrayBuffer, e.data?.byteLength ?? e.data?.size);   // ← temporary debug line
-    const bytes = e.data instanceof ArrayBuffer ? new Uint8Array(e.data) : e.data;
-    if (typeof onShellDataReceived === "function") onShellDataReceived(id, bytes);
+    // No consumer yet — the xterm terminal that used to take these bytes is
+    // gone, and the DATA kind's own receive hook comes later. Size-only debug
+    // log so a live test can at least see traffic arriving.
+    const size = e.data instanceof ArrayBuffer ? e.data.byteLength : (e.data?.size ?? e.data?.length ?? 0);
+    mlog.debug(`SHELL RTC  data rx  ${size}b  ${pid(id)}`);
   };
-}
- 
-function wireShellCtrlChannel(id, ch) {
-  ch.onopen = () => mlog.debug(`SHELL RTC  ctrl channel open  ${pid(id)}`);
-  ch.onclose = () => mlog.debug(`SHELL RTC  ctrl channel closed  ${pid(id)}`);
-  ch.onmessage = () => {}; // agent doesn't send ctrl messages back today — nothing to handle yet
-}
- 
-// Send resize over the ctrl channel — step 4 (terminal UI) will call this
-// on window/panel resize. Exposed now so that wiring is a one-line call
-// once xterm.js is in place, not another RTC-layer change.
-function sendShellResize(id, cols, rows) {
-  const ch = shellConns[id]?.ctrlCh;
-  if (!ch || ch.readyState !== "open") return;
-  ch.send(JSON.stringify({ type: "resize", cols, rows }));
 }
 
 /* ══════════════════════════════════════════
    CONTACTS
 ══════════════════════════════════════════ */
-async function addContact(name,shareableKey,save=true,type="human"){
+async function addContact(name,shareableKey,save=true){
   if(!name||!shareableKey)return false;
   let x25519PublicKey,signPublicKey,relayWss=null;
   try{
@@ -5745,10 +5708,6 @@ async function addContact(name,shareableKey,save=true,type="human"){
   catch(e){return false;}
   const publicId=await deriveIdentityPublicId(x25519PublicKey,signPublicKey);
   if(publicId===state.publicId||state.contacts[publicId])return!!state.contacts[publicId];
-  // type is local-only UI metadata — never on the wire, never trusted as a
-  // security boundary. It just decides which button (call vs shell) shows
-  // in the header. Real enforcement of shell access lives entirely in the
-  // agent's own SHELL_CONTACTS allowlist. Anything but "agent" is "human".
   // encKey is derived via ECDH, not imported off the wire — this contact's
   // x25519PublicKey is public by design (it's what's in the QR code), but
   // the AES key it produces is the shared secret only WE and THEY can
@@ -5758,9 +5717,9 @@ async function addContact(name,shareableKey,save=true,type="human"){
   // it per device pair once a session exists.
   const encKey=await deriveSharedAesKey(state.x25519Seed,x25519PublicKey);
   state.contacts[publicId]={name,publicId,shareableKey,encKey,x25519PublicKey,signPublicKey,messages:[],
-    lastRelay:relayWss||null, type: type==="agent"?"agent":"human"};
+    lastRelay:relayWss||null};
   if(save)await saveContacts();
-  mlog.info(`CONTACT    added ${name}  ${pid(publicId)}${relayWss?" wss="+relayWss:""}${type==="agent"?"  [agent]":""}`);
+  mlog.info(`CONTACT    added ${name}  ${pid(publicId)}${relayWss?" wss="+relayWss:""}`);
   renderContactList();
   return true;
 }
