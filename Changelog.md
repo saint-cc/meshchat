@@ -11,6 +11,141 @@ work, not yet cut as a numbered release.
 
 ---
 
+## 0.5.5
+
+Rolls up the 0.5.3–0.5.5 work as one entry (the individual cut points weren't
+recorded at the time). Mostly the sibling-sync/backup rework decided in
+September, plus the removal of agent/shell. **Several changes are wire-visible
+and no compatibility shims were attempted** — same stance as `0.5.2`, while
+testing is still limited to a small number of people. Per-item live-confirmation
+status lives in `X4DH.md`/`Roadmap.md`, not here; at the time of writing this
+release is being exercised on meshdev.
+
+- **Removed: agent contacts, the bounded command whitelist and shell
+  escalation.** `agent.py`, the `type` field on contacts, the xterm terminal UI
+  and the `shell:*` packet family are gone. The shell work was only ever a test
+  of the WebRTC data channel; it is expected to come back later as a plugin, not
+  in this shape. A relay now drops `shell:*` as an unknown type.
+- **Replaced by a data-channel test: `data:*`.** Seven wire types
+  (`data:invite`/`claim`/`cancel`/`end`/`offer`/`answer`/`ice`), same shape,
+  signing rules and shared state machine as `call:*` (`transition()` in
+  `statemachine.js`, `kind: "data"`), keyed by `sessionId`. It is a connection
+  test and nothing more: the caller opens one channel (`"data"`), sends a single
+  ping, the callee echoes a pong, the caller reports the round-trip time and ends
+  the session. Nothing is stored in `contact.messages` (so nothing is backed up
+  or synced) — the result is a transient toast. Differences from the old shell
+  path: **nothing auto-claims** — an incoming invite raises an accept/decline
+  banner, since answering reveals the answerer's network address through ICE; the
+  receive hook is strict (strings only, ≤128 chars, one known shape, nonce must
+  match, role-gated, at most 3 pongs echoed); ring timeout 30s, negotiate timeout
+  20s; early ICE candidates that overtake the offer are queued (capped at 50).
+  Still STUN-only, still no TURN.
+- **New: self-sync message path replaces `pushMiniBackup`.** A message or manual
+  reaction composed on one device is now mirrored to the identity's other devices
+  as an ordinary `app:message` whose payload type is `selfsync`
+  (`{ peerId, msg }`), sent through the normal per-device fanout
+  (`sendFannedX4DH`) addressed to the identity itself. Over the old mini backup
+  this gives per-sibling X4DH keys where a self-session exists, an Ed25519
+  signature (self-sync backup packets carry none), and per-endpoint offline
+  buffers — an identity-level buffered packet is consumed by whichever device
+  reconnects first, so two offline siblings could never both receive it. Receive
+  side (`handleSelfSync`) is deliberately narrow: must be from our own identity,
+  signature must be valid (unlike an ordinary message there is no
+  displayed-with-a-warning case), own echo ignored, whitelisted field copy rather
+  than a spread, never acks or re-fans, never bumps unread, never sets
+  `ackTrusted`, and the embedded `n` is stored but never fed to
+  `recordKnownDevice`. Media goes as a stub only; call notices and RECEIVED
+  auto-acks are not mirrored. A self-addressed `app:message` never triggers a
+  push. Self-fanout also no longer targets the sending device itself
+  (`resolveDeviceTargets`). The retired mini-backup shape (a bare contacts map) is
+  still accepted on receive. **Known gap:** a sibling we've never heard from is
+  not synced to at all — there is nothing to address; it is discovered through
+  the self-backup handshake or its own traffic.
+- **Changed: self-sync backups no longer ride the static backup key.** The full
+  self push is now a targeted, per-sibling send under that sibling's X4DH wire key
+  (skipped when its fingerprint already matches). Where no usable session exists
+  — no sibling known, endpoint unknown or stale, or no session yet — a
+  content-free discovery **hello** (`{ deviceId, endpointId, hello: true }`, under
+  the backup key, broadcast to our own identity, 60s cooldown) goes out instead,
+  purely so siblings learn the device and X4DH can bootstrap a self-session.
+  `handleSelfHello` answers with a small targeted ack (session key plus
+  fingerprint if a session exists, otherwise content-free under the backup key).
+  Receive side (`decryptSelfBackupBlob`) trial-decrypts every self-session wire
+  key newest-first, then the backup key last, and cross-checks the payload's
+  `deviceId` against the session it decrypted under. A full push under the static
+  backup key from an older sibling is still accepted (and logged). Consequence: a
+  brand-new sibling receives contacts from the first push after its session
+  exists, not instantly; a genuinely wiped device still restores immediately via
+  the `restore_ack`/`restore_push` path. The hello still exposes the
+  `deviceId`↔`endpointId` link to recorded traffic plus a later passphrase
+  compromise — metadata only, accepted for the discovery step.
+- **Changed: self `restore_push` is now ephemeral-wrapped.** `0.5.1` deliberately
+  left self-sync out of the wrap; the self branch of `handleRestoreAck` now wraps
+  the push the same way the contact branch does, since it carries full message
+  history. The ack's signature covers `ek`, so a relay cannot strip or swap it.
+- **Changed: contact-path backups carry contacts only.** The blob offered/pushed
+  to another contact (`serialiseContactsForPeers`) has `messages: []` on every
+  entry. A peer holding your backup is a third party with an indefinitely stored
+  copy; the contact list is what restore needs, and message history never had to
+  ride along. Self-sync blobs are unaffected.
+- **Changed: the server no longer buffers `sync:backup_push`.** The `0.5.0`
+  behaviour (buffer on a missed live delivery) is reverted; it never got
+  independent live confirmation and turned out to be the wrong tool. Contact-path
+  pushes answer a live handshake and may be wrapped under an ephemeral held ~60s
+  in memory, so a buffered copy flushed on reconnect can never be unwrapped (and
+  an unwrapped stale one could overwrite a newer stored backup). The
+  sibling-catch-up job moved to the `selfsync` path above, which gets per-endpoint
+  buffering as an ordinary `app:message`. Self-sync full backups are online-only
+  again.
+- **Changed: handshake replies are one-to-one.** The root cause behind several
+  `0.5.2` symptoms was addressing, not bookkeeping: the opening packet of the
+  backup/restore handshake is addressed to a bare identity and fans out to every
+  live session, and every reply was then also addressed bare, so with two devices
+  under one identity each reply fanned out too — and each reply is wrapped for
+  exactly one ephemeral. `backup_accept`, `backup_push`, `restore_ack` (when the
+  requester's endpoint is already known) and `restore_push` are now addressed
+  compound (`id::endpointId`) to the `from` endpoint of the verified opening
+  packet (`replyAddress`). Unverified or fresh senders, and the bootstrap ping,
+  keep the bare fallback. Dedup keys for `backup_offer`/`backup_accept`/
+  `backup_push` are endpoint-aware once verified, so a second sibling's genuinely
+  distinct packet isn't swallowed. `pendingEkCandidates` additionally searches the
+  identity's other slots as a safety net — a wrong candidate costs one failed
+  AES-GCM tag check, nothing more.
+- **Changed: manual SYNC (`app:sync`) is encrypted, signed and wrapped.** The
+  packet used to carry `msgs` and `reply` as plaintext JSON with no signature, so
+  a relay could read the text and forge `from` to inject messages. It is now
+  `{ type, from, to, blob, sig }`: the payload (`from`, `to`, `syncId`, `reply`,
+  `ek`, and on a reply `wrapped`) is encrypted under the pairwise key and the
+  ciphertext is signed, with verification mandatory on receive. The request
+  carries no messages — only a fresh ephemeral `ek`; the reply carries its own
+  `ek` and the batch wrapped under the ephemeral-to-ephemeral key, so a recorded
+  batch plus a later identity-key compromise exposes nothing. **SYNC is therefore
+  one-directional now:** the side that presses it receives the other side's recent
+  messages; press it on both sides for a two-way exchange. A reply is accepted
+  only while a request of our own to that contact is pending (`syncId`, 60s,
+  `pendingSyncs`); inbound batches are whitelist-sanitised and capped at 50
+  (`sanitizeSyncedMessages`). Legacy plaintext sync is dropped — a SYNC between a
+  new and an old client simply does nothing.
+- **Changed: push subscriptions are keyed by `endpointId`, not `deviceId`.**
+  `sig:push_subscribe`/`sig:push_unsubscribe` carry `endpointId` and the relay
+  stores `<publicId>/<endpointId>.json`. Keying on `deviceId` let the relay join
+  its view (endpoints, seen at auth) with a contact's view (deviceIds) — exactly
+  the correlation the `deviceId`/`endpointId` split exists to prevent. On
+  subscribe, the relay drops any stale file for the same browser endpoint URL
+  (including old `<deviceId>.json` files). Old clients that still send `deviceId`
+  are dropped by the relay, so their push stops working until they update.
+- **Doc correction: `resolveReactionTarget` does not exist.** The `0.5.0` entry
+  above, and `protocol.md`'s Delivery Acknowledgement section, describe a targeted
+  single-device ack path that was never present in `meshchat.js`.
+  `sendReaction` has always used the full `sendFannedX4DH` fanout for both manual
+  reactions and the RECEIVED auto-ack — deliberately, since an ack reaching only
+  the originating device would leave the sender's other devices showing "sent"
+  forever. The `0.5.0` text is left as written (it's history); the spec text is
+  corrected separately. Narrowing the ack fanout would need pairing with the
+  self-sync path first, and is not done.
+- **Version.** `CLIENT_VERSION` and the relay's `PROTOCOL_VERSION` are both
+  `0.5.5`, surfaced informationally via `sig:relay_info`.
+
 ## 0.5.2
 
 Raises the PBKDF2 iteration count used for identity derivation from

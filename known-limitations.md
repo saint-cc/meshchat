@@ -1,4 +1,3 @@
-```markdown
 # MeshChat — Known Limitations
 
 This document describes limitations and trade-offs that are inherent to MeshChat's design. These are not implementation bugs, but consequences of prioritising decentralisation, cryptographic identity and infrastructure independence.
@@ -22,6 +21,22 @@ If you lose your passphrase, your identity is permanently lost.
 Changing either your username or passphrase produces a completely different cryptographic identity.
 
 Existing contacts cannot automatically determine that the new identity belongs to the same person.
+
+---
+
+## Key-derivation changes are hard cutovers
+
+The key-derivation parameters — PBKDF2 iteration count, HKDF labels, salt format — are inputs to your identity exactly as the username and passphrase are. Raising the iteration count from 100,000 to 1,000,000 in `0.5.2` therefore had the same effect as changing everyone's passphrase at once: logging in with the same credentials derived a completely different identity, with no local data under it and no path back to the old one.
+
+No dual-version detection or migration was attempted, and any future change to these parameters will behave the same way.
+
+---
+
+## A weak passphrase can be attacked offline
+
+Your `publicId` is public by design. Anyone who knows your username and your public ID can therefore test passphrase guesses entirely offline — derive the keys from a guess, hash the two public keys, compare against the known ID — with no captured traffic and no network access.
+
+The 1,000,000 PBKDF2 iterations make each guess more expensive; they do not change the shape of the problem. The passphrase is the security floor for everything built on top of it, including every forward-secrecy property that depends on identity keys not leaking. The login screen's entropy meter is a rough guide, not a guarantee.
 
 ---
 
@@ -57,9 +72,34 @@ The protocol never invents or reorders history.
 
 ## Multi-device synchronisation is not instantaneous
 
-Devices sharing the same identity exchange information through normal protocol traffic and peer backups.
+Devices sharing the same identity exchange information through mirrored copies of outgoing messages, self-backups and normal protocol traffic.
 
 They converge over time rather than maintaining constant real-time synchronisation.
+
+---
+
+## Mirroring to your other devices is best-effort
+
+Messages and reactions you send are mirrored to your other devices as small per-device messages. This has gaps:
+
+- A device this one has never heard from is not mirrored to — there is nothing to address. It is discovered through the self-backup hello or its own traffic, and later sends then reach it.
+- A device with no known routing ID, or not seen for more than 7 days, is reached through the identity-level buffer instead. The first of your devices to reconnect consumes that copy, so another offline device may miss it until the next self-backup cycle repairs it.
+- Media is mirrored as a stub only. Call notices and delivery acknowledgements are not mirrored at all, so delivery status can differ between your devices.
+- A brand-new device receives your contacts from the first backup push after its session with your other devices exists, not instantly. A genuinely wiped device still restores through the restore handshake.
+
+---
+
+## Peer backups restore contacts, not conversations
+
+Backups held by your contacts carry your contact list only (since `0.5.5`). After a wipe, restore recovers who you know, not what you said. Message history comes back only from the other side of each conversation (manual SYNC) or from your own other devices.
+
+Separately, each device persists — to local storage and into backups — only roughly the 15 most recent messages per contact, and there is no wire-level request to backfill older ones. The "not received yet" banner can tell you a gap exists; it cannot close it.
+
+---
+
+## Manual SYNC is one-way and needs the contact online
+
+Pressing SYNC asks the other party for its most recent messages (up to 10) and receives them; it does not also send yours. Press it on both sides for a two-way exchange. It only works while the contact is online, and a client that predates the encrypted form cannot take part.
 
 ---
 
@@ -82,6 +122,7 @@ Relay operators necessarily observe:
 - timing
 - approximate message size
 - client IP addresses
+- which device routing ID (`endpointId`) is connected or addressed — not linkable to the device ID your contacts see, but stable per device
 
 Message contents remain end-to-end encrypted.
 
@@ -99,19 +140,23 @@ Identity keys are static, and the identity-level pairwise key derived from them 
   - The session root key is stored on the device, encrypted with a key derived from the passphrase. An attacker with both the device's storage and the passphrase obtains it directly, without needing any identity-key attack.
 - None of this is a full ratchet yet — a device pair's session key is reused for every message under it until the session itself resets (X4DH.md §16.5/§16.6). Per-message forward secrecy (a real Double Ratchet) is separate, later work.
 - Any device pair that hasn't (yet, or ever) completed X4DH bootstrap still falls back to the identity-level static key, with none of the above.
-- Calls, shell escalation, relay migration notices, and burn notices are permanently out of scope for this — they aren't device-targeted infrastructure, so there's no session for them to ride on.
+- Calls, data-channel tests, relay migration notices, and burn notices are permanently out of scope for this — they aren't device-targeted infrastructure, so there's no session for them to ride on.
+- Copies of your own messages mirrored between your devices ride the same per-device keys as ordinary messages where a self-session exists, and the legacy self key otherwise — so the same qualifiers apply.
+- Manual SYNC's envelope uses the identity-level key, but the message batch inside a reply is wrapped under a one-shot ephemeral key (since `0.5.5`), so a recorded batch is not exposed by a later identity-key compromise. The envelope itself carries only an ephemeral public key and a request ID.
 
 In short: if an attacker records encrypted traffic today and later compromises your identity, previously recorded traffic on any device pair without a completed X4DH session — and any non-message traffic regardless — may become decryptable. A device pair with a completed `RK1` session is protected against exactly that scenario for the messages sent after the upgrade; a device pair still at `RK0` is protected only against a future compromise of the initiator's key.
 
 ## Restore and backup traffic have their own, narrower wire protection
 
-The forward-secrecy discussion above is about `app:message` traffic specifically. The peer backup and restore handshake (`protocol.md`'s [Peer Backup Protocol](protocol.md#peer-backup-protocol)) uses a completely separate key hierarchy — the passphrase-derived backup key, not the pairwise/X4DH message key — and as of `0.5.1` has its own, independent wire protection layered on top of it, for the contact path specifically (not self-sync):
+The forward-secrecy discussion above is about `app:message` traffic specifically. The peer backup and restore handshake (`protocol.md`'s [Peer Backup Protocol](protocol.md#peer-backup-protocol)) uses a completely separate key hierarchy — the passphrase-derived backup key, not the pairwise/X4DH message key — and has its own, independent wire protection layered on top of it. As of `0.5.5` the contact path and the self restore push use the ephemeral wrap described below, while self-sync backup pushes ride X4DH session keys instead (see the last bullets):
 
-- `sync:restore_push` and `sync:backup_push` can carry an additional one-shot X25519 ephemeral-to-ephemeral wrap (`protocol.md`'s [Ephemeral Wrap](protocol.md#ephemeral-wrap)) around the existing backup-key-encrypted blob. This protects against exactly the scenario described above — recorded wire traffic plus a later passphrase compromise — for these two packet types, independent of whether the device pair has ever bootstrapped an X4DH session at all.
+- `sync:restore_push` and `sync:backup_push` (contact path since `0.5.1`; the self `restore_push` since `0.5.5`) can carry an additional one-shot X25519 ephemeral-to-ephemeral wrap (`protocol.md`'s [Ephemeral Wrap](protocol.md#ephemeral-wrap)) around the existing backup-key-encrypted blob. This protects against exactly the scenario described above — recorded wire traffic plus a later passphrase compromise — for these packet types, independent of whether the device pair has ever bootstrapped an X4DH session at all.
 - This is a per-exchange, memory-only ephemeral, not a session — there is no root key, no upgrade path, and nothing persisted. It either happens for a given push or it doesn't; there's no `RK0`/`RK1`-style partial state to reason about.
 - It's gated on the *preceding* ack/accept having a valid signature. An offer or ack from a sender with no established signing key on file (the genuinely-fresh-relationship case) gets no wrap — the same soft-verification stance the rest of this handshake family already has.
 - **Once a push has actually been wrapped, there is no graceful fallback.** A relay that strips the ephemeral in transit (without also invalidating the signature, which covers it) causes that specific restore or backup attempt to fail closed rather than silently downgrading to the unwrapped form. This is deliberate — accepting a stripped wrap would defeat the point of having one — but it does mean an actively hostile relay has a cleaner denial-of-service target here than against an ordinary unwrapped exchange.
-- Self-sync (an identity's own multiple devices exchanging backups) is not covered by any of this yet — the fresh-client bootstrap case there is a distinct, separate piece of work (see `X4DH.md`'s note on self-sync forward secrecy).
+- Self-sync full backups (an identity's own devices exchanging contact stores) do not use the ephemeral wrap. As of `0.5.5` a full push goes to each known sibling under that pair's X4DH session key — the same per-device key `app:message` uses, with the same caveats: static per session, `RK0` narrower than `RK1`, no ratchet. It is skipped when the sibling's fingerprint already matches.
+- Where no session exists yet, only a content-free discovery hello goes out under the passphrase-derived backup key: no contacts, no messages, just the device's ID and routing ID. That keeps contact data off the wire under the deterministic key, but a recorded hello plus a later passphrase compromise reveals the link between a device ID and its routing ID. Older siblings that still send a full push under the static backup key are accepted for interoperability, and those pushes keep the old exposure.
+- Contacts holding your backup receive your contact list only, with no message history, which limits what any stored copy could expose in the first place.
 
 Separately: the restore token (`protocol.md`'s [Restore Token](protocol.md#restore-token)) that authenticates a wiped device's restore push is a fixed, unrotated object for as long as the underlying contact relationship exists — the same token bytes travel on the wire every time that specific restore path is exercised, until the storing side re-adds the contact and a fresh one is issued. Its contents are opaque without the issuer's passphrase, but its presence is a stable, linkable fingerprint of that specific contact pair.
 
@@ -143,13 +188,15 @@ End-to-end encryption protects message contents, not service availability.
 
 ---
 
-## No TURN server — some calls and shell sessions will not connect
+## No TURN server — some calls and data-channel tests will not connect
 
-Voice calls and agent shell escalation negotiate directly between the two devices over WebRTC, using STUN only (three public STUN servers, for resilience). There is no TURN relay, and this is a permanent design decision rather than a gap awaiting a fix.
+Voice calls and the data-channel connection test negotiate directly between the two devices over WebRTC, using STUN only (three public STUN servers, for resilience). There is no TURN relay, and this is a permanent design decision rather than a gap awaiting a fix.
 
-Most NAT setups traverse fine with STUN alone. Some do not — certain symmetric-NAT and carrier-grade-NAT pairings cannot establish a direct peer-to-peer path, and no amount of retrying will change that outcome. When this happens, the call or shell session simply fails to connect; the bounded command whitelist (for agent contacts) needs no WebRTC and is unaffected.
+Most NAT setups traverse fine with STUN alone. Some do not — certain symmetric-NAT and carrier-grade-NAT pairings cannot establish a direct peer-to-peer path, and no amount of retrying will change that outcome. When this happens, the call or test simply fails to connect.
 
-This trade-off avoids running or trusting a TURN relay server, which would otherwise see call/shell metadata and be able to observe (though not decrypt) the connection attempt. The cost is that a small fraction of NAT pairings are permanently unreachable for calls and shell sessions specifically — text messaging is unaffected, since it never uses WebRTC.
+This trade-off avoids running or trusting a TURN relay server, which would otherwise see call/data-channel metadata and be able to observe (though not decrypt) the connection attempt. The cost is that a small fraction of NAT pairings are permanently unreachable for calls and data-channel tests specifically — text messaging is unaffected, since it never uses WebRTC.
+
+A direct connection also means the other party learns your network address when you accept a call or test, because ICE exchanges it. The data-channel accept prompt says so; the same is true of voice calls.
 
 ---
 
@@ -184,8 +231,9 @@ Packet formats, routing behaviour and synchronisation mechanisms may change betw
 
 ---
 
-\1
-X4DH in particular is a MeshChat-specific 2DH/4DH construction — not Signal's X3DH, and without signed or one-time prekeys. It has had no formal analysis.
+## X4DH has had no formal analysis
+
+X4DH is a MeshChat-specific 2DH/4DH construction — not Signal's X3DH, and without signed or one-time prekeys. It has had no formal analysis.
 
 It should be considered experimental software.
 
@@ -198,4 +246,3 @@ MeshChat protects message confidentiality.
 It does not attempt to hide who communicates with whom or conceal network-level metadata.
 
 For anonymity, additional technologies such as Tor are required.
-```
