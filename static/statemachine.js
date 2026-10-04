@@ -1,7 +1,7 @@
 /* ══════════════════════════════════════════
-   SESSION STATE MACHINE — shared by calls and shell escalation
+   SESSION STATE MACHINE — shared by voice calls and data sessions
    transition(id, event, kind) — pure logic, no side effects
-   kind: "call" (default) | "shell" — selects contact.call vs contact.shell
+   kind: "call" (default) | "data" — selects contact.call vs contact.data
    Valid phases: idle | calling | ringing | negotiating | connected | failed
    Valid roles:  caller | callee (set on entering calling/ringing, cleared on idle)
 
@@ -17,31 +17,30 @@
    the session THIS device is party to.
 
    ONE table, TWO kinds. The phase/role logic below is identical for a
-   voice call and a shell escalation — same "did the other side
+   voice call and a data session — same "did the other side
    claim/accept," same "cancel before connect," same "fail after
    connect" shape — so it's written once. What differs between the two
    is entirely on the OTHER side of the fork: onStateEnter (call) vs.
-   onShellStateEnter (shell) below have no shared code, because their
+   onDataStateEnter (data) below have no shared code, because their
    side effects are genuinely different (getUserMedia/addTrack vs.
    createDataChannel; an audio element vs. no media element at all).
    Sharing the table but forking the consequences means a fix
    to the tricky bits (stale-callId rejection, the multi-device races)
    only has to happen once.
 
-   "ringing" for the shell kind: an incoming shell:invite does put the
-   contact into "ringing" (handleShellInvite), but this client has no
-   callee-side path yet — showIncomingShellUI is a log-only stub and
-   handleShellOffer ignores offers — so nothing can move it forward from
-   here. Left as-is rather than special-cased out: the callee path is the
-   next piece of work and needs exactly this phase.
+   "ringing" for the data kind: an incoming data:invite puts the contact
+   into "ringing" (handleDataInvite) and showIncomingDataUI raises an
+   accept/decline banner. Nothing auto-claims: answering lets the caller
+   learn this device's network address through ICE, so it takes an
+   explicit user action — same as a voice call.
 ══════════════════════════════════════════ */
 
 // Lets kind-appropriate event names normalize to the single internal
 // vocabulary the switch below actually matches on, without touching any
 // existing call call-site — they already pass the right-hand names below,
-// so the alias lookup is simply a no-op for them. New shell call-sites can
-// use either form; "session_*" just reads less oddly than "call_*" when
-// nothing being escalated is a phone call.
+// so the alias lookup is simply a no-op for them. Data-session call-sites
+// can use either form; "session_*" just reads less oddly than "call_*"
+// when the session isn't a phone call.
 const EVENT_ALIASES = {
   session_started:   "call_started",
   session_cancelled: "call_cancelled",
@@ -51,7 +50,7 @@ const EVENT_ALIASES = {
 function transition(id, event, kind = "call") {
 	const contact = state.contacts[id];
 	if (!contact) return;
-	const key  = kind === "shell" ? "shell" : "call";
+	const key  = kind === "data" ? "data" : "call";
 	const conn = contact[key] ??= { phase: "idle", role: null };
 
 	const oldPhase = conn.phase;
@@ -109,7 +108,7 @@ function transition(id, event, kind = "call") {
 
 	if (conn.phase !== oldPhase) {
 		mlog.info(`${kind.toUpperCase()}  ${pid(id)}  ${oldPhase} → ${conn.phase}${conn.role ? " ("+conn.role+")" : ""}`);
-		if (kind === "shell") onShellStateEnter(id, oldPhase, conn.phase, conn.role);
+		if (kind === "data") onDataStateEnter(id, oldPhase, conn.phase, conn.role);
 		else                  onStateEnter(id, oldPhase, conn.phase, conn.role);
 	}
 	return { from: oldPhase, to: conn.phase };
@@ -161,50 +160,62 @@ function onStateEnter(id, oldPhase, newPhase, role) {
 }
 
 /* ══════════════════════════════════════════
-   ON STATE ENTER — shell escalation
+   ON STATE ENTER — data sessions
    Mirrors onStateEnter's structure exactly (same switch, same "here's
    what happens on entry into each phase" shape) but the hooks it calls
-   are shell-specific: a data channel instead of media tracks, no <audio>
-   element. The hooks (sendShellInvite, shellRtcOffer, shellRtcClose) live
-   in meshchat.js; showIncomingShellUI/hideIncomingShellUI are log-only
-   stubs in meshchat-gui.js. There is no header button or terminal any
-   more — the connected phase only logs. Transitions are visible in the
-   in-page log via transition()'s own mlog line.
+   are data-specific: a data channel instead of media tracks, no <audio>
+   element. The hooks live in meshchat.js (sendDataInvite, dataRtcOffer,
+   dataRtcClose, armDataTimer/clearDataTimer, reportDataResult) and
+   meshchat-gui.js (showIncomingDataUI/hideIncomingDataUI,
+   updateDataHeaderBtn).
+
+   Timers live here, on phase entry, so every way into a phase arms the
+   right one and every way out of it (idle/failed) clears it: "calling"
+   and "ringing" get the ring timeout, "negotiating" gets the (shorter)
+   connect-and-ping timeout, which deliberately keeps running through
+   "connected" — the test isn't over until the pong is back. What a
+   timeout actually does is onDataTimeout's job (meshchat.js).
 ══════════════════════════════════════════ */
-function onShellStateEnter(id, oldPhase, newPhase, role) {
+function onDataStateEnter(id, oldPhase, newPhase, role) {
   switch (newPhase) {
 
     case "calling":
-      sendShellInvite(id);
+      sendDataInvite(id);
+      armDataTimer(id, DATA_RING_TIMEOUT_MS);
       break;
 
     case "ringing":
-      // no callee-side path yet — see the "ringing" paragraph at the top
-      showIncomingShellUI(id);
+      // needs an explicit user action — see the "ringing" paragraph at the top
+      showIncomingDataUI(id);
+      armDataTimer(id, DATA_RING_TIMEOUT_MS);
       break;
 
     case "negotiating":
-      if (oldPhase === "ringing") hideIncomingShellUI(id);
-      if (role === "caller") shellRtcOffer(id);
-      // callee waits for the offer to arrive — nothing to do on entry
-      // here, same as the call-side comment above (and, for shell, no
-      // handler for that offer exists yet)
+      if (oldPhase === "ringing") hideIncomingDataUI(id);
+      if (role === "caller") dataRtcOffer(id);
+      // callee waits for the offer to arrive (handleDataOffer answers it)
+      // — nothing to do on entry here, same as the call-side comment above
+      armDataTimer(id, DATA_NEGOTIATE_TIMEOUT_MS);
       break;
 
     case "connected":
-      mlog.info(`SHELL UP  ${pid(id)}`);
-      hideIncomingShellUI(id);
+      mlog.info(`DATA UP  ${pid(id)}`);
+      hideIncomingDataUI(id);
       break;
 
     case "failed":
-      mlog.warn(`SHELL FAILED  ${pid(id)}`);
-      shellRtcClose(id);
+      mlog.warn(`DATA FAILED  ${pid(id)}`);
+      clearDataTimer(id);
+      reportDataResult(id, false, `data channel with ${dataPeerName(id)} failed — the connection could not be established (firewall/NAT? there is no relay for data channels)`);
+      dataRtcClose(id);
       break;
 
     case "idle":
+      clearDataTimer(id);
       if (oldPhase === "ringing" || oldPhase === "calling")
-        hideIncomingShellUI(id);
-      shellRtcClose(id);   // safe no-op if no pc exists for this contact
+        hideIncomingDataUI(id);
+      dataRtcClose(id);   // safe no-op if no pc exists for this contact
       break;
   }
+  updateDataHeaderBtn(id);
 }

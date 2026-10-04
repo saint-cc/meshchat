@@ -113,6 +113,7 @@ if ("serviceWorker" in navigator) {
           <div id="chatHeaderRelay" style="display:none;font-size:10px;color:var(--muted);margin-top:2px;letter-spacing:0.05em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis"></div>		  
         </div>		
 		<button id="callBtn" title="Call">☎</button>
+		<button id="dataBtn" title="Test data channel">⇄</button>
 		<button id="contactMenuBtn" title="Contact options">⋯</button>
       </div>
       <div class="contact-dropdown" id="contactDropdown">
@@ -154,6 +155,21 @@ if ("serviceWorker" in navigator) {
     <button id="declineCallBtn">DECLINE</button>
   </div>
 </div>
+
+<!-- incoming data-channel test. Deliberately a separate banner from the call
+     one: different ids, different handlers, and both can in principle be up
+     at once (style.css stacks the second one below the first). -->
+<div id="incomingDataBanner">
+  <div id="incomingDataName"></div>
+  <div id="incomingDataHint">accepting shares your network address with them</div>
+  <div class="incomingCallBtns">
+    <button id="answerDataBtn">ACCEPT</button>
+    <button id="declineDataBtn">DECLINE</button>
+  </div>
+</div>
+
+<!-- result line for the data-channel test (both sides) — transient, never stored -->
+<div id="dataToast"></div>
 
 <!-- CONTACT ACTION MODAL -->
 <div id="contactActionOverlay" class="overlay">

@@ -274,12 +274,73 @@ document.getElementById("callBtn").onclick = () => {
 document.getElementById("answerCallBtn").onclick  = () => { if (incomingCallContactId) answerCall(incomingCallContactId); };
 document.getElementById("declineCallBtn").onclick = () => { if (incomingCallContactId) cancelCall(incomingCallContactId); };
 
-function showIncomingShellUI(id) {
-  mlog.debug(`SHELL      showIncomingShellUI(${pid(id)}) — log-only stub, no callee-side UI yet`);
+/* ══════════════════════════════════════════
+   DATA-CHANNEL TEST — header button, accept banner, result toast
+   Same shape as the call UI above (that is deliberate — the session
+   machinery underneath is the same table), minus anything media. The
+   result toast is where the one thing this feature produces ends up:
+   "it works (N ms)" or "it doesn't". It is transient and never written
+   into contact.messages — a connection test isn't conversation, and
+   anything in messages is backed up and synced to sibling devices.
+══════════════════════════════════════════ */
+let incomingDataContactId = null;
+
+function showIncomingDataUI(id) {
+  incomingDataContactId = id;
+  const contact = state.contacts[id];
+  document.getElementById("incomingDataName").textContent = (contact?.name || pid(id)) + " wants to test the data channel";
+  document.getElementById("incomingDataBanner").classList.add("open");
+  updateDataHeaderBtn(id);
 }
 
-function hideIncomingShellUI(id) {
-  mlog.debug(`SHELL      hideIncomingShellUI(${pid(id)}) — stub`);
+function hideIncomingDataUI(id) {
+  if (incomingDataContactId === id) {
+    incomingDataContactId = null;
+    document.getElementById("incomingDataBanner").classList.remove("open");
+  }
+  updateDataHeaderBtn(id);
+}
+
+// Reflects data.phase on the header button — same only-if-open guard as
+// updateCallHeaderBtn.
+function updateDataHeaderBtn(id) {
+  if (id !== state.currentChat) return;
+  const btn = document.getElementById("dataBtn");
+  if (!btn) return;
+  const isMe  = id === state.publicId;
+  const phase = state.contacts[id]?.data?.phase || "idle";
+  const GLYPH = { idle: "⇄", calling: "⇄…", ringing: "⇄…", negotiating: "⇄…", connected: "⇄…", failed: "⇄" };
+  const TITLE = { idle: "Test data channel", calling: "Waiting for answer… (click to cancel)", ringing: "Incoming — use the popup",
+                  negotiating: "Connecting… (click to cancel)", connected: "Testing… (click to end)", failed: "Test failed (click to reset)" };
+  btn.className   = "state-" + phase;
+  btn.classList.toggle("visible", !isMe);
+  btn.textContent = GLYPH[phase] || "⇄";
+  btn.title       = TITLE[phase] || "Test data channel";
+  btn.disabled    = phase === "ringing";   // accept/decline only via the popup, to avoid two conflicting controls
+}
+
+document.getElementById("dataBtn").onclick = () => {
+  const id = state.currentChat;
+  if (!id || id === state.publicId) return;
+  const phase = state.contacts[id]?.data?.phase || "idle";
+  if (phase === "idle")                                                   startData(id);
+  else if (phase === "calling" || phase === "negotiating")                cancelData(id);
+  else if (phase === "connected")                                         endData(id);
+  else if (phase === "failed")                                            transition(id, { type: "reset" }, "data");
+};
+
+document.getElementById("answerDataBtn").onclick  = () => { if (incomingDataContactId) answerData(incomingDataContactId); };
+document.getElementById("declineDataBtn").onclick = () => { if (incomingDataContactId) cancelData(incomingDataContactId); };
+
+// textContent, never innerHTML — the text carries a contact's local display
+// name, and nothing here should ever be a way to turn that into markup.
+let _dataToastTimer = null;
+function showDataToast(text, ok) {
+  const el = document.getElementById("dataToast");
+  el.textContent = (ok ? "✓ " : "✗ ") + text;
+  el.className   = "open " + (ok ? "ok" : "fail");
+  clearTimeout(_dataToastTimer);
+  _dataToastTimer = setTimeout(() => { el.className = ""; }, 7000);
 }
 
 /* ══════════════════════════════════════════
@@ -496,6 +557,7 @@ function openChat(id) {
   idEl.textContent   = c.publicId.slice(0,16) + "…";
   updateChatRelayInfo(id);
   updateCallHeaderBtn(id);
+  updateDataHeaderBtn(id);
   const menuBtn = document.getElementById("contactMenuBtn");
   const isMe    = c.publicId === state.publicId;
   menuBtn.classList.add("visible");

@@ -614,7 +614,7 @@
 #callBtn.state-failed { color: var(--danger); border-color: var(--danger); animation: none; }
 #callBtn:disabled { opacity: 0.5; cursor: default; animation: none; }
 
-#incomingCallBanner {
+#incomingCallBanner, #incomingDataBanner {
   display: none;
   position: fixed; top: 0; left: 50%; transform: translateX(-50%);
   background: var(--surface2); border: 1px solid var(--accent); border-top: none;
@@ -622,12 +622,43 @@
   flex-direction: column; align-items: center; gap: 10px;
   box-shadow: 0 4px 16px rgba(0,0,0,.6);
 }
-#incomingCallBanner.open { display: flex; }
-#incomingCallName { font-size: 13px; letter-spacing: 0.1em; color: var(--accent); }
+#incomingCallBanner.open, #incomingDataBanner.open { display: flex; }
+#incomingCallName, #incomingDataName { font-size: 13px; letter-spacing: 0.1em; color: var(--accent); }
 .incomingCallBtns { display: flex; gap: 8px; }
 .incomingCallBtns button {
   padding: 8px 16px; font-family: inherit; font-size: 11px; letter-spacing: 0.1em;
   border: 1px solid var(--border); cursor: pointer;
 }
-#answerCallBtn  { background: var(--online); color: #000; border-color: var(--online); font-weight: bold; }
-#declineCallBtn { background: none; color: var(--danger); border-color: var(--danger); }
+#answerCallBtn, #answerDataBtn  { background: var(--online); color: #000; border-color: var(--online); font-weight: bold; }
+#declineCallBtn, #declineDataBtn { background: none; color: var(--danger); border-color: var(--danger); }
+
+/* second banner drops below the first when a call and a data test arrive together */
+#incomingCallBanner.open ~ #incomingDataBanner.open { top: 96px; }
+#incomingDataHint { font-size: 10px; color: var(--muted); letter-spacing: 0.05em; }
+
+#dataBtn {
+  background: none; border: 1px solid var(--border); color: var(--accent);
+  width: 28px; height: 28px; font-size: 14px; cursor: pointer;
+  display: none; align-items: center; justify-content: center;
+  transition: border-color 0.2s, color 0.2s, background 0.2s;
+  flex-shrink: 0; margin-right: 8px;
+}
+#dataBtn.visible { display: flex; }
+#dataBtn:hover { border-color: var(--accent); background: var(--surface2); }
+#dataBtn.state-calling, #dataBtn.state-ringing, #dataBtn.state-negotiating {
+  color: var(--accent); border-color: var(--accent); animation: pulse 1s infinite;
+}
+#dataBtn.state-connected { color: var(--online); border-color: var(--online); animation: pulse 1s infinite; }
+#dataBtn.state-failed { color: var(--danger); border-color: var(--danger); animation: none; }
+#dataBtn:disabled { opacity: 0.5; cursor: default; animation: none; }
+
+#dataToast {
+  display: none; position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
+  max-width: min(520px, 90vw); padding: 10px 16px; z-index: 600;
+  font-size: 12px; letter-spacing: 0.05em; text-align: center; line-height: 1.5;
+  background: var(--surface2); border: 1px solid var(--border);
+  box-shadow: 0 4px 16px rgba(0,0,0,.6);
+}
+#dataToast.open { display: block; }
+#dataToast.ok   { color: var(--online); border-color: var(--online); }
+#dataToast.fail { color: var(--danger); border-color: var(--danger); }

@@ -331,8 +331,8 @@ connected: dict[str, set] = {}   # publicId → set of websockets
 # NOT a replacement for `connected`: a socket that presents a endpoint_id at
 # auth ends up in both. endpointId is a separate HKDF derivation off the same
 # device seed as deviceId, deliberately unlinkable from it (see
-# deriveDeviceEndpointId in meshchat-lib.js / derive_device_endpoint_id in
-# Agent.py) — this map is what lets route_or_buffer target one specific
+# deriveDeviceEndpointId in meshchat-lib.js) — this map is what lets
+# route_or_buffer target one specific
 # device ("bob::laptop") instead of fanning an app:message out to every live
 # session under a publicId. A set (not a bare ws) per endpointId in case a
 # device briefly holds two sockets across a reconnect race.
@@ -751,7 +751,7 @@ async def route_or_buffer(kind, frm, to_id, to_endpoint, msg, ws):
     receive the message live. app:migrate/app:burn/session:propose/
     session:ack never push — none of them are something a human needs to
     be woken up for (the handshake is transparent crypto housekeeping,
-    same reasoning call:*/shell:* signaling packets never push either).
+    same reasoning call:*/data:* signaling packets never push either).
 
     Device targeting (app:message only): a `to` address carrying a
     "::endpointId" suffix is delivered only to that specific registered
@@ -1570,8 +1570,8 @@ async def handler(ws):
                           "sync:token_req", "sync:token_resp",
                           "call:invite", "call:claim", "call:cancel", "call:end",
                           "call:offer", "call:answer", "call:ice",
-                          "shell:invite", "shell:claim", "shell:cancel", "shell:end",
-                          "shell:offer", "shell:answer", "shell:ice"):
+                          "data:invite", "data:claim", "data:cancel", "data:end",
+                          "data:offer", "data:answer", "data:ice"):
                 frm = msg.get("from", "?")
                 # `to` may carry a compound "id::endpointId" address — see
                 # parse_address()'s comment near valid_id for the format.
@@ -1581,7 +1581,7 @@ async def handler(ws):
                 # — none of these types are durably buffered, so a
                 # device-targeted `to` aimed at a currently-offline device
                 # simply reaches nobody, exactly like an untargeted send to
-                # an offline recipient already does today. call:*/shell:*
+                # an offline recipient already does today. call:*/data:*
                 # never send a device-targeted address, so their behavior
                 # is byte-for-byte unchanged; sync:backup_push/accept are
                 # the first types to actually use it, for self-device-
@@ -1604,7 +1604,7 @@ async def handler(ws):
                 # frm_id falls straight through to the original bare
                 # string, so the client_ids membership check below is
                 # byte-for-byte the same check it always was for
-                # app:sync/restore_req/token_*/call:*/shell:*. The message
+                # app:sync/restore_req/token_*/call:*/data:*. The message
                 # is forwarded to the recipient exactly as received — this
                 # only changes what the AUTH check itself is allowed to
                 # match against.
@@ -1627,7 +1627,7 @@ async def handler(ws):
                 log.info("%-16s from=%s  to=%s  reached=%d",
                          kind.upper()[:16], short_addr(frm), short_addr(msg.get("to")), reached)
                 # sync:backup_push is deliberately NOT buffered — live delivery
-                # only, same as every other sync:*/call:*/shell:* type in this
+                # only, same as every other sync:*/call:*/data:* type in this
                 # branch. History: 0.5.0 buffered it on a missed live
                 # delivery so offline siblings would catch up on mini
                 # backups. That was the wrong tool:

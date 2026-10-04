@@ -1,7 +1,7 @@
 /* ═════════════════════════════════════════════════════════════
    MESHCHAT — meshchat.js  (formerly script.js)
    Core client: `state`, WebSocket/relay plumbing, the protocol
-   handlers (messages, migrate, burn, calls, shell escalation,
+   handlers (messages, migrate, burn, calls, data sessions,
    sync/backup), and the crypto functions that reach into `state`
    directly (decryptMessage, signBlob — see lib.js for their
    stateless counterparts, decryptObject/verifyBlob etc.).
@@ -1096,7 +1096,7 @@ async function getOrDeriveWireKey(contactId, theirDeviceId) {
    session:propose / session:ack carry no blob — ekPub is a public key,
    not secret, so nothing here needs encryption; the signature is what
    makes it trustworthy. Mandatory signature, same trust tier as
-   app:migrate / app:burn / the call and shell signaling groups — this
+   app:migrate / app:burn / the call and data signaling groups — this
    drives crypto session state, not just display, so an unsigned or
    invalid packet is dropped outright rather than flagged and shown.
 ── */
@@ -3372,13 +3372,13 @@ function handleSignal(msg) {
 	case "call:offer":  handleCallOffer(msg);   break;
 	case "call:answer": handleCallAnswer(msg);  break;
 	case "call:ice":    handleCallIce(msg);     break;
-	case "shell:invite":handleShellInvite(msg); break;
-	case "shell:claim": handleShellClaim(msg);  break;
-	case "shell:cancel":handleShellCancel(msg); break;
-	case "shell:end":   handleShellEnd(msg);    break;	
-    case "shell:offer": handleShellOffer(msg);  break;
-    case "shell:answer":handleShellAnswer(msg); break;
-    case "shell:ice":   handleShellIce(msg);    break;
+	case "data:invite":handleDataInvite(msg); break;
+	case "data:claim": handleDataClaim(msg);  break;
+	case "data:cancel":handleDataCancel(msg); break;
+	case "data:end":   handleDataEnd(msg);    break;	
+    case "data:offer": handleDataOffer(msg);  break;
+    case "data:answer":handleDataAnswer(msg); break;
+    case "data:ice":   handleDataIce(msg);    break;
 	case "session:propose": handleX4DHPropose(msg); break;
 	case "session:ack":     handleX4DHAck(msg);     break;
 	
@@ -4994,12 +4994,12 @@ function verifyCallPacket(obj, contactSignPublicKey) {
   return verifyBlob({ type, from, to, callId, deviceId: deviceId || null, ts, blob: blob || null }, obj.sig, contactSignPublicKey);
 }
 
-function signShellPacket(obj) {
+function signDataPacket(obj) {
   const { type, from, to, sessionId, deviceId, ts, blob } = obj;
   return signBlob({ type, from, to, sessionId, deviceId: deviceId || null, ts, blob: blob || null });
 }
 
-function verifyShellPacket(obj, contactSignPublicKey) {
+function verifyDataPacket(obj, contactSignPublicKey) {
   if (!obj.sig || !contactSignPublicKey) return false;
   const { type, from, to, sessionId, deviceId, ts, blob } = obj;
   return verifyBlob({ type, from, to, sessionId, deviceId: deviceId || null, ts, blob: blob || null }, obj.sig, contactSignPublicKey);
@@ -5031,7 +5031,7 @@ function sendCallPacket(toId, type, callId) {
    state-aware (e.g. update the same id's text as the call phase
    advances) once that's actually wanted; no need to build that now.
 
-   Deliberately only wired for voice calls, never the shell/data session
+   Deliberately only wired for voice calls, never the data session
    kind — that one has no conversational surface to leave a notice for. ── */
 async function sendCallNotice(id) {
   const contact = state.contacts[id];
@@ -5192,115 +5192,201 @@ async function handleCallEnd(msg) {
   transition(msg.from, { type: "call_ended" });
 }
 
-async function handleShellInvite(msg) {
+async function handleDataInvite(msg) {
   if (!msg.from || !msg.to || !msg.sessionId || parseAddress(msg.to).id !== state.publicId) return;
   const contact = state.contacts[msg.from];
   if (!contact || contact.blocked) return;
-  if (!verifyShellPacket(msg, contact.signPublicKey)) {
-    mlog.warn(`← SHELL INVITE from ${pid(msg.from)} — signature invalid, dropped`);
+  if (!verifyDataPacket(msg, contact.signPublicKey)) {
+    mlog.warn(`← DATA INVITE  from ${pid(msg.from)} — signature invalid, dropped`);
     return;
   }
   markOnline(msg.from);
-  if (contact.shell && contact.shell.phase !== "idle") {
-    mlog.debug(`← SHELL INVITE from ${pid(msg.from)} — already in session (phase=${contact.shell.phase}), ignored`);
+  if (contact.data && contact.data.phase !== "idle") {
+    mlog.debug(`← DATA INVITE  from ${pid(msg.from)} — already in session (phase=${contact.data.phase}), ignored`);
     return;
   }
-  contact.shell = { sessionId: msg.sessionId, phase: "idle", role: null };
-  transition(msg.from, { type: "invite_received" }, "shell");
+  contact.data = { sessionId: msg.sessionId, phase: "idle", role: null };
+  transition(msg.from, { type: "invite_received" }, "data");
 }
 
-async function handleShellClaim(msg) {
+// Called by the cancel/end handlers before they transition. If the peer stops
+// a session that was mid-negotiation or mid-test and this side hadn't seen its
+// half succeed, that is a result worth telling the user about; a cancel while
+// still ringing (the normal "caller gave up") and the end that follows a
+// successful test (finished is set) are not.
+function reportDataEndedEarly(id, verb) {
+  const phase = state.contacts[id]?.data?.phase;
+  if ((phase === "negotiating" || phase === "connected") && !dataConns[id]?.finished) {
+    reportDataResult(id, false, `${dataPeerName(id)} ${verb} the data channel test before it finished`);
+  }
+}
+
+async function handleDataClaim(msg) {
+  if (!msg.from || !msg.to || !msg.sessionId || parseAddress(msg.to).id !== state.publicId) return;
+
+  if (msg.from === state.publicId) {
+    // one of OUR OTHER devices accepted — verify against our own signing
+    // key, not a contact's, since this is self-addressed. Same multi-device
+    // dedup as call:claim: every device that was ringing on this sessionId
+    // stops ringing, silently.
+    const me = state.contacts[state.publicId];
+    if (!verifyDataPacket(msg, me.signPublicKey)) {
+      mlog.warn(`← DATA CLAIM   from self — signature invalid, dropped`);
+      return;
+    }
+    if (msg.deviceId === state.deviceId) return;   // our own echo, shouldn't happen
+    const contactId = Object.keys(state.contacts)
+      .find(id => state.contacts[id].data?.sessionId === msg.sessionId);
+    if (!contactId) return;   // stale — we're not tracking this sessionId (anymore)
+    mlog.info(`← DATA CLAIM   from self — accepted on another device`);
+    transition(contactId, { type: "claimed_elsewhere" }, "data");
+    return;
+  }
+
+  const contact = state.contacts[msg.from];
+  if (!contact || contact.blocked) return;
+  if (!verifyDataPacket(msg, contact.signPublicKey)) {
+    mlog.warn(`← DATA CLAIM   from ${pid(msg.from)} — signature invalid, dropped`);
+    return;
+  }
+  if (contact.data?.sessionId !== msg.sessionId) {
+    mlog.debug(`← DATA CLAIM   from ${pid(msg.from)} — sessionId mismatch/stale, ignored`);
+    return;
+  }
+  markOnline(msg.from);
+  transition(msg.from, { type: "claim_received" }, "data");
+}
+
+async function handleDataCancel(msg) {
+  if (!msg.from || !msg.to || !msg.sessionId || parseAddress(msg.to).id !== state.publicId) return;
+  const contact = state.contacts[msg.from];
+  if (!contact) return;
+  if (!verifyDataPacket(msg, contact.signPublicKey)) {
+    mlog.warn(`← DATA CANCEL  from ${pid(msg.from)} — signature invalid, dropped`);
+    return;
+  }
+  if (contact.data?.sessionId !== msg.sessionId) return;
+  reportDataEndedEarly(msg.from, "cancelled");
+  transition(msg.from, { type: "session_cancelled" }, "data");
+}
+
+async function handleDataEnd(msg) {
+  if (!msg.from || !msg.to || !msg.sessionId || parseAddress(msg.to).id !== state.publicId) return;
+  const contact = state.contacts[msg.from];
+  if (!contact) return;
+  if (!verifyDataPacket(msg, contact.signPublicKey)) {
+    mlog.warn(`← DATA END     from ${pid(msg.from)} — signature invalid, dropped`);
+    return;
+  }
+  if (contact.data?.sessionId !== msg.sessionId) return;
+  reportDataEndedEarly(msg.from, "ended");
+  transition(msg.from, { type: "session_ended" }, "data");
+}
+
+// Callee side (mirrors handleCallOffer). Only valid while we've accepted
+// (phase negotiating, role callee) — an offer outside that window is either
+// stale or somebody poking, and answering it would open a peer connection
+// the user never agreed to.
+async function handleDataOffer(msg) {
   if (!msg.from || !msg.to || !msg.sessionId || parseAddress(msg.to).id !== state.publicId) return;
   const contact = state.contacts[msg.from];
   if (!contact || contact.blocked) return;
-  if (!verifyShellPacket(msg, contact.signPublicKey)) {
-    mlog.warn(`← SHELL CLAIM  from ${pid(msg.from)} — signature invalid, dropped`);
+  if (!verifyDataPacket(msg, contact.signPublicKey)) {
+    mlog.warn(`← DATA OFFER   from ${pid(msg.from)} — signature invalid, dropped`);
     return;
   }
-  if (contact.shell?.sessionId !== msg.sessionId) {
-    mlog.debug(`← SHELL CLAIM  from ${pid(msg.from)} — sessionId mismatch/stale, ignored`);
+  if (contact.data?.sessionId !== msg.sessionId || contact.data.role !== "callee" || contact.data.phase !== "negotiating") {
+    mlog.debug(`← DATA OFFER   from ${pid(msg.from)} — not expecting offer (phase=${contact.data?.phase}, role=${contact.data?.role}), ignored`);
     return;
   }
   markOnline(msg.from);
-  transition(msg.from, { type: "claim_received" }, "shell");
-}
+  let plain;
+  try { plain = await decryptMessage(msg.blob, contact.encKey); }
+  catch(e) { mlog.warn(`← DATA OFFER   from ${pid(msg.from)} — decrypt failed`); return; }
+  if (typeof plain?.sdp !== "string") { mlog.warn(`← DATA OFFER   from ${pid(msg.from)} — no sdp, dropped`); return; }
 
-async function handleShellCancel(msg) {
-  if (!msg.from || !msg.to || !msg.sessionId || parseAddress(msg.to).id !== state.publicId) return;
-  const contact = state.contacts[msg.from];
-  if (!contact) return;
-  if (!verifyShellPacket(msg, contact.signPublicKey)) {
-    mlog.warn(`← SHELL CANCEL from ${pid(msg.from)} — signature invalid, dropped`);
-    return;
+  try {
+    const pc = createDataPeerConnection(msg.from);
+    // The offerer creates the channel; we only ever receive it. Anything
+    // other than the one channel this feature defines is closed unseen.
+    pc.ondatachannel = (ev) => {
+      if (ev.channel.label !== "data") {
+        mlog.debug(`DATA RTC   unexpected channel "${ev.channel.label}" — closed  ${pid(msg.from)}`);
+        ev.channel.close();
+        return;
+      }
+      const ent = dataConns[msg.from];
+      if (!ent) return;
+      ent.dataCh = ev.channel;
+      wireDataChannel(msg.from, ev.channel);
+    };
+    await pc.setRemoteDescription({ type: "offer", sdp: plain.sdp });
+    await flushDataIceQueue(msg.from);
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+    await sendDataSDP(msg.from, "data:answer", answer.sdp);
+    mlog.info(`← DATA OFFER   from ${pid(msg.from)} — answered`);
+  } catch(e) {
+    mlog.err(`DATA RTC   answer failed: ${e.message}`);
+    transition(msg.from, { type: "rtc_failed" }, "data");
   }
-  if (contact.shell?.sessionId !== msg.sessionId) return;
-  transition(msg.from, { type: "call_cancelled" }, "shell");
-}
-
-async function handleShellEnd(msg) {
-  if (!msg.from || !msg.to || !msg.sessionId || parseAddress(msg.to).id !== state.publicId) return;
-  const contact = state.contacts[msg.from];
-  if (!contact) return;
-  if (!verifyShellPacket(msg, contact.signPublicKey)) {
-    mlog.warn(`← SHELL END    from ${pid(msg.from)} — signature invalid, dropped`);
-    return;
-  }
-  if (contact.shell?.sessionId !== msg.sessionId) return;
-  transition(msg.from, { type: "call_ended" }, "shell");
-}
-
-async function handleShellOffer(msg) {
-  // No callee-side path exists yet: this client only ever acts as the
-  // offerer for the shell kind. Logged rather than silently ignored so an
-  // incoming offer is at least visible in a live test.
-  mlog.debug(`← SHELL OFFER  from ${pid(msg.from)} — no callee-side handler yet, ignored`);
 }
  
-async function handleShellAnswer(msg) {
+async function handleDataAnswer(msg) {
   if (!msg.from || !msg.to || !msg.sessionId || parseAddress(msg.to).id !== state.publicId) return;
   const contact = state.contacts[msg.from];
   if (!contact || contact.blocked) return;
-  if (!verifyShellPacket(msg, contact.signPublicKey)) {
-    mlog.warn(`← SHELL ANSWER from ${pid(msg.from)} — signature invalid, dropped`);
+  if (!verifyDataPacket(msg, contact.signPublicKey)) {
+    mlog.warn(`← DATA ANSWER  from ${pid(msg.from)} — signature invalid, dropped`);
     return;
   }
-  if (contact.shell?.sessionId !== msg.sessionId || contact.shell.role !== "caller") {
-    mlog.debug(`← SHELL ANSWER from ${pid(msg.from)} — not expecting answer, ignored`);
+  if (contact.data?.sessionId !== msg.sessionId || contact.data.role !== "caller") {
+    mlog.debug(`← DATA ANSWER  from ${pid(msg.from)} — not expecting answer, ignored`);
     return;
   }
   markOnline(msg.from);
-  const entry = shellConns[msg.from];
-  if (!entry) { mlog.warn(`← SHELL ANSWER from ${pid(msg.from)} — no pc, dropped`); return; }
+  const entry = dataConns[msg.from];
+  if (!entry) { mlog.warn(`← DATA ANSWER  from ${pid(msg.from)} — no pc, dropped`); return; }
   try {
     const plain = await decryptMessage(msg.blob, contact.encKey);
     await entry.pc.setRemoteDescription({ type: "answer", sdp: plain.sdp });
-    await flushShellIceQueue(msg.from);
-    mlog.info(`← SHELL ANSWER from ${pid(msg.from)} — remote set`);
+    await flushDataIceQueue(msg.from);
+    mlog.info(`← DATA ANSWER  from ${pid(msg.from)} — remote set`);
   } catch(e) {
-    mlog.err(`← SHELL ANSWER from ${pid(msg.from)} — failed: ${e.message}`);
-    transition(msg.from, { type: "rtc_failed" }, "shell");
+    mlog.err(`← DATA ANSWER  from ${pid(msg.from)} — failed: ${e.message}`);
+    transition(msg.from, { type: "rtc_failed" }, "data");
   }
 }
  
-async function handleShellIce(msg) {
+async function handleDataIce(msg) {
   if (!msg.from || !msg.to || !msg.sessionId || parseAddress(msg.to).id !== state.publicId) return;
   const contact = state.contacts[msg.from];
   if (!contact || contact.blocked) return;
-  if (!verifyShellPacket(msg, contact.signPublicKey)) {
-    mlog.warn(`← SHELL ICE    from ${pid(msg.from)} — signature invalid, dropped`);
+  if (!verifyDataPacket(msg, contact.signPublicKey)) {
+    mlog.warn(`← DATA ICE     from ${pid(msg.from)} — signature invalid, dropped`);
     return;
   }
-  if (contact.shell?.sessionId !== msg.sessionId) return; // stale/unrelated session
+  if (contact.data?.sessionId !== msg.sessionId || contact.data.phase === "idle") return; // stale/unrelated session
  
   let plain;
   try { plain = await decryptMessage(msg.blob, contact.encKey); }
-  catch(e) { mlog.warn(`← SHELL ICE    from ${pid(msg.from)} — decrypt failed`); return; }
+  catch(e) { mlog.warn(`← DATA ICE     from ${pid(msg.from)} — decrypt failed`); return; }
  
-  const entry = shellConns[msg.from];
-  if (!entry) return;
+  const entry = dataConns[msg.from];
+  if (!entry) {
+    // Callee side: the offerer's candidates can overtake its offer (its
+    // trickle ICE starts the moment setLocalDescription runs, while the
+    // offer still has to be encrypted and signed), and this handler can also
+    // finish its decrypt before handleDataOffer has built the connection.
+    // Hold them instead of dropping them; createDataPeerConnection adopts
+    // the queue. Capped — this is a few candidates, not a stream.
+    const q = (dataEarlyIce[msg.from] ||= []);
+    if (q.length < DATA_EARLY_ICE_MAX) q.push(plain);
+    return;
+  }
   if (entry.pc.remoteDescription) {
     try { await entry.pc.addIceCandidate(plain); }
-    catch(e) { mlog.debug(`SHELL RTC  addIceCandidate failed: ${e.message}`); }
+    catch(e) { mlog.debug(`DATA RTC   addIceCandidate failed: ${e.message}`); }
   } else {
     entry.iceQueue.push(plain);
   }
@@ -5539,156 +5625,296 @@ function rtcClose(id) {
 }
 
 /* ══════════════════════════════════════════
-   SHELL ESCALATION — user-facing entry points
-   Mirrors startCall/cancelCall/endCall exactly, shell-flavored. No header
-   button calls these any more (the agent layer that gated it is gone), so
-   for now they are only reachable from the console. sessionId plays the
-   same role callId does for calls: assigned once here, never touched
-   again by transition() itself.
+   DATA SESSIONS — user-facing entry points
+   A data session is a connection test, nothing more: the caller opens a
+   WebRTC data channel to one contact, sends a single ping, the callee
+   echoes it, the caller reports "works · N ms" and ends the session. It
+   exists to answer "can these two devices reach each other directly?"
+   (there is no TURN — see protocol.md — so sometimes they can't), and to
+   keep the full invite/accept/offer/answer/ICE/channel machinery alive and
+   exercised for whatever builds on it later. Nothing from the channel is
+   stored or forwarded anywhere.
+
+   Mirrors startCall/cancelCall/endCall/answerCall exactly, data-flavored.
+   The header button (meshchat-gui.js) drives start/cancel/end; the accept
+   banner drives answer/cancel. sessionId plays the same role callId does
+   for calls: assigned once here, never touched again by transition()
+   itself.
 ══════════════════════════════════════════ */
-function startShell(id) {
+function startData(id) {
   const contact = state.contacts[id];
   if (!contact || contact.blocked) return;
-  if (contact.shell && contact.shell.phase !== "idle") return;
-  contact.shell = { sessionId: crypto.randomUUID(), phase: "idle", role: null };
-  transition(id, { type: "session_started" }, "shell");
+  if (contact.data && contact.data.phase !== "idle") return;
+  contact.data = { sessionId: crypto.randomUUID(), phase: "idle", role: null };
+  transition(id, { type: "session_started" }, "data");
 }
 
-function cancelShell(id) {
+function cancelData(id) {
   const contact = state.contacts[id];
-  if (!contact?.shell?.sessionId) return;
-  sendShellPacket(id, "shell:cancel", contact.shell.sessionId);
-  transition(id, { type: "session_cancelled" }, "shell");
+  if (!contact?.data?.sessionId) return;
+  sendDataPacket(id, "data:cancel", contact.data.sessionId);
+  transition(id, { type: "session_cancelled" }, "data");
 }
 
-function endShell(id) {
+function endData(id) {
   const contact = state.contacts[id];
-  if (!contact?.shell?.sessionId) return;
-  sendShellPacket(id, "shell:end", contact.shell.sessionId);
-  transition(id, { type: "session_ended" }, "shell");
+  if (!contact?.data?.sessionId) return;
+  sendDataPacket(id, "data:end", contact.data.sessionId);
+  transition(id, { type: "session_ended" }, "data");
+}
+
+// user-facing: accept an incoming test on THIS device. Claims twice, same as
+// answerCall: once to the caller (advances their state), once to our own
+// identity so our other devices stop ringing (handleDataClaim's self branch).
+function answerData(id) {
+  const contact = state.contacts[id];
+  if (!contact?.data?.sessionId || contact.data.phase !== "ringing") return;
+  const sessionId = contact.data.sessionId;
+  transition(id, { type: "claimed_here" }, "data");
+  sendDataPacket(id, "data:claim", sessionId);
+  sendDataPacket(state.publicId, "data:claim", sessionId);
 }
 
 /* ══════════════════════════════════════════
-   SHELL signalling + RTC — statemachine.js's onShellStateEnter calls
-   these. Despite the name this section used to carry ("stubs"), everything
-   here is real except showIncomingShellUI/hideIncomingShellUI, which are
-   still log-only stubs in meshchat-gui.js — there is no callee-side path.
-     sendShellInvite / sendShellPacket — signing (signShellPacket) + send
-     shellRtcOffer / shellRtcClose — RTCPeerConnection + one data channel
-       (shell-data); mirrors rtcOffer/rtcClose but createDataChannel
-       instead of getUserMedia/addTrack
+   DATA signalling + RTC — statemachine.js's onDataStateEnter calls these.
+     sendDataInvite / sendDataPacket — signing (signDataPacket) + send
+     dataRtcOffer / dataRtcClose — RTCPeerConnection + one data channel
+       (labelled "data"); mirrors rtcOffer/rtcClose but createDataChannel
+       instead of getUserMedia/addTrack. The answering half is
+       handleDataOffer (callee side).
+     sendDataPing / onDataReceived — the ping/echo itself
+     armDataTimer / onDataTimeout / reportDataResult — what happens when it
+       doesn't work, and how either outcome is surfaced
 ══════════════════════════════════════════ */
-function sendShellPacket(id, type, sessionId) {
+function sendDataPacket(id, type, sessionId) {
   const obj = { type, from: state.publicId, to: id, sessionId, ts: Date.now(), deviceId: state.deviceId };
-  obj.sig = signShellPacket(obj);
+  obj.sig = signDataPacket(obj);
   const viaRelay = sendToRelay(id, obj, false);
   if (!viaRelay) sendSignal(obj);
   mlog.info(`→ ${type.toUpperCase()}  to ${pid(id)}  session=${pid(sessionId)}  via=${viaRelay ? "relay" : "signal(fallback)"}`);
 }
 
-function sendShellInvite(id) {
+function sendDataInvite(id) {
   const contact = state.contacts[id];
-  if (!contact?.shell?.sessionId) return;
-  sendShellPacket(id, "shell:invite", contact.shell.sessionId);
+  if (!contact?.data?.sessionId) return;
+  sendDataPacket(id, "data:invite", contact.data.sessionId);
 }
 
-const shellConns = {};   // contactId → { pc, dataCh, iceQueue: [] }
+// Timeouts. RING covers invite→accept (the callee is a human with a banner
+// to look at); NEGOTIATE covers accept→result, i.e. ICE plus the ping — long
+// enough for a slow STUN round trip, short enough that "it doesn't work" is
+// an answer rather than a wait.
+const DATA_RING_TIMEOUT_MS      = 30_000;
+const DATA_NEGOTIATE_TIMEOUT_MS = 20_000;
+// The only traffic this channel is meant to carry is two tiny JSON strings,
+// so anything bigger is not from this feature. Checked before JSON.parse.
+const DATA_MAX_MSG_CHARS        = 128;
+// A well-behaved caller sends exactly one ping; this is the slack, not the
+// expectation. Bounds how much a misbehaving peer can make us echo.
+const DATA_MAX_PONGS            = 3;
+const DATA_EARLY_ICE_MAX        = 50;
+
+// contactId → { pc, dataCh, iceQueue, pingNonce, pingSentAt, pongsSent, finished }
+// finished: this side has seen its half of the test succeed. After that, the
+// peer tearing the connection down is expected and must not be reported as a
+// failure (see createDataPeerConnection's onconnectionstatechange).
+const dataConns    = {};
+const dataEarlyIce = {};   // contactId → candidates that arrived before the pc existed
+const dataTimers   = {};   // contactId → timeout handle (at most one per session)
+
+const dataPeerName = (id) => state.contacts[id]?.name || pid(id);
  
-async function sendShellSDP(id, type, sdp) {
+async function sendDataSDP(id, type, sdp) {
   const contact = state.contacts[id];
-  if (!contact?.shell?.sessionId || !contact.encKey) return;
+  if (!contact?.data?.sessionId || !contact.encKey) return;
   const blob = await encryptMessage(contact.encKey, { sdp });
-  const obj  = { type, from: state.publicId, to: id, sessionId: contact.shell.sessionId,
+  const obj  = { type, from: state.publicId, to: id, sessionId: contact.data.sessionId,
                  ts: Date.now(), deviceId: state.deviceId, blob };
-  obj.sig = signShellPacket(obj);
+  obj.sig = signDataPacket(obj);
   const viaRelay = sendToRelay(id, obj, false);
   if (!viaRelay) sendSignal(obj);
-  mlog.info(`→ ${type.toUpperCase()}  to ${pid(id)}  session=${pid(contact.shell.sessionId)}  via=${viaRelay ? "relay" : "signal(fallback)"}`);
+  mlog.info(`→ ${type.toUpperCase()}  to ${pid(id)}  session=${pid(contact.data.sessionId)}  via=${viaRelay ? "relay" : "signal(fallback)"}`);
 }
  
-async function sendShellIce(id, candidate) {
+async function sendDataIce(id, candidate) {
   const contact = state.contacts[id];
-  if (!contact?.shell?.sessionId || !contact.encKey) return;
+  if (!contact?.data?.sessionId || !contact.encKey) return;
   const blob = await encryptMessage(contact.encKey, candidate.toJSON());
-  const obj  = { type: "shell:ice", from: state.publicId, to: id, sessionId: contact.shell.sessionId,
+  const obj  = { type: "data:ice", from: state.publicId, to: id, sessionId: contact.data.sessionId,
                  ts: Date.now(), deviceId: state.deviceId, blob };
-  obj.sig = signShellPacket(obj);
+  obj.sig = signDataPacket(obj);
   const viaRelay = sendToRelay(id, obj, false);
   if (!viaRelay) sendSignal(obj);
-  mlog.debug(`→ SHELL ICE    to ${pid(id)}  session=${pid(contact.shell.sessionId)}`);
+  mlog.debug(`→ DATA ICE     to ${pid(id)}  session=${pid(contact.data.sessionId)}`);
 }
  
-function createShellPeerConnection(id) {
-  if (shellConns[id]?.pc) return shellConns[id].pc;
+function createDataPeerConnection(id) {
+  if (dataConns[id]?.pc) return dataConns[id].pc;
   const pc = new RTCPeerConnection(RTC_CONFIG);   // reuse the same STUN-only config as calls
-  const entry = { pc, dataCh: null, iceQueue: [] };
-  shellConns[id] = entry;
+  const entry = { pc, dataCh: null, iceQueue: dataEarlyIce[id] || [],
+                  pingNonce: null, pingSentAt: 0, pongsSent: 0, finished: false };
+  delete dataEarlyIce[id];
+  dataConns[id] = entry;
  
-  pc.onicecandidate = (e) => { if (e.candidate) sendShellIce(id, e.candidate); };
+  pc.onicecandidate = (e) => { if (e.candidate) sendDataIce(id, e.candidate); };
  
   pc.onconnectionstatechange = () => {
-    mlog.debug(`SHELL RTC  state=${pc.connectionState}  ${pid(id)}`);
-    if (pc.connectionState === "connected") transition(id, { type: "rtc_connected" }, "shell");
-    else if (pc.connectionState === "failed") transition(id, { type: "rtc_failed" }, "shell");
-    else if (pc.connectionState === "closed") transition(id, { type: "rtc_closed" }, "shell");
+    mlog.debug(`DATA RTC   state=${pc.connectionState}  ${pid(id)}`);
+    if (pc.connectionState === "connected") transition(id, { type: "rtc_connected" }, "data");
+    else if (pc.connectionState === "failed") {
+      // After a successful test the caller closes its end straight away; on
+      // our side that can surface as "failed" before the data:end signal
+      // arrives. Not a failure — the test already worked.
+      if (entry.finished) { mlog.debug(`DATA RTC   post-test teardown, ignored  ${pid(id)}`); return; }
+      transition(id, { type: "rtc_failed" }, "data");
+    }
+    else if (pc.connectionState === "closed") transition(id, { type: "rtc_closed" }, "data");
   };
  
   return pc;
 }
  
-async function flushShellIceQueue(id) {
-  const entry = shellConns[id];
+async function flushDataIceQueue(id) {
+  const entry = dataConns[id];
   if (!entry) return;
   for (const cand of entry.iceQueue) {
     try { await entry.pc.addIceCandidate(cand); }
-    catch(e) { mlog.debug(`SHELL RTC  queued ICE add failed: ${e.message}`); }
+    catch(e) { mlog.debug(`DATA RTC   queued ICE add failed: ${e.message}`); }
   }
   entry.iceQueue = [];
 }
  
 // Offerer side only (mirrors rtcOffer for calls), but unlike calls there is
 // no media to acquire — this creates the data channel up front instead.
-async function shellRtcOffer(id) {
+async function dataRtcOffer(id) {
   try {
-    const pc    = createShellPeerConnection(id);
-    const entry = shellConns[id];
+    const pc    = createDataPeerConnection(id);
+    const entry = dataConns[id];
  
-    entry.dataCh = pc.createDataChannel("shell-data");
-    wireShellDataChannel(id, entry.dataCh);
+    entry.dataCh = pc.createDataChannel("data");
+    wireDataChannel(id, entry.dataCh);
  
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
-    await sendShellSDP(id, "shell:offer", offer.sdp);
-    mlog.info(`SHELL RTC  offer sent  ${pid(id)}`);
+    await sendDataSDP(id, "data:offer", offer.sdp);
+    mlog.info(`DATA RTC   offer sent  ${pid(id)}`);
   } catch(e) {
-    mlog.err(`SHELL RTC  offer failed: ${e.message}`);
-    transition(id, { type: "rtc_failed" }, "shell");
+    mlog.err(`DATA RTC   offer failed: ${e.message}`);
+    transition(id, { type: "rtc_failed" }, "data");
   }
 }
  
-function shellRtcClose(id) {
-  const entry = shellConns[id];
+function dataRtcClose(id) {
+  const entry = dataConns[id];
   if (entry) {
     entry.dataCh?.close();
     entry.pc.close();
-    delete shellConns[id];
+    delete dataConns[id];
   }
-  mlog.debug(`SHELL RTC  closed  ${pid(id)}`);
+  delete dataEarlyIce[id];
+  mlog.debug(`DATA RTC   closed  ${pid(id)}`);
 }
  
-// Wiring for the data channel. The callee-side equivalent doesn't exist
-// yet client-side; this is here purely for the offerer's own local channel.
-function wireShellDataChannel(id, ch) {
+// Wiring for the data channel — shared by both sides (the offerer wires the
+// channel it created, the answerer wires the one handed to ondatachannel).
+// The caller pings the moment its end opens; the callee just listens.
+function wireDataChannel(id, ch) {
   ch.binaryType = "arraybuffer";
-  ch.onopen = () => mlog.info(`SHELL RTC  data channel open  ${pid(id)}`);
-  ch.onclose = () => mlog.debug(`SHELL RTC  data channel closed  ${pid(id)}`);
-  ch.onmessage = (e) => {
-    // No consumer yet — the xterm terminal that used to take these bytes is
-    // gone, and the DATA kind's own receive hook comes later. Size-only debug
-    // log so a live test can at least see traffic arriving.
-    const size = e.data instanceof ArrayBuffer ? e.data.byteLength : (e.data?.size ?? e.data?.length ?? 0);
-    mlog.debug(`SHELL RTC  data rx  ${size}b  ${pid(id)}`);
+  ch.onopen = () => {
+    mlog.info(`DATA RTC   data channel open  ${pid(id)}`);
+    if (state.contacts[id]?.data?.role === "caller") sendDataPing(id);
   };
+  ch.onclose = () => mlog.debug(`DATA RTC   data channel closed  ${pid(id)}`);
+  ch.onmessage = (e) => onDataReceived(id, e.data);
+}
+
+function sendDataPing(id) {
+  const entry = dataConns[id];
+  if (!entry?.dataCh || entry.dataCh.readyState !== "open") return;
+  entry.pingNonce  = Math.random().toString(36).slice(2, 10);
+  entry.pingSentAt = performance.now();
+  entry.dataCh.send(JSON.stringify({ t: "ping", n: entry.pingNonce }));
+  mlog.debug(`DATA RTC   ping sent  ${pid(id)}`);
+}
+
+// The receive hook. Strict on purpose — this is a channel to a peer that has
+// only been trusted enough to talk to, not one whose content we act on:
+// strings only, short, one known shape, a nonce that must match what we sent,
+// and role-gated (only a callee answers a ping, only a caller accepts a pong).
+function onDataReceived(id, data) {
+  const entry = dataConns[id];
+  if (!entry) return;
+  if (typeof data !== "string" || data.length > DATA_MAX_MSG_CHARS) {
+    mlog.debug(`DATA RTC   dropped non-conforming message  ${pid(id)}`);
+    return;
+  }
+  let msg;
+  try { msg = JSON.parse(data); } catch(e) { return; }
+  if (!msg || typeof msg.n !== "string" || msg.n.length > 32) return;
+
+  const role = state.contacts[id]?.data?.role;
+  if (msg.t === "ping" && role === "callee") {
+    if (entry.pongsSent >= DATA_MAX_PONGS || entry.dataCh?.readyState !== "open") return;
+    entry.pongsSent++;
+    entry.dataCh.send(JSON.stringify({ t: "pong", n: msg.n }));
+    if (!entry.finished) {
+      entry.finished = true;
+      reportDataResult(id, true, `data channel with ${dataPeerName(id)} works (they ran the test)`);
+    }
+  } else if (msg.t === "pong" && role === "caller" && entry.pingNonce !== null && msg.n === entry.pingNonce) {
+    const rtt = Math.max(1, Math.round(performance.now() - entry.pingSentAt));
+    entry.pingNonce = null;
+    entry.finished  = true;
+    reportDataResult(id, true, `data channel to ${dataPeerName(id)} works · ${rtt} ms`);
+    endData(id);   // test over — signals the callee and tears our side down
+  }
+}
+
+// One timer per session, replaced on every phase entry (see onDataStateEnter).
+function clearDataTimer(id) {
+  clearTimeout(dataTimers[id]);
+  delete dataTimers[id];
+}
+function armDataTimer(id, ms) {
+  clearDataTimer(id);
+  dataTimers[id] = setTimeout(() => { delete dataTimers[id]; onDataTimeout(id); }, ms);
+}
+
+// What each phase's timeout means, and who tells the peer:
+//   ringing      callee never answered — nothing to tell, the caller's own
+//                timer (or its cancel) covers its side
+//   calling      no answer — tell the callee to stop ringing (data:cancel)
+//   negotiating/ connected but no result — tell the peer (data:end)
+//   connected
+// A session whose test already succeeded (finished) is only waiting on the
+// peer's data:end to arrive; if that was lost, close quietly rather than
+// report a failure for something that worked.
+function onDataTimeout(id) {
+  const d = state.contacts[id]?.data;
+  if (!d || d.phase === "idle" || d.phase === "failed") return;
+  const name  = dataPeerName(id);
+  const phase = d.phase;
+
+  if (dataConns[id]?.finished) {
+    transition(id, { type: "idle_timeout" }, "data");
+    return;
+  }
+  if (phase === "ringing") {
+    reportDataResult(id, false, `data channel test request from ${name} expired`);
+    transition(id, { type: "session_cancelled" }, "data");
+    return;
+  }
+  reportDataResult(id, false, phase === "calling"
+    ? `no answer from ${name}`
+    : `couldn't connect to ${name} in time — a firewall/NAT may be blocking the direct path (there is no relay for data channels)`);
+  sendDataPacket(id, phase === "calling" ? "data:cancel" : "data:end", d.sessionId);
+  transition(id, { type: "idle_timeout" }, "data");
+}
+
+// Single place a result becomes visible: the in-page log and the toast.
+function reportDataResult(id, ok, text) {
+  if (ok) mlog.info(`DATA       ${text}`); else mlog.warn(`DATA       ${text}`);
+  showDataToast(text, ok);
 }
 
 /* ══════════════════════════════════════════
