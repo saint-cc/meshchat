@@ -4,19 +4,20 @@ Working notes on what's done, what's next, and what still needs a real design
 conversation before it gets touched. Not a promise of order or timing — just
 so the list lives somewhere other than someone's head.
 
-Current version: `0.5.0` per `protocol.md`'s formal wire spec, as of this
-update — the X4DH session-establishment work (root-key bootstrap/upgrade,
-per-device wire encryption, targeted ack routing, and the tightened device
-registry retention) has now been witnessed firing correctly live and
-unprompted enough times to graduate from this file's own tracking into
-`protocol.md` itself, per this project's documentation discipline. `X4DH.md`
-remains the authoritative document for the cryptographic design and the
-live-confirmation status of pieces still in progress (automatic retry,
-self-sync forward secrecy, etc.) — `protocol.md` only carries the wire
-shapes and relay-visible behavior, not the DH derivations. One piece of the
-`0.5.0` cycle has NOT graduated: the `sync:backup_push` offline-buffering fix
-(see Done, below) is implemented but still not independently confirmed live,
-so it stays here rather than in `protocol.md` until that changes.
+Current version: `0.5.5` (client `CLIENT_VERSION` and relay `PROTOCOL_VERSION`
+both). `0.5.0`'s X4DH session-establishment work — root-key bootstrap/upgrade,
+per-device wire encryption, the tightened device registry retention — graduated
+into `protocol.md` once it had been witnessed firing correctly live and
+unprompted. `X4DH.md` remains the authoritative document for the cryptographic
+design and for the live-confirmation status of pieces still in progress
+(automatic retry's exhausted → re-armed transition, etc.); `protocol.md` only
+carries wire shapes and relay-visible behavior, not the DH derivations.
+
+The `0.5.3`–`0.5.5` work (see `CHANGELOG.md`) is implemented and being exercised
+on meshdev. Per this project's documentation discipline it stays listed under
+"Implemented in 0.5.5, awaiting live confirmation" below until each piece has
+been seen working live; only then does it move into `protocol.md`.
+
 See `protocol.md` for the authoritative wire spec and `known-limitations.md`
 for permanent, by-design tradeoffs (no TURN, no real revocation, etc.) —
 those aren't roadmap items, they're not going to change.
@@ -30,12 +31,6 @@ by version) and `protocol.md`/`X4DH.md` (the current spec itself). This
 section only keeps what isn't fully captured there yet, or context specific
 to what "next" picks up from:
 
-- Reaction/ack fanout narrowed to the single target device (`resolveReactionTarget`)
-  — confirmed live. See `protocol.md`'s [Delivery Acknowledgement](protocol.md#delivery-acknowledgement-received).
-  **Still open**: pull `server.py`'s `STATS` log (`buf_rate_rejected`/
-  `buf_cap_rejected`/`buf_endpoint_cap_rejected`) to see how much of the
-  original throughput pressure this alone accounted for, before deciding
-  whether server-side limits still need raising.
 - X4DH session establishment, per-device wire encryption, automatic
   bootstrap/retry, and tightened device registry retention — all confirmed
   live. See `CHANGELOG.md`'s `0.5.0` entry, `protocol.md`, and `X4DH.md`'s
@@ -45,21 +40,56 @@ to what "next" picks up from:
   / RK1, threshold shared verbatim with `checkStuckX4DHSessions` so the UI
   can never disagree with the log-level detector. UI-only, not covered
   elsewhere in the docs.
-- **`sync:backup_push` now buffers on missed live delivery** (`server.py`)
-  — implemented and syntax-validated, closing a real data-loss gap in
-  `pushMiniBackup`'s one-shot sends. **Not yet independently confirmed
-  live** — no captured before/after test run yet. Once confirmed, this
-  moves to `CHANGELOG.md`/`protocol.md` like everything else above.
 - Fixed: reactions silently disappearing on merge (`mergeMessages`' `byId`
   dedup resolves by `ts` now, not array position) — see `protocol.md`'s
   [Message Merging](protocol.md#message-merging).
-- X25519 static-static ECDH pairwise encryption, burn notice, WebRTC shell
-  escalation for agent contacts, Double Ratchet Phase 1 groundwork (send
-  counters, device registry upgrade, passive gap detection, packet
-  inspector), push notifications, SEND/RECEIVED message status, causal
-  message ordering, and the endpoint-keyed offline buffer — all shipped
-  and documented; see `CHANGELOG.md` for which version each landed in and
-  `protocol.md` for current behavior.
+- PBKDF2 iteration count raised from 100,000 to 1,000,000 (`0.5.2`), as a
+  hard cutover. What's still open about the KDF is under Planned, below.
+- X25519 static-static ECDH pairwise encryption, burn notice, Double Ratchet
+  Phase 1 groundwork (send counters, device registry upgrade, passive gap
+  detection, packet inspector), push notifications, SEND/RECEIVED message
+  status, causal message ordering, and the endpoint-keyed offline buffer —
+  all shipped and documented; see `CHANGELOG.md` for which version each
+  landed in and `protocol.md` for current behavior. (WebRTC shell escalation
+  for agent contacts shipped in `0.3.6` and was removed again in `0.5.5`.)
+
+**Correction to earlier versions of this file:** this section used to list
+"reaction/ack fanout narrowed to the single target device
+(`resolveReactionTarget`) — confirmed live". That was never true of the code;
+see "Targeted RECEIVED acks" under Planned. It also listed
+`sync:backup_push` buffering on missed live delivery as implemented but
+unconfirmed; that was reverted in `0.5.5` (see `CHANGELOG.md`).
+
+### Implemented in 0.5.5, awaiting live confirmation
+
+Nothing below has been independently confirmed live as of this update — all of
+it is reasoned-not-observed until a test run says otherwise. Each line says what
+would confirm it; move it to `CHANGELOG.md`/`protocol.md` once witnessed.
+
+- **Self-sync mirroring (`selfsync`).** Send from device A while sibling B is
+  offline: B gets its own per-endpoint buffered copy on reconnect (relay log:
+  `BUF write … endpoint=…`), two offline siblings both receive it, and no push
+  fires for it.
+- **Self-backup under session keys + discovery hello.** A full push to a sibling
+  with a session logs `targeted, session key`; a sibling with no session yet gets
+  only the content-free hello, and the self X4DH session bootstraps afterwards.
+- **Self `restore_push` wrap.** A wiped device restoring from its own sibling
+  logs `+wrap` on both sides.
+- **One-to-one handshake replies.** On an identity running two devices, backup
+  and restore cycles stop producing `wrap present but no pending ephemeral` /
+  `unwrap failed` for replies that were addressed to a sibling. Residual
+  `unwrap failed against N candidate(s)` is only expected on the bare-fallback
+  paths (unverified/fresh sender, the bootstrap ping).
+- **Manual SYNC, new form.** Request → wrapped reply, one-directional, `+wrap`
+  in the log; a legacy plaintext sync is dropped.
+- **Push keyed by `endpointId`.** `PUSH_SUB subscribed` logs the endpoint, and an
+  old `<deviceId>.json` for the same browser is dropped as a stale duplicate.
+- **Data-channel test.** Accept → ping/pong → RTT toast; decline, cancel and both
+  timeouts behave; nothing auto-accepts.
+- **Contacts-only peer backups.** A restore from a peer's copy logs
+  `+N contacts +0 msgs`.
+- **`sync:backup_push` not buffered.** A push to an offline target leaves no file
+  in `relay_buf`.
 
 ---
 
@@ -67,11 +97,16 @@ to what "next" picks up from:
 
 Things with a rough shape already, not blocked on a bigger design call:
 
-- **Keep `protocol.md` from drifting again.** No process yet beyond "notice
-  it during unrelated work," which is how the `deviceId` envelope drift sat
-  unnoticed for a while. Worth a lightweight habit at minimum (docs pass
-  whenever a wire-format or storage-shape change lands), even without
-  tooling.
+- **Keep `protocol.md` from drifting again.** Still no process beyond "notice
+  it during unrelated work", and the `0.5.5` docs pass showed how much that
+  misses: a `resolveReactionTarget` the docs described but the code never had, a
+  `sig:auth_challenge` row describing an encrypted nonce the relay no longer
+  sends, server config variables missing from the config table, and stray `\1`
+  characters (an apparent sed backreference accident) that swallowed text — and
+  at least one heading — in `protocol.md`, `X4DH.md` and `known-limitations.md`.
+  A docs pass whenever a wire-format or storage-shape change lands is still the
+  minimum habit; a cheap grep for stray `\1`, and for function names the docs
+  mention that no longer exist in the code, would have caught most of this.
 - **Verify the epoch guard against a genuinely stale `session:ack` in
   practice, not just by code inspection.** `upgradeX4DHSessionToRK1`
   refuses to apply an ack whose `sessionEpoch` doesn't match the session's
@@ -114,32 +149,33 @@ recognise from their own device popover. Compound addressing
 [Compound Addressing](protocol.md#compound-addressing)) is live for
 `app:message`, the `sync:*` self-targeting paths, and `session:propose`/
 `session:ack`. This directly enabled the sync/backup device-smartness work
-below — no further design pass needed on the routing mechanism itself.
+below — no further design pass needed on the routing mechanism itself. Since `0.5.5` the same mechanism also carries the one-to-one
+handshake replies and the `selfsync` mirror copies.
 
-### Passphrase KDF iteration count (PBKDF2 → possibly Argon2id)
-- Flagged by external review: `masterSecret` derivation (see
-  `protocol.md`'s Identity and Key Derivation) uses PBKDF2-HMAC-SHA256 at
-  100,000 iterations. Current OWASP guidance for PBKDF2-HMAC-SHA256 is
-  600k+ iterations — this sits well below that.
-- Matters more than it might look at first glance: `publicId` is public
-  by design (`SHA-256(x25519_pub || ed25519_pub)[0:12]`, shared freely in
-  the shareable address), so given a known username an attacker already
-  has a fast, fully offline verification oracle — derive candidate keys
-  from a guessed passphrase, hash, compare against the known `publicId`
-  — no captured ciphertext or network access required at all. Every
-  forward-secrecy property X4DH/the ratchet ever provide is ultimately
-  bounded by how expensive that oracle is to run at scale.
-- Raising the iteration count alone is compatible with existing
-  identities (same algorithm, more rounds) but still needs *some*
-  migration story to actually take effect for already-created identities,
-  not just new ones. Switching to Argon2id is a bigger lift — breaking,
-  same blast radius as the 0.4.0 X25519 swap — and not a native WebCrypto
-  primitive, unlike everything else in this codebase's crypto stack
-  (would need a WASM dependency).
-- Not urgent, not free — needs its own design pass on migration strategy
-  before picking a direction. Deliberately kept separate from X4DH/
-  ratchet work; the two are unrelated axes of the same broader "how
-  strong are our guarantees really" question.
+### Passphrase KDF (PBKDF2 → possibly Argon2id)
+- Iteration count raised from 100,000 to 1,000,000 in `0.5.2`, following
+  external review (OWASP guidance for PBKDF2-HMAC-SHA256 was 600k+), as a hard
+  cutover: no dual-version detection, no migration path — the earlier
+  C64/AES128 key migration was painful enough to rule that out. See
+  `CHANGELOG.md`.
+- Why this matters more than it might look: `publicId` is public by design
+  (`SHA-256(x25519_pub || ed25519_pub)[0:12]`, shared freely in the shareable
+  address), so given a known username an attacker already has a fast, fully
+  offline verification oracle — derive candidate keys from a guessed
+  passphrase, hash, compare against the known `publicId` — no captured
+  ciphertext or network access required at all. Every forward-secrecy property
+  X4DH/the ratchet ever provide is ultimately bounded by how expensive that
+  oracle is to run at scale. More iterations raise the per-guess cost; they
+  don't make it memory-hard.
+- What's still open: whether to move to Argon2id at all. It would be breaking
+  again (same blast radius as `0.4.0` and `0.5.2`) and isn't a native WebCrypto
+  primitive, unlike everything else in this codebase's crypto stack — it would
+  need a WASM dependency. Not urgent, not free; needs its own design pass.
+  Because any such change is another hard cutover, it's worth weighing
+  against batching with any other identity-derivation changes rather than
+  doing it alone. Deliberately kept separate from X4DH/ratchet work; the two
+  are unrelated axes of the same broader "how strong are our guarantees
+  really" question.
 
 ### Real per-message forward secrecy (the Double Ratchet, on top of X4DH)
 This item used to be flagged as "the hardest open item" and framed as a
@@ -200,16 +236,17 @@ worth carrying into that session:
   all. What ratchets is the *transport* the already-encrypted blob rides
   inside, not the blob itself — same as how image/audio bytes already ride
   as opaque payload inside an ordinary `app:message` today.
-- **`pushMiniBackup`'s purpose survives a ratchet, its plumbing doesn't.**
-  It exists to keep siblings live-current after every outgoing message,
-  not just periodically reconciled — worth keeping. It works today only
-  because self-sync shares one static, coordination-free key across every
-  device; a real per-message ratchet removes that coordination-free
-  property. Once chain keys exist, mini-backup's payload just becomes
-  whatever rides inside one, same as the full backup push. Bonus: self-sync
-  packets carry no `sig` at all today (unlike `app:message`) — riding
-  inside a real ratchet session fixes that for free, not as a separate
-  task.
+- **Self-sync mirroring needs no special plumbing under a ratchet.**
+  `pushMiniBackup` was retired in `0.5.5`: mirrored copies of our own outgoing
+  messages now travel as ordinary `selfsync` `app:message`s over the per-device
+  fanout, so a ratchet covers them exactly as it covers any message. What it
+  leaves open is the periodic **full** self-backup, still its own handshake
+  (`sync:backup_push`, self path), encrypted per sibling under the static X4DH
+  wire key where a session exists — that path will need its own answer once
+  chain keys exist.
+- **Self-sync backup packets still carry no `sig`** (the `selfsync` messages
+  do — they're ordinary signed `app:message`s). Riding inside a real ratchet
+  session would fix that for the full-backup path too, not as a separate task.
 - **A worked Double Ratchet sketch matching this shape already exists**
   (from an external cross-model design discussion) — session state keyed
   by `(networkID, deviceID, sessionEpoch)`, a symmetric ratchet
@@ -223,22 +260,46 @@ worth carrying into that session:
   competitive-research pass above, not a substitute for it, since Signal's
   is only one of the four systems that pass is meant to weigh.
 
+### Targeted RECEIVED acks (not done — earlier docs said it was)
+- `protocol.md`'s Delivery Acknowledgement section and the `0.5.0` changelog
+  entry described a `resolveReactionTarget` that routes the RECEIVED auto-ack to
+  the single originating device instead of fanning to every known one. It was
+  never in the code: `sendReaction` sends every reaction — manual and auto —
+  through the same `sendFannedX4DH` fanout as an ordinary message (one auto-ack
+  was observed fanned to 6 targeted devices plus the broadcast fallback for a
+  single contact). The docs are being corrected; this item tracks whether to
+  actually build it.
+- The M×N ack multiplication it was meant to fix is a real, correctness-shaped
+  cost — raising server rate-limit constants would only defer it — so it's
+  still worth doing, but not by itself. Targeting only the originating device
+  would leave the sender's *other* devices showing "sent" forever, since nothing
+  else flips their delivery status. The inline comment in `sendReaction` says
+  exactly this.
+- Needs pairing with the self-sync mirror: auto-acks are deliberately excluded
+  from `selfsync` today (`isAuto`), so the pairing means deciding how a
+  delivery-status flip reaches sibling devices — mirror the ack itself, or
+  mirror just the status change.
+- Before deciding, pull `server.py`'s `STATS` log (`buf_rate_rejected`/
+  `buf_cap_rejected`/`buf_endpoint_cap_rejected`) to see how much throughput
+  pressure ack fanout actually accounts for.
+
 ### Sync / backup device-smartness (for later, no urgency)
-- Self-device backup targeting is now done — see Done above. What's left
-  here:
-- Sync: when syncing a conversation (the manual `app:sync`/SYNC-button
-  path), also check other-self devices, not just the other party
-- Contact-facing backup (`backup_offer`/`backup_accept`/`backup_push`) has
-  no device-targeting at all yet — still broadcasts to every live session
-  under the contact's identity, same as before this pass
-- Backup: if devices reliably merge first, a backup push might be able to
-  go out as just "identity," with no contact-device specificity needed —
-  **partially resolved above**: self-devices already get their own X4DH
-  session like any other peer, so per-device addressing for self-sync is
-  no longer a special case; whether that's enough to simplify backup
-  distribution further still depends on the still-open Double Ratchet
-  work above, not just the session-establishment piece that's already
-  shipped
+- Self-device backup targeting is done, and as of `0.5.5` so is moving self-sync
+  content onto per-device X4DH keys (see Done and `CHANGELOG.md`). What's left:
+- Sync: manual `app:sync` is now an encrypted, signed, one-directional
+  request/reply (see `CHANGELOG.md`), but it still only talks to the other
+  party — also checking other-self devices when syncing a conversation remains
+  open
+- Contact-facing backup: the opening `backup_offer` still broadcasts to every
+  live session under the contact's identity, but as of `0.5.5` the
+  `backup_accept` and `backup_push` replies are one-to-one (compound-addressed at
+  the verified sender's endpoint). The remaining broadcast is the offer itself;
+  device-targeting it is an optimisation now, not a correctness need
+- Backup: the old idea that a push might go out as just "identity" once devices
+  reliably merge first is resolved differently — contact backups are
+  contacts-only, and self-sync content travels as `selfsync`. Whether that
+  simplifies backup distribution further still depends on the open Double
+  Ratchet work and on the self-to-self backup question under "Sync strategy"
 
 ### Sync strategy — needs a real rethink, not just the dev2dev slice
 Flagged explicitly during the self-device-backup-targeting session: the
@@ -251,6 +312,17 @@ was deliberately kept narrow (self-only, backup/restore only) specifically
 so it wouldn't get tangled up with this larger question before the larger
 question has actually been thought through.
 
+
+`0.5.5` took a first, deliberately narrow step: backups to contacts carry
+contacts only, backup pushes are online-only again, and self-to-self message
+traffic moved off the backup path onto the normal per-device message path
+(`selfsync`). That is a split of jobs, not the rethink — manual `app:sync`,
+`backup_offer`/`accept`/`push`, `restore_req`/`ack`/`push`, the restore token and
+the self-backup hello are all still separate, accreted mechanisms. Still open,
+and meant to be worked out together: whether self-to-self backups keep carrying
+messages (wrapped), and how RESTORE relates to the wrap and X4DH options. Not
+scoped yet.
+
 ---
 
 ## Ideas — not yet scoped
@@ -258,32 +330,33 @@ question has actually been thought through.
 Lower-fidelity than "Planned" above — captured so they're not lost, not
 because there's a plan yet.
 
-### General plugin architecture (shell escalation as the worked example)
-- Shell today is threaded through four places: `meshchat.js` (signaling,
-  `shellConns`), `meshchat-gui.js` (terminal DOM), `statemachine.js` (the
-  `kind: "shell"` fork), and `index.html` markup (button, panel). None of
-  that is plugin-shaped yet — it's just the first agent-capable feature,
-  hardcoded.
-- A real plugin API needs hook points for at least: header-button
-  registration (gated on `contact.type`), a state-machine "kind"
-  registration instead of the hardcoded `call`/`shell` fork, and a
-  message-render override (agent chats already render left-aligned with
-  reactions suppressed — that's already a de facto per-type override,
-  just not a general one).
-- **Sub-question already sketched:** lazy-loading third-party plugin
-  assets (xterm.js/xterm-addon-fit/xterm.css today are unconditional
-  `<head>` tags everyone pays for, whether or not they ever touch shell).
-  Answer sketched out: a small `assetLoader` (dedupes concurrent loads,
-  ordered script loading, promise-based) triggered from the *action* that
-  needs it (`startShell()`), not from app boot or even from adding an
-  agent contact. Leaning self-hosted under `static/vendor/` over CDN —
-  same lazy-load benefit either way, but avoids leaking "this identity
-  uses shell" to a third party's request logs, which matters more here
-  than it would in a typical app.
-- Open: whether to scope a first pass as just the asset-loading slice
-  (prove the lazy-load pattern against shell as-is), or go straight for
-  the fuller manifest/hook-point design with shell as the reference
-  implementation. Undecided — flagged in chat, not yet a decision.
+### General plugin architecture (agent/shell as the eventual first plugin)
+- Agent contacts, the bounded command whitelist and shell escalation were
+  removed in `0.5.5`: shell was only ever a test of the WebRTC data channel, and
+  it was threaded through four places (signaling, terminal DOM, the state
+  machine fork, `index.html` markup) as hardcoded first-feature code, not
+  anything plugin-shaped. The idea is to bring them back later as a plugin
+  instead of as core. What stays in core is the data channel itself (`data:*`,
+  the connection test).
+- A real plugin API needs hook points for at least: header-button registration
+  (`callBtn`/`dataBtn` are hardcoded today), a state-machine "kind"
+  registration instead of the hardcoded `call`/`data` fork in `transition()`/
+  `onStateEnter`, and packet-type registration in the signal dispatcher
+  (`handleSignal` is a plain switch). The old "message-render override" hook is
+  moot with agent chats gone; revisit if a plugin needs it.
+- **Sub-question, still applicable:** lazy-loading third-party plugin assets.
+  xterm.js used to be three unconditional `<head>` tags everyone paid for;
+  they went away with shell, so nothing loads eagerly today — the question
+  returns with the first plugin that has assets. Answer sketched: a small
+  `assetLoader` (dedupes concurrent loads, ordered script loading,
+  promise-based) triggered from the *action* that needs it, not from app boot or
+  from adding a contact. Leaning self-hosted under `static/vendor/` over CDN —
+  same lazy-load benefit either way, but it avoids leaking "this identity uses
+  X" to a third party's request logs, which matters more here than it would in
+  a typical app.
+- Open: whether to scope a first pass as just the asset-loading slice, or go
+  straight for the fuller manifest/hook-point design with the returning plugin
+  as the reference implementation. Undecided.
 
 ### Agent access without a full client (a MeshChat skill/tool)
 - Idea, not yet built: a lightweight skill/tool (e.g. a `SKILL.md`) that
@@ -294,11 +367,10 @@ because there's a plan yet.
   primitives, so a minimal implementation is plausible; it just wouldn't
   get X4DH's per-device forward secrecy for free and would likely fall
   back to the legacy pairwise key (see `protocol.md`'s Encryption section).
-- Distinct from, and doesn't depend on, the existing agent-contact
-  mechanism (bounded command whitelist + shell escalation — see
-  `protocol.md`'s Agent Contacts & Shell Escalation section). That's
-  already a real client talking to another real client. This idea is
-  about an agent *being* the client, with no GUI at all.
+- Distinct from, and doesn't depend on, the agent-contact mechanism that used to
+  exist (bounded command whitelist + shell escalation, removed in `0.5.5` — see
+  `CHANGELOG.md`). That was a real client talking to another real client. This
+  idea is about an agent *being* the client, with no GUI at all.
 - Agent-to-agent messaging would fall out of this for free, since the
   protocol draws no distinction between a human's device and an agent's
   one — not tested, not a current goal, just a consequence of the design
