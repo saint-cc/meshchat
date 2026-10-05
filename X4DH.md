@@ -22,7 +22,7 @@ Two pieces of §13.2 hardening have since landed. **Stuck-at-RK0 detection** (`c
 
 `window.x4dhDebug` (console-only, not wired into any UI or automatic path) provides `list()` (session/stage/age/retry-state dump across every contact/device), `retry(contactId, deviceId)` (thin wrapper over the manual path, unaffected by the automatic budget), `forceStuck(contactId, deviceId, opts)` (manufactures an RK0 session sitting past the stuck threshold, with a chosen starting `retryAttempts`/`exhausted` state — does **not** fake `endpointId` or override the real `isFixedInitiator` comparison, both of which are read live from actual identity material), `simulateTransition(contactId)` (drives the detector with `isTransition=true` without waiting for a real presence signal), and `check(contactId, deviceId)` (surfaces the live `isFixedInitiator`/`endpointKnown`/session state in one call — the fastest way to see *why* a forced test isn't progressing, e.g. a null `endpointKnown` explains a silent `sendX4DHPropose` refusal that would otherwise only show up as a console-level `mlog.debug` line).
 
-Client/protocol version is `0.5.0`. What that means has changed since this note was first written: the pieces of this document that were confirmed live and unprompted — root-key bootstrap/upgrade (§3–§7), the fixed-initiator rule (§13.1), the propose-freshness/stuck-RK0-detection/bounded-retry hardening (§13.2 and the Status block above), and the per-device wire-message key (§16) — have now graduated out of `meshdev`-only tracking and into `protocol.md`'s own formal wire spec (see its [Session Establishment](protocol.md#session-establishment-x4dh) and [Encryption](protocol.md#encryption) sections), per this project's documentation discipline: a feature moves into `protocol.md` only once it's been witnessed firing correctly live, not on a development-cycle timer. This document remains the authoritative source for the cryptographic design and derivations themselves — `protocol.md` only restates the wire shapes and relay-visible behavior, not the DH math. Not everything here has graduated: the exhausted → re-armed automatic-retry transition (see the Status block) is still reasoned-not-observed, and self-sync forward secrecy (the "self-devices get a ratchet session too" follow-on work tracked under `Roadmap.md`'s Per-device encryption & relay-stored messages section) remains design-only — both stay `0.5.0`-cycle, meshdev-tracked facts until independently confirmed. The root-key KDF construction (§6.1) and the wire-message key derivation built on top of it (§16) are both fully specified and live; chain-key derivation and the rest of the Double Ratchet remain a separate, not-yet-scoped design session (see `Roadmap.md`).
+Client/protocol version is `0.5.5`. The pieces of this document that were confirmed live and unprompted — root-key bootstrap/upgrade (§3–§7), the fixed-initiator rule (§13.1), the propose-freshness/stuck-RK0-detection/bounded-retry hardening (§13.2 and the Status block above), and the per-device wire-message key (§16) — are in `protocol.md`'s formal wire spec (see its [Session Establishment](protocol.md#session-establishment-x4dh) and [Encryption](protocol.md#encryption) sections). This document remains the authoritative source for the cryptographic design and derivations themselves — `protocol.md` only restates the wire shapes and relay-visible behavior, not the DH math. Not everything here has been directly observed: the exhausted → re-armed automatic-retry transition (see the Status block) is still reasoned-not-observed, and self-sync content riding the session wire keys (§16.7) is implemented but awaiting live confirmation (tracked in `Roadmap.md`). A self-pair does not get a ratchet yet; that follows the Double Ratchet work. The root-key KDF construction (§6.1) and the wire-message key derivation built on top of it (§16) are fully specified and live; chain-key derivation and the rest of the Double Ratchet remain a separate, not-yet-scoped design session (see `Roadmap.md`).
 
 ---
 
@@ -608,7 +608,8 @@ This value distinguishes independent attempts to establish sessions between the 
 
 **It is authenticated, not mixed into the root-key KDF.** An earlier draft of this document sketched `sessionEpoch` and both sides' identity/`deviceId` as direct KDF inputs; §6.1's precise construction deliberately doesn't do this. The reasoning: `RK0`/`RK1`'s uniqueness already comes from `EK_A` (and `EK_B`) being freshly generated per session — two different `sessionEpoch` attempts between the same device pair necessarily produce different ephemeral keys, and therefore different DH outputs and different root keys, with no help needed from mixing metadata into the KDF itself.
 
-`sessionEpoch`, `deviceId`, and both identities instead live where they're actually enforced: inside the **signed** fields of `session:propose`/`session:ack` (§4, §13). The signature authenticates the ephemeral key and the session/device metadata from which the root key is derived, thereby binding the resulting session to the claimed identity and device pair; \1
+`sessionEpoch`, `deviceId`, and both identities instead live where they're actually enforced: inside the **signed** fields of `session:propose`/`session:ack` (§4, §13). The signature authenticates the ephemeral key and the session/device metadata from which the root key is derived, thereby binding the resulting session to the claimed identity and device pair: a different epoch, device or ephemeral key cannot be substituted without invalidating it.
+
 The device half of that binding is an **identity-authenticated device claim**: `deviceId` is asserted under the *identity* key's signature, not proven with a separate device key. Anyone holding the identity key could sign a propose claiming any `deviceId`. That is inside the trust model (the identity-key holder can already act as the identity), but "device binding" here should not be read as device-key attestation.
 
 This still prevents otherwise identical key material from being interpreted as the same protocol session — the guarantee just comes from freshness plus authentication, rather than from the KDF's `info` string carrying session metadata directly.
@@ -722,7 +723,8 @@ provable guarantee against every possible double-delivery ordering,
 so a receiving device should additionally refuse to adopt a
 `session:propose` whose `ts` is older than its currently-active
 session's own establishment time for that device — a cheap, sufficient
-\1
+guard against a stale proposal silently regressing a newer session.
+
 **What this guard is — and isn't.** It is *state-rollback (downgrade) protection*, not authentication and not replay prevention in the cryptographic sense. Authentication is the signature's job; the guard only stops a validly signed but older `session:propose` from overwriting newer local session state. As implemented it compares the packet's signed `ts` against the stored `proposeTs` (both the sender's clock, deliberately — see `storeX4DHSessionRK0`) and refuses `ts <= proposeTs`. Two consequences worth stating rather than leaving implicit:
 
 - **It is not a replay defence when no session record exists.** It incidentally rejects an exact replay of the *latest* propose, but only while a session record for that device is on file. After a wipe, a burn, or loss of the session store there is nothing to compare against, so a replayed propose would be accepted. The worst case is a desynchronised session (the original initiator no longer holds the matching pending ephemeral, so no upgrade completes) that stuck-at-RK0 detection and retry then repair; it does not yield key material. *Reasoned-not-observed.*
@@ -885,7 +887,7 @@ A device pair with no X4DH session yet — or one that never bootstraps one, suc
 
 The broadcast fallback — reached when a device is unresolved (no known `endpointId` yet) or when no devices are known for a contact at all — always uses the legacy key. There is no single device pair to derive an X4DH key *for* when addressing "every live session under this identity" at once; this path is unchanged from before X4DH existed.
 
-`app:migrate`, `app:burn`, and the `call:*`/`shell:*` signaling groups are **permanently** out of scope for this mechanism, not just deferred. The first two are never device-targeted by protocol design (`protocol.md`'s Compound Addressing section — a compound `to` is rejected outright for both types), so there is no single device pair to key against. Calls and shell escalation aren't device-aware infrastructure yet — their `RTCPeerConnection` state is keyed by contact, not device — and folding them into per-device keying is its own, separate follow-on scope.
+`app:migrate`, `app:burn`, and the `call:*`/`data:*` signaling groups are **permanently** out of scope for this mechanism, not just deferred. The first two are never device-targeted by protocol design (`protocol.md`'s Compound Addressing section — a compound `to` is rejected outright for both types), so there is no single device pair to key against. Calls and data-channel tests aren't device-aware infrastructure yet — their `RTCPeerConnection` state is keyed by contact, not device — and folding them into per-device keying is its own, separate follow-on scope.
 
 ## 16.4 Receive-side key resolution — trial decryption
 
@@ -902,6 +904,24 @@ Deliberately reactive only, for this phase — no time-based or message-count-ba
 ## 16.6 What this explicitly is not
 
 Still not a ratchet, and not meant to be mistaken for one. A device pair's wire key is reused for every message under that session, identically in spirit to how the old identity-level key was reused for every message under an entire identity pair — the structural improvements here are the *granularity* (per device pair, not per identity) and the *rotation trigger* (a session reset via retry, rather than effectively never). Real per-message key evolution — a genuine forward ratchet, where compromising today's key does not compromise tomorrow's — remains the separate, later Double Ratchet work this document has scoped itself away from since §6.1 and §15. See `Roadmap.md`'s Double Ratchet section for how that later work is expected to build on top of the session infrastructure this section relies on, rather than replace it outright.
+
+---
+
+## 16.7 Self-sync rides the same keys
+
+Between an identity's own devices — a self-pair, established like any other pair with §13.1's `deviceId` tiebreak — two kinds of traffic use the session wire key rather than the deterministic, passphrase-derived backup key:
+
+- **Mirrored copies of outgoing messages** (`selfsync`, see `protocol.md`'s Self-sync mirror). These are ordinary `app:message`s sent through `sendFannedX4DH` to the identity itself, so each sibling with a session gets its own ciphertext under that pair's wire key, and a sibling without one gets the legacy self key.
+- **Full self-backup pushes** (`sync:backup_push`, self path). The payload `{ deviceId, endpointId, fingerprint, contacts }` is encrypted per sibling under that sibling's wire key. The receiver has no key hint, so it trial-decrypts every self-session wire key (newest session first), then the backup key last, and cross-checks the payload's `deviceId` against the session that decrypted it — the same pattern as §16.4.
+
+The deterministic backup key remains in exactly two places:
+
+- A **content-free discovery hello** (`{ deviceId, endpointId, hello: true }`) sent when a sibling is unknown or has no session yet. It carries no contacts and no messages; its job is to let siblings learn each other so a self-session can bootstrap (§13.3's passive discovery, via `recordKnownDevice`). It does expose the `deviceId`↔`endpointId` link to recorded traffic plus a later passphrase compromise.
+- **Interop**: a full push under the static key from an older sibling is still accepted, and logged as a legacy push.
+
+Fresh-client consequence: a brand-new device has no session, so it receives contacts from the first push after its session exists, not instantly. A genuinely wiped device restores through the restore handshake (wrapped under a one-shot ephemeral, `protocol.md`'s Ephemeral Wrap), not through this path.
+
+The caveats of §16 apply unchanged: the key is static per session, `RK0` is narrower than `RK1`, and there is no ratchet. Implemented; live confirmation is tracked in `Roadmap.md`.
 
 ---
 
