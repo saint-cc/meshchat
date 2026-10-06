@@ -13,7 +13,7 @@
 
    Load order: meshchat-lib.js → meshchat-gui.js → meshchat.js → statemachine.js
 ═══════════════════════════════════════════════════════════════ */
-const CLIENT_VERSION = "0.5.5";
+const CLIENT_VERSION = "0.5.6";
 
 const POLL_INTERVAL_MS        	= 30_000;			// base interval between presence polls
 const POLL_JITTER_MS          	= 10_000;			// ± random jitter added to poll interval
@@ -3260,10 +3260,11 @@ async function handleMsgExchange(msg) {
 ══════════════════════════════════════════ */
 /* ══════════════════════════════════════════
    AUTH STATE
-   authStep: "idle" | "await_challenge" | "done"
-   After "done" the usual post-connect flow runs.
+   authStep: "idle" | "await_challenge" | "await_ok" | "done"
+   After "done" the usual post-connect flow runs. `auth` is the
+   createRelayAuth() helper for the CURRENT socket only (see below).
 ══════════════════════════════════════════ */
-const authState = { step: "idle" };
+const authState = { step: "idle", auth: null };
 
 // SIGNAL_URL is the bootstrap default — used only when we have no local
 // truth yet (fresh identity, first load on this origin). Once me.lastRelay
@@ -3282,7 +3283,7 @@ function connectSignal() {
   ws.onopen = () => {
     mlog.info(`WS         connected  ${url}`);
     authState.step = "idle";
-    startAuth();
+    startAuth(url);   // url = what THIS socket dialed — the relay host the proof gets bound to
   };
   ws.onclose = () => {
     // stale guard — if state.ws has already moved on to a newer connection
@@ -3313,36 +3314,92 @@ function rebootSignal() {
   connectSignal();
 }
 
-function startAuth() {
-  authState.step = "await_challenge";
-  const parts = state.shareableKey.split(".");
-  state.ws.send(JSON.stringify({
-    type:        "sig:auth_init",
-    x25519_pub:  Array.from(base64ToRaw(parts[0])),
-    ed25519_pub: Array.from(base64ToRaw(parts[1])),
-    endpoint_id:  state.endpointId || undefined,
-  }));
-  mlog.info(`AUTH       init  ${pid(state.publicId, { endpointId: state.endpointId })}`);
+/* ══════════════════════════════════════════
+   RELAY AUTH — one helper for every handshake
+   Used by all four places that authenticate to a relay: the main signal
+   socket (startAuth), outbound contact relays (getOrOpenRelayConn), the
+   MIGRATE test probe (testRelayConnection) and the old-relay drain
+   (drainOldRelay). Each used to carry its own copy of
+   "ed25519.sign(nonce)" over whatever bytes the relay sent.
+
+   What the proof signs, and why, is documented at buildAuthMessage
+   (meshchat-lib.js). The two properties that matter for call sites:
+     - the relay host comes from `url` — the URL this socket was opened
+       with — never from anything in the challenge;
+     - proof() refuses any challenge that isn't exactly AUTH_NONCE_LEN
+       bytes, so a relay can't pick what we sign. It THROWS on a bad
+       challenge; every caller treats that as a failed handshake and
+       drops the connection.
+   endpointId / noReceive are part of what's signed, so they're fixed at
+   construction and the same values go out in init().
+══════════════════════════════════════════ */
+function createRelayAuth(url, { endpointId = null, noReceive = false } = {}) {
+  const host       = authHostFromUrl(url);
+  const parts      = state.shareableKey.split(".");
+  const x25519Pub  = base64ToRaw(parts[0]);
+  const ed25519Pub = base64ToRaw(parts[1]);
+  return {
+    host,
+    init() {
+      const o = {
+        type: "sig:auth_init", auth_v: AUTH_VERSION,
+        x25519_pub: Array.from(x25519Pub), ed25519_pub: Array.from(ed25519Pub),
+      };
+      if (endpointId) o.endpoint_id = endpointId;
+      if (noReceive)  o.no_receive  = true;
+      return o;
+    },
+    proof(challenge) {
+      if (!host) throw new Error("cannot derive relay host from url");
+      const nonce = challenge?.nonce;
+      if (!Array.isArray(nonce) || nonce.length !== AUTH_NONCE_LEN
+          || !nonce.every(b => Number.isInteger(b) && b >= 0 && b <= 255)) {
+        throw new Error(`challenge nonce must be exactly ${AUTH_NONCE_LEN} bytes`);
+      }
+      const message = buildAuthMessage(host, Uint8Array.from(nonce), x25519Pub, ed25519Pub, endpointId, noReceive);
+      return { type: "sig:auth_proof", sig: Array.from(ed25519.sign(message, state.keys.signingKeySeed)) };
+    },
+  };
 }
 
-// Possession proof is now "sign the nonce with your Ed25519 private key,"
-// not "decrypt the nonce with the same AES key you just handed the server
-// in auth_init" (which proved nothing — the server already had that key
-// in plaintext from the message immediately before). The nonce itself
-// travels in the clear now too; there's nothing about it worth hiding,
-// only something worth proving you can sign.
+function startAuth(url) {
+  authState.auth = createRelayAuth(url, { endpointId: state.endpointId });
+  authState.step = "await_challenge";
+  state.ws.send(JSON.stringify(authState.auth.init()));
+  mlog.info(`AUTH       init  ${pid(state.publicId, { endpointId: state.endpointId })}  host=${authState.auth.host}`);
+}
+
+// Possession proof: a signature over the domain-separated auth message
+// (see createRelayAuth), not over the raw nonce. Only answered while WE are
+// waiting for a challenge on the main socket — a stray challenge at any
+// other time is not something to sign.
 function handleAuthChallenge(msg) {
+  if (authState.step !== "await_challenge" || !authState.auth) {
+    mlog.warn(`AUTH       unexpected challenge (step=${authState.step}) — ignored`);
+    return;
+  }
   try {
-    const nonce = new Uint8Array(msg.nonce);
-    const sig   = Array.from(ed25519.sign(nonce, state.keys.signingKeySeed));
-    state.ws.send(JSON.stringify({ type: "sig:auth_proof", sig }));
+    state.ws.send(JSON.stringify(authState.auth.proof(msg)));
+    authState.step = "await_ok";
     mlog.info("AUTH       proof sent");
   } catch(e) {
-    mlog.err(`AUTH       sign failed: ${e.message}`);
+    mlog.err(`AUTH       sign refused: ${e.message} — dropping connection`);
+    try { state.ws.close(1008, "bad challenge"); } catch(_) {}
   }
 }
 
 function handleAuthOk(msg) {
+  if (authState.step !== "await_ok") {
+    mlog.warn(`AUTH       unexpected auth_ok (step=${authState.step}) — ignored`);
+    return;
+  }
+  // The relay derives public_id from the keys we presented. Anything else
+  // means it didn't authenticate the identity we think it did.
+  if (msg.public_id !== state.publicId) {
+    mlog.err(`AUTH       auth_ok for a different id (${pid(msg.public_id)} != ${pid(state.publicId)}) — dropping connection`);
+    try { state.ws.close(1008, "id mismatch"); } catch(_) {}
+    return;
+  }
   mlog.info(`AUTH OK    id=${pid(msg.public_id)}`);
 
   // fully authenticated, run post-connect flow
@@ -3353,12 +3410,19 @@ function handleAuthOk(msg) {
   schedulePoll();
 }
 
+const AUTH_FAIL_HINTS = {
+  auth_version:         "relay and client speak different auth versions — update both",
+  relay_not_configured: "this relay has no valid RELAY_WSS_URL set and refuses to authenticate anyone",
+  proof_invalid:        "signature rejected — the relay doesn't recognise the host we dialed (RELAY_WSS_URL / RELAY_AUTH_HOSTS), or relay/client versions differ",
+};
+
 function handleAuthFail(msg) {
   if (authState.step === "done") {
     mlog.debug(`RELAY      remote rejected unauthenticated traffic  reason=${msg.reason}`);
     return;
   }
-  mlog.err(`AUTH FAIL  reason=${msg.reason}  step=${authState.step}`);
+  const hint = AUTH_FAIL_HINTS[msg.reason];
+  mlog.err(`AUTH FAIL  reason=${msg.reason}  step=${authState.step}${hint ? "  — " + hint : ""}`);
 }
 
 let sessionFresh = true;
@@ -3548,22 +3612,19 @@ function testRelayConnection(url) {
     const timer = setTimeout(() => finish({ ok: false, reason: "timeout" }), RELAY_TEST_TIMEOUT_MS);
 
     let step = "idle";
+    // no_receive is part of what the proof signs (see createRelayAuth), so
+    // a relay in the middle can't flip it.
+    const auth = createRelayAuth(url, { noReceive: true });
 
     ws.onopen = () => {
       step = "await_challenge";
-      const parts = state.shareableKey.split(".");
       // no_receive: this probe closes itself the instant auth_ok arrives — it
       // must never be registered as a recipient server-side, or a buffer
       // flush racing the deliberate close can either warn harmlessly (the
       // common case) or, in the unlucky ordering, have the server delete a
       // buffered packet (e.g. a migrate breadcrumb) it believes was delivered
       // to a socket that was actually already gone or about to discard it.
-      ws.send(JSON.stringify({
-        type: "sig:auth_init",
-        x25519_pub:  Array.from(base64ToRaw(parts[0])),
-        ed25519_pub: Array.from(base64ToRaw(parts[1])),
-        no_receive: true,
-      }));
+      ws.send(JSON.stringify(auth.init()));
     };
 
     ws.onmessage = async (evt) => {
@@ -3571,9 +3632,8 @@ function testRelayConnection(url) {
         const msg = JSON.parse(evt.data);
 
         if (step === "await_challenge" && msg.type === "sig:auth_challenge") {
-          const nonce = new Uint8Array(msg.nonce);
-          const sig   = Array.from(ed25519.sign(nonce, state.keys.signingKeySeed));
-          ws.send(JSON.stringify({ type: "sig:auth_proof", sig }));
+          // proof() throws on a malformed challenge — caught below, reported as a failed test
+          ws.send(JSON.stringify(auth.proof(msg)));
           step = "await_ok";
           return;
         }
@@ -3636,17 +3696,12 @@ function getOrOpenRelayConn(url, messageOnly) {
   try {
     const ws = new WebSocket(url);
     entry.ws = ws;
+    const auth = createRelayAuth(url, { endpointId: state.endpointId });
 
     ws.onopen = () => {
       clearTimeout(connectTimeout);
       entry.authStep = "await_challenge";
-      const parts = state.shareableKey.split(".");
-      ws.send(JSON.stringify({
-        type: "sig:auth_init",
-        x25519_pub:  Array.from(base64ToRaw(parts[0])),
-        ed25519_pub: Array.from(base64ToRaw(parts[1])),
-        endpoint_id:  state.endpointId || undefined,
-      }));
+      ws.send(JSON.stringify(auth.init()));
       mlog.info(`RELAY      open, authing  host=${hostname}  ${pid(state.publicId, { endpointId: state.endpointId })}`);
     };
 
@@ -3656,9 +3711,16 @@ function getOrOpenRelayConn(url, messageOnly) {
 
         // ── challenge ──
         if (entry.authStep === "await_challenge" && msg.type === "sig:auth_challenge") {
-          const nonce = new Uint8Array(msg.nonce);
-          const sig   = Array.from(ed25519.sign(nonce, state.keys.signingKeySeed));
-          ws.send(JSON.stringify({ type: "sig:auth_proof", sig }));
+          // A relay we dialed for a contact is exactly the kind of party that
+          // might send a hostile challenge — proof() refuses anything but a
+          // well-formed one, and a refusal ends the connection.
+          try {
+            ws.send(JSON.stringify(auth.proof(msg)));
+          } catch(e) {
+            mlog.warn(`RELAY      auth sign refused  host=${hostname}  err=${e.message} — closing`);
+            ws.close();
+            return;
+          }
           entry.authStep = "await_ok";
           mlog.info(`RELAY      auth proof sent  host=${hostname}`);
           return;
@@ -3678,6 +3740,15 @@ function getOrOpenRelayConn(url, messageOnly) {
         if (msg.type === "sig:auth_fail") {
           mlog.warn(`RELAY      auth failed  step=${entry.authStep}  host=${hostname}  reason=${msg.reason}`);
           ws.close();
+          return;
+        }
+
+        // sig:auth_* belongs to THIS connection's own handshake, handled
+        // above — never to handleSignal, whose auth handlers drive the MAIN
+        // socket's state. Without this, a stray challenge/ok/fail arriving
+        // on a contact-relay socket after its handshake was routed there.
+        if (typeof msg.type === "string" && msg.type.startsWith("sig:auth_")) {
+          mlog.debug(`RELAY      stray ${msg.type} ignored  host=${hostname}  step=${entry.authStep}`);
           return;
         }
 
@@ -3726,23 +3797,23 @@ function drainOldRelay(url) {
   let recovered = 0;
   const ws = new WebSocket(url);
   let step = "idle", closeTimer;
+  const auth = createRelayAuth(url);   // no endpoint_id: this is a drain, not a routable session
 
   ws.onopen = () => {
     step = "await_challenge";
-    const parts = state.shareableKey.split(".");
-    ws.send(JSON.stringify({
-      type: "sig:auth_init",
-      x25519_pub:  Array.from(base64ToRaw(parts[0])),
-      ed25519_pub: Array.from(base64ToRaw(parts[1])),
-    }));
+    ws.send(JSON.stringify(auth.init()));
   };
 
   ws.onmessage = async (evt) => {
     const msg = JSON.parse(evt.data);
     if (step === "await_challenge" && msg.type === "sig:auth_challenge") {
-      const nonce = new Uint8Array(msg.nonce);
-      const sig   = Array.from(ed25519.sign(nonce, state.keys.signingKeySeed));
-      ws.send(JSON.stringify({ type: "sig:auth_proof", sig }));
+      try {
+        ws.send(JSON.stringify(auth.proof(msg)));
+      } catch(e) {
+        mlog.warn(`MIGRATE    drain — auth sign refused: ${e.message} — closing`);
+        ws.close();
+        return;
+      }
       step = "await_ok";
       return;
     }
@@ -3753,6 +3824,9 @@ function drainOldRelay(url) {
       return;
     }
     if (msg.type === "sig:auth_fail") { ws.close(); return; }
+    // stray sig:auth_* after the handshake — not a recovered message, and
+    // never something to hand to handleSignal (it drives the MAIN socket's auth state)
+    if (typeof msg.type === "string" && msg.type.startsWith("sig:auth_")) return;
 	
 	// Our own breadcrumb, consumed by our own drain — buf_deliver just
     // deleted it server-side. Put it straight back so a straggler device

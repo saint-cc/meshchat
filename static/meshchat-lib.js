@@ -179,6 +179,69 @@ function parseAddress(addr) {
 function lerp(a, b, t) { return a + (b - a) * t; }
 
 /* ══════════════════════════════════════════
+   RELAY AUTH — what the possession proof signs (auth_v 2)
+   The proof used to be a bare Ed25519 signature over whatever bytes the
+   relay sent as its "nonce". That made every relay we ever connect to
+   (our home relay, a contact's relay, a MIGRATE test target) a signing
+   oracle for the identity key — the same key that signs every packet in
+   this app. It is now a signature over a fixed layout:
+
+     "meshchat-auth-v1" 00 | relayHost 00 | nonce(32) | x25519_pub(32)
+       | ed25519_pub(32) | endpoint_id 00 | no_receive(1 byte)
+
+   - label   : every packet signature in this app is over JSON text, which
+               starts with "{" — an auth signature can therefore never
+               verify as a packet signature, and nothing a relay sends can
+               be steered into a packet-shaped signed message.
+   - host    : the host WE dialed (authHostFromUrl on the socket's own URL),
+               never anything from the challenge. A relay that forwards
+               someone else's challenge to us gets a signature bound to
+               ITS host, which the real relay rejects.
+   - nonce   : fixed length — the relay chooses neither length nor content.
+   - the rest: endpoint_id / no_receive travel in auth_init, which nothing
+               protected; inside the signature they can't be swapped in
+               transit.
+   AUTH_LABEL versions this signed layout; AUTH_VERSION versions the whole
+   handshake (auth_init carries it as auth_v; the old raw-nonce scheme was
+   implicitly version 1). Mirrors server.py's build_auth_message exactly —
+   any change here is a change there.
+══════════════════════════════════════════ */
+const AUTH_VERSION   = 2;
+const AUTH_LABEL     = "meshchat-auth-v1";
+const AUTH_NONCE_LEN = 32;
+
+// Lowercase hostname, IPv6 brackets and a trailing dot stripped — the
+// exact normalisation server.py's _norm_auth_host applies, so both sides
+// feed identical bytes into the signed message. null if url doesn't parse.
+function authHostFromUrl(url) {
+  try {
+    let h = new URL(url).hostname.toLowerCase();
+    if (h.startsWith("[") && h.endsWith("]")) h = h.slice(1, -1);
+    h = h.replace(/\.$/, "");
+    return h || null;
+  } catch { return null; }
+}
+
+function buildAuthMessage(relayHost, nonce, x25519Pub, ed25519Pub, endpointId, noReceive) {
+  if (!relayHost) throw new Error("buildAuthMessage: no relay host");
+  if (nonce.length !== AUTH_NONCE_LEN)                      throw new Error("buildAuthMessage: bad nonce length");
+  if (x25519Pub.length !== 32 || ed25519Pub.length !== 32)  throw new Error("buildAuthMessage: bad key length");
+  const enc   = new TextEncoder();
+  const zero  = Uint8Array.of(0);
+  const parts = [
+    enc.encode(AUTH_LABEL), zero,
+    enc.encode(relayHost),  zero,
+    nonce, x25519Pub, ed25519Pub,
+    enc.encode(endpointId || ""), zero,
+    Uint8Array.of(noReceive ? 1 : 0),
+  ];
+  const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+  let off = 0;
+  for (const p of parts) { out.set(p, off); off += p.length; }
+  return out;
+}
+
+/* ══════════════════════════════════════════
    CRYPTO
 ══════════════════════════════════════════ */
 async function deriveMasterSecret(name, passphrase) {

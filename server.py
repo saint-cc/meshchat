@@ -43,10 +43,22 @@ WS_PORT = int(os.environ.get("WS_PORT", 8888))
 # Relay identity — sent to clients on request
 RELAY_WSS_URL = os.environ.get("RELAY_WSS_URL", "")   # e.g. wss://yourrelay.example.com/ws/
 
+# Hostnames this relay accepts a client's auth proof for — see AUTH_HOSTS in
+# the AUTH HELPERS section. The host of RELAY_WSS_URL is always included and
+# is REQUIRED: with no valid RELAY_WSS_URL the relay refuses every
+# sig:auth_init ("relay_not_configured") rather than guessing its own name.
+# RELAY_AUTH_HOSTS adds extra names, comma-separated — bare hostnames or
+# full URLs — for a relay that is reachable under more than one name (a
+# client signs the host IT dialed, so a second name that isn't listed here
+# fails with proof_invalid). Never derived from the Host header: that's
+# chosen by whoever is connecting, which is the one party that must not
+# get to decide what the proof is bound to.
+RELAY_AUTH_HOSTS_RAW = os.environ.get("RELAY_AUTH_HOSTS", "")
+
 # Protocol version — informational only for now, surfaced in sig:relay_info
 # so client/server version drift shows up in both logs. Not enforced yet;
 # room to add real backwards-compat handling once this is actually needed.
-PROTOCOL_VERSION = os.environ.get("PROTOCOL_VERSION", "0.5.5")
+PROTOCOL_VERSION = os.environ.get("PROTOCOL_VERSION", "0.5.6")
 
 # Connection limits
 MAX_CONNECTIONS        = int(os.environ.get("MAX_CONNECTIONS",        100))   # total WS sessions
@@ -797,6 +809,83 @@ async def route_or_buffer(kind, frm, to_id, to_endpoint, msg, ws):
 #   auth_verify       — check proof, register, flush buffer
 # ══════════════════════════════════════════
 
+# ── relay-bound auth proof (auth_v 2) ──
+# Mirrors meshchat-lib.js (AUTH_LABEL / buildAuthMessage / authHostFromUrl)
+# byte for byte — read the comment there for what each field is for. The
+# short version: the client no longer signs the raw nonce (which made every
+# relay a signing oracle for the identity key); it signs
+#   "meshchat-auth-v1" 00 host 00 nonce(32) x25519_pub ed25519_pub
+#   endpoint_id 00 no_receive(1)
+# and this side rebuilds exactly those bytes from what it ISSUED (nonce) and
+# what the client PRESENTED in auth_init (keys, endpoint_id, no_receive),
+# against its own configured host(s) — never against anything the peer
+# claims about where it connected.
+AUTH_VERSION   = 2
+AUTH_LABEL     = b"meshchat-auth-v1"
+AUTH_NONCE_LEN = 32
+
+def _norm_auth_host(h):
+    """Same normalisation as the client's authHostFromUrl: lowercase, IPv6
+    brackets and trailing dot stripped, IDNA/punycode ASCII form. None if it
+    can't be turned into a plain ASCII hostname."""
+    if not h or not isinstance(h, str):
+        return None
+    h = h.strip().lower().rstrip(".")
+    if h.startswith("[") and h.endswith("]"):
+        h = h[1:-1]
+    try:
+        h = h.encode("idna").decode("ascii")
+    except UnicodeError:
+        return None
+    return h or None
+
+def _load_auth_hosts():
+    hosts = set()
+    if RELAY_WSS_URL:
+        h = None
+        try:
+            parsed = urllib.parse.urlparse(RELAY_WSS_URL)
+            if parsed.scheme in ("ws", "wss"):
+                h = _norm_auth_host(parsed.hostname)
+        except ValueError:
+            pass
+        if h:
+            hosts.add(h)
+        else:
+            log.error("CONFIG     RELAY_WSS_URL=%r is not a usable ws(s):// URL — treated as unset", RELAY_WSS_URL)
+    for entry in RELAY_AUTH_HOSTS_RAW.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        h = None
+        try:
+            h = _norm_auth_host(urllib.parse.urlparse(entry).hostname if "://" in entry else entry)
+        except ValueError:
+            pass
+        if h:
+            hosts.add(h)
+        else:
+            log.warning("CONFIG     RELAY_AUTH_HOSTS invalid entry skipped: %r", entry)
+    # Extra names are only meaningful ON TOP of a valid RELAY_WSS_URL —
+    # alone they'd let a half-configured relay start authenticating.
+    if hosts and not (RELAY_WSS_URL and _norm_auth_host(urllib.parse.urlparse(RELAY_WSS_URL).hostname) in hosts):
+        log.error("CONFIG     RELAY_AUTH_HOSTS set but RELAY_WSS_URL missing/invalid — auth stays disabled")
+        return frozenset()
+    return frozenset(hosts)
+
+AUTH_HOSTS = _load_auth_hosts()
+
+def build_auth_message(host: str, nonce: bytes, x25519_pub: bytes, ed25519_pub: bytes,
+                       endpoint_id, no_receive: bool) -> bytes:
+    """endpoint_id has already passed valid_id() (base64url ASCII) or is None."""
+    return b"".join((
+        AUTH_LABEL, b"\x00",
+        host.encode("ascii"), b"\x00",
+        nonce, x25519_pub, ed25519_pub,
+        (endpoint_id or "").encode("ascii"), b"\x00",
+        b"\x01" if no_receive else b"\x00",
+    ))
+
 def derive_public_id(x25519_pub: bytes, ed25519_pub: bytes) -> str:
     """SHA-256(x25519_pub || ed25519_pub)[0..12] encoded as base64url — mirrors
     client deriveIdentityPublicId(). Deliberately hashes BOTH keys together,
@@ -817,7 +906,8 @@ async def auth_challenge(ws, x25519_pub: bytes, ed25519_pub: bytes, bits: int, n
     the client had just handed the server in plaintext one message
     earlier, which proved nothing). The nonce here exists purely as
     something for the client to SIGN with its Ed25519 private key in
-    auth_verify — that signature is the actual possession proof.
+    auth_verify — that signature is the actual possession proof. What it
+    signs is NOT the bare nonce: see build_auth_message.
 
     no_receive: caller is a disposable probe (e.g. testRelayConnection) that
     has no business being treated as a reachable recipient — it intends to
@@ -832,7 +922,7 @@ async def auth_challenge(ws, x25519_pub: bytes, ed25519_pub: bytes, bits: int, n
     of the matching identity is still what auth_verify actually proves.
     Carried through pending_auth so it's only ever registered once the
     challenge is genuinely answered, same as everything else here."""
-    nonce_plain = secrets.token_bytes(32)
+    nonce_plain = secrets.token_bytes(AUTH_NONCE_LEN)
     pending_auth[id(ws)] = {
         "x25519_pub":  x25519_pub,
         "ed25519_pub": ed25519_pub,
@@ -851,8 +941,9 @@ async def auth_challenge(ws, x25519_pub: bytes, ed25519_pub: bytes, bits: int, n
               "  [no_receive]" if no_receive else "")
 
 async def auth_verify(ws, sig_bytes: list, addr: str) -> str | None:
-    """Verify the Ed25519 signature over the nonce, register identity, flush
-    buffer. Returns public_id or None on failure."""
+    """Verify the Ed25519 signature over the domain-separated auth message
+    (build_auth_message), register identity, flush buffer. Returns
+    public_id or None on failure."""
     entry = pending_auth.pop(id(ws), None)
     if not entry:
         log.warning("AUTH       proof with no pending challenge  peer=%s", addr)
@@ -861,9 +952,29 @@ async def auth_verify(ws, sig_bytes: list, addr: str) -> str | None:
         log.warning("AUTH       challenge expired  peer=%s", addr)
         await send_to(ws, {"type": "sig:auth_fail", "reason": "timeout"})
         return None
+    # The signature must verify against OUR host name(s), rebuilt from what
+    # we issued (nonce) and what the client presented in auth_init. A proof
+    # a client made for some other relay's host — e.g. one forwarded by a
+    # relay that was handed OUR challenge — signs different bytes and fails
+    # here. A set, not a single host, only because one relay may legitimately
+    # answer to several names (RELAY_AUTH_HOSTS); a handful of verifies at
+    # worst, and only a proof that fails them all is rejected.
+    verified_host = None
     try:
-        Ed25519PublicKey.from_public_bytes(entry["ed25519_pub"]).verify(bytes(sig_bytes), entry["nonce"])
+        pub = Ed25519PublicKey.from_public_bytes(entry["ed25519_pub"])
+        sig = bytes(sig_bytes)
+        for host in AUTH_HOSTS:
+            message = build_auth_message(host, entry["nonce"], entry["x25519_pub"], entry["ed25519_pub"],
+                                         entry.get("endpoint_id"), entry.get("no_receive", False))
+            try:
+                pub.verify(sig, message)
+                verified_host = host
+                break
+            except Exception:
+                continue
     except Exception:
+        verified_host = None
+    if verified_host is None:
         log.warning("AUTH       proof invalid  peer=%s", addr)
         await send_to(ws, {"type": "sig:auth_fail", "reason": "proof_invalid"})
         return None
@@ -891,8 +1002,8 @@ async def auth_verify(ws, sig_bytes: list, addr: str) -> str | None:
         if endpoint_id:
             connected_by_endpoint.setdefault(public_id, {}).setdefault(endpoint_id, set()).add(ws)
             ws_to_endpoint.setdefault(ws, []).append((public_id, endpoint_id))
-    log.info("AUTH OK    id=%s  bits=%d  peer=%s  keys=%d  sessions=%d%s%s",
-             short(public_id), entry["bits"], addr, unique_keys(), session_count(),
+    log.info("AUTH OK    id=%s  bits=%d  host=%s  peer=%s  keys=%d  sessions=%d%s%s",
+             short(public_id), entry["bits"], verified_host, addr, unique_keys(), session_count(),
              "  [no_receive — not registered]" if no_receive else "",
              f"  endpoint={short(endpoint_id)}" if (endpoint_id and not no_receive) else "")
     await send_to(ws, {"type": "sig:auth_ok", "public_id": public_id})
@@ -1425,10 +1536,30 @@ async def handler(ws):
 
             # ── auth_init: client presents both public keys, server sends challenge ──
             if kind == "sig:auth_init":
+                # Strict: with no valid RELAY_WSS_URL there is no host to bind
+                # the proof to, and guessing one from the Host header would
+                # hand that choice to the connecting party. Refuse, loudly.
+                if not AUTH_HOSTS:
+                    log.warning("AUTH       relay not configured (RELAY_WSS_URL unset/invalid) — refusing auth  peer=%s", addr)
+                    await send_to(ws, {"type": "sig:auth_fail", "reason": "relay_not_configured"})
+                    continue
+                # Hard cutover, no dual-version path. An auth_v 1 (raw-nonce)
+                # client gets a clear reason instead of a generic proof_invalid.
+                if msg.get("auth_v") != AUTH_VERSION:
+                    log.warning("AUTH       auth_v mismatch  got=%r  want=%d  peer=%s", msg.get("auth_v"), AUTH_VERSION, addr)
+                    await send_to(ws, {"type": "sig:auth_fail", "reason": "auth_version"})
+                    continue
                 x25519_list  = msg.get("x25519_pub")
                 ed25519_list = msg.get("ed25519_pub")
                 bits         = 256
-                no_receive   = bool(msg.get("no_receive", False))
+                # strictly a bool (or absent): it is inside the signed message as
+                # one byte, so a loosely-coerced value could never match anyway —
+                # reject it here with a useful reason instead of at proof time
+                no_receive   = msg.get("no_receive", False)
+                if not isinstance(no_receive, bool):
+                    log.warning("AUTH       bad no_receive  peer=%s", addr)
+                    await send_to(ws, {"type": "sig:auth_fail", "reason": "bad_init"})
+                    continue
                 endpoint_id   = msg.get("endpoint_id")
                 if not x25519_list or not ed25519_list:
                     log.warning("AUTH       bad auth_init  peer=%s", addr)
@@ -1724,6 +1855,11 @@ async def run_signal_server():
     log.info("Rate limits: per-socket=%d/s burst=%d  per-ip=%d/s burst=%d",
               RATE_LIMIT_RATE, RATE_LIMIT_BURST, IP_RATE_LIMIT_RATE, IP_RATE_LIMIT_BURST)
     log.info("Trusted proxies: %s", ", ".join(str(n) for n in TRUSTED_PROXIES) or "(none)")
+    if AUTH_HOSTS:
+        log.info("Auth: v%d  bound to host(s): %s", AUTH_VERSION, ", ".join(sorted(AUTH_HOSTS)))
+    else:
+        log.error("Auth: v%d  NOT CONFIGURED — RELAY_WSS_URL is unset or invalid, so EVERY client auth is refused "
+                  "(relay_not_configured). Set RELAY_WSS_URL (e.g. wss://yourrelay.example.com/ws/).", AUTH_VERSION)
     log.info("Push: subs_dir=%s  vapid_key=%s  vapid_pub=%s…  ttl=%ds  subject=%s",
              PUSH_SUBS_DIR, VAPID_KEY_FILE, VAPID_PUBLIC_KEY_B64[:16], PUSH_TTL_SECONDS, VAPID_SUBJECT)
     log.info("=" * 50)
