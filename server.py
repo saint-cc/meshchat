@@ -58,7 +58,7 @@ RELAY_AUTH_HOSTS_RAW = os.environ.get("RELAY_AUTH_HOSTS", "")
 # Protocol version — informational only for now, surfaced in sig:relay_info
 # so client/server version drift shows up in both logs. Not enforced yet;
 # room to add real backwards-compat handling once this is actually needed.
-PROTOCOL_VERSION = os.environ.get("PROTOCOL_VERSION", "0.5.6")
+PROTOCOL_VERSION = os.environ.get("PROTOCOL_VERSION", "0.5.7")
 
 # Connection limits
 MAX_CONNECTIONS        = int(os.environ.get("MAX_CONNECTIONS",        100))   # total WS sessions
