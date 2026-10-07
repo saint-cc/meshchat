@@ -13,7 +13,7 @@
 
    Load order: meshchat-lib.js → meshchat-gui.js → meshchat.js → statemachine.js
 ═══════════════════════════════════════════════════════════════ */
-const CLIENT_VERSION = "0.5.6";
+const CLIENT_VERSION = "0.5.7";
 
 const POLL_INTERVAL_MS        	= 30_000;			// base interval between presence polls
 const POLL_JITTER_MS          	= 10_000;			// ± random jitter added to poll interval
@@ -297,16 +297,65 @@ async function computeBackupFingerprint() {
 // legacy identity-level OR (as of this pass) an X4DH per-device wire key.
 // See decryptIncomingMessage below for how app:message's receive path
 // now resolves WHICH key to hand this.
-async function decryptMessage(blob, key) {
-  // v missing = v0 (legacy unversioned), v:1 = AES-256-GCM explicit
-  if (blob.v !== undefined && blob.v > 1) throw new Error(`unsupported message version v${blob.v}`);
-  const plain = await crypto.subtle.decrypt({ name: "AES-GCM", iv: new Uint8Array(blob.iv) }, key, new Uint8Array(blob.data));
+async function decryptMessage(blob, key, aad) {
+  // v missing = v0 (legacy unversioned), v:1 = AES-256-GCM explicit,
+  // v:2 = v1 + envelope-bound (AAD) — see ENV_LABEL/envelopeAad in lib.js.
+  // Passing an aad REQUIRES v:2 (no fallback to an unbound blob); without
+  // one, a v:2 blob is refused (it couldn't decrypt without its binding anyway).
+  if (blob.v !== undefined && blob.v > 2) throw new Error(`unsupported message version v${blob.v}`);
+  if (aad) { if (blob.v !== 2) throw new Error(`message blob v${blob.v} lacks envelope binding`); }
+  else if (blob.v === 2)       throw new Error("message blob v2 needs its envelope binding to decrypt");
+  const params = { name: "AES-GCM", iv: new Uint8Array(blob.iv) };
+  if (aad) params.additionalData = aad;
+  const plain = await crypto.subtle.decrypt(params, key, new Uint8Array(blob.data));
   return JSON.parse(new TextDecoder().decode(plain));
 }
 function signBlob(blob){
   const bytes=new TextEncoder().encode(JSON.stringify(blob));
   const sig=ed25519.sign(bytes,state.keys.signingKeySeed);
   return Array.from(sig);
+}
+
+/* ══════════════════════════════════════════
+   PACKET ENVELOPE — app:message, app:migrate, app:burn, app:sync
+   These four carry { type, from, to, blob, sig } and used to sign only
+   the blob. type/from/to are outside the ciphertext, so a relay could
+   retype a packet (an ordinary legacy-key app:message re-labelled
+   app:burn blocked a contact and wiped the conversation — reproduced
+   against 0.5.6), reflect it back at its sender, or redirect it to another
+   device. Now:
+     - the signature covers { type, from, to, blob } (same convention the
+       call/data/session/handshake packets already use — their `type` is
+       inside the signed JSON, so a signature for one type can never verify
+       as another);
+     - the ciphertext is bound to [type, from, to] as AES-GCM AAD, so the
+       same rewrite fails at decrypt and the packet is dropped.
+   sealEnvelope() is the ONE place such a packet is built; receivers pass
+   envelopeAad(msg.type, msg.from, msg.to) — built from the packet AS
+   RECEIVED, never from anything inside the payload — to decryptMessage and
+   check verifyEnvelope(msg, key). `to` is bare ("id") or compound
+   ("id::endpointId"), exactly as sent.
+══════════════════════════════════════════ */
+function signEnvelope(type, from, to, blob) {
+  return signBlob({ type, from, to, blob });
+}
+function verifyEnvelope(msg, contactSignPublicKey) {
+  if (!msg.sig || !contactSignPublicKey) return false;
+  return verifyBlob({ type: msg.type, from: msg.from, to: msg.to, blob: msg.blob }, msg.sig, contactSignPublicKey);
+}
+async function sealEnvelope(type, from, to, key, payload) {
+  const blob = await encryptMessage(key, payload, envelopeAad(type, from, to));
+  return { type, from, to, blob, sig: signEnvelope(type, from, to, blob) };
+}
+
+// Is this packet addressed to THIS device? A bare "id" means any device of
+// the identity; "id::endpointId" additionally names one device — and the
+// endpoint part used to be ignored by every receive handler (the relay
+// routes on it, but a relay is exactly who can't be trusted to). Replaces
+// the old bare-id comparison on `msg.to` at every handler.
+function isAddressedToMe(to) {
+  const { id, endpoint } = parseAddress(to);
+  return id === state.publicId && (!endpoint || endpoint === state.endpointId);
 }
 
 function getLast(contactId, n = EXCHANGE_COUNT) { return selectRetainedMessages(state.contacts[contactId]?.messages || [], n); }
@@ -1439,7 +1488,7 @@ async function sendX4DHPropose(contactId, theirDeviceId) {
    simultaneous redelivery: isDuplicateInbound/DEDUP_WINDOW_MS.
 ── */
 async function handleX4DHPropose(msg) {
-  if (!msg.from || !msg.to || !msg.sessionEpoch || !msg.ekPub || parseAddress(msg.to).id !== state.publicId) return;
+  if (!msg.from || !msg.to || !msg.sessionEpoch || !msg.ekPub || !isAddressedToMe(msg.to)) return;
   const contact = state.contacts[msg.from];
   if (!contact || contact.blocked || !contact.x25519PublicKey) return;
   if (isDuplicateInbound(`x4dh_propose:${msg.from}:${msg.deviceId}:${msg.sessionEpoch}`)) {
@@ -1503,7 +1552,7 @@ async function handleX4DHPropose(msg) {
 // this ack answers; a miss means stale/duplicate/already-upgraded/
 // timed-out and is dropped rather than guessed at.
 async function handleX4DHAck(msg) {
-  if (!msg.from || !msg.to || !msg.sessionEpoch || !msg.ekPub || parseAddress(msg.to).id !== state.publicId) return;
+  if (!msg.from || !msg.to || !msg.sessionEpoch || !msg.ekPub || !isAddressedToMe(msg.to)) return;
   const contact = state.contacts[msg.from];
   if (!contact || contact.blocked || !contact.x25519PublicKey) return;
   if (!verifyX4DHPacket(msg, contact.signPublicKey)) {
@@ -1607,9 +1656,7 @@ async function sendFannedX4DH(contactId, payload) {
   for (const { deviceId, endpointId } of targeted) {
     const wireKey = await getOrDeriveWireKey(contactId, deviceId);
     const key = wireKey || contact.encKey;
-    const blob = await encryptMessage(key, payload);
-    const sig  = await signBlob(blob);
-    const obj  = { type: "app:message", from: state.publicId, to: buildAddress(contactId, endpointId), blob, sig };
+    const obj = await sealEnvelope("app:message", state.publicId, buildAddress(contactId, endpointId), key, payload);
     const viaRelay = sendToRelay(contactId, obj, true);
     if (!viaRelay) sendSignal(obj);
     sent = sent || viaRelay || state.ws?.readyState === WebSocket.OPEN;
@@ -1618,9 +1665,7 @@ async function sendFannedX4DH(contactId, payload) {
   }
 
   if (needsBroadcast) {
-    const blob = await encryptMessage(contact.encKey, payload);
-    const sig  = await signBlob(blob);
-    const obj  = { type: "app:message", from: state.publicId, to: contactId, blob, sig };
+    const obj = await sealEnvelope("app:message", state.publicId, contactId, contact.encKey, payload);
     const viaRelay = sendToRelay(contactId, obj, true);
     if (!viaRelay) sendSignal(obj);
     sent = sent || viaRelay || state.ws?.readyState === WebSocket.OPEN;
@@ -1745,7 +1790,7 @@ const isIdLike = (s) => typeof s === "string" && /^[A-Za-z0-9_-]{8,64}$/.test(s)
 const SELF_HELLO_COOLDOWN_MS = 60_000;   // discovery hello is tiny, but backup cycles fire on every couple of messages — don't spam siblings with acks
 let   lastSelfHelloSent      = 0;
 
-async function decryptSelfBackupBlob(blob) {
+async function decryptSelfBackupBlob(blob, aad) {
   const sessions   = state.x4dhSessions[state.publicId] || {};
   const candidates = Object.entries(sessions)
     .sort(([, a], [, b]) => (b.establishedAt || 0) - (a.establishedAt || 0));
@@ -1753,10 +1798,10 @@ async function decryptSelfBackupBlob(blob) {
     const wireKey = await getOrDeriveWireKey(state.publicId, theirDeviceId);
     if (!wireKey) continue;
     try {
-      return { plain: await decryptObject(wireKey, blob), wireDeviceId: theirDeviceId };
+      return { plain: await decryptObject(wireKey, blob, aad), wireDeviceId: theirDeviceId };
     } catch(e) { /* wrong key for this sibling — try the next */ }
   }
-  return { plain: await decryptObject(state.cryptoKey, blob), wireDeviceId: null };
+  return { plain: await decryptObject(state.cryptoKey, blob, aad), wireDeviceId: null };
 }
 
 // Receive side of the discovery hello. Learns the sibling (which can
@@ -1777,9 +1822,9 @@ async function handleSelfHello(plain) {
   const sessionKey = await getOrDeriveWireKey(state.publicId, plain.deviceId);
   const ackPayload = { deviceId: state.deviceId, endpointId: state.endpointId };
   if (sessionKey) ackPayload.fingerprint = await computeBackupFingerprint();
-  const ackBlob = await encryptObject(sessionKey || state.cryptoKey, ackPayload);
-  sendSignal({ type: "sync:backup_accept", from: state.publicId,
-               to: buildAddress(state.publicId, helloEndpoint), blob: ackBlob });
+  const ackTo   = buildAddress(state.publicId, helloEndpoint);
+  const ackBlob = await encryptObject(sessionKey || state.cryptoKey, ackPayload, envelopeAad("sync:backup_accept", state.publicId, ackTo));
+  sendSignal({ type: "sync:backup_accept", from: state.publicId, to: ackTo, blob: ackBlob });
   mlog.debug(`→ BACKUP_ACK   to self  ${pid(state.publicId, { deviceId: plain.deviceId, endpointId: helloEndpoint })} — ${sessionKey ? "session key, with fingerprint" : "content-free"}`);
 }
 
@@ -1836,8 +1881,9 @@ async function pushBackupToContacts(blob) {
 					deviceId: state.deviceId, endpointId: state.endpointId, fingerprint,
 					contacts: serialiseContacts(),
 				};
-				const blob = await encryptObject(wireKey, selfPayload);
-				sendSignal({ type: "sync:backup_push", from: state.publicId, to: buildAddress(id, devEndpoint), blob });
+				const pushTo = buildAddress(id, devEndpoint);
+				const blob = await encryptObject(wireKey, selfPayload, envelopeAad("sync:backup_push", state.publicId, pushTo));
+				sendSignal({ type: "sync:backup_push", from: state.publicId, to: pushTo, blob });
 				sent++;
 				mlog.info(`→ BACKUP_PUSH  to self — targeted, session key  ${pid(state.publicId, { deviceId: devId, endpointId: devEndpoint })}`);
 			}
@@ -1847,7 +1893,7 @@ async function pushBackupToContacts(blob) {
 				lastSelfHelloSent = Date.now();
 				const helloBlob = await encryptObject(state.cryptoKey, {
 					deviceId: state.deviceId, endpointId: state.endpointId, hello: true,
-				});
+				}, envelopeAad("sync:backup_push", state.publicId, id));
 				sendSignal({ type: "sync:backup_push", from: state.publicId, to: id, blob: helloBlob });
 				mlog.info(`→ BACKUP_PUSH  to self — content-free hello  (${needsBroadcast ? "device(s) unknown/unresolved/stale" : ""}${needsBroadcast && noSession ? ", " : ""}${noSession ? noSession + " without a session yet" : ""})`);
 			}
@@ -1895,7 +1941,7 @@ function replyAddress(fromId, fromEndpoint, verified) {
 }
 
 async function handleBackupOffer(msg) {
-  if (!msg.from || !msg.size) return;
+  if (!msg.from || !msg.size || !isAddressedToMe(msg.to)) return;
   const { id: fromId, endpoint: fromEndpoint } = parseAddress(msg.from);
   if (!fromId) { mlog.warn(`← BACKUP_OFFER  bad 'from' address, dropped`); return; }
   if (state.contacts[fromId]?.blocked) return;
@@ -1937,7 +1983,7 @@ async function handleBackupOffer(msg) {
 }
 
 async function handleBackupAccept(msg) {
-  if (!msg.from) return;
+  if (!msg.from || !isAddressedToMe(msg.to)) return;
   const { id: fromId, endpoint: fromEndpoint } = parseAddress(msg.from);
   if (!fromId) return;
   markOnline(fromId);   // covers both branches below — self-sync's own `from` is always bare, so fromId === msg.from there
@@ -1953,7 +1999,7 @@ async function handleBackupAccept(msg) {
       // Same key resolution as the push side: session keys first, backup key
       // last. A content-free ack (reply to a discovery hello, sent before a
       // session exists) simply carries no fingerprint.
-      const { plain, wireDeviceId } = await decryptSelfBackupBlob(msg.blob);
+      const { plain, wireDeviceId } = await decryptSelfBackupBlob(msg.blob, envelopeAad(msg.type, msg.from, msg.to));
       if (!plain?.deviceId || plain.deviceId === state.deviceId) return;  // malformed, or own echo (shouldn't happen)
       if (!isIdLike(plain.deviceId)) return;
       if (wireDeviceId && plain.deviceId !== wireDeviceId) {
@@ -2070,7 +2116,7 @@ async function handleBackupAccept(msg) {
 }
 
 async function handleBackupPush(msg) {
-  if (!msg.from || !msg.blob) return;
+  if (!msg.from || !msg.blob || !isAddressedToMe(msg.to)) return;
   const { id: fromId, endpoint: fromEndpoint } = parseAddress(msg.from);
   if (!fromId) return;
   if (state.contacts[fromId]?.blocked) return;
@@ -2081,7 +2127,7 @@ async function handleBackupPush(msg) {
 		  // Key resolution: any X4DH self-session wire key first, backup key
 		  // last — see decryptSelfBackupBlob. wireDeviceId is set only when a
 		  // session key was the one that worked.
-		  const { plain, wireDeviceId } = await decryptSelfBackupBlob(msg.blob);
+		  const { plain, wireDeviceId } = await decryptSelfBackupBlob(msg.blob, envelopeAad(msg.type, msg.from, msg.to));
 		  if (typeof plain !== "object" || plain === null || Array.isArray(plain)) return;
 
 		  // Content-free discovery hello — { deviceId, endpointId, hello:true },
@@ -2118,9 +2164,9 @@ async function handleBackupPush(msg) {
 			mlog.warn(`← BACKUP_PUSH  from self — decrypted under ${pid(wireDeviceId)}'s session key but payload claims deviceId=${pid(plain.deviceId)}, dropped`);
 			return;
 		  }
-		  // A full push under the static backup key is what the sibling's older
-		  // client sends — still accepted (interop), but it's exactly the
-		  // deterministic-key exposure this path no longer produces itself.
+		  // A full push under the static backup key is what a pre-0.5.7 sibling
+		  // sent. Those can no longer arrive here (self blobs are envelope-bound
+		  // since 0.5.7), so this only fires for a modified client — logged, not dropped.
 		  if (isWrapped && !wireDeviceId) {
 			mlog.info(`← BACKUP_PUSH  from self — full push under static backup key (legacy sender)`);
 		  }
@@ -2180,11 +2226,11 @@ async function handleBackupPush(msg) {
 		  // key when the sender used one, the backup key otherwise (an older
 		  // sender can only decrypt that).
 		  const ackKey  = wireDeviceId ? await getOrDeriveWireKey(state.publicId, wireDeviceId) : null;
+		  const ackTo   = buildAddress(state.publicId, plain.endpointId);
 		  const ackBlob = await encryptObject(ackKey || state.cryptoKey, {
 			  deviceId: state.deviceId, endpointId: state.endpointId, fingerprint: ownFingerprint,
-		  });
-		  sendSignal({ type: "sync:backup_accept", from: state.publicId,
-					   to: buildAddress(state.publicId, plain.endpointId), blob: ackBlob });
+		  }, envelopeAad("sync:backup_accept", state.publicId, ackTo));
+		  sendSignal({ type: "sync:backup_accept", from: state.publicId, to: ackTo, blob: ackBlob });
 		  mlog.debug(`→ BACKUP_ACK   to self  ${plain.endpointId ? pid(state.publicId, { deviceId: plain.deviceId, endpointId: plain.endpointId }) : pid(state.publicId)} — fingerprint ${ownFingerprint}${plain.endpointId ? "" : "  (broadcast — sender endpoint unknown)"}`);
 		} catch(e) {
 		  mlog.warn(`← BACKUP_PUSH  from self — decrypt failed`);
@@ -2333,7 +2379,7 @@ async function tokenBoundId(tokenPlain) {
 }
 
 async function handleTokenRequest(msg) {
-  if (!msg.from) return;
+  if (!msg.from || !isAddressedToMe(msg.to)) return;
   const contact = state.contacts[msg.from];
   if (!contact || contact.blocked) return;
   markOnline(msg.from);
@@ -2347,7 +2393,7 @@ async function handleTokenRequest(msg) {
 }
 
 async function handleTokenResponse(msg) {
-  if (!msg.from || !msg.token) return;
+  if (!msg.from || !msg.token || !isAddressedToMe(msg.to)) return;
   const contact = state.contacts[msg.from];
   if (!contact || contact.blocked) {
     mlog.warn(`← TOKEN_RESP   from ${pid(msg.from)} — not a contact, ignored`);
@@ -2629,7 +2675,7 @@ async function sendRestoreRequest(id) {
 }
 
 async function handleRestoreRequest(msg) {
-  if (!msg.from || !msg.blob) return;
+  if (!msg.from || !msg.blob || !isAddressedToMe(msg.to)) return;
   const contact = state.contacts[msg.from];
   if (!contact) {
     // Under the old symmetric-by-address scheme, ANY sender could produce
@@ -2763,7 +2809,7 @@ if (contact.blocked) {
 
 async function handleRestoreAck(msg) {
   if (!msg.from || !msg.to) return;
-  if (parseAddress(msg.to).id !== state.publicId) return;
+  if (!isAddressedToMe(msg.to)) return;
   const { id: fromId, endpoint: fromEndpoint } = parseAddress(msg.from);
   if (!fromId) return;
   markOnline(fromId);
@@ -2885,7 +2931,7 @@ async function handleRestoreAck(msg) {
 }
 
 async function handleRestorePush(msg) {
-  if (!msg.from || !msg.blob) return;
+  if (!msg.from || !msg.blob || !isAddressedToMe(msg.to)) return;
   const { id: fromId, endpoint: fromEndpoint } = parseAddress(msg.from);
   if (!fromId) return;
   markOnline(fromId);
@@ -3097,9 +3143,7 @@ const validSyncEk = (ek) => Array.isArray(ek) && ek.length === 32 && ek.every(b 
 async function buildSyncPacket(contact, { syncId, reply, ek, wrapped }) {
   const payload = { from: state.publicId, to: contact.publicId, syncId, reply, ek };
   if (wrapped) payload.wrapped = wrapped;
-  const blob = await encryptMessage(contact.encKey, payload);
-  const sig  = signBlob(blob);
-  return { type: "app:sync", from: state.publicId, to: contact.publicId, blob, sig };
+  return sealEnvelope("app:sync", state.publicId, contact.publicId, contact.encKey, payload);
 }
 
 // Whitelisted field copy, never a spread — same discipline as
@@ -3172,7 +3216,7 @@ async function initiateExchange(contactId) {
 }
 
 async function handleMsgExchange(msg) {
-  if (!msg.from || !msg.to || parseAddress(msg.to).id !== state.publicId) return;
+  if (!msg.from || !msg.to || !isAddressedToMe(msg.to)) return;
   if (!msg.blob) {
     mlog.warn(`\u2190 SYNC         from ${pid(msg.from)} \u2014 no encrypted blob (legacy plaintext sync), dropped`);
     return;
@@ -3183,12 +3227,12 @@ async function handleMsgExchange(msg) {
   // Signature first (cheap, and nothing below is worth doing for a forgery).
   // Mandatory, same tier as app:migrate — a missing or invalid one is dropped,
   // never flagged-and-shown, because this packet writes into the conversation.
-  if (!msg.sig || !contact.signPublicKey || !verifyBlob(msg.blob, msg.sig, contact.signPublicKey)) {
+  if (!verifyEnvelope(msg, contact.signPublicKey)) {
     mlog.warn(`\u2190 SYNC         from ${pid(msg.from)} \u2014 signature missing or invalid, dropped`);
     return;
   }
   let plain;
-  try { plain = await decryptMessage(msg.blob, contact.encKey); }
+  try { plain = await decryptMessage(msg.blob, contact.encKey, envelopeAad(msg.type, msg.from, msg.to)); }
   catch(e) { mlog.warn(`\u2190 SYNC         from ${pid(msg.from)} \u2014 decrypt failed, dropped`); return; }
 
   // Envelope fields are unsigned and relay-rewritable; the payload copies are
@@ -4235,7 +4279,7 @@ async function togglePushPref(enabled) {
    candidate fails, same failure shape decryptMessage itself already
    has — callers catch this exactly as before.
 ── */
-async function decryptIncomingMessage(fromId, blob) {
+async function decryptIncomingMessage(fromId, blob, aad) {
   const contact  = state.contacts[fromId];
   const sessions = state.x4dhSessions[fromId] || {};
   const candidates = Object.entries(sessions)
@@ -4245,14 +4289,14 @@ async function decryptIncomingMessage(fromId, blob) {
     const wireKey = await getOrDeriveWireKey(fromId, theirDeviceId);
     if (!wireKey) continue;
     try {
-      const plain = await decryptMessage(blob, wireKey);
+      const plain = await decryptMessage(blob, wireKey, aad);
       return { plain, viaX4DH: true, theirDeviceId };
     } catch(e) { /* wrong key for this device — try the next candidate */ }
   }
 
   // legacy identity-level key — last resort, covers any device that
   // hasn't bootstrapped an X4DH session yet (or never will)
-  const plain = await decryptMessage(blob, contact.encKey);
+  const plain = await decryptMessage(blob, contact.encKey, aad);
   return { plain, viaX4DH: false, theirDeviceId: null };
 }
 
@@ -4357,16 +4401,16 @@ async function handleSelfSync(msg, plain, valid) {
 }
 
 async function receiveMessage(msg) {
-  if (!msg.from || !msg.blob) return;
+  if (!msg.from || !msg.blob || !isAddressedToMe(msg.to)) return;
   const contact = state.contacts[msg.from];
   if (!contact || contact.blocked) return;
   markOnline(msg.from);
   try {
     let plain, valid, viaX4DH, matchedDeviceId;
-    ({ plain, viaX4DH, theirDeviceId: matchedDeviceId } = await decryptIncomingMessage(msg.from, msg.blob));
-    valid = msg.sig && contact.signPublicKey
-      ? verifyBlob(msg.blob, msg.sig, contact.signPublicKey)
-      : false;
+    // AAD is built from the envelope AS RECEIVED — a packet retyped, reflected or
+    // redirected in transit no longer decrypts (see PACKET ENVELOPE above)
+    ({ plain, viaX4DH, theirDeviceId: matchedDeviceId } = await decryptIncomingMessage(msg.from, msg.blob, envelopeAad(msg.type, msg.from, msg.to)));
+    valid = verifyEnvelope(msg, contact.signPublicKey);
 
     // Belt-and-suspenders consistency check: a successful decrypt under
     // a specific device's X4DH session key means that ciphertext was
@@ -4553,22 +4597,21 @@ async function receiveMessage(msg) {
        behind than us can still find the trail.
 ══════════════════════════════════════════ */
 async function handleMigrate(msg) {
-  if (!msg.from || !msg.blob) return;
+  // never device-targeted (server.py drops a compound `to` for this type too) — bare identity only
+  if (!msg.from || !msg.blob || msg.to !== state.publicId) return;
   const contact = state.contacts[msg.from];
   if (!contact || contact.blocked) return;
   markOnline(msg.from);
 
   let plain;
   try {
-    plain = await decryptMessage(msg.blob, contact.encKey);
+    plain = await decryptMessage(msg.blob, contact.encKey, envelopeAad(msg.type, msg.from, msg.to));
   } catch(e) {
     mlog.warn(`← MIGRATE      from ${pid(msg.from)} — decrypt failed`);
     return;
   }
 
-  const sigValid = msg.sig && contact.signPublicKey
-    ? verifyBlob(msg.blob, msg.sig, contact.signPublicKey)
-    : false;
+  const sigValid = verifyEnvelope(msg, contact.signPublicKey);
   if (!sigValid) {
     mlog.warn(`← MIGRATE      from ${pid(msg.from)} — signature invalid, dropped`);
     return;
@@ -4602,9 +4645,7 @@ async function handleMigrate(msg) {
       // this has to go by explicit URL.
       if (beforeUrl) {
         try {
-          const blob = await encryptMessage(me.encKey, { newRelay: plain.newRelay, ts: plain.ts });
-          const sig  = await signBlob(blob);
-          const breadcrumbObj = { type: "app:migrate", from: state.publicId, to: state.publicId, blob, sig };
+          const breadcrumbObj = await sealEnvelope("app:migrate", state.publicId, state.publicId, me.encKey, { newRelay: plain.newRelay, ts: plain.ts });
           const sent = sendViaRelayUrl(beforeUrl, breadcrumbObj);
           mlog.info(`→ MIGRATE      breadcrumb replanted @ ${beforeUrl}  sent=${sent}`);
         } catch(e) {
@@ -4649,20 +4690,25 @@ async function handleMigrate(msg) {
 async function handleBurn(msg) {
   if (!msg.from || !msg.blob) return;
  
+  // never device-targeted — bare identity only (same rule as migrate)
+  if (msg.to !== state.publicId) {
+    mlog.warn(`← BURN         from ${pid(msg.from)} — not addressed to our bare identity, dropped`);
+    return;
+  }
   const isSelf  = msg.from === state.publicId;
   const contact = state.contacts[msg.from];
   if (!isSelf && !contact) return;   // unknown sender, nothing to act on
  
   let plain;
   try {
-    plain = await decryptMessage(msg.blob, contact.encKey);
+    plain = await decryptMessage(msg.blob, contact.encKey, envelopeAad(msg.type, msg.from, msg.to));
   } catch(e) {
     mlog.warn(`← BURN         from ${pid(msg.from)} — decrypt failed`);
     return;
   }
  
   const verifyKey = isSelf ? state.contacts[state.publicId]?.signPublicKey : contact.signPublicKey;
-  const sigValid  = msg.sig && verifyKey ? verifyBlob(msg.blob, msg.sig, verifyKey) : false;
+  const sigValid  = verifyEnvelope(msg, verifyKey);
   if (!sigValid) {
     mlog.warn(`← BURN         from ${pid(msg.from)} — signature invalid, dropped`);
     return;
@@ -4770,9 +4816,7 @@ async function notifyMigration(newRelay, ts, oldRelay) {
     const contact = state.contacts[id];
     if (!contact?.encKey || contact.blocked) continue;
     try {
-      const blob = await encryptMessage(contact.encKey, payload);
-      const sig  = await signBlob(blob);
-      const migMsgObj = { type: "app:migrate", from: state.publicId, to: id, blob, sig };
+      const migMsgObj = await sealEnvelope("app:migrate", state.publicId, id, contact.encKey, payload);
       const viaRelay  = sendToRelay(id, migMsgObj, true);
       if (!viaRelay) sendSignal(migMsgObj);
       mlog.info(`→ MIGRATE      to   ${pid(id)}  via=${viaRelay ? "relay" : "signal(fallback)"}`);
@@ -4784,9 +4828,7 @@ async function notifyMigration(newRelay, ts, oldRelay) {
   if (oldRelay) {
     const me = state.contacts[state.publicId];
     try {
-      const blob = await encryptMessage(me.encKey, payload);
-      const sig  = await signBlob(blob);
-      const selfMsgObj = { type: "app:migrate", from: state.publicId, to: state.publicId, blob, sig };
+      const selfMsgObj = await sealEnvelope("app:migrate", state.publicId, state.publicId, me.encKey, payload);
       const sent = sendViaRelayUrl(oldRelay, selfMsgObj);
       mlog.info(`→ MIGRATE      to self @ old relay ${oldRelay}  sent=${sent}`);
     } catch(e) {
@@ -4833,9 +4875,7 @@ async function notifyBurn(ts) {
     const contact = state.contacts[id];
     if (!contact?.encKey || contact.blocked) continue;
     try {
-      const blob = await encryptMessage(contact.encKey, payload);
-      const sig  = await signBlob(blob);
-      const burnMsgObj = { type: "app:burn", from: state.publicId, to: id, blob, sig };
+      const burnMsgObj = await sealEnvelope("app:burn", state.publicId, id, contact.encKey, payload);
       const viaRelay    = sendToRelay(id, burnMsgObj, true);
       if (!viaRelay) sendSignal(burnMsgObj);
       mlog.info(`→ BURN         to   ${pid(id)}  via=${viaRelay ? "relay" : "signal(fallback)"}`);
@@ -4846,9 +4886,7 @@ async function notifyBurn(ts) {
  
   const me = state.contacts[state.publicId];
   try {
-    const blob = await encryptMessage(me.encKey, payload);
-    const sig  = await signBlob(blob);
-    const selfBurnObj = { type: "app:burn", from: state.publicId, to: state.publicId, blob, sig };
+    const selfBurnObj = await sealEnvelope("app:burn", state.publicId, state.publicId, me.encKey, payload);
     sendSignal(selfBurnObj);
     mlog.info(`→ BURN         to self`);
   } catch(e) {
@@ -5186,7 +5224,7 @@ function endCall(contactId) {
 /* ── receive side ── */
 
 async function handleCallInvite(msg) {
-  if (!msg.from || !msg.to || !msg.callId || parseAddress(msg.to).id !== state.publicId) return;
+  if (!msg.from || !msg.to || !msg.callId || !isAddressedToMe(msg.to)) return;
   const contact = state.contacts[msg.from];
   if (!contact || contact.blocked) return;
   if (!verifyCallPacket(msg, contact.signPublicKey)) {
@@ -5209,7 +5247,7 @@ async function handleCallInvite(msg) {
 }
 
 async function handleCallClaim(msg) {
-  if (!msg.from || !msg.to || !msg.callId || parseAddress(msg.to).id !== state.publicId) return;
+  if (!msg.from || !msg.to || !msg.callId || !isAddressedToMe(msg.to)) return;
 
   if (msg.from === state.publicId) {
     // one of OUR OTHER devices answered — verify against our own signing
@@ -5243,7 +5281,7 @@ async function handleCallClaim(msg) {
 }
 
 async function handleCallCancel(msg) {
-  if (!msg.from || !msg.to || !msg.callId || parseAddress(msg.to).id !== state.publicId) return;
+  if (!msg.from || !msg.to || !msg.callId || !isAddressedToMe(msg.to)) return;
   const contact = state.contacts[msg.from];
   if (!contact) return;
   if (!verifyCallPacket(msg, contact.signPublicKey)) {
@@ -5255,7 +5293,7 @@ async function handleCallCancel(msg) {
 }
 
 async function handleCallEnd(msg) {
-  if (!msg.from || !msg.to || !msg.callId || parseAddress(msg.to).id !== state.publicId) return;
+  if (!msg.from || !msg.to || !msg.callId || !isAddressedToMe(msg.to)) return;
   const contact = state.contacts[msg.from];
   if (!contact) return;
   if (!verifyCallPacket(msg, contact.signPublicKey)) {
@@ -5267,7 +5305,7 @@ async function handleCallEnd(msg) {
 }
 
 async function handleDataInvite(msg) {
-  if (!msg.from || !msg.to || !msg.sessionId || parseAddress(msg.to).id !== state.publicId) return;
+  if (!msg.from || !msg.to || !msg.sessionId || !isAddressedToMe(msg.to)) return;
   const contact = state.contacts[msg.from];
   if (!contact || contact.blocked) return;
   if (!verifyDataPacket(msg, contact.signPublicKey)) {
@@ -5296,7 +5334,7 @@ function reportDataEndedEarly(id, verb) {
 }
 
 async function handleDataClaim(msg) {
-  if (!msg.from || !msg.to || !msg.sessionId || parseAddress(msg.to).id !== state.publicId) return;
+  if (!msg.from || !msg.to || !msg.sessionId || !isAddressedToMe(msg.to)) return;
 
   if (msg.from === state.publicId) {
     // one of OUR OTHER devices accepted — verify against our own signing
@@ -5332,7 +5370,7 @@ async function handleDataClaim(msg) {
 }
 
 async function handleDataCancel(msg) {
-  if (!msg.from || !msg.to || !msg.sessionId || parseAddress(msg.to).id !== state.publicId) return;
+  if (!msg.from || !msg.to || !msg.sessionId || !isAddressedToMe(msg.to)) return;
   const contact = state.contacts[msg.from];
   if (!contact) return;
   if (!verifyDataPacket(msg, contact.signPublicKey)) {
@@ -5345,7 +5383,7 @@ async function handleDataCancel(msg) {
 }
 
 async function handleDataEnd(msg) {
-  if (!msg.from || !msg.to || !msg.sessionId || parseAddress(msg.to).id !== state.publicId) return;
+  if (!msg.from || !msg.to || !msg.sessionId || !isAddressedToMe(msg.to)) return;
   const contact = state.contacts[msg.from];
   if (!contact) return;
   if (!verifyDataPacket(msg, contact.signPublicKey)) {
@@ -5362,7 +5400,7 @@ async function handleDataEnd(msg) {
 // stale or somebody poking, and answering it would open a peer connection
 // the user never agreed to.
 async function handleDataOffer(msg) {
-  if (!msg.from || !msg.to || !msg.sessionId || parseAddress(msg.to).id !== state.publicId) return;
+  if (!msg.from || !msg.to || !msg.sessionId || !isAddressedToMe(msg.to)) return;
   const contact = state.contacts[msg.from];
   if (!contact || contact.blocked) return;
   if (!verifyDataPacket(msg, contact.signPublicKey)) {
@@ -5407,7 +5445,7 @@ async function handleDataOffer(msg) {
 }
  
 async function handleDataAnswer(msg) {
-  if (!msg.from || !msg.to || !msg.sessionId || parseAddress(msg.to).id !== state.publicId) return;
+  if (!msg.from || !msg.to || !msg.sessionId || !isAddressedToMe(msg.to)) return;
   const contact = state.contacts[msg.from];
   if (!contact || contact.blocked) return;
   if (!verifyDataPacket(msg, contact.signPublicKey)) {
@@ -5433,7 +5471,7 @@ async function handleDataAnswer(msg) {
 }
  
 async function handleDataIce(msg) {
-  if (!msg.from || !msg.to || !msg.sessionId || parseAddress(msg.to).id !== state.publicId) return;
+  if (!msg.from || !msg.to || !msg.sessionId || !isAddressedToMe(msg.to)) return;
   const contact = state.contacts[msg.from];
   if (!contact || contact.blocked) return;
   if (!verifyDataPacket(msg, contact.signPublicKey)) {
@@ -5490,7 +5528,7 @@ async function sendCallIce(id, candidate) {
 }
 
 async function handleCallOffer(msg) {
-  if (!msg.from || !msg.to || !msg.callId || parseAddress(msg.to).id !== state.publicId) return;
+  if (!msg.from || !msg.to || !msg.callId || !isAddressedToMe(msg.to)) return;
   const contact = state.contacts[msg.from];
   if (!contact || contact.blocked) return;
   if (!verifyCallPacket(msg, contact.signPublicKey)) {
@@ -5523,7 +5561,7 @@ async function handleCallOffer(msg) {
 }
 
 async function handleCallAnswer(msg) {
-  if (!msg.from || !msg.to || !msg.callId || parseAddress(msg.to).id !== state.publicId) return;
+  if (!msg.from || !msg.to || !msg.callId || !isAddressedToMe(msg.to)) return;
   const contact = state.contacts[msg.from];
   if (!contact || contact.blocked) return;
   if (!verifyCallPacket(msg, contact.signPublicKey)) {
@@ -5549,7 +5587,7 @@ async function handleCallAnswer(msg) {
 }
 
 async function handleCallIce(msg) {
-  if (!msg.from || !msg.to || !msg.callId || parseAddress(msg.to).id !== state.publicId) return;
+  if (!msg.from || !msg.to || !msg.callId || !isAddressedToMe(msg.to)) return;
   const contact = state.contacts[msg.from];
   if (!contact || contact.blocked) return;
   if (!verifyCallPacket(msg, contact.signPublicKey)) {

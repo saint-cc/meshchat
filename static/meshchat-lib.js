@@ -369,26 +369,61 @@ async function decompress(bytes) {
   writer.close();
   return new TextDecoder().decode(await new Response(stream.readable).arrayBuffer());
 }
-async function encryptObject(key, obj) {
+/* ── ENVELOPE BINDING (AAD) ──
+   A wire packet's { type, from, to } sit OUTSIDE its ciphertext, where the
+   relay can rewrite them. Passing envelopeAad(type, from, to) as AES-GCM
+   additionalData ties the ciphertext to exactly those three values: change
+   any of them in transit and the GCM tag fails — the packet is dropped at
+   decrypt, not shown with a warning. That is what stops a relay from
+   retyping a packet (app:message -> app:burn), reflecting it back at its
+   sender (from/to swapped) or redirecting it to another device (to's
+   endpoint rewritten).
+   Bound blobs carry a distinct version — encryptMessage v:2, encryptObject
+   v:3 — and a decrypt that PASSES an aad requires exactly that version: a
+   receiver that expects the binding never falls back to an unbound blob (a
+   packet recorded before the binding existed can't be replayed in). Without
+   an aad, a bound blob is refused too (it couldn't decrypt anyway).
+   The array form is canonical and unambiguous (JSON string escaping), and
+   the leading label keeps it disjoint from any other use of these bytes.
+   Everything here that is NOT a wire packet — contacts/sessions at rest,
+   backup files, ephemeral wraps — stays unbound v1/v2 exactly as before. */
+const ENV_LABEL = "meshchat-env-v1";
+function envelopeAad(type, from, to) {
+  for (const [name, v] of [["type", type], ["from", from], ["to", to]]) {
+    if (typeof v !== "string" || !v) throw new Error(`envelopeAad: bad ${name}`);
+  }
+  return new TextEncoder().encode(JSON.stringify([ENV_LABEL, type, from, to]));
+}
+
+async function encryptObject(key, obj, aad) {
   const iv     = crypto.getRandomValues(new Uint8Array(12));
   const plain  = await compress(JSON.stringify(obj));
-  const cipher = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, plain);
-  return { v: 2, iv: Array.from(iv), data: Array.from(new Uint8Array(cipher)) };
+  const params = { name: "AES-GCM", iv };
+  if (aad) params.additionalData = aad;
+  const cipher = await crypto.subtle.encrypt(params, key, plain);
+  return { v: aad ? 3 : 2, iv: Array.from(iv), data: Array.from(new Uint8Array(cipher)) };
 }
-async function decryptObject(key, payload) {
-  // v missing = v0 (legacy unversioned), v1 = AES-GCM plain JSON, v2 = AES-GCM + gzip
-  if (payload.v !== undefined && payload.v > 2) throw new Error(`unsupported object version v${payload.v}`);
-  const raw  = await crypto.subtle.decrypt({ name: "AES-GCM", iv: new Uint8Array(payload.iv) }, key, new Uint8Array(payload.data));
-  const text = payload.v === 2
+async function decryptObject(key, payload, aad) {
+  // v missing = v0 (legacy unversioned), v1 = AES-GCM plain JSON, v2 = AES-GCM + gzip,
+  // v3 = v2 + envelope-bound (AAD) — see ENV_LABEL above
+  if (payload.v !== undefined && payload.v > 3) throw new Error(`unsupported object version v${payload.v}`);
+  if (aad) { if (payload.v !== 3) throw new Error(`object v${payload.v} lacks envelope binding`); }
+  else if (payload.v === 3)        throw new Error("object v3 needs its envelope binding to decrypt");
+  const params = { name: "AES-GCM", iv: new Uint8Array(payload.iv) };
+  if (aad) params.additionalData = aad;
+  const raw  = await crypto.subtle.decrypt(params, key, new Uint8Array(payload.data));
+  const text = (payload.v === 2 || payload.v === 3)
     ? await decompress(new Uint8Array(raw))
     : new TextDecoder().decode(raw);
   return JSON.parse(text);
 }
 
-async function encryptMessage(recipientEncKey, payload) {
+async function encryptMessage(recipientEncKey, payload, aad) {
   const iv     = crypto.getRandomValues(new Uint8Array(12));
-  const cipher = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, recipientEncKey, new TextEncoder().encode(JSON.stringify(payload)));
-  return { v: 1, iv: Array.from(iv), data: Array.from(new Uint8Array(cipher)) };
+  const params = { name: "AES-GCM", iv };
+  if (aad) params.additionalData = aad;   // envelope-bound — see ENV_LABEL / envelopeAad
+  const cipher = await crypto.subtle.encrypt(params, recipientEncKey, new TextEncoder().encode(JSON.stringify(payload)));
+  return { v: aad ? 2 : 1, iv: Array.from(iv), data: Array.from(new Uint8Array(cipher)) };
 }
 
 // THE fix — replaces "AES key handed out in the QR code" with a real
