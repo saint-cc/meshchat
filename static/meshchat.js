@@ -13,7 +13,7 @@
 
    Load order: meshchat-lib.js → meshchat-gui.js → meshchat.js → statemachine.js
 ═══════════════════════════════════════════════════════════════ */
-const CLIENT_VERSION = "0.5.7";
+const CLIENT_VERSION = "0.5.8";
 
 const POLL_INTERVAL_MS        	= 30_000;			// base interval between presence polls
 const POLL_JITTER_MS          	= 10_000;			// ± random jitter added to poll interval
@@ -767,6 +767,11 @@ function recordKnownDevice(identityId, deviceId, n, endpointId) {
   // initiator, or no endpoint yet) — see maybeTriggerX4DHPropose's own
   // comment for the full guard chain.
   maybeTriggerX4DHPropose(identityId, deviceId);
+  // …and the mirror image for the RESPONDER side: a propose we couldn't ack
+  // because this device's endpoint wasn't known yet (the first-contact race)
+  // can be completed the moment this call learned it. No-op unless a
+  // pendingAck is parked on the session.
+  maybeCompleteDeferredAck(identityId, deviceId);
 }
 
 function loadSendCounters() {
@@ -1089,6 +1094,7 @@ async function upgradeX4DHSessionToRK1(contactId, theirDeviceId, sessionEpoch, r
   existing.stage      = "rk1";
   existing.rootKey    = rawToBase64(rk1Bytes);
   existing.upgradedAt = Date.now();
+  delete existing.pendingAck;   // nothing left to defer — see maybeCompleteDeferredAck
   // A session that reaches RK1 isn't stuck anymore — clear whatever
   // retry bookkeeping it was carrying so a FUTURE unrelated episode of
   // this same device pair getting stuck (post-reset, down the line)
@@ -1368,6 +1374,7 @@ window.x4dhDebug = {
           ageSec: Math.round((Date.now() - (s.establishedAt || 0)) / 1000),
           retryAttempts: s.retryAttempts || 0,
           exhausted: !!s.retryExhaustedAt,
+          deferredAck: !!s.pendingAck,
           epoch: pid(s.sessionEpoch),
         });
       }
@@ -1526,26 +1533,120 @@ async function handleX4DHPropose(msg) {
 
   const theirEndpoint = state.knownDevices[msg.from]?.[theirDeviceId]?.endpointId;
   if (!theirEndpoint) {
-    // §13.3's precondition should already guarantee this is known by the
-    // time a propose can even be addressed to us — defensive only.
-    mlog.warn(`← X4DH_PROPOSE from ${pid(msg.from, { deviceId: theirDeviceId })} — no known endpoint to ack back to, staying at RK0`);
+    // NOT a "can't happen" — it is the ordinary first-contact race. The
+    // initiator proposes the moment it learns OUR endpoint (from our first
+    // message to it); the only thing that would tell US its endpoint is its
+    // delivery ack, which follows that propose, so the propose can win the
+    // race to the relay. §13.3's "already known by now" only holds when the
+    // initiator happened to message us first. We can't address a
+    // session:ack without a compound `to`, so instead of giving up (the old
+    // behaviour left BOTH sides at RK0 until the stuck-retry fired, minutes
+    // later) the verified propose is parked on the RK0 session as
+    // `pendingAck`, and recordKnownDevice -> maybeCompleteDeferredAck
+    // finishes the handshake the moment the endpoint is learned. Everything
+    // needed to finish is already on the session (rootKey = RK0) plus the
+    // initiator's ephemeral PUBLIC key stored here, so nothing secret is
+    // added to what is persisted. Only honoured for X4DH_DEFERRED_ACK_WINDOW_MS.
+    // The check above and this set happen in ONE synchronous stretch (no await
+    // between them), so an endpoint learned by another handler can't slip
+    // into the gap — it either shows up in the lookup above or finds
+    // pendingAck already set.
+    const session = getX4DHSession(msg.from, theirDeviceId);
+    if (session && session.sessionEpoch === msg.sessionEpoch) {
+      session.pendingAck = { ekPub: rawToBase64(ekAPub), receivedAt: Date.now() };
+      await saveX4DHSessions();
+      mlog.info(`← X4DH_PROPOSE from ${pid(msg.from, { deviceId: theirDeviceId })} — endpoint not known yet, ack deferred (up to ${X4DH_DEFERRED_ACK_WINDOW_MS / 1000}s) — session stays at RK0 meanwhile`);
+    }
     return;
   }
+  await completeX4DHAck(msg.from, theirDeviceId, theirEndpoint, msg.sessionEpoch, ekAPub, rk0);
+}
+
+/* ── deferred ack (the first-contact race) ──
+   completeX4DHAck is the responder's whole second half — DH3/DH4, upgrade
+   to RK1, send session:ack — pulled out of handleX4DHPropose so the direct
+   path (endpoint already known) and the deferred path (endpoint learned
+   later, maybeCompleteDeferredAck) are the SAME code.
+
+   Upgrades only if the session is STILL the one this propose created
+   (upgradeX4DHSessionToRK1's epoch match). If a newer propose replaced it
+   during the awaits above, nothing is acked: acking a superseded epoch
+   would leave the initiator holding an RK1 we no longer have. (The old
+   inline code ignored upgrade's return value and acked regardless.)
+
+   WINDOW. The initiator discards its ephemeral private key after
+   X4DH_PROPOSAL_TIMEOUT_MS (60s) and we move to RK1 BEFORE the ack is
+   delivered, so a late ack would leave us at RK1 and it at RK0 — each side
+   unable to decrypt the other. A deferred ack is therefore only completed
+   within X4DH_DEFERRED_ACK_WINDOW_MS (30s) of receiving the propose — half
+   the initiator's lifetime, leaving room for transit. Past that we stay at
+   RK0 and the existing stuck-retry repairs it, exactly as before this
+   change. The real race closes in milliseconds, so the window is only a
+   backstop. Must stay well below X4DH_PROPOSAL_TIMEOUT_MS. */
+const X4DH_DEFERRED_ACK_WINDOW_MS = 30_000;
+const x4dhAckInFlight = new Set();   // "contactId:theirDeviceId" — one completion at a time per device
+
+async function completeX4DHAck(contactId, theirDeviceId, theirEndpoint, sessionEpoch, ekAPub, rk0) {
+  const contact = state.contacts[contactId];
+  if (!contact || contact.blocked || !contact.x25519PublicKey) return false;
 
   const { priv: ekBPriv, pub: ekBPub } = generateX25519Ephemeral();
   const dh3 = x25519.getSharedSecret(ekBPriv, contact.x25519PublicKey);
   const dh4 = x25519.getSharedSecret(ekBPriv, ekAPub);
   const rk1 = await deriveX4DHRootStage2(rk0, dh3, dh4);
-  await upgradeX4DHSessionToRK1(msg.from, theirDeviceId, msg.sessionEpoch, rk1);
+  if (!(await upgradeX4DHSessionToRK1(contactId, theirDeviceId, sessionEpoch, rk1))) return false;
 
   const ackObj = {
-    type: "session:ack", from: state.publicId, to: buildAddress(msg.from, theirEndpoint),
-    sessionEpoch: msg.sessionEpoch, ekPub: Array.from(ekBPub), deviceId: state.deviceId, ts: Date.now(),
+    type: "session:ack", from: state.publicId, to: buildAddress(contactId, theirEndpoint),
+    sessionEpoch, ekPub: Array.from(ekBPub), deviceId: state.deviceId, ts: Date.now(),
   };
   ackObj.sig = signX4DHPacket(ackObj);
-  const viaRelay = sendToRelay(msg.from, ackObj, true);
+  const viaRelay = sendToRelay(contactId, ackObj, true);
   if (!viaRelay) sendSignal(ackObj);
-  mlog.info(`→ X4DH_ACK     to   ${pid(msg.from, { deviceId: theirDeviceId, endpointId: theirEndpoint })}  epoch=${pid(msg.sessionEpoch)}  via=${viaRelay ? "relay" : "signal(fallback)"}`);
+  mlog.info(`→ X4DH_ACK     to   ${pid(contactId, { deviceId: theirDeviceId, endpointId: theirEndpoint })}  epoch=${pid(sessionEpoch)}  via=${viaRelay ? "relay" : "signal(fallback)"}`);
+  return true;
+}
+
+// Called from recordKnownDevice on EVERY observation of a device — so a
+// no-op the overwhelming majority of the time (no pendingAck). Fires when
+// the endpoint that was missing at propose time has now been learned.
+function maybeCompleteDeferredAck(contactId, theirDeviceId) {
+  if (!theirDeviceId) return;
+  const session = getX4DHSession(contactId, theirDeviceId);
+  const pending = session?.pendingAck;
+  if (!pending) return;
+  const key = `${contactId}:${theirDeviceId}`;
+  if (x4dhAckInFlight.has(key)) return;
+  const theirEndpoint = state.knownDevices[contactId]?.[theirDeviceId]?.endpointId;
+  if (!theirEndpoint) return;   // still unknown — keep waiting
+
+  const ageMs = Date.now() - pending.receivedAt;
+  if (session.stage !== "rk0" || session.initiator || ageMs > X4DH_DEFERRED_ACK_WINDOW_MS) {
+    delete session.pendingAck;
+    saveX4DHSessions();
+    mlog.info(ageMs > X4DH_DEFERRED_ACK_WINDOW_MS
+      ? `X4DH       deferred ack window expired (${Math.round(ageMs / 1000)}s > ${X4DH_DEFERRED_ACK_WINDOW_MS / 1000}s) — staying at RK0 until the initiator retries  ${pid(contactId, { deviceId: theirDeviceId })}`
+      : `X4DH       deferred ack dropped — session no longer a pending responder RK0  ${pid(contactId, { deviceId: theirDeviceId })}`);
+    return;
+  }
+
+  x4dhAckInFlight.add(key);
+  const epoch = session.sessionEpoch;
+  (async () => {
+    try {
+      const ekAPub = base64ToRaw(pending.ekPub);
+      const rk0    = base64ToRaw(session.rootKey);   // stage is rk0 (checked above), so this IS RK0
+      mlog.info(`X4DH       endpoint learned — completing deferred ack  ${pid(contactId, { deviceId: theirDeviceId, endpointId: theirEndpoint })}  epoch=${pid(epoch)}  after=${Math.round(ageMs)}ms`);
+      await completeX4DHAck(contactId, theirDeviceId, theirEndpoint, epoch, ekAPub, rk0);
+    } catch(e) {
+      mlog.warn(`X4DH       deferred ack failed: ${e.message}  ${pid(contactId, { deviceId: theirDeviceId })}`);
+    } finally {
+      x4dhAckInFlight.delete(key);
+      // a newer propose may have parked ITS pendingAck while we were busy
+      const s = getX4DHSession(contactId, theirDeviceId);
+      if (s?.pendingAck && s.sessionEpoch !== epoch) maybeCompleteDeferredAck(contactId, theirDeviceId);
+    }
+  })();
 }
 
 // handleX4DHAck(msg) — X4DH.md §6/§7.1. Looks up the pending proposal
