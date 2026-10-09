@@ -13,7 +13,7 @@
 
    Load order: meshchat-lib.js → meshchat-gui.js → meshchat.js → statemachine.js
 ═══════════════════════════════════════════════════════════════ */
-const CLIENT_VERSION = "0.5.8";
+const CLIENT_VERSION = "0.5.9";
 
 const POLL_INTERVAL_MS        	= 30_000;			// base interval between presence polls
 const POLL_JITTER_MS          	= 10_000;			// ± random jitter added to poll interval
@@ -1046,6 +1046,13 @@ function getX4DHSession(contactId, theirDeviceId) {
 async function storeX4DHSessionRK0(contactId, theirDeviceId, sessionEpoch, rk0Bytes, initiator, proposeTs) {
   if (!state.x4dhSessions[contactId]) state.x4dhSessions[contactId] = {};
   const existing = state.x4dhSessions[contactId][theirDeviceId];
+  // A reset/retry replaces the whole session. Packets the OTHER side already
+  // sent under the old generation(s) are still in flight — keep those roots
+  // as decrypt-only for X4DH_RETIRED_GRACE_MS instead of discarding them.
+  if (existing) {
+    retireX4DHRoot(contactId, theirDeviceId, existing.rootKey);
+    retireX4DHRoot(contactId, theirDeviceId, existing.rk0Root);
+  }
   state.x4dhSessions[contactId][theirDeviceId] = {
     // proposeTs — the ORIGINATING session:propose packet's own signed
     // `ts` field (the sender's clock), kept separate from establishedAt
@@ -1068,14 +1075,7 @@ async function storeX4DHSessionRK0(contactId, theirDeviceId, sessionEpoch, rk0By
     retryExhaustedAt: existing?.retryExhaustedAt || null,
     lastRetryAt:      existing?.lastRetryAt      || null,
   };
-  // Wire key is derived from rootKey, which just changed (a fresh RK0 —
-  // whether this is a first-ever bootstrap or a reset/retry with a brand
-  // new epoch). Drop any cached key for this device pair so the next
-  // send/receive re-derives from the NEW root instead of silently
-  // continuing to encrypt/decrypt under a superseded one. See
-  // x4dhWireKeyCache's own comment for why this is keyed on
-  // (contactId, deviceId) alone, not sessionEpoch.
-  x4dhWireKeyCache.delete(`${contactId}:${theirDeviceId}`);
+  // (wire keys are cached per ROOT now — nothing to evict here, see x4dhWireKeyByRoot)
   await saveX4DHSessions();
   mlog.info(`X4DH       RK0 established  ${pid(contactId, { deviceId: theirDeviceId })}  epoch=${pid(sessionEpoch)}`);
 }
@@ -1085,14 +1085,21 @@ async function storeX4DHSessionRK0(contactId, theirDeviceId, sessionEpoch, rk0By
 // was issued), this ack is stale and must not regress it. Full
 // staleness/replay hardening beyond this single check is X4DH.md §13.2,
 // deliberately deferred past this pass.
-async function upgradeX4DHSessionToRK1(contactId, theirDeviceId, sessionEpoch, rk1Bytes) {
+// sendStage — which root WE encrypt under from now on (see the key-generation
+// block below): "rk1" for the initiator (the ack was built from RK1, so the
+// responder provably has it), "rk0" for the responder (it has no proof yet
+// that the initiator received the ack — it keeps sending under RK0, which
+// the initiator certainly holds, until a message arrives under RK1).
+async function upgradeX4DHSessionToRK1(contactId, theirDeviceId, sessionEpoch, rk1Bytes, sendStage = "rk1") {
   const existing = getX4DHSession(contactId, theirDeviceId);
   if (!existing || existing.sessionEpoch !== sessionEpoch) {
     mlog.warn(`X4DH       stale upgrade attempt — no matching rk0 session, dropped  ${pid(contactId, { deviceId: theirDeviceId })}  epoch=${pid(sessionEpoch)}`);
     return false;
   }
+  if (existing.stage === "rk0") existing.rk0Root = existing.rootKey;   // RK0 stays usable (decrypt always; send too while sendStage is "rk0")
   existing.stage      = "rk1";
   existing.rootKey    = rawToBase64(rk1Bytes);
+  existing.sendStage  = sendStage;
   existing.upgradedAt = Date.now();
   delete existing.pendingAck;   // nothing left to defer — see maybeCompleteDeferredAck
   // A session that reaches RK1 isn't stuck anymore — clear whatever
@@ -1101,50 +1108,116 @@ async function upgradeX4DHSessionToRK1(contactId, theirDeviceId, sessionEpoch, r
   // starts with a clean budget rather than inheriting an old exhaustion.
   existing.retryAttempts    = 0;
   existing.retryExhaustedAt = null;
-  // Root key material just changed (RK0 -> RK1) even though the epoch
-  // is UNCHANGED across this upgrade — an epoch-keyed cache would keep
-  // serving the stale RK0-derived key forever after. MUST evict here,
-  // keyed on (contactId, deviceId) alone. This is the one place in the
-  // whole X4DH lifecycle where rootKey changes without sessionEpoch
-  // changing alongside it, which is exactly why the cache below can't
-  // be keyed on epoch.
-  x4dhWireKeyCache.delete(`${contactId}:${theirDeviceId}`);
   await saveX4DHSessions();
   mlog.info(`X4DH       RK1 upgrade complete  ${pid(contactId, { deviceId: theirDeviceId })}  epoch=${pid(sessionEpoch)}`);
   return true;
 }
 
-/* ── wire-message key cache ──
-   In-memory only, NEVER persisted or written to localStorage under any
-   key — same sensitivity tier as pendingX4DHProposals' ekPriv above.
-   Keyed by "contactId:deviceId", deliberately NOT by sessionEpoch:
-   upgradeX4DHSessionToRK1 mutates rootKey/stage IN PLACE on the same
-   epoch (RK0 -> RK1 is not a new epoch), so an epoch-keyed cache would
-   silently keep serving the pre-upgrade key after a live upgrade
-   completed underneath it — exactly the kind of bug that would quietly
-   under-deliver the security property this pass exists to provide.
-   storeX4DHSessionRK0 and upgradeX4DHSessionToRK1 are the ONLY two
-   places rootKey ever changes, and both explicitly evict their own
-   entry here — nothing else needs to know this cache exists.
+/* ── wire-message keys: SEND vs DECRYPT, and key generations ──
+   Pass 1 derived ONE key per (contact, device) from the session's current
+   root and used it for everything. That lost packets whenever the two sides
+   disagreed, for a moment, about which root was current:
+     - the responder upgrades to RK1 BEFORE its ack is delivered, so the
+       initiator's RK0-keyed messages (sent meanwhile) were undecryptable,
+       and the responder's RK1-keyed ones were undecryptable to the
+       initiator (still at RK0);
+     - a lost or late ack (the initiator drops its ephemeral after 60s)
+       left the pair permanently desynced until the stuck-retry;
+     - a reset replaced the session wholesale, so anything the peer had
+       already sent under the old keys was lost.
+   Rule now: SEND under the newest root the peer has demonstrably reached,
+   DECRYPT under every generation still alive.
+     session.rootKey  — newest root (RK1 once upgraded, else RK0)
+     session.rk0Root  — RK0, retained after the upgrade until the peer is
+                        confirmed to hold RK1 (persisted with the session,
+                        encrypted at rest like everything in it)
+     session.sendStage— "rk0" | "rk1": which of the two we encrypt under
+                        (absent on a pre-0.5.9 record = its current stage)
+   The initiator sends under RK1 as soon as the ack lands (the ack was built
+   from RK1). The responder keeps sending under RK0 until a VERIFIED message
+   from that device decrypts under RK1 — proof the initiator upgraded —
+   then switches (confirmX4DHPeerKey) and retires RK0. A lost ack therefore
+   no longer desyncs anything: both sides simply stay on RK0, which both
+   hold, until the retry.
+   Roots that are replaced (a reset) or retired (RK0 after confirmation) go
+   to x4dhRetired for X4DH_RETIRED_GRACE_MS: decrypt-only, memory-only —
+   never persisted, so a reload drops them (forward secrecy over
+   in-flight-across-a-reload packets). Wire keys are cached by ROOT CONTENT
+   (x4dhWireKeyByRoot), so a cache hit can never be stale; the entry is
+   evicted when its root's grace ends.
 ── */
-const x4dhWireKeyCache = new Map();   // "contactId:deviceId" -> CryptoKey (AES-256-GCM)
+const X4DH_RETIRED_GRACE_MS = 120_000;
+const x4dhWireKeyByRoot = new Map();   // root (base64) -> CryptoKey (AES-256-GCM) — memory only
+const x4dhRetired       = new Map();   // "contactId:deviceId" -> [{ rootB64, retiredAt }] — memory only
 
-// getOrDeriveWireKey(contactId, theirDeviceId) — returns the AES-256-GCM
-// key for that device pair's CURRENT X4DH session (rk0 or rk1, whichever
-// it's at — see the design discussion for why rk0 is eligible), or null
-// if no session exists for that device at all. Lazily derives+caches on
-// first use per (contactId, deviceId); storeX4DHSessionRK0/
-// upgradeX4DHSessionToRK1 evict the cache entry whenever rootKey changes,
-// so a cache HIT here is always guaranteed current, never stale.
+async function wireKeyForRoot(rootB64) {
+  let k = x4dhWireKeyByRoot.get(rootB64);
+  if (!k) { k = await deriveX4DHWireKey(base64ToRaw(rootB64)); x4dhWireKeyByRoot.set(rootB64, k); }
+  return k;
+}
+
+function retireX4DHRoot(contactId, theirDeviceId, rootB64) {
+  if (!rootB64) return;
+  const key = `${contactId}:${theirDeviceId}`;
+  const list = x4dhRetired.get(key) || [];
+  if (!list.some(r => r.rootB64 === rootB64)) list.push({ rootB64, retiredAt: Date.now() });
+  x4dhRetired.set(key, list);
+}
+
+function purgeRetiredX4DHRoots() {
+  const now = Date.now();
+  for (const [key, list] of x4dhRetired) {
+    const keep = list.filter(r => now - r.retiredAt <= X4DH_RETIRED_GRACE_MS);
+    for (const r of list) if (!keep.includes(r)) x4dhWireKeyByRoot.delete(r.rootB64);
+    if (keep.length) x4dhRetired.set(key, keep); else x4dhRetired.delete(key);
+  }
+}
+setInterval(purgeRetiredX4DHRoots, 30_000);   // so a retired key doesn't outlive its grace just because nothing decrypted lately
+
+// the root WE encrypt under for this session
+function x4dhSendRoot(s) {
+  return (s.stage === "rk1" && s.sendStage === "rk0" && s.rk0Root) ? s.rk0Root : s.rootKey;
+}
+
+// getOrDeriveWireKey(contactId, theirDeviceId) — the key to ENCRYPT under
+// for that device pair (null if no session). Decrypting uses
+// getDecryptWireKeys below, never this.
 async function getOrDeriveWireKey(contactId, theirDeviceId) {
   const session = getX4DHSession(contactId, theirDeviceId);
   if (!session) return null;
-  const cacheKey = `${contactId}:${theirDeviceId}`;
-  const cached = x4dhWireKeyCache.get(cacheKey);
-  if (cached) return cached;
-  const wireKey = await deriveX4DHWireKey(base64ToRaw(session.rootKey));
-  x4dhWireKeyCache.set(cacheKey, wireKey);
-  return wireKey;
+  return wireKeyForRoot(x4dhSendRoot(session));
+}
+
+// Every key a packet from this device could legitimately be under, most
+// likely first: the current root, the retained RK0, then recently retired
+// roots (newest first). label tells the caller which one matched —
+// "current" is what confirmX4DHPeerKey keys off.
+async function getDecryptWireKeys(contactId, theirDeviceId) {
+  purgeRetiredX4DHRoots();
+  const out = [], seen = new Set();
+  const add = async (rootB64, label) => {
+    if (!rootB64 || seen.has(rootB64)) return;
+    seen.add(rootB64);
+    out.push({ key: await wireKeyForRoot(rootB64), label });
+  };
+  const s = getX4DHSession(contactId, theirDeviceId);
+  if (s) { await add(s.rootKey, "current"); await add(s.rk0Root, "prev-rk0"); }
+  for (const r of [...(x4dhRetired.get(`${contactId}:${theirDeviceId}`) || [])].reverse()) await add(r.rootB64, "retired");
+  return out;
+}
+
+// A verified message from this device just decrypted under our CURRENT RK1:
+// it provably holds RK1. Switch to sending under RK1 (responder) and retire
+// the retained RK0 (both sides) into the decrypt-only grace.
+function confirmX4DHPeerKey(contactId, theirDeviceId) {
+  const s = getX4DHSession(contactId, theirDeviceId);
+  if (!s || s.stage !== "rk1") return;
+  const switching = s.sendStage === "rk0";
+  if (!switching && !s.rk0Root) return;
+  if (s.rk0Root) { retireX4DHRoot(contactId, theirDeviceId, s.rk0Root); delete s.rk0Root; }
+  s.sendStage = "rk1";
+  saveX4DHSessions();
+  mlog.info(`X4DH       peer confirmed RK1 — ${switching ? "now sending under RK1, " : ""}RK0 retired (decrypt-only grace ${X4DH_RETIRED_GRACE_MS / 1000}s)  ${pid(contactId, { deviceId: theirDeviceId })}`);
 }
 
 /* ── packet signing ──
@@ -1375,6 +1448,7 @@ window.x4dhDebug = {
           retryAttempts: s.retryAttempts || 0,
           exhausted: !!s.retryExhaustedAt,
           deferredAck: !!s.pendingAck,
+          sendStage: s.sendStage || s.stage, rk0Kept: !!s.rk0Root,
           epoch: pid(s.sessionEpoch),
         });
       }
@@ -1407,7 +1481,6 @@ window.x4dhDebug = {
       retryAttempts, retryExhaustedAt: exhausted ? Date.now() : null,
       lastRetryAt: null,
     };
-    x4dhWireKeyCache.delete(`${contactId}:${theirDeviceId}`);
     saveX4DHSessions();
     mlog.info(`X4DH       forceStuck  ${pid(contactId, { deviceId: theirDeviceId })}  retryAttempts=${retryAttempts}  exhausted=${exhausted}`);
   },
@@ -1594,7 +1667,7 @@ async function completeX4DHAck(contactId, theirDeviceId, theirEndpoint, sessionE
   const dh3 = x25519.getSharedSecret(ekBPriv, contact.x25519PublicKey);
   const dh4 = x25519.getSharedSecret(ekBPriv, ekAPub);
   const rk1 = await deriveX4DHRootStage2(rk0, dh3, dh4);
-  if (!(await upgradeX4DHSessionToRK1(contactId, theirDeviceId, sessionEpoch, rk1))) return false;
+  if (!(await upgradeX4DHSessionToRK1(contactId, theirDeviceId, sessionEpoch, rk1, "rk0"))) return false;
 
   const ackObj = {
     type: "session:ack", from: state.publicId, to: buildAddress(contactId, theirEndpoint),
@@ -1896,11 +1969,15 @@ async function decryptSelfBackupBlob(blob, aad) {
   const candidates = Object.entries(sessions)
     .sort(([, a], [, b]) => (b.establishedAt || 0) - (a.establishedAt || 0));
   for (const [theirDeviceId] of candidates) {
-    const wireKey = await getOrDeriveWireKey(state.publicId, theirDeviceId);
-    if (!wireKey) continue;
-    try {
-      return { plain: await decryptObject(wireKey, blob, aad), wireDeviceId: theirDeviceId };
-    } catch(e) { /* wrong key for this sibling — try the next */ }
+    for (const { key, label } of await getDecryptWireKeys(state.publicId, theirDeviceId)) {
+      try {
+        const plain = await decryptObject(key, blob, aad);
+        // self blobs carry no signature, but AES-GCM success under RK1 is the
+        // same proof of possession — see confirmX4DHPeerKey
+        if (label === "current") confirmX4DHPeerKey(state.publicId, theirDeviceId);
+        return { plain, wireDeviceId: theirDeviceId };
+      } catch(e) { /* wrong key — try the next generation / sibling */ }
+    }
   }
   return { plain: await decryptObject(state.cryptoKey, blob, aad), wireDeviceId: null };
 }
@@ -2059,6 +2136,13 @@ async function handleBackupOffer(msg) {
     mlog.warn(`← BACKUP_OFFER from ${pid(fromId)} — signature invalid, dropped`);
     return;
   }
+
+  // Second trigger for the cross-relay bootstrap — see
+  // pingRestoreIfFreshStranger. A fresh device accepts this offer from a
+  // stranger and then drops the push (nothing to store it under); the offer
+  // is still useful as proof the holder is reachable, so ping before the
+  // dedup below can suppress anything.
+  if (!contact) pingRestoreIfFreshStranger(fromId, "backup_offer");
 
   // Dedup AFTER verification, keyed on the sender's endpoint once verified.
   // Accepts are now targeted at the one device that offered (see
@@ -2746,6 +2830,30 @@ function sendRestoreAckPing(toId) {
   sendSignal(obj);
 }
 
+// Cross-relay bootstrap trigger. sig:seen is the ONLY thing that normally
+// makes a fresh device say hi (sendRestoreAckPing), and sig:seen is relay-
+// local: a holder living on ANOTHER relay announces to its own relay, which
+// has never heard of us, so no sig:seen ever reaches us. What does reach us
+// is the holder's OUTBOUND connection to our relay, which delivers its
+// restore_req / backup_offer straight to this socket (the holder's relay
+// conn registers there under its own id). Seeing an unknown sender arrive
+// that way while we're fresh is the same fact sig:seen would have told us,
+// so it gets the same answer: the ping, which is what draws the token and
+// the wrapped restore_push.
+//
+// Gated on sessionFresh (a device that already has contacts waits for the
+// normal poll/restore cadence instead — and cannot be made to emit pings by
+// strangers) and on the sender not being ourselves. Called from two sites
+// because either packet can be the one that arrives (restore_req is skipped
+// by the holder's own cooldown, backup_offer is not); sendRestoreAckPing's
+// own 60s per-id cooldown makes the second call a no-op.
+function pingRestoreIfFreshStranger(fromId, via) {
+  if (!sessionFresh || !fromId || fromId === state.publicId || state.contacts[fromId]) return;
+  if (!canSendRestoreAckPing(fromId)) return;
+  sendRestoreAckPing(fromId);
+  mlog.info(`→ RESTORE_ACK  to   ${pid(fromId)} — fresh, unknown sender reached us directly (${via}) — asking for peer backup`);
+}
+
 async function sendRestoreRequest(id) {
   const contact = state.contacts[id];
   if (!contact || contact.blocked) return;
@@ -2787,6 +2895,11 @@ async function handleRestoreRequest(msg) {
     // is only ever invoked for ids already in state.contacts on the
     // sending side, so this isn't a new practical limitation — just
     // enforced by the crypto now instead of a policy check after decrypt.
+    //
+    // The request itself still can't be served — but when we're fresh, its
+    // arrival is the cross-relay equivalent of sig:seen (see
+    // pingRestoreIfFreshStranger), so answer with the bootstrap ping.
+    pingRestoreIfFreshStranger(msg.from, "restore_req");
     mlog.warn(`← RESTORE_REQ  from ${pid(msg.from)} — unknown contact, can't decrypt, dropped`);
     return;
   }
@@ -4387,18 +4500,20 @@ async function decryptIncomingMessage(fromId, blob, aad) {
     .sort(([, a], [, b]) => (b.establishedAt || 0) - (a.establishedAt || 0));
 
   for (const [theirDeviceId] of candidates) {
-    const wireKey = await getOrDeriveWireKey(fromId, theirDeviceId);
-    if (!wireKey) continue;
-    try {
-      const plain = await decryptMessage(blob, wireKey, aad);
-      return { plain, viaX4DH: true, theirDeviceId };
-    } catch(e) { /* wrong key for this device — try the next candidate */ }
+    // every live generation for this device, not just the send key — see
+    // "wire-message keys" above. keyLabel says which one worked.
+    for (const { key, label } of await getDecryptWireKeys(fromId, theirDeviceId)) {
+      try {
+        const plain = await decryptMessage(blob, key, aad);
+        return { plain, viaX4DH: true, theirDeviceId, keyLabel: label };
+      } catch(e) { /* wrong key — try the next generation / device */ }
+    }
   }
 
   // legacy identity-level key — last resort, covers any device that
   // hasn't bootstrapped an X4DH session yet (or never will)
   const plain = await decryptMessage(blob, contact.encKey, aad);
-  return { plain, viaX4DH: false, theirDeviceId: null };
+  return { plain, viaX4DH: false, theirDeviceId: null, keyLabel: null };
 }
 
 /* ══════════════════════════════════════════
@@ -4507,10 +4622,10 @@ async function receiveMessage(msg) {
   if (!contact || contact.blocked) return;
   markOnline(msg.from);
   try {
-    let plain, valid, viaX4DH, matchedDeviceId;
+    let plain, valid, viaX4DH, matchedDeviceId, keyLabel;
     // AAD is built from the envelope AS RECEIVED — a packet retyped, reflected or
     // redirected in transit no longer decrypts (see PACKET ENVELOPE above)
-    ({ plain, viaX4DH, theirDeviceId: matchedDeviceId } = await decryptIncomingMessage(msg.from, msg.blob, envelopeAad(msg.type, msg.from, msg.to)));
+    ({ plain, viaX4DH, theirDeviceId: matchedDeviceId, keyLabel } = await decryptIncomingMessage(msg.from, msg.blob, envelopeAad(msg.type, msg.from, msg.to)));
     valid = verifyEnvelope(msg, contact.signPublicKey);
 
     // Belt-and-suspenders consistency check: a successful decrypt under
@@ -4526,6 +4641,10 @@ async function receiveMessage(msg) {
       mlog.warn(`← MSG          from ${pid(msg.from)} — decrypted under ${pid(matchedDeviceId)}'s X4DH key but payload claims deviceId=${pid(plain.deviceId)} — mismatch, treating as unverified`);
       valid = false;
     }
+    // A VERIFIED message under our current RK1 proves the peer holds RK1 —
+    // see "wire-message keys". Only after verification: nothing here may
+    // switch our send key on the strength of an unverified packet.
+    if (viaX4DH && valid && keyLabel === "current") confirmX4DHPeerKey(msg.from, matchedDeviceId);
 
     // Duplicate-delivery guard (0.4.9) — a targeted send and the
     // identity-level broadcast fallback are NOT mutually exclusive: a
@@ -4879,7 +4998,7 @@ async function burnBlockContact(id) {
    credentials and we can't actually stop a re-login anyway, only
    pretend to). X4DH session state (rootKeys, retry bookkeeping) lives
    under X4DH_SESSION_KEY, wiped here same as everything else — the
-   in-memory x4dhWireKeyCache simply becomes garbage on reload, nothing
+   in-memory x4dhWireKeyByRoot/x4dhRetired simply becomes garbage on reload, nothing
    extra needed for it.
 ══════════════════════════════════════════ */
 function selfDestruct() {
