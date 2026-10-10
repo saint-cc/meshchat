@@ -11,6 +11,140 @@ work, not yet cut as a numbered release.
 
 ---
 
+## 0.5.9
+
+Rolls up the 0.5.6–0.5.9 work as one entry (as with `0.5.5`, the individual cut
+points weren't recorded). Mostly a security pass on the wire — relay-bound
+authentication and envelope binding — plus a reliability fix for X4DH session
+upgrade. **Two changes are hard cutovers with no compatibility shim** (auth
+`auth_v` 2, and envelope-bound packets), same stance as `0.5.2`/`0.5.5` while
+testing is still limited to a small number of people. **Relay operators must now
+set `RELAY_WSS_URL`** — see the first item.
+
+- **Breaking: relay auth is now bound to the relay's host (`auth_v` 2).** The
+  possession proof used to be an Ed25519 signature over whatever bytes the relay
+  sent as its "nonce", which made every relay we ever connected to — our home
+  relay, a contact's relay, a MIGRATE test target — a signing oracle for the
+  identity key, the same key that signs every packet in the app. The proof now
+  signs a fixed layout:
+  `"meshchat-auth-v1" 00 | relayHost 00 | nonce(32) | x25519_pub | ed25519_pub | endpoint_id 00 | no_receive(1)`.
+  The host is the one the client *dialed* (never anything from the challenge), so
+  a relay that forwards someone else's challenge gets a signature bound to its
+  own host, which the real relay rejects. The nonce is fixed-length (the client
+  refuses any challenge that isn't exactly 32 bytes, so a relay can't choose what
+  gets signed). `endpoint_id` and `no_receive`, which used to travel unprotected
+  in `sig:auth_init`, are now inside the signature. The label also keeps an auth
+  signature disjoint from packet signatures (those are over JSON text, which
+  starts with `{`). `sig:auth_init` carries `auth_v: 2`; a mismatch gets
+  `sig:auth_fail` with reason `auth_version`.
+  - **Relay side:** the host(s) a proof is accepted for come from the relay's own
+    configuration — the host of `RELAY_WSS_URL`, plus any extra names in
+    `RELAY_AUTH_HOSTS` (comma-separated, for a relay reachable under more than one
+    name) — and are never derived from the `Host` header, which is chosen by the
+    party connecting. **A relay with no valid `RELAY_WSS_URL` now refuses every
+    auth** (`relay_not_configured`) rather than guessing its own name, and logs
+    loudly at startup. A client signs the host *it* dialed, so a second name that
+    isn't listed fails with `proof_invalid`.
+  - **Client side:** one helper, `createRelayAuth`, now serves all four places
+    that authenticate to a relay (main signal socket, outbound contact relays, the
+    MIGRATE test probe, the old-relay drain). The main socket also drops the
+    connection if `auth_ok` names a different `public_id` than ours, and stray
+    `sig:auth_*` packets on a contact-relay socket are no longer routed into
+    `handleSignal` (whose auth handlers drive the *main* socket's state).
+- **Breaking: packet envelopes are signed and bound to their ciphertext.**
+  `app:message`, `app:migrate`, `app:burn` and `app:sync` carry
+  `{ type, from, to, blob, sig }`, and `type`/`from`/`to` sit outside the
+  ciphertext where a relay can rewrite them. The signature used to cover only the
+  blob. Reproduced against `0.5.6`: an ordinary legacy-key `app:message`
+  re-labelled `app:burn` blocked a contact and wiped the conversation. Now the
+  signature covers `{ type, from, to, blob }` and the ciphertext is bound to
+  `[type, from, to]` as AES-GCM additional data, so retyping a packet, reflecting
+  it back at its sender, or redirecting it to another device fails at decrypt and
+  the packet is dropped. Bound blobs are versioned (`encryptMessage` → `v:2`,
+  `encryptObject` → `v:3`); a receiver that expects the binding never falls back
+  to an unbound blob, so a pre-binding packet can't be replayed in. The binding
+  also covers the self-sync backup packets (`sync:backup_push`/`backup_accept`
+  between our own devices). `sealEnvelope` is now the single place such a packet
+  is built, and receivers build the AAD from the packet *as received*. Things that
+  are not wire packets — contacts/sessions at rest, backup files, ephemeral wraps
+  — are deliberately unbound, as before. Consequence: packets from a pre-binding
+  client are dropped, and so are ours on their end.
+- **Receivers now honour the endpoint part of `to`.** A compound
+  `id::endpointId` address names one device, but every receive handler used to
+  compare only the bare id — the relay routes on the endpoint, and a relay is
+  exactly who can't be trusted to. `isAddressedToMe` replaces the bare-id check at
+  every handler; `app:migrate`/`app:burn` still require a bare `to`.
+- **Fixed: X4DH session upgrade could lose packets (key generations).** The
+  first wire-key pass derived one key per (contact, device) from the session's
+  *current* root and used it for everything, which lost messages whenever the two
+  sides briefly disagreed about which root was current: the responder moves to RK1
+  before its ack is delivered (so the initiator's RK0-keyed messages, and the
+  responder's RK1-keyed ones, were undecryptable to each other), a lost or late
+  ack (the initiator drops its ephemeral after 60s) left the pair desynced until
+  the stuck-retry, and a reset discarded the old keys while the peer still had
+  traffic in flight. The rule is now **send under the newest root the peer has
+  demonstrably reached, decrypt under every generation still alive.** The
+  initiator sends under RK1 as soon as the ack lands; the responder keeps sending
+  under RK0 until a *verified* message from that device decrypts under RK1 —
+  proof the initiator upgraded — then switches (`confirmX4DHPeerKey`). RK0 is
+  retained until then; replaced or retired roots are kept decrypt-only, in memory
+  and never persisted, for 120s. Wire keys are cached per root, so a cache hit can
+  never be stale. Session records gain `sendStage` and `rk0Root`; older records
+  (no `sendStage`) are read as "send under the current stage", so nothing needs
+  migrating. Self-backup blobs benefit identically (`decryptSelfBackupBlob` tries
+  every generation).
+- **Fixed: first-contact race left both sides at RK0.** The initiator proposes
+  the moment it learns the responder's `endpointId`, but the only thing that tells
+  the responder the initiator's endpoint is the delivery ack that follows, so the
+  propose could win the race to the relay. The responder couldn't address a
+  `session:ack` (a compound `to` is mandatory for that type), gave up, and the
+  session sat at RK0 until the stuck-retry fired minutes later. The verified
+  propose is now parked on the RK0 session as `pendingAck`, and
+  `recordKnownDevice` completes the handshake the moment the endpoint is learned
+  (`maybeCompleteDeferredAck`). Only honoured for 30s after the propose arrived —
+  half the initiator's 60s ephemeral lifetime — because acking later would leave
+  the responder at RK1 and the initiator at RK0; past that, behaviour is exactly
+  as before. The ack half is now shared code (`completeX4DHAck`) and only acks if
+  the session is still the epoch the propose created — the old inline path
+  ignored the upgrade's result and acked a superseded epoch regardless.
+  `x4dhDebug.list()` now shows `sendStage`, whether RK0 is still held, and
+  whether an ack is deferred.
+- **Fixed: a sender-chosen timestamp could pin a contact's relay.**
+  `updateRelay` adopts a relay only if its timestamp is newer than
+  `lastRelaySeen`, then pins `lastRelaySeen` to it — and the timestamp was
+  chosen by the sender (or by whoever replays a packet). A hint stamped in the
+  future won once and then outranked every genuine later notice. All inputs are
+  now clamped to the receiver's clock (`clampRelayTs`). A replayed
+  `sync:restore_req` used to stamp its relay hint with `Date.now()`, turning an
+  old genuine request into a fresh-looking one that outranked the contact's real
+  newer migrate; it now uses the request's own *signed* `ts`. A relay hint inside
+  an `app:message` is only adopted when the message's signature is valid. The
+  breadcrumb replanted at an old relay keeps its original `ts` — it must not
+  manufacture freshness.
+- **Fixed: message text was rendered as HTML.** `renderMessages` handed a
+  decrypted message body to `linkify()` and then `innerHTML` with no escaping, so
+  any contact could send markup (e.g. an `<img onerror=…>`) and have it execute in
+  the page that holds `state.contacts`, `sendMessage()`, `exportBackup()` and so
+  on. Text is now escaped before linkifying, and `linkify` percent-encodes a
+  literal `"` in a URL so it can't close the `href` attribute early.
+- **Changed: relay abuse limits (operator-facing).** Forwarded-for headers
+  (`X-Real-IP`/`X-Forwarded-For`) are only honoured when the TCP peer is inside
+  `TRUSTED_PROXIES` (bare IPs or CIDR ranges), since otherwise a direct connection
+  can claim any address and defeat the per-IP limits. The per-socket and per-IP
+  rate limits are now separate knobs (`RATE_LIMIT_*` / `IP_RATE_LIMIT_*`), and a
+  server-wide `GLOBAL_AUTH_RATE`/`GLOBAL_AUTH_BURST` caps new auth completions
+  regardless of source address — spent only on proofs that already verified.
+  Offline-buffer growth is bounded by `MAX_BUF_RECIPIENTS` (distinct recipient
+  directories), `MAX_ENDPOINTS_PER_RECIPIENT` and a per-recipient write-rate limit
+  (`BUF_WRITE_RATE_LIMIT`/`BURST`, idle limiters pruned); none of this affects live
+  delivery. A client that sends `sig:auth_init` and then goes silent is now closed
+  after `AUTH_TIMEOUT` instead of holding a connection slot indefinitely.
+- **Service worker: network errors no longer surface as unhandled.** The fetch
+  handler returns a 504 when the request is aborted or the network is down. This
+  is not offline support — the app shell is still network-only.
+- **Version.** `CLIENT_VERSION` and the relay's `PROTOCOL_VERSION` are both
+  `0.5.9`, surfaced informationally via `sig:relay_info`.
+
 ## 0.5.5
 
 Rolls up the 0.5.3–0.5.5 work as one entry (the individual cut points weren't

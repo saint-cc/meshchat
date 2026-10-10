@@ -2883,6 +2883,27 @@ async function sendRestoreRequest(id) {
  
 }
 
+/* ── RELAY-HINT TIMESTAMPS ──
+   updateRelay (meshchat-lib.js) adopts a relay only when its ts is newer
+   than contact.lastRelaySeen, and then PINS lastRelaySeen to that ts. The
+   ts that reaches it is chosen by the sender (a message's plain.ts, a
+   migrate notice's plain.ts) or, for a replayed restore_req, by whoever
+   replays it — and the receiver's own clock plays no part. A hint stamped
+   in the future therefore wins once and then outranks every genuine
+   later notice (a real MIGRATE would be "not newer, ignored") until the
+   real clock catches up. A sender with a fast clock does this by
+   accident; a hostile one can do it deliberately.
+   Clamping to the receiver's now closes that without touching the
+   ordering rule itself: a hint can still never be older than what we
+   hold, it just can't claim to be from the future.
+   Non-numeric / missing ts deliberately passes through as NaN rather than
+   being defaulted to now — updateRelay treats NaN as 0 and ignores it, so
+   a notice with no usable timestamp can't manufacture freshness for
+   itself. */
+function clampRelayTs(ts, now = Date.now()) {
+  return Math.min(ts, now);
+}
+
 async function handleRestoreRequest(msg) {
   if (!msg.from || !msg.blob || !isAddressedToMe(msg.to)) return;
   const contact = state.contacts[msg.from];
@@ -2966,7 +2987,15 @@ if (contact.blocked) {
     // update contact with wss and signPublicKey from blob if we know them
     // (unchanged from before this pass — deliberately not touched here)
     if (state.contacts[msg.from]) {
-      if (plain.wss) updateRelay(state.contacts[msg.from], plain.wss, Date.now());
+      // Stamped with the request's own SIGNED ts (verifyRestorePacket covers
+      // it), not Date.now(). restore_req is live-only but never freshness-
+      // checked, so a malicious relay can replay an old genuine request at
+      // any later time; stamping "now" turned that replay into a fresh,
+      // validly-timestamped relay hint that outranks the contact's real
+      // newer migrate. The signed ts means a replay carries its ORIGINAL
+      // age, so updateRelay's newer-than guard rejects it. Clamped so a
+      // sender-chosen future ts can't pin lastRelaySeen either.
+      if (plain.wss) updateRelay(state.contacts[msg.from], plain.wss, clampRelayTs(msg.ts));
       if (plain.signPublicKey) {
         state.contacts[msg.from].signPublicKey = base64ToRaw(plain.signPublicKey);
       }
@@ -4685,8 +4714,15 @@ async function receiveMessage(msg) {
     // failures early on; tightened now that it's a real trust boundary.
     if (valid && plain.deviceId) recordKnownDevice(msg.from, plain.deviceId, plain.n, plain.endpointId);
     if (plain.id) packetCache[plain.id] = { envelope: msg, payload: plain };
-    if (plain.relay?.wss) {
-      updateRelay(contact, plain.relay.wss, plain.ts || Date.now());
+    // Relay hint rides inside the signed payload, so it carries the same
+    // trust requirement as recordKnownDevice above: only a validly signed
+    // message may steer where we send this contact's traffic. A message
+    // that decrypts but fails (or lacks) the signature — a relay stripping
+    // the outer sig, say — still displays, but its hint is ignored. The
+    // ts is clamped to now (see clampRelayTs) so a sender-chosen future
+    // timestamp can't pin lastRelaySeen and shut out later genuine notices.
+    if (valid && plain.relay?.wss) {
+      updateRelay(contact, plain.relay.wss, clampRelayTs(plain.ts || Date.now()));
       if (state.currentChat === msg.from) updateChatRelayInfo(msg.from);
     }
     // sub-id annotation only once signed+verified — same trust gate as
@@ -4848,7 +4884,12 @@ async function handleMigrate(msg) {
     // regress us, regardless of which device sent it or when it arrives.
     const me        = state.contacts[state.publicId];
     const beforeUrl = me.lastRelay;
-    updateRelay(me, plain.newRelay, plain.ts);
+    // ts clamped to now (clampRelayTs): a migrate notice is signed, but its
+    // ts is still sender-chosen, and a future one would pin lastRelaySeen
+    // and make every genuine later notice "not newer". The breadcrumb
+    // replant below deliberately keeps the ORIGINAL plain.ts — it must not
+    // manufacture freshness, and the clamp only ever lowers a ts.
+    updateRelay(me, plain.newRelay, clampRelayTs(plain.ts));
     if (me.lastRelay !== beforeUrl) {
       mlog.info(`← MIGRATE      from self — following to ${plain.newRelay}`);
       me.prevRelay     = beforeUrl;
@@ -4877,7 +4918,7 @@ async function handleMigrate(msg) {
     }
   } else {
     const before = contact.lastRelay;
-    updateRelay(contact, plain.newRelay, plain.ts);
+    updateRelay(contact, plain.newRelay, clampRelayTs(plain.ts));   // clamp: see the self branch above
     if (contact.lastRelay !== before) {
       mlog.info(`← MIGRATE      from ${pid(msg.from)} — relay updated to ${plain.newRelay}`);
       await saveContacts();
