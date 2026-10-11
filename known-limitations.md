@@ -2,6 +2,8 @@
 
 This document describes limitations and trade-offs that are inherent to MeshChat's design. These are not implementation bugs, but consequences of prioritising decentralisation, cryptographic identity and infrastructure independence.
 
+MeshChat is a small decentralised messaging protocol built to current cryptographic standards. It is a learning and study project, not a hardened system for people facing well-resourced adversaries — see "MeshChat is not an anonymity network" and "Experimental protocol" at the end.
+
 ---
 
 # Identity
@@ -37,6 +39,14 @@ No dual-version detection or migration was attempted, and any future change to t
 Your `publicId` is public by design. Anyone who knows your username and your public ID can therefore test passphrase guesses entirely offline — derive the keys from a guess, hash the two public keys, compare against the known ID — with no captured traffic and no network access.
 
 The 1,000,000 PBKDF2 iterations make each guess more expensive; they do not change the shape of the problem. The passphrase is the security floor for everything built on top of it, including every forward-secrecy property that depends on identity keys not leaking. The login screen's entropy meter is a rough guide, not a guarantee.
+
+---
+
+## Contact keys are trusted on first exchange
+
+Adding a contact means accepting the key you were given — by QR code, copy-paste or however it reached you. Everything after that (signatures, "Bob can prove he is Bob") is only as trustworthy as that first exchange. There is no safety-number or fingerprint comparison, and editing a contact's key replaces it without any warning to the other side.
+
+Anyone who can substitute the key in transit — for example, one pasted over an untrusted channel — can impersonate that contact from the start.
 
 ---
 
@@ -113,18 +123,44 @@ Reloading the page or switching devices loses the media payload while leaving th
 
 # Privacy
 
-## Relay operators observe metadata
+## Relays see who talks to whom — by design
 
-Relay operators necessarily observe:
+Message contents are end-to-end encrypted. Who sent a packet and who it is for are not: `from` and `to` are plaintext on every packet, because the relay needs `to` to deliver or buffer it. Hiding them would mean replacing identity-addressed delivery with opaque per-pair mailboxes, which would make the relays stateful and is deliberately out of scope.
 
-- sender public ID
-- recipient public ID
-- timing
-- approximate message size
+Relay operators therefore observe:
+
+- sender public ID and recipient public ID of every packet they carry
+- timing and approximate message size
 - client IP addresses
 - which device routing ID (`endpointId`) is connected or addressed — not linkable to the device ID your contacts see, but stable per device
+- for connections they receive from you: your public ID and routing ID (see the next item)
 
-Message contents remain end-to-end encrypted.
+The recommended mitigation is at the network layer. If that matters to you, run the client over a VPN or Tor. Note that a VPN does not necessarily cover WebRTC: voice calls and data-channel tests can reveal your real address through ICE regardless of how your WebSocket traffic is routed.
+
+---
+
+## A contact's relay learns your identity when you message them
+
+Messages go to the *recipient's* relay, and to send one your client authenticates to that relay as you. Alice messaging Bob therefore tells Bob's relay Alice's public ID, her routing ID and her IP, and that she is talking to Bob — even though neither side's relay is "Alice's".
+
+A send-only, unauthenticated path would avoid this, but it would also need a different way for relays to key their per-sender buffer overwrites, and a different route for replies. It has been considered and left out.
+
+---
+
+## Your contact list leaks gradually to your home relay
+
+Roughly every 30 seconds your client announces its own ID plus a small random sample of your contacts' IDs to its home relay, to learn who is online. Over time that relay can reconstruct most of your contact list and see which of those contacts are connected to it. Contacts on other relays learn nothing from this, and the announce is not a way for a stranger to look you up — but your own relay sees it.
+
+---
+
+## Running many relays does not make you unlinkable
+
+Spreading users across many relays means one operator sees only a fraction of the network, and there is no central directory to compel. That is a real property of the design, but it is not unlinkability:
+
+- Public IDs are global and stable across relays and across migrations, so anyone watching several relays can correlate you.
+- Relays cost nothing to run and identities cost nothing to create, so one party can operate many of them.
+- Contacts tend to cluster on a few popular relays, as with every federated system.
+- Unlinkability would need per-relay pseudonyms, sealed sender, padding or a mix network — none of which MeshChat attempts.
 
 ---
 
@@ -138,8 +174,10 @@ Identity keys are static, and the identity-level pairwise key derived from them 
   - It relies on both ephemeral private keys being erased. In JavaScript that is best-effort (dropped and garbage-collected, not zeroised).
   - The wire key is static per session, so there is no per-message forward secrecy and no post-compromise recovery until the session resets.
   - The session root key is stored on the device, encrypted with a key derived from the passphrase. An attacker with both the device's storage and the passphrase obtains it directly, without needing any identity-key attack.
+  - Since `0.5.9`, key material lingers slightly longer than a strict "delete on upgrade" would suggest: `RK0` stays in the session record (encrypted at rest) until the peer is confirmed to be on `RK1`, and replaced roots are kept in memory, decrypt-only, for 120 seconds so in-flight packets aren't lost. Both are deliberate trade-offs for reliability, and both widen the window in which old keys exist on the device.
 - None of this is a full ratchet yet — a device pair's session key is reused for every message under it until the session itself resets (X4DH.md §16.5/§16.6). Per-message forward secrecy (a real Double Ratchet) is separate, later work.
 - Any device pair that hasn't (yet, or ever) completed X4DH bootstrap still falls back to the identity-level static key, with none of the above.
+- **The legacy key is also still accepted on receive for device pairs that do have a session.** A message from such a device that decrypts under the identity-level key is processed (its signature is still checked and a failure is flagged), rather than rejected. Until that fallback is closed, a session is not a one-way door: protection against a compromised static key applies to what you send, not to what is accepted.
 - Calls, data-channel tests, relay migration notices, and burn notices are permanently out of scope for this — they aren't device-targeted infrastructure, so there's no session for them to ride on.
 - Copies of your own messages mirrored between your devices ride the same per-device keys as ordinary messages where a self-session exists, and the legacy self key otherwise — so the same qualifiers apply.
 - Manual SYNC's envelope uses the identity-level key, but the message batch inside a reply is wrapped under a one-shot ephemeral key (since `0.5.5`), so a recorded batch is not exposed by a later identity-key compromise. The envelope itself carries only an ephemeral public key and a request ID.
@@ -188,6 +226,17 @@ End-to-end encryption protects message contents, not service availability.
 
 ---
 
+## Relay authentication proves possession, not trustworthiness
+
+Since `0.5.9` the authentication proof is bound to the relay's own host name, so a relay cannot reuse your proof to authenticate as you somewhere else. That closes the signing-oracle problem; it does not make a relay trustworthy for anything else.
+
+Two practical consequences:
+
+- Identity costs nothing to create, so authentication is not an anti-spam gate. Abuse limits on a relay (per-IP and server-wide rate limits, buffer caps) are what actually bound it, and a distributed flood from many real addresses can still exhaust them.
+- A relay with no valid `RELAY_WSS_URL` configured refuses every authentication rather than guessing its own name, and a relay reachable under several names must list each one (`RELAY_AUTH_HOSTS`) or clients dialling an unlisted name are rejected. This is a misconfiguration failure, not a protocol one, but it looks like "nobody can log in".
+
+---
+
 ## No TURN server — some calls and data-channel tests will not connect
 
 Voice calls and the data-channel connection test negotiate directly between the two devices over WebRTC, using STUN only (three public STUN servers, for resilience). There is no TURN relay, and this is a permanent design decision rather than a gap awaiting a fix.
@@ -210,7 +259,25 @@ Delivery through the underlying push service (Google's, Mozilla's, etc.) is best
 
 ---
 
+## No offline use
+
+The service worker exists for push notifications. It does not cache the app, so MeshChat needs a network connection to load, even for a page you've opened before.
+
+---
+
 # General
+
+## Wire-security changes are hard cutovers
+
+Several changes to how packets are authenticated and protected have deliberately shipped with no dual-version path, while testing is limited to a small number of people:
+
+- **Relay authentication (`0.5.9`, `auth_v` 2):** a client and relay that disagree on the auth version cannot connect at all.
+- **Envelope binding (`0.5.9`):** packets are now signed over, and encrypted against, their type and addresses. Clients on either side of that line drop each other's `app:message`, `app:migrate`, `app:burn` and `app:sync` packets, and any packets already sitting in a relay's buffer from before the change will not decrypt.
+- **Manual SYNC (`0.5.5`):** a SYNC between a current and a legacy client does nothing.
+
+Anyone running a mixed set of versions should expect silent drops (visible in the log, not in the UI) until everything is updated. Future changes of this kind should be assumed to behave the same way until the project says otherwise.
+
+---
 
 ## The X4DH freshness guard trusts the sender's clock
 
@@ -220,6 +287,16 @@ The check that stops an older `session:propose` from overwriting a newer session
 - If a sender's clock is ever far ahead when a propose is adopted, its later legitimate proposes (including automatic retries) are refused until real time catches up with the stored value.
 
 Both are reasoned from the code rather than observed live.
+
+Relay hints in messages and notices are handled differently: the timestamp is clamped to the receiver's own clock, so a sender cannot pin a contact's relay by claiming a future time.
+
+---
+
+## An X4DH handshake can stay at RK0 for minutes after first contact
+
+When a propose reaches a device before it has learned the sender's routing ID, the acknowledgement is deferred and completed as soon as the ID is known — but only within 30 seconds of the propose arriving. Beyond that the handshake is not completed from that attempt, the session stays at `RK0`, and the initiator has to retry: stuck sessions are noticed after about two minutes, and automatic retries only fire when the peer comes online, up to 10 attempts before waiting for the next reconnect.
+
+Messages keep flowing meanwhile — both sides hold `RK0` — they just have the narrower `RK0` protection described above until the upgrade finally lands.
 
 ---
 
@@ -246,3 +323,13 @@ MeshChat protects message confidentiality.
 It does not attempt to hide who communicates with whom or conceal network-level metadata.
 
 For anonymity, additional technologies such as Tor are required.
+
+---
+
+## What is deliberately out of scope
+
+For clarity about where the line sits, these are choices rather than oversights:
+
+- **Metadata protection** — sender/recipient hiding, sealed sender, mailbox tokens, padding, mixnets (see "Relays see who talks to whom — by design").
+- **Defence against well-resourced adversaries** — MeshChat aims for sound, current cryptography with a simple design, not resistance to a state-level attacker. A passphrase-derived identity and a browser as the platform put a ceiling on what it could claim anyway.
+- **A relay-assisted TURN path, offline use, and revocation** — see their sections above.
