@@ -872,7 +872,7 @@ function getAckPointer(contactId) {
    for each TARGETED entry this function returns, rather than reusing one
    shared ciphertext across all of them the way the old sendFanned did.
 ══════════════════════════════════════════ */
-const FANOUT_STALE_MS = 7 * 24 * 60 * 60 * 1000;   // 7 days — deliberately its own, shorter window than DEVICE_REGISTRY_CUTOFF_MS's 30-day retention (see that constant's comment for why the two don't need to match)
+const FANOUT_STALE_MS = 7 * 24 * 60 * 60 * 1000;   // 7 days. A device past this with NO session is demoted to the broadcast fallback; one with a session and a known endpointId stays targeted (see resolveDeviceTargets). Deliberately independent of DEVICE_REGISTRY_CUTOFF_MS's 30-day retention.
 
 function resolveDeviceTargets(contactId) {
   const devices = state.knownDevices[contactId] || {};
@@ -892,10 +892,18 @@ function resolveDeviceTargets(contactId) {
 
   for (const [deviceId, info] of entries) {
     const isStale = (now - (info.lastSeen || 0)) > FANOUT_STALE_MS;
-    if (info.endpointId && !isStale) {
+    // A device we hold an X4DH session with is worth addressing directly however long it
+    // has been quiet: the targeted copy is encrypted under its own session key and
+    // buffered in ITS endpoint bucket. Demoting it to the broadcast fallback instead sent
+    // EVERY message to this contact a second time under the static legacy key, just
+    // because one old device went quiet. Staleness still demotes a device with no session
+    // (nothing to encrypt it under but the legacy key anyway), and stops mattering once
+    // the registry prunes the device (DEVICE_REGISTRY_CUTOFF_MS).
+    const hasSession = !!getX4DHSession(contactId, deviceId);
+    if (info.endpointId && (!isStale || hasSession)) {
       targeted.push({ deviceId, endpointId: info.endpointId });
     } else {
-      needsBroadcast = true;   // unresolved OR stale — falls back, not dropped
+      needsBroadcast = true;   // unresolved, or stale with no session — falls back, not dropped
     }
   }
   // knownCount — how many devices (excluding our own, in the self case) we
@@ -2043,11 +2051,16 @@ async function pushBackupToContacts(blob) {
 		try {
 			const fingerprint = await computeBackupFingerprint();
 			const { targeted, needsBroadcast } = resolveDeviceTargets(state.publicId);
-			let sent = 0, current = 0, noSession = 0;
+			let sent = 0, current = 0, noSession = 0, stale = 0;
+			const siblingInfo = state.knownDevices[state.publicId] || {};
 			let selfPayload = null;
 
 			for (const { deviceId: devId, endpointId: devEndpoint } of targeted) {
 				if (state.knownDeviceFingerprints[devId] === fingerprint) { current++; continue; }
+				// A sibling not heard from within FANOUT_STALE_MS is skipped: it gets nothing until it
+				// comes back (its own traffic refreshes lastSeen, so the next cycle includes it again).
+				// Counted separately so it neither triggers a hello nor reads as "current".
+				if ((Date.now() - (siblingInfo[devId]?.lastSeen || 0)) > FANOUT_STALE_MS) { stale++; continue; }
 				const wireKey = await getOrDeriveWireKey(state.publicId, devId);
 				if (!wireKey) { noSession++; continue; }
 				// deviceId/endpointId/fingerprint ride INSIDE the encrypted blob, never
@@ -2076,7 +2089,7 @@ async function pushBackupToContacts(blob) {
 				mlog.info(`→ BACKUP_PUSH  to self — content-free hello  (${needsBroadcast ? "device(s) unknown/unresolved/stale" : ""}${needsBroadcast && noSession ? ", " : ""}${noSession ? noSession + " without a session yet" : ""})`);
 			}
 			if (!sent && !wantsHello) {
-				mlog.debug(`→ BACKUP_PUSH  to self — nothing to send (${current} sibling(s) already current)`);
+				mlog.debug(`→ BACKUP_PUSH  to self — nothing to send (${current} sibling(s) already current, ${stale} stale)`);
 			}
 		} catch(e) {
 			mlog.warn(`→ BACKUP_PUSH  to self — failed: ${e.message}`);
