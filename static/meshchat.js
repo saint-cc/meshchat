@@ -317,8 +317,8 @@ function signBlob(blob){
 }
 
 /* ══════════════════════════════════════════
-   PACKET ENVELOPE — app:message, app:migrate, app:burn, app:sync
-   These four carry { type, from, to, blob, sig } and used to sign only
+   PACKET ENVELOPE — app:message, app:migrate (blob + AAD)
+   These two carry { type, from, to, blob, sig } and used to sign only
    the blob. type/from/to are outside the ciphertext, so a relay could
    retype a packet (an ordinary legacy-key app:message re-labelled
    app:burn blocked a contact and wiped the conversation — reproduced
@@ -330,6 +330,10 @@ function signBlob(blob){
        as another);
      - the ciphertext is bound to [type, from, to] as AES-GCM AAD, so the
        same rewrite fails at decrypt and the packet is dropped.
+   app:burn and app:sync used to be in this group; both are now SIGN-ONLY
+   (no blob, no AAD, no pairwise key — their fields sit in plaintext inside
+   the signature; see handleBurn / buildSyncPacket), so they no longer use
+   the legacy static-static key at all.
    sealEnvelope() is the ONE place such a packet is built; receivers pass
    envelopeAad(msg.type, msg.from, msg.to) — built from the packet AS
    RECEIVED, never from anything inside the payload — to decryptMessage and
@@ -1827,16 +1831,29 @@ async function retryX4DHPropose(contactId, theirDeviceId) {
    representative envelope is enough to inspect wire shape/sig format;
    showing all N per-device ciphertexts wasn't judged worth the extra
    UI complexity for a debug feature.
+
+   opts.sessionOnly — never touch the legacy static-static key. A targeted
+   device with no X4DH session is SKIPPED (counted in skippedNoSession, not
+   sent a legacy-key copy), and the identity-level broadcast fallback is
+   never sent at all (it can only ever be legacy-keyed). Used by
+   sendSelfSync: mirrored copies of our own messages carry full message
+   text, so they must not ride a key that is deterministic from the two
+   identity keys. Ordinary contact traffic leaves this off — a first
+   message to a fresh contact has nothing BUT the legacy key to ride on.
 ══════════════════════════════════════════ */
-async function sendFannedX4DH(contactId, payload) {
+async function sendFannedX4DH(contactId, payload, opts = {}) {
   const contact = state.contacts[contactId];
-  const { targeted, needsBroadcast } = resolveDeviceTargets(contactId);
+  const sessionOnly = !!opts.sessionOnly;
+  const resolved = resolveDeviceTargets(contactId);
+  const targeted = resolved.targeted;
+  const needsBroadcast = sessionOnly ? false : resolved.needsBroadcast;
   let sent = false;
-  let x4dhCount = 0, legacyCount = 0;
+  let x4dhCount = 0, legacyCount = 0, skippedNoSession = 0;
   const envelopes = [];
 
   for (const { deviceId, endpointId } of targeted) {
     const wireKey = await getOrDeriveWireKey(contactId, deviceId);
+    if (sessionOnly && !wireKey) { skippedNoSession++; continue; }
     const key = wireKey || contact.encKey;
     const obj = await sealEnvelope("app:message", state.publicId, buildAddress(contactId, endpointId), key, payload);
     const viaRelay = sendToRelay(contactId, obj, true);
@@ -1855,7 +1872,7 @@ async function sendFannedX4DH(contactId, payload) {
     envelopes.push(obj);
   }
 
-  return { sent, targetedCount: targeted.length, broadcastSent: needsBroadcast, x4dhCount, legacyCount, envelopes };
+  return { sent, targetedCount: targeted.length, broadcastSent: needsBroadcast, x4dhCount, legacyCount, skippedNoSession, envelopes };
 }
 
 /* ══════════════════════════════════════════
@@ -3342,22 +3359,33 @@ async function handleRestorePush(msg) {
 /* ══════════════════════════════════════════
    MSG EXCHANGE (manual SYNC button)
 ══════════════════════════════════════════ */
-/* Same protection tier as app:migrate: the batch is encrypted under the
-   pairwise key (contact.encKey) and the ciphertext is signed, with
-   verification MANDATORY on receive. Before this, the packet carried
-   `msgs` as plain JSON with no signature at all — the relay could read the
-   text and could forge `from` to inject messages into any conversation.
+/* SIGN-ONLY packet — no pairwise-key blob, no AAD. Wire shape:
+     { type:"app:sync", from, to, syncId, reply, ek, wrapped?, sig }
+   and the signature covers every one of those fields (type/from/to
+   included — same convention as session:propose/ack, see signX4DHPacket).
+   Nothing in it needs a second encryption layer:
+     - the only secret is the message batch, and that is already wrapped
+       under an ephemeral-to-ephemeral key (below) — `wrapped`;
+     - `ek` is a PUBLIC key, `syncId` is a random nonce, `reply` is a flag
+       whose value the relay can already infer from direction and size.
+   What the pairwise-key layer used to add — authenticity and binding of
+   from/to/syncId — the signature gives on its own: it is mandatory on
+   receive, the sender must be a known non-blocked contact (verified against
+   THEIR signing key), and a relay can neither retype the packet (type is
+   signed), redirect it (to is signed) nor reflect it back at its sender
+   (isAddressedToMe(msg.to) fails there). Dropping the layer means SYNC no
+   longer touches the legacy static-static key at all. Cost: the relay now
+   sees syncId, ek and the request/reply flag in the clear — a nonce, a
+   one-shot public key and a bit it could already infer, no new content.
 
-   Deliberately the legacy identity-level key, not an X4DH wire key: SYNC is
-   addressed to the contact (bare `to`, every live session answers), not to
-   one device pair, so there is no single session to derive a key against —
-   same reasoning that keeps app:migrate/app:burn/call:* off X4DH.
+   Before 0.5.5 the packet carried `msgs` as plain JSON with no signature at
+   all — the relay could read the text and could forge `from` to inject
+   messages into any conversation. Signature verification stays MANDATORY.
 
-   Everything that used to ride as an unsigned outer field (`reply`, and the
-   `from`/`to` pair) now lives INSIDE the encrypted+signed payload, and
-   receive checks them against the envelope: an outer field is silently
-   rewritable by an untrusted relay, and with a pairwise-symmetric key a
-   captured packet could otherwise be reflected back at its own sender.
+   SYNC is addressed to the contact (bare `to`, every live session
+   answers), not to one device pair, so there is no single X4DH session to
+   derive a key against — which is why it never rode X4DH, and now rides no
+   static key either.
 
    syncId ties a reply to the request that caused it. A reply is accepted
    only while a request of OURS to that same contact is still pending
@@ -3366,40 +3394,57 @@ async function handleRestorePush(msg) {
    broadcast, so several of the contact's devices can each legitimately
    answer it, and merging the same batch twice is a no-op anyway.
 
-   Old clients send plaintext `msgs` with no blob; those are dropped. Hard
-   cutover, same stance as the other recent wire changes — the only real
-   consequence is that SYNC between a new and an old client does nothing.
+   Old clients send a `blob` (pairwise-key envelope) or plaintext `msgs`;
+   neither verifies against the signed field set below, so both are dropped.
+   Hard cutover, same stance as the other recent wire changes — the only
+   real consequence is that SYNC between a new and an old client does
+   nothing.
 
-   EPHEMERAL WRAP (the messages themselves). The pairwise key above is
-   static-static ECDH — deterministic — so a recorded batch plus a later
-   identity-key compromise would expose every message text in it. The
-   message batch therefore never rides under that key alone:
+   EPHEMERAL WRAP (the messages themselves). The batch never rides under a
+   static key — a recorded batch plus a later identity-key compromise would
+   expose every message text in it:
      - the REQUEST carries no messages at all, only a fresh X25519 ephemeral
-       public key `ek` (inside the encrypted+signed payload, so a relay can
-       neither strip nor swap it);
+       public key `ek` (inside the signature, so a relay can neither strip
+       nor swap it);
      - the REPLY carries its own fresh ephemeral `ek` plus `wrapped` — the
        batch encrypted under HKDF(X25519(replier ephemeral, requester
        ephemeral)). The requester's ephemeral private half lives only in
        pendingSyncs, in memory, until SYNC_PENDING_TTL_MS expires.
    Same one-shot ephemeral-to-ephemeral construction (and the same
-   deriveEphemeralWrapKey) as the restore/backup push wraps. The outer
-   pairwise layer stays: it is what authenticates and binds from/to/syncId.
+   deriveEphemeralWrapKey) as the restore/backup push wraps. `wrapped` is
+   inside the signature too, so a relay can't swap one reply's batch for
+   another's.
    Consequence: SYNC is one-directional — the side that presses SYNC
    receives the other side's recent messages; it no longer also pushes its
    own. Press it on both sides for a two-way exchange. A request with no
    valid `ek` is dropped (hard cutover, no unwrapped fallback). */
 const MAX_SYNC_MSGS        = 50;       // inbound cap per batch — EXCHANGE_COUNT is 10, this is just a sanity ceiling
 const SYNC_PENDING_TTL_MS  = 60_000;   // how long a reply to our own request stays acceptable
+const SYNC_MAX_ID_LEN      = 64;       // syncId is a uuid; anything longer is junk
 const pendingSyncs = new Map();        // syncId -> { contactId, createdAt, ekPriv } — ekPriv is memory-only, same tier as pendingX4DHProposals
 
 const validSyncEk = (ek) => Array.isArray(ek) && ek.length === 32 && ek.every(b => Number.isInteger(b) && b >= 0 && b <= 255);
 
+// The exact object that is signed/verified — built in ONE place, with a
+// fixed key order, so sender and receiver can't drift apart (JSON.stringify
+// is order-sensitive). `wrapped` is always present in it, null on a request,
+// so a relay that bolts a `wrapped` onto a signed request invalidates it.
+function syncSignedBody(type, from, to, syncId, reply, ek, wrapped) {
+  return { type, from, to, syncId, reply, ek, wrapped: wrapped || null };
+}
+function verifySyncPacket(msg, contactSignPublicKey) {
+  if (!msg.sig || !contactSignPublicKey) return false;
+  return verifyBlob(syncSignedBody(msg.type, msg.from, msg.to, msg.syncId, msg.reply, msg.ek, msg.wrapped), msg.sig, contactSignPublicKey);
+}
+
 // request: { syncId, reply:false, ek }
 // reply:   { syncId, reply:true,  ek, wrapped }   (wrapped = encryptObject(ephemeralWrapKey, msgs))
-async function buildSyncPacket(contact, { syncId, reply, ek, wrapped }) {
-  const payload = { from: state.publicId, to: contact.publicId, syncId, reply, ek };
-  if (wrapped) payload.wrapped = wrapped;
-  return sealEnvelope("app:sync", state.publicId, contact.publicId, contact.encKey, payload);
+function buildSyncPacket(contact, { syncId, reply, ek, wrapped }) {
+  const body = syncSignedBody("app:sync", state.publicId, contact.publicId, syncId, reply, ek, wrapped);
+  const obj  = { type: body.type, from: body.from, to: body.to, syncId, reply, ek };
+  if (wrapped) obj.wrapped = wrapped;   // absent on the wire for a request; null in the signed body
+  obj.sig = signBlob(body);
+  return obj;
 }
 
 // Whitelisted field copy, never a spread — same discipline as
@@ -3450,7 +3495,7 @@ async function initiateExchange(contactId) {
     return;
   }
   const contact = state.contacts[contactId];
-  if (!contact || contact.blocked || !contact.encKey) return;
+  if (!contact || contact.blocked) return;   // no encKey needed any more — the packet is sign-only
   const syncId = crypto.randomUUID();
   const now = Date.now();
   for (const [id, p] of pendingSyncs) if (now - p.createdAt > SYNC_PENDING_TTL_MS) pendingSyncs.delete(id);   // no leak across a long session
@@ -3461,7 +3506,7 @@ async function initiateExchange(contactId) {
   // private key sitting in memory long after its window closed.
   setTimeout(() => pendingSyncs.delete(syncId), SYNC_PENDING_TTL_MS);
   try {
-    sendSignal(await buildSyncPacket(contact, { syncId, reply: false, ek: Array.from(ekPub) }));
+    sendSignal(buildSyncPacket(contact, { syncId, reply: false, ek: Array.from(ekPub) }));
     mlog.info(`\u2192 SYNC         to   ${pid(contactId)}  id=${pid(syncId)}`);
     setSyncStatus("syncing\u2026");
   } catch(e) {
@@ -3473,60 +3518,57 @@ async function initiateExchange(contactId) {
 
 async function handleMsgExchange(msg) {
   if (!msg.from || !msg.to || !isAddressedToMe(msg.to)) return;
-  if (!msg.blob) {
-    mlog.warn(`\u2190 SYNC         from ${pid(msg.from)} \u2014 no encrypted blob (legacy plaintext sync), dropped`);
-    return;
-  }
   const contact = state.contacts[msg.from];
   if (!contact || contact.blocked || msg.from === state.publicId) return;
 
   // Signature first (cheap, and nothing below is worth doing for a forgery).
   // Mandatory, same tier as app:migrate — a missing or invalid one is dropped,
   // never flagged-and-shown, because this packet writes into the conversation.
-  if (!verifyEnvelope(msg, contact.signPublicKey)) {
-    mlog.warn(`\u2190 SYNC         from ${pid(msg.from)} \u2014 signature missing or invalid, dropped`);
+  // type/from/to/syncId/reply/ek/wrapped are ALL inside it (verifySyncPacket),
+  // so after this line every field below is the contact's own word, not the
+  // relay's: nothing needs re-checking against a second copy. A packet in the
+  // old blob / plaintext-msgs formats cannot verify and is dropped here —
+  // the log line just says why.
+  if (!verifySyncPacket(msg, contact.signPublicKey)) {
+    mlog.warn(`← SYNC         from ${pid(msg.from)} — signature missing or invalid${msg.blob || msg.msgs ? " (legacy blob/plaintext sync format)" : ""}, dropped`);
     return;
   }
-  let plain;
-  try { plain = await decryptMessage(msg.blob, contact.encKey, envelopeAad(msg.type, msg.from, msg.to)); }
-  catch(e) { mlog.warn(`\u2190 SYNC         from ${pid(msg.from)} \u2014 decrypt failed, dropped`); return; }
-
-  // Envelope fields are unsigned and relay-rewritable; the payload copies are
-  // authoritative. A mismatch means reflection/redirection, not a normal case.
-  if (plain.from !== msg.from || plain.to !== state.publicId
-      || typeof plain.syncId !== "string" || plain.syncId.length > 64 || typeof plain.reply !== "boolean") {
-    mlog.warn(`\u2190 SYNC         from ${pid(msg.from)} \u2014 payload/envelope mismatch, dropped`);
+  // Sender is the genuine contact, but still only a peer: shape-check what
+  // it sent. (msg.to is signed, so isAddressedToMe above already ruled out
+  // reflection — a copy aimed at its own sender names someone else.)
+  if (typeof msg.syncId !== "string" || !msg.syncId || msg.syncId.length > SYNC_MAX_ID_LEN || typeof msg.reply !== "boolean") {
+    mlog.warn(`← SYNC         from ${pid(msg.from)} — malformed syncId/reply, dropped`);
     return;
   }
-  markOnline(msg.from);   // only now \u2014 handleSignal used to do this before any verification
+  markOnline(msg.from);   // only now — handleSignal used to do this before any verification
 
-  if (!plain.reply) {
-    if (!validSyncEk(plain.ek)) {
-      mlog.warn(`\u2190 SYNC_REQ     from ${pid(msg.from)} \u2014 no valid ephemeral key (legacy sync request), dropped`);
+  if (!msg.reply) {
+    if (!validSyncEk(msg.ek)) {
+      mlog.warn(`← SYNC_REQ     from ${pid(msg.from)} — no valid ephemeral key (legacy sync request), dropped`);
       return;
     }
-    if (isDuplicateInbound(`app_sync:${msg.from}:${plain.syncId}`)) {
-      mlog.debug(`\u2190 SYNC_REQ     from ${pid(msg.from)} \u2014 duplicate within ${DEDUP_WINDOW_MS}ms, suppressed`);
+    if (isDuplicateInbound(`app_sync:${msg.from}:${msg.syncId}`)) {
+      mlog.debug(`← SYNC_REQ     from ${pid(msg.from)} — duplicate within ${DEDUP_WINDOW_MS}ms, suppressed`);
       return;
     }
-    mlog.info(`\u2190 SYNC_REQ     from ${pid(msg.from)}  id=${pid(plain.syncId)} \u2014 replying (wrapped)`);
+    mlog.info(`← SYNC_REQ     from ${pid(msg.from)}  id=${pid(msg.syncId)} — replying (wrapped)`);
     try {
       const { priv, pub } = generateX25519Ephemeral();
-      const wrapKey = await deriveEphemeralWrapKey(x25519.getSharedSecret(priv, new Uint8Array(plain.ek)));
+      const wrapKey = await deriveEphemeralWrapKey(x25519.getSharedSecret(priv, new Uint8Array(msg.ek)));
       const wrapped = await encryptObject(wrapKey, getLast(msg.from));
-      sendSignal(await buildSyncPacket(contact, { syncId: plain.syncId, reply: true, ek: Array.from(pub), wrapped }));
+      sendSignal(buildSyncPacket(contact, { syncId: msg.syncId, reply: true, ek: Array.from(pub), wrapped }));
     } catch(e) {
       mlog.warn(`\u2192 SYNC_REPLY   to   ${pid(msg.from)} \u2014 send failed: ${e.message}`);
     }
     return;   // the request carries no messages — nothing to merge on this side
   }
 
-  const pending = pendingSyncs.get(plain.syncId);
+  const pending = pendingSyncs.get(msg.syncId);
   if (!pending || pending.contactId !== msg.from || (Date.now() - pending.createdAt) > SYNC_PENDING_TTL_MS) {
     mlog.debug(`\u2190 SYNC_REPLY   from ${pid(msg.from)} \u2014 no matching pending request, ignored`);
     return;
   }
-  if (!validSyncEk(plain.ek) || !plain.wrapped || typeof plain.wrapped !== "object") {
+  if (!validSyncEk(msg.ek) || !msg.wrapped || typeof msg.wrapped !== "object") {
     mlog.warn(`\u2190 SYNC_REPLY   from ${pid(msg.from)} \u2014 missing ephemeral key or wrapped batch, dropped`);
     return;
   }
@@ -3536,8 +3578,8 @@ async function handleMsgExchange(msg) {
   // is why the pending entry is not consumed here.
   let msgs;
   try {
-    const wrapKey = await deriveEphemeralWrapKey(x25519.getSharedSecret(pending.ekPriv, new Uint8Array(plain.ek)));
-    msgs = await decryptObject(wrapKey, plain.wrapped);
+    const wrapKey = await deriveEphemeralWrapKey(x25519.getSharedSecret(pending.ekPriv, new Uint8Array(msg.ek)));
+    msgs = await decryptObject(wrapKey, msg.wrapped);
   } catch(e) {
     mlog.warn(`\u2190 SYNC_REPLY   from ${pid(msg.from)} \u2014 unwrap failed, dropped`);
     return;
@@ -4943,15 +4985,19 @@ async function handleMigrate(msg) {
 }
 /* ══════════════════════════════════════════
    BURN NOTICE — receive side
-   Packet: { type: "app:burn", from, to, blob: encrypted{ts}, sig }
-   Decryption is identical to a regular message/migrate — always
-   state.encKey, symmetric scheme. Same "OUT OF SCOPE for X4DH wire keys,
-   permanently" reasoning as app:migrate above — never device-targeted
-   by protocol design, so there's no per-device key to switch to.
+   Packet: { type: "app:burn", from, to, ts, sig } — SIGN-ONLY, no blob.
+   sig covers { type, from, to, ts } (same convention as session:propose/
+   ack). The only payload was ever a timestamp: nothing secret, so the
+   pairwise-key blob it used to ride in added nothing the signature doesn't
+   already give — authenticity, and (type/from/to inside the signature) no
+   retyping, redirecting or reflecting by the relay. Burn no longer touches
+   the legacy static-static key at all. Never device-targeted by protocol
+   design (same reasoning as app:migrate above), so no X4DH wire key applies.
    Signature verification is NOT optional here, same rule as app:migrate
    and the call:* group: this packet drives an irreversible action, so
    an unsigned or invalid one is dropped outright rather than flagged
-   and shown.
+   and shown. A burn in the old blob format cannot verify against this
+   field set and is dropped — hard cutover, as with the other envelope changes.
  
    Two branches:
      - from self        → another of our own devices burned (or we
@@ -4962,7 +5008,10 @@ async function handleMigrate(msg) {
        Already-blocked contact → no-op, nothing left to do.
 ══════════════════════════════════════════ */
 async function handleBurn(msg) {
-  if (!msg.from || !msg.blob) return;
+  if (!msg.from || !msg.sig || !Number.isFinite(msg.ts)) {
+    if (msg.blob) mlog.warn(`← BURN         from ${pid(msg.from)} — legacy blob-format burn, dropped`);
+    return;
+  }
  
   // never device-targeted — bare identity only (same rule as migrate)
   if (msg.to !== state.publicId) {
@@ -4970,21 +5019,14 @@ async function handleBurn(msg) {
     return;
   }
   const isSelf  = msg.from === state.publicId;
-  const contact = state.contacts[msg.from];
-  if (!isSelf && !contact) return;   // unknown sender, nothing to act on
+  const contact = state.contacts[msg.from];   // for self this is the "me" contact
+  if (!contact) return;   // unknown sender, nothing to act on
  
-  let plain;
-  try {
-    plain = await decryptMessage(msg.blob, contact.encKey, envelopeAad(msg.type, msg.from, msg.to));
-  } catch(e) {
-    mlog.warn(`← BURN         from ${pid(msg.from)} — decrypt failed`);
-    return;
-  }
- 
-  const verifyKey = isSelf ? state.contacts[state.publicId]?.signPublicKey : contact.signPublicKey;
-  const sigValid  = verifyEnvelope(msg, verifyKey);
-  if (!sigValid) {
-    mlog.warn(`← BURN         from ${pid(msg.from)} — signature invalid, dropped`);
+  // type/from/to/ts are all inside the signature (verifyBurnPacket), so the
+  // relay can't retype another packet into a burn, redirect one, or reflect
+  // one back at its sender (the bare-`to` check above fails for a reflection).
+  if (!verifyBurnPacket(msg, contact.signPublicKey)) {
+    mlog.warn(`← BURN         from ${pid(msg.from)} — signature missing or invalid, dropped`);
     return;
   }
  
@@ -5141,30 +5183,40 @@ async function notifyMigration(newRelay, ts, oldRelay) {
        stale relay won't see it until it next syncs there — same
        known limitation migrate already has, not solved here either.
 ══════════════════════════════════════════ */
+// Sign-only packet (see handleBurn). `to` is always bare. Built in ONE place
+// so the signed field set and order can't drift between sender and receiver.
+function burnSignedBody(type, from, to, ts) { return { type, from, to, ts }; }
+function buildBurnPacket(to, ts) {
+  const body = burnSignedBody("app:burn", state.publicId, to, ts);
+  return { ...body, sig: signBlob(body) };
+}
+function verifyBurnPacket(msg, contactSignPublicKey) {
+  if (!msg.sig || !contactSignPublicKey) return false;
+  return verifyBlob(burnSignedBody(msg.type, msg.from, msg.to, msg.ts), msg.sig, contactSignPublicKey);
+}
+
 async function notifyBurn(ts) {
-  const payload = { ts };
- 
+  // No encKey gate any more: the packet is sign-only, so a contact we hold no
+  // pairwise key for can still be told.
   for (const id of Object.keys(state.contacts)) {
     if (id === state.publicId) continue;
     const contact = state.contacts[id];
-    if (!contact?.encKey || contact.blocked) continue;
+    if (!contact || contact.blocked) continue;
     try {
-      const burnMsgObj = await sealEnvelope("app:burn", state.publicId, id, contact.encKey, payload);
+      const burnMsgObj = buildBurnPacket(id, ts);
       const viaRelay    = sendToRelay(id, burnMsgObj, true);
       if (!viaRelay) sendSignal(burnMsgObj);
       mlog.info(`→ BURN         to   ${pid(id)}  via=${viaRelay ? "relay" : "signal(fallback)"}`);
     } catch(e) {
-      mlog.warn(`→ BURN         to   ${pid(id)} — encrypt failed: ${e.message}`);
+      mlog.warn(`→ BURN         to   ${pid(id)} — send failed: ${e.message}`);
     }
   }
  
-  const me = state.contacts[state.publicId];
   try {
-    const selfBurnObj = await sealEnvelope("app:burn", state.publicId, state.publicId, me.encKey, payload);
-    sendSignal(selfBurnObj);
+    sendSignal(buildBurnPacket(state.publicId, ts));
     mlog.info(`→ BURN         to self`);
   } catch(e) {
-    mlog.warn(`→ BURN         to self — encrypt failed: ${e.message}`);
+    mlog.warn(`→ BURN         to self — send failed: ${e.message}`);
   }
 }
  
@@ -5202,16 +5254,27 @@ async function commitBurn() {
    OWN identity: one small app:message per outgoing message/reaction,
    payload type "selfsync" wrapping the message plus the target contact id.
    What that buys over the mini backup:
-     - per-sibling X4DH session keys where a self-session exists (legacy
-       self key otherwise) instead of the static backup key
+     - per-sibling X4DH session keys instead of the static backup key
      - an Ed25519 signature — self-sync backup traffic carries none
      - per-endpoint offline buffers: each known sibling gets its OWN copy
        queued at the relay. An identity-level buffered packet is consumed by
        whichever device reconnects first, so two offline siblings could not
        both get it — that is exactly what per-endpoint targeting fixes.
+
+   SESSION-ONLY. The mirrored copy carries message text, so it goes ONLY to
+   siblings we hold an X4DH session with (sendFannedX4DH opts.sessionOnly):
+   no legacy static-static self key, and no identity-level broadcast
+   fallback (which could only ever be legacy-keyed). Same rule the full
+   self-backup push has followed since 0.5.5. Receive side is unchanged —
+   handleSelfSync still accepts whatever key decrypts.
    Known limits (accepted, the periodic full self-backup is the repair layer):
-     - a sibling with no known endpointId (or stale >7d) falls back to the
-       identity-level broadcast, i.e. first-reconnecting-device-wins
+     - a sibling with no X4DH session yet — including one with no known
+       endpointId, or stale >7d with no session — does NOT get the mirrored
+       message. It is skipped, not downgraded to the legacy key; the next
+       full self-backup push (which also needs a session) repairs it once
+       one exists. A session bootstraps from ordinary traffic and from the
+       self-backup hello, so this window is the first stretch after a new
+       device appears.
      - a sibling we have never heard from is not synced to at all: with
        nothing known there is no one to address. It gets discovered through
        the self-backup handshake / its own traffic, and later sends target it.
@@ -5259,8 +5322,14 @@ async function sendSelfSync(peerId, stored) {
     // for a stale duplicate of the old one.
     const payload = { id: `ss:${stored.id}`, type: "selfsync", peerId, msg: inner, ts: stored.ts,
                       deviceId: state.deviceId, endpointId: state.endpointId, ...(relay ? { relay } : {}) };
-    const fanned = await sendFannedX4DH(state.publicId, payload);
-    mlog.info(`→ SELFSYNC     peer=${pid(peerId)}  type=${inner.type}  ${fanned.targetedCount} targeted (${fanned.x4dhCount} x4dh, ${fanned.legacyCount} legacy)${fanned.broadcastSent ? " + broadcast" : ""}${!fanned.sent ? " — nowhere, no open socket" : ""}`);
+    const fanned = await sendFannedX4DH(state.publicId, payload, { sessionOnly: true });
+    if (fanned.x4dhCount === 0) {
+      // Nothing went out: every known sibling lacks a session (or none is
+      // targetable). Not an error — see SESSION-ONLY above.
+      mlog.debug(`SELFSYNC   no sibling with an X4DH session — skipped  id=${pid(stored.id)}  (${fanned.skippedNoSession} without a session)`);
+      return;
+    }
+    mlog.info(`→ SELFSYNC     peer=${pid(peerId)}  type=${inner.type}  ${fanned.x4dhCount} x4dh${fanned.skippedNoSession ? `, ${fanned.skippedNoSession} skipped (no session)` : ""}${!fanned.sent ? " — nowhere, no open socket" : ""}`);
   } catch(e) {
     mlog.warn(`→ SELFSYNC     peer=${pid(peerId)} — send failed: ${e.message}`);
   }
