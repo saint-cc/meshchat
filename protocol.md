@@ -2,7 +2,7 @@
 
 A decentralised, encrypted messaging protocol built on WebSocket relay servers. No accounts, no central authority, no plaintext.
 
-Implementation version: `0.5.5`, surfaced informationally via the `version` field on `sig:relay_info` (not enforced). This document describes the protocol as it stands today. Version history is in `CHANGELOG.md`; work not yet confirmed live is tracked in `Roadmap.md`; `X4DH.md` is the authoritative source for the X4DH cryptographic design; `known-limitations.md` lists the permanent trade-offs.
+Implementation version: `0.5.9`, surfaced informationally via the `version` field on `sig:relay_info` (not enforced). This document describes the protocol as it stands today. Version history is in `Changelog.md`; work not yet confirmed live is tracked in `Roadmap.md`; `X4DH.md` is the authoritative source for the X4DH cryptographic design; `known-limitations.md` lists the permanent trade-offs.
 
 ---
 
@@ -14,7 +14,9 @@ Implementation version: `0.5.5`, surfaced informationally via the `version` fiel
 
 **Relays** are WebSocket servers that route packets between clients. A relay has no knowledge of message contents. Clients choose which relay to use. Relays are interoperable — clients on different relays communicate directly.
 
-**Authentication** gates both sending and receiving. A client must prove possession of their signing key before the relay accepts any messages from them or registers them for inbound routing. The `from` field of any packet must match an identity already proven on that socket. When connecting to a foreign relay to send, the client runs the same challenge-response handshake before any messages are transmitted. The queue is held until auth completes, then flushed.
+**Authentication** gates both sending and receiving. A client must prove possession of its signing key, bound to the specific relay it is talking to, before the relay accepts any messages from it or registers it for inbound routing. The `from` field of any packet must match an identity already proven on that socket. When connecting to a foreign relay to send, the client runs the same challenge-response handshake before any messages are transmitted. The queue is held until auth completes, then flushed.
+
+**The relay is untrusted infrastructure.** Cryptographic proof — signatures and authenticated encryption — is the only trust boundary. Everything outside a packet's ciphertext (`type`, `from`, `to`) is relay-visible and relay-rewritable, which is why the ciphertext is bound to it (see [Envelope Binding](#envelope-binding)).
 
 ---
 
@@ -52,7 +54,7 @@ publicId = base64url( SHA-256(x25519PublicKey || ed25519PublicKey)[0:12] )
 
 PublicId is derived from **both** public keys concatenated, not the X25519 key alone. If it depended only on the X25519 key, an attacker could present a victim's real (public, no secret required) X25519 public key alongside an Ed25519 public key of their own choosing, sign the relay's auth challenge with their own Ed25519 private key, and have the relay register their socket under the victim's publicId — unable to decrypt anything routed there, but able to silently swallow it or otherwise squat on the identity's routing. Hashing both keys together means a given publicId can only be produced by one specific (X25519, Ed25519) pair.
 
-The server derives publicId from the two presented public keys during auth (see [Relay Authentication](#relay-authentication)) and never trusts a client-supplied ID claim.
+The server derives publicId from the two presented public keys during auth (see [Relay Authentication](#relay-authentication)) and never trusts a client-supplied ID claim; the client checks that the `public_id` in `sig:auth_ok` equals the one it derived itself.
 
 ### Device Identity
 
@@ -89,7 +91,7 @@ What the split does and does not buy:
 - It does **not** hide the link from a relay that sees the packets that carry `deviceId` in plaintext (`call:*`, `data:*`, `session:*`): the relay knows which `endpointId` the sending socket authenticated with, and reads the `deviceId` beside it.
 
 `endpointId` is:
-- **Presented to the relay** — optionally, in the clear, alongside the two public keys on `sig:auth_init` (see [Relay Authentication](#relay-authentication)). A client that omits it gets no device-level routing and falls back to broadcast to every session of the identity.
+- **Presented to the relay** — optionally, in the clear, alongside the two public keys on `sig:auth_init` and covered by the auth signature (see [Relay Authentication](#relay-authentication)). A client that omits it gets no device-level routing and falls back to broadcast to every session of the identity.
 - **Learned by contacts** — from the encrypted payload of `app:message` (alongside `deviceId` and `n`), from self-sync blobs, and from the compound `from` address on handshake packets whose signature has verified. Recorded in the device registry (see [Device Registry](#device-registry)) only after signature verification.
 - **Never in the shareable address, never in backups.**
 - **Static per (device, identity)** — no rotation, no revocation.
@@ -121,7 +123,9 @@ The separator is `::`. base64url — the charset every id in this protocol uses 
 
 **Validation.** `valid_id()` (bare-id validator for `deviceId`, `callId`, `sessionId`, `endpoint_id` and similar) deliberately does not accept the compound form; `parse_address()` is a separate function for `to` (and for the compound `from` types), so nothing else accepts `id::endpoint` where a bare id is required.
 
-**Delivery.** A compound `to` is delivered only to the socket(s) registered under that endpoint (`deliver_to_endpoint`/`connected_by_endpoint`). A targeted device that is not connected is treated as offline; it is never silently broadcast to every session. Which types are buffered for an offline target is covered under [Offline Delivery](#offline-delivery).
+**Delivery.** A compound `to` is delivered by the relay only to the socket(s) registered under that endpoint (`deliver_to_endpoint`/`connected_by_endpoint`). A targeted device that is not connected is treated as offline; it is never silently broadcast to every session. Which types are buffered for an offline target is covered under [Offline Delivery](#offline-delivery).
+
+**Receive-side check.** The relay routes on the endpoint half, but a relay is exactly the party that cannot be trusted to do so, so every client handler also checks the address itself: a packet is accepted only if its base id equals our own publicId *and*, when an endpoint is named, that endpoint equals our own `endpointId`. `app:migrate` and `app:burn` require `to` to be exactly our bare publicId.
 
 ---
 
@@ -141,45 +145,67 @@ The third segment is optional but included when sharing via QR code or copy-past
 
 ## Relay Authentication
 
-Authentication happens on connect, before routing or buffer delivery. The protocol proves possession of the identity's Ed25519 private key via a sign-the-nonce challenge.
+Authentication happens on connect, before routing or buffer delivery. The client proves possession of the identity's Ed25519 private key by signing a fixed-layout message that binds the proof to the relay it dialed.
 
 ### Sequence
 
 ```
-client → server:  sig:auth_init      { x25519_pub: [...bytes], ed25519_pub: [...bytes], endpoint_id?: "...", no_receive?: true }
-server → client:  sig:auth_challenge { nonce: [...bytes] }
+client → server:  sig:auth_init      { auth_v: 2, x25519_pub: [...bytes], ed25519_pub: [...bytes], endpoint_id?: "...", no_receive?: true }
+server → client:  sig:auth_challenge { nonce: [...32 bytes] }
 client → server:  sig:auth_proof     { sig: [...bytes] }
 server → client:  sig:auth_ok        { public_id: "..." }
              or:  sig:auth_fail      { reason: "..." }
 ```
 
-1. The client sends both public keys, plus an optional `endpoint_id` (see [Device Endpoint ID](#device-endpoint-id)), validated (`valid_id`) before the challenge is issued.
-2. The server sends a random 32-byte nonce in the clear — there is no shared secret to encrypt it with, and nothing about the nonce is worth hiding.
-3. The client signs the nonce with its Ed25519 signing key and returns the signature.
-4. The server verifies the signature against the presented Ed25519 public key, derives the publicId from **both** presented keys (see [PublicId](#publicid)), registers the socket, and flushes the offline buffer. If an `endpoint_id` was presented the socket is additionally registered in `connected_by_endpoint[publicId][endpoint_id]`.
-5. The client proceeds with `sig:relay_req`, presence polling and normal operation.
+1. The client sends `auth_v`, both public keys, plus an optional `endpoint_id` (see [Device Endpoint ID](#device-endpoint-id)) and `no_receive` (sent only when `true`). The server requires `auth_v` to equal its own (`2`), `no_receive` to be a boolean if present, both keys to be 32 bytes, and `endpoint_id` to pass `valid_id`.
+2. The server sends a random 32-byte nonce in the clear — there is no shared secret to encrypt it with, and nothing about the nonce is worth hiding. The client refuses to sign any challenge whose nonce is not exactly 32 bytes, so a relay cannot choose the length or content of what is signed.
+3. The client signs the auth message (below) with its Ed25519 signing key and returns the signature.
+4. The server rebuilds the same message from what it issued (nonce) and what the client presented in `auth_init`, against its own configured host(s), and verifies the signature against the presented Ed25519 public key. It derives the publicId from **both** presented keys (see [PublicId](#publicid)), registers the socket, and flushes the offline buffer. If an `endpoint_id` was presented the socket is additionally registered in `connected_by_endpoint[publicId][endpoint_id]`.
+5. The client checks that `public_id` equals its own, then proceeds with `sig:relay_req`, presence polling and normal operation. A mismatch drops the connection.
 
 `no_receive: true` completes the handshake without registering the socket as a recipient and without a buffer flush. Used by disposable connectivity probes (the migrate panel's TEST) that must not consume buffered packets.
 
-A socket is bound to one identity: a second, different identity proven on the same socket is rejected (`already_authenticated`); re-proving the same identity is a no-op.
+A socket is bound to one identity: a second, different identity proven on the same socket is rejected (`already_authenticated`); re-proving the same identity is a no-op. A client answers a challenge only while it is itself waiting for one on that socket.
 
-**Admission limits.** A connection that sends `sig:auth_init` but never a proof is closed after `AUTH_TIMEOUT` (15s, enforced by a periodic sweep). Completed auths are additionally rate-limited server-wide (`GLOBAL_AUTH_RATE`/`GLOBAL_AUTH_BURST`), checked only after the proof is valid so garbage proofs don't spend from the budget; a rejected completion gets `server_busy`.
+### The signed auth message
+
+```
+"meshchat-auth-v1" 00 | relayHost 00 | nonce(32) | x25519_pub(32) | ed25519_pub(32) | endpoint_id 00 | no_receive(1 byte)
+```
+
+| Field | Why it is there |
+|---|---|
+| `"meshchat-auth-v1"` label | Every packet signature in this protocol is over JSON text, which starts with `{`. An auth signature can therefore never verify as a packet signature, and nothing a relay sends can be steered into a packet-shaped signed message |
+| `relayHost` | The host the client **dialed** — taken from the URL of the socket itself, never from anything in the challenge. A relay that forwards someone else's challenge to us gets a signature bound to *its* host, which the real relay rejects |
+| `nonce` | Fixed length; the relay chooses neither length nor content |
+| keys, `endpoint_id`, `no_receive` | These travel in `auth_init`; being inside the signature, they cannot be swapped in transit |
+
+Host normalisation is identical on both sides: lowercase, IPv6 brackets and trailing dot stripped; the server additionally IDNA/punycode-encodes to ASCII.
+
+**Server-side host binding.** The relay verifies against its own configured host name(s): the host of `RELAY_WSS_URL`, plus any extra names in `RELAY_AUTH_HOSTS` (comma-separated bare hostnames or URLs) for a relay reachable under more than one name. A client signs the host it dialed, so a name not listed fails with `proof_invalid`. The host is never derived from the `Host` header — that is chosen by the connecting party, the one party that must not decide what the proof is bound to. With no valid `RELAY_WSS_URL` the relay refuses every `sig:auth_init` with `relay_not_configured`; extra names without a valid `RELAY_WSS_URL` do not enable auth.
+
+`AUTH_LABEL` versions the signed layout; `auth_v` versions the whole handshake. There is no dual-version path: a client on a different `auth_v` gets `auth_version`.
 
 ### Cross-relay connections
 
-When a client opens a connection to a foreign relay to deliver a message, it runs the full handshake. The connection is registered as a sender session on the foreign relay for as long as it stays open; the outbound queue is held until auth completes, then flushed.
+When a client opens a connection to a foreign relay to deliver a message, it runs the full handshake against that relay's own host. The connection is registered as a sender session on the foreign relay for as long as it stays open; the outbound queue is held until auth completes, then flushed. `sig:auth_*` messages arriving on such a socket belong to that socket's own handshake and are never handed to the main signal handler.
 
 The home relay is never targeted this way: `getOrOpenRelayConn` checks the target hostname against `relayHostname(getSignalUrl())` and returns null on a match, and callers fall back to the main signal socket.
 
+### Admission limits
+
+A connection that sends `sig:auth_init` but never a proof is closed after `AUTH_TIMEOUT` (15s, enforced by a periodic sweep). Completed auths are additionally rate-limited server-wide (`GLOBAL_AUTH_RATE`/`GLOBAL_AUTH_BURST`), checked only after the proof is valid so garbage proofs don't spend from the budget; a rejected completion gets `server_busy`.
+
 ### Auth failure
 
-On `sig:auth_fail` the client does not retry immediately — the socket `onclose` handler drives reconnect with backoff. Reason codes: `bad_init`, `bad_key_length`, `bad_endpoint_id`, `timeout`, `proof_invalid`, `server_busy`, `already_authenticated`, `not_authenticated`.
+On `sig:auth_fail` the client does not retry immediately — the socket `onclose` handler drives reconnect with backoff. Reason codes: `auth_version`, `relay_not_configured`, `bad_init`, `bad_key_length`, `bad_endpoint_id`, `timeout`, `proof_invalid`, `server_busy`, `already_authenticated`, `not_authenticated`.
 
 ### Security properties
 
 - Proves possession of the Ed25519 private signing key via a real signature, not a decrypt-what-you-just-sent round trip.
+- The signature is bound to the relay host the client dialed, so no relay can use a challenge as a signing oracle for the identity key, and a proof captured at one relay is worthless at another.
 - Both public keys are public by design; presenting them to the server is not a privacy concern.
-- A captured signature is only valid for its nonce; each connection gets a fresh one.
+- A captured signature is only valid for its nonce and host; each connection gets a fresh nonce.
 - publicId binds both public keys together, closing the swap attack described under [PublicId](#publicid).
 - Buffer hijacking, ID spoofing and fake presence are closed by this mechanism.
 
@@ -206,8 +232,8 @@ aesKey = HKDF-SHA-256(
   info = "meshchat-v1:pairwise",
   bits = 256
 )
-ciphertext = AES-GCM(key = aesKey, iv = random 12 bytes, data = JSON(payload))
-wire = { v: 1, iv: [...], data: [...] }
+ciphertext = AES-GCM(key = aesKey, iv = random 12 bytes, data = JSON(payload), aad = envelope binding)
+wire = { v: 2, iv: [...], data: [...] }
 ```
 
 Static-static ECDH is symmetric — `X25519(alicePriv, bobPub)` and `X25519(bobPriv, alicePub)` yield the same value — so both sides derive the same `aesKey` without transmitting it. The key depends on both parties' private material, so it is unique to that pair. Self-targeted traffic uses the same derivation against the identity's own public key; every device holding the identity derives the identical result.
@@ -223,7 +249,7 @@ It is the key in use wherever no X4DH wire key applies:
 
 ### X4DH wire key
 
-For a device pair that has an X4DH session (see [Session Establishment](#session-establishment-x4dh)), `app:message` traffic — text, audio, image, reaction, system-notice and `selfsync` payloads alike — encrypts under a key derived from that session's current root key (`RK0` or `RK1`):
+For a device pair that has an X4DH session (see [Session Establishment](#session-establishment-x4dh)), `app:message` traffic — text, audio, image, reaction, system-notice and `selfsync` payloads alike — encrypts under a key derived from one of that session's root keys (`RK0` or `RK1`):
 
 ```
 wireKey = HKDF( salt = zero32, ikm = rootKeyBytes, info = "MeshChat-X4DH-v1/wire-message", length = 32 )
@@ -235,15 +261,45 @@ wireKey = HKDF( salt = zero32, ikm = rootKeyBytes, info = "MeshChat-X4DH-v1/wire
 
 Within one fanout to a single contact, some of that contact's devices may be on an X4DH wire key while others are simultaneously on the legacy key.
 
-**Receive side.** `deviceId` is inside the encrypted payload, so the recipient cannot know which key applies before decrypting. It tries every X4DH session held for that sender (most recently established first), then the legacy key. AES-GCM's tag makes a wrong-key attempt fail cleanly, so this costs a few rejected decrypts, never a false positive. After a successful X4DH decrypt, the payload's `deviceId` is cross-checked against the session that decrypted it; a mismatch is treated like an invalid signature (flagged, unverified). Detail: `X4DH.md` §16.
+**Send key vs. decrypt keys.** The two sides of a pair can briefly disagree about which root is current (the responder upgrades to `RK1` before its ack is delivered; an ack can be lost; a reset replaces the session while the peer's packets are still in flight). So the rule is:
+
+- **Send** under the newest root the peer has demonstrably reached.
+- **Decrypt** under every generation still alive.
+
+A session records its newest root (`rootKey`), the retained `RK0` after an upgrade (`rk0Root`) and which of the two we encrypt under (`sendStage`). The initiator sends under `RK1` as soon as the ack lands (the ack was built from `RK1`, so the responder provably has it). The responder keeps sending under `RK0` — which the initiator certainly holds — until a *verified* message from that device decrypts under `RK1`, proof the initiator upgraded; it then switches to `RK1` and both sides retire `RK0`. A lost ack therefore desyncs nothing: both stay on `RK0` until the stuck-session retry.
+
+Roots that are replaced (a reset) or retired (`RK0` after confirmation) are kept as decrypt-only for 120 seconds (`X4DH_RETIRED_GRACE_MS`), in memory only, never persisted. Derived wire keys are cached by root content, so a cache hit cannot be stale.
+
+**Receive side.** `deviceId` is inside the encrypted payload, so the recipient cannot know which key applies before decrypting. It tries every X4DH session held for that sender (most recently established first), within each session every live generation (current root, retained `RK0`, recently retired roots), then the legacy key. AES-GCM's tag makes a wrong-key attempt fail cleanly, so this costs a few rejected decrypts, never a false positive. After a successful X4DH decrypt, the payload's `deviceId` is cross-checked against the session that decrypted it; a mismatch is treated like an invalid signature (flagged, unverified). A message that is *verified* and decrypts under the current `RK1` confirms the peer holds `RK1` (above); nothing switches the send key on an unverified packet. Detail: `X4DH.md` §16.
+
+### Envelope Binding
+
+A wire packet's `{ type, from, to }` sit outside its ciphertext, where a relay can rewrite them. Two mechanisms tie the ciphertext to them:
+
+1. **AAD.** The AES-GCM additional data is
+   ```
+   aad = UTF-8( JSON( ["meshchat-env-v1", type, from, to] ) )
+   ```
+   built by the receiver from the packet *as received* — `to` bare or compound, exactly as sent — never from anything inside the payload. Rewriting any of the three in transit (retyping an `app:message` as `app:burn`, reflecting a packet back at its sender, redirecting it to another device) makes the GCM tag fail, and the packet is dropped at decrypt rather than displayed with a warning.
+2. **Signature scope.** The Ed25519 signature covers `{ type, from, to, blob }`, the same convention the `call`/`data`/`session`/handshake packets use (their `type` is inside the signed JSON), so a signature for one type can never verify as another.
+
+Bound blobs carry a distinct version: message blobs `v:2` (unbound `v:1`), object blobs `v:3` (unbound `v:2`, gzip). A decrypt that passes an `aad` requires exactly the bound version — it never falls back to an unbound blob — and a decrypt without one refuses a bound blob.
+
+| Packet | Binding |
+|---|---|
+| `app:message`, `app:migrate`, `app:burn`, `app:sync` | AAD-bound (`v:2`) **and** signed over `{ type, from, to, blob }` |
+| Self-sync `sync:backup_push` / `sync:backup_accept` | AAD-bound (`v:3`), unsigned |
+| `call:*`, `data:*` | `blob` unbound (`v:1`) but inside the packet signature, which covers `type`, `from`, `to` and the session id |
+| `sync:restore_req` | blob unbound (`v:2`), inside the packet signature |
+| Backup blobs, restore token, ephemeral wraps | not packet-bound; protected by their own key and (where present) the handshake signature |
 
 ### Message signing
 
 ```
-sig = Ed25519.sign(JSON(wire), sender.signingKeySeed)
+sig = Ed25519.sign( JSON({ type, from, to, blob }), sender.signingKeySeed )
 ```
 
-The recipient verifies against the sender's signing public key (known from the shareable address). An invalid signature on an `app:message` is flagged but not dropped — the message is displayed with a warning. Packet types that drive state rather than display (see the per-type rules below) drop on an invalid signature instead.
+The recipient verifies against the sender's signing public key (known from the shareable address). An invalid or missing signature on an `app:message` whose ciphertext nevertheless decrypts is flagged but not dropped — the message is displayed with a warning. Packet types that drive state rather than display (see the per-type rules below) drop on an invalid signature instead.
 
 ### Backup encryption
 
@@ -281,6 +337,10 @@ Device pairs establish an X4DH session — an asynchronous root-key agreement th
 - **Are always durably buffered** in addition to any live delivery (the same exception `app:migrate`/`app:burn` get): a stale-but-not-yet-closed session of the same identity could otherwise swallow a packet meant for a device still catching up. `session:propose` additionally overwrites per sender in its own bucket (`_x4dh_propose.json` suffix) and uses the ordinary 24h TTL — an unanswered handshake attempt isn't something that must eventually be seen; a fresh one follows when the conversation resumes. `session:ack` is not overwritten — a stale ack for a superseded `sessionEpoch` fails the epoch-match check client-side and is harmless until it expires.
 - **Never trigger a push notification** — transparent crypto housekeeping.
 
+The initiator holds its ephemeral private key in memory for 60 seconds awaiting the ack; after that the session simply stays at `RK0` for that attempt.
+
+**Deferred ack.** The initiator proposes the moment it learns the responder's `endpointId`, which can precede the responder learning the initiator's — and a `session:ack` cannot be addressed without a compound `to`. The responder therefore parks a verified propose it cannot yet answer (`pendingAck`: the initiator's ephemeral *public* key and the receive time) on its `RK0` session, and completes the handshake as soon as the endpoint is learned, provided the session is still the same epoch and no more than 30 seconds (`X4DH_DEFERRED_ACK_WINDOW_MS`, half the initiator's ephemeral lifetime) have passed. Past that window it stays at `RK0` until the initiator retries.
+
 Session state is local-only and stored encrypted at rest under the backup key (see [Client Storage Keys](#client-storage-keys)); root keys are never part of any backup or export.
 
 ---
@@ -305,7 +365,7 @@ The plaintext payload (before encryption) for a text message:
 
 A text payload carries no `type` field; absence means text. Other payloads set `type`: `audio`, `image`, `reaction`, `system`, `selfsync`.
 
-- `relay.wss` is the sender's current relay. Recipients update their routing table for the sender on every message received (timestamp-guarded — see [Relay Discovery](#relay-discovery)). This is how relay information propagates passively.
+- `relay.wss` is the sender's current relay. Recipients update their routing table for the sender from it, **only when the message's signature verified**, and timestamp-guarded and clamped (see [Relay Discovery](#relay-discovery)). This is how relay information propagates passively.
 - `endpointId` travels alongside `deviceId` — it is how a contact learns a sender's endpointId, recorded in the device registry only once the envelope's signature has verified. Optional; an omitted value leaves whatever is on file untouched.
 - `n` is a per-(sending device, contact) send counter, local to the sender and never synced between a sender's own devices. It counts text, audio, image and system payloads; reactions carry none. Recipients use it for gap detection (see [Device Registry](#device-registry)).
 - `ackDeviceId`/`ackN` point at the specific `(deviceId, n)` message this one was composed as a reply-after — see [Message Merging](#message-merging). Absent when the sender has no usable pointer yet.
@@ -334,7 +394,7 @@ A message or manual reaction composed on one device is mirrored to the identity'
 }
 ```
 
-What is mirrored: text, audio/image as a stub only (`id`, `type`, `mimeType` — never the media), and manual reactions. Not mirrored: call notices, RECEIVED auto-acks (every sibling receives the original from the contact itself and acks on its own), and messages to oneself (a self chat already fans to siblings as a plain message). Nothing is sent while no sibling device is known. The outer `id` is deterministic (`ss:` + inner id) and `ts` is the inner message's, so a retry or a second delivery path of the same copy hits the receive-side duplicate guard.
+What is mirrored: text, audio/image as a stub only (`id`, `type`, `mimeType` — never the media), and manual reactions. Not mirrored: call notices, RECEIVED auto-acks (every sibling receives the original from the contact itself and acks on its own), and messages to oneself (a self chat already fans to siblings as a plain message). Nothing is sent while no sibling device is known. A sibling that has never been heard from is not mirrored to — there is nothing to address; it is discovered through the self-backup hello or its own traffic. The outer `id` is deterministic (`ss:` + inner id) and `ts` is the inner message's, so a retry or a second delivery path of the same copy hits the receive-side duplicate guard.
 
 **Receive rules** (`handleSelfSync`) — each closes a specific hole:
 - The packet must come from our own identity, and its signature must be valid. An ordinary message with a bad signature is displayed with a warning; here it is dropped, because the payload writes into a different conversation than the sender field suggests.
@@ -358,7 +418,7 @@ The id is derived — `SHA-256("reaction:" + myPublicId + ":" + targetMsgId)` �
 
 The ack never fires for self-targeted traffic, for a message that failed verification, or in response to a reaction.
 
-**The ack goes through the same per-device fanout as any message** — every known device of the original sender receives its own copy. This is deliberate: an ack that reached only the originating device would leave the sender's other devices showing "sent" forever, since nothing else flips their local status. The cost is that M receiving devices acking N sending devices produce M×N ack packets. A targeted alternative is tracked in `Roadmap.md`.
+**The ack goes through the same per-device fanout as any message** — every known device of the original sender receives its own copy. This is deliberate: an ack that reached only the originating device would leave the sender's other devices showing "sent" forever, since nothing else flips their local status. The cost is that M receiving devices acking N sending devices produce M×N ack packets.
 
 **READ status is not implemented.**
 
@@ -369,12 +429,12 @@ The ack never fires for self-targeted traffic, for a message that failed verific
   "type": "app:message",
   "from": "<publicId>",
   "to":   "<publicId>" | "<publicId>::<endpointId>",
-  "blob": { "v": 1, "iv": [...], "data": [...] },
+  "blob": { "v": 2, "iv": [...], "data": [...] },
   "sig":  [...]
 }
 ```
 
-The envelope carries no `deviceId`; the sender's device is inside the encrypted payload. A compound `to` carries the **recipient's** `endpointId` (learned earlier), requesting delivery to one registered device rather than every live session; a targeted device that isn't connected is treated as offline, not silently broadcast. `blob` and `sig` differ per destination, because each targeted device may be encrypted under a different key.
+The envelope carries no `deviceId`; the sender's device is inside the encrypted payload. A compound `to` carries the **recipient's** `endpointId` (learned earlier), requesting delivery to one registered device rather than every live session; a targeted device that isn't connected is treated as offline, not silently broadcast. `blob` and `sig` differ per destination, because each targeted device may be encrypted under a different key and the AAD and signature cover that destination's `to`.
 
 ---
 
@@ -395,12 +455,12 @@ If the contact's relay is unreachable the fallback lands on the sender's own sig
 
 Sending to a contact resolves its known devices from the [device registry](#device-registry):
 
-- **Targeted** — a device with an `endpointId` on file and `lastSeen` within `FANOUT_STALE_MS` (7 days). It gets its own copy: compound `to`, encrypted under that device's X4DH wire key if a session exists, otherwise the legacy key.
-- **Broadcast** — sent in addition (bare `to`, legacy key) whenever at least one known device is unresolved (no `endpointId` yet) or stale, or no devices are known at all (a fresh contact).
+- **Targeted** — a device with an `endpointId` on file that either was seen within `FANOUT_STALE_MS` (7 days) or has an X4DH session with us. It gets its own copy: compound `to`, encrypted under that device's X4DH wire key if a session exists, otherwise the legacy key. A device with a session stays targeted however long it has been quiet: its copy is encrypted under its own session key and buffered in its own endpoint bucket, whereas demoting it would send every message to the contact a second time under the static legacy key.
+- **Broadcast** — sent in addition (bare `to`, legacy key) whenever at least one known device is unresolved (no `endpointId` yet) or stale with no session, or no devices are known at all (a fresh contact).
 
-Staleness demotes a device from "own targeted copy" to "covered by the broadcast"; it never excludes anything. In a self fanout (identity to itself) the sending device is left out. A device reached by both a targeted copy and the broadcast can receive the same message twice; the receiver drops a repeated `(id, ts)` within a 3-second window, so unread counts and acks aren't doubled.
+Staleness demotes a session-less device from "own targeted copy" to "covered by the broadcast"; it never excludes anything. In a self fanout (identity to itself) the sending device is left out. A device reached by both a targeted copy and the broadcast can receive the same message twice; the receiver drops a repeated `(id, ts)` within a 3-second window, so unread counts and acks aren't doubled.
 
-`FANOUT_STALE_MS` (whether a device still gets its own send) is deliberately independent of the registry retention period (whether it is kept in the registry at all).
+`FANOUT_STALE_MS` (whether a session-less device still gets its own send) is deliberately independent of the registry retention period (whether it is kept in the registry at all).
 
 ### Relay Connections
 
@@ -432,7 +492,7 @@ A packet whose `to` is bare goes into the identity-level bucket; one with a `::e
 
 `app:migrate`, `app:burn`, `session:propose` and `session:ack` are written to the buffer even when a live session was reached; see their sections for why.
 
-On auth, the relay flushes buffered packets oldest-first and deletes each on successful delivery. A connection that presents `endpoint_id` gets **both** the identity-level bucket and its own endpoint bucket; a connection that doesn't gets only the identity-level one — a device-targeted packet is never handed to whichever session reconnects first. Unauthenticated connections never receive buffered packets.
+On auth, the relay flushes buffered packets oldest-first and deletes each on successful delivery. A connection that presents `endpoint_id` gets **both** the identity-level bucket and its own endpoint bucket; a connection that doesn't gets only the identity-level one — a device-targeted packet is never handed to whichever session reconnects first. Unauthenticated connections never receive buffered packets. A device not heard from within `FANOUT_STALE_MS` and without a session is reached through the identity-level bucket instead, which the first reconnecting device consumes.
 
 **Limits** (environment-configurable; applied independently to the identity-level bucket and to each endpoint bucket):
 - `BUF_MAX_MSGS` — maximum buffered packets (default 100, drops oldest).
@@ -456,12 +516,12 @@ A deliberate relay change is announced via a dedicated packet type so contacts (
   "type": "app:migrate",
   "from": "<publicId>",
   "to":   "<publicId>",
-  "blob": { "v": 1, "iv": [...], "data": [...] },
+  "blob": { "v": 2, "iv": [...], "data": [...] },
   "sig":  [...]
 }
 ```
 
-The encrypted payload is `{ newRelay, ts }`, under the legacy pairwise key (for the self-targeted breadcrumb, the identity's own self-ECDH key). `to` is always bare.
+The encrypted payload is `{ newRelay, ts }`, under the legacy pairwise key (for the self-targeted breadcrumb, the identity's own self-ECDH key), envelope-bound like every `app:*` packet. `to` is always bare.
 
 **Signature is mandatory.** A missing or invalid signature is dropped outright — unlike a regular message, where a bad signature is flagged but displayed. This packet redirects routing and must not be trusted on decryption success alone.
 
@@ -473,15 +533,15 @@ The encrypted payload is `{ newRelay, ts }`, under the legacy pairwise key (for 
 5. Reconnects its signal socket to the new relay, locks the migrate panel, and after 10 seconds connects to the old relay for 3 seconds to collect any stragglers left there; it also puts back its own breadcrumb, which that flush consumed.
 
 **On receipt**, handling diverges by sender:
-- **From self** — adopted silently via the timestamp-guarded `updateRelay`. If adopting moves `lastRelay` forward, the receiving device reconnects and replants a fresh breadcrumb at the relay it is *itself* now leaving behind, carrying the same `newRelay`/`ts` (not a new timestamp), so a further-behind device can still find the trail.
-- **From a contact** — same passive relay-learning as the `relay` field in regular messages, arriving as its own dedicated packet.
+- **From self** — adopted silently via the timestamp-guarded `updateRelay`, with `ts` clamped to the receiver's current time (see [Relay Discovery](#relay-discovery)). If adopting moves `lastRelay` forward, the receiving device reconnects and replants a fresh breadcrumb at the relay it is *itself* now leaving behind, carrying the same `newRelay` and the *original* `ts` (not a new or clamped one), so a further-behind device can still find the trail without manufacturing freshness.
+- **From a contact** — same passive relay-learning as the `relay` field in regular messages, arriving as its own dedicated packet; `ts` clamped the same way.
 
 **Server-side buffering:**
 - **Always durably buffered**, even when a live recipient session is reached — a stale-but-not-yet-closed session of the same identity could swallow the only copy meant for a device still catching up.
 - **Overwrite-per-sender** — a newly buffered `app:migrate` replaces any older one from the same sender.
 - **Long TTL** (`BUF_MAX_AGE_MIGRATE`, default 7 days).
 
-Gaps: there is no boot-time drain of the previous relay; the only drain is the one the committing device runs after commit.
+There is no boot-time drain of the previous relay; the only drain is the one the committing device runs after commit.
 
 ---
 
@@ -494,12 +554,12 @@ A deliberate, irreversible local action — "stop trusting this identity" — an
   "type": "app:burn",
   "from": "<publicId>",
   "to":   "<publicId>",
-  "blob": { "v": 1, "iv": [...], "data": [...] },
+  "blob": { "v": 2, "iv": [...], "data": [...] },
   "sig":  [...]
 }
 ```
 
-The encrypted payload is `{ ts }` — deliberately thin: burn is a one-shot action, not a routing fact to timestamp-guard. `to` is always bare. Encryption is the legacy pairwise key, as for `app:migrate`.
+The encrypted payload is `{ ts }` — deliberately thin: burn is a one-shot action, not a routing fact to timestamp-guard. `to` is always bare. Encryption is the legacy pairwise key, envelope-bound, as for `app:migrate`; the binding means a packet of another type cannot be retyped into a burn.
 
 **Signature is mandatory**, same rule as `app:migrate`: this packet drives an irreversible action.
 
@@ -548,7 +608,7 @@ Local-only, never in backup blobs or `serialiseContacts()`. Populated passively 
 2. **Self-sync traffic** — the discovery hello, the acks and the full pushes teach each of the user's own devices about the others. `deviceId`, `endpointId` and `fingerprint` ride inside the encrypted blob, never as outer fields: the relay is untrusted, and an unsigned outer field is silently rewritable in transit. `endpointId` is what lets a push target a specific sibling.
 3. **`restore_req`** — the decrypted blob's `deviceId` is recorded (no endpoint).
 
-Every registry write is also a chance to satisfy the precondition for starting an X4DH session with that device (see `X4DH.md` §13.3).
+Every registry write is also a chance to satisfy the precondition for starting an X4DH session with that device (see `X4DH.md` §13.3) or to complete a deferred session ack (see [Session Establishment](#session-establishment-x4dh)).
 
 The registry is shown in a per-contact device popover, with a status dot per device (no session / `RK0` fresh / `RK0` stuck / `RK1`). Contacts with no recorded devices show an "unknown" placeholder. There is no dedicated discovery handshake.
 
@@ -603,7 +663,7 @@ Routing follows the normal contact-relay priority (`sendToRelay` → `sendSignal
 }
 ```
 
-Three types: `call:offer`, `call:answer`, `call:ice`. These carry a `blob` — the SDP (`{ sdp }`) or one ICE candidate (`candidate.toJSON()`) — encrypted with the legacy pairwise key (see [Encryption](#encryption)). The signed payload includes the ciphertext, so the relay cannot swap the blob for another without invalidating the signature.
+Three types: `call:offer`, `call:answer`, `call:ice`. These carry a `blob` — the SDP (`{ sdp }`) or one ICE candidate (`candidate.toJSON()`) — encrypted with the legacy pairwise key (see [Encryption](#encryption)). The signed payload includes the ciphertext, so the relay cannot swap the blob for another without invalidating the signature. The blob is not AAD-bound; the signature over `type`, `from`, `to` and `callId` is what ties it to its envelope.
 
 Only accepted while `contact.call.callId` matches and the local role is the expected one (`call:offer` only while `role === "callee"`, `call:answer` only while `role === "caller"`). `call:ice` candidates that arrive before the remote description is set are queued and flushed once it is applied, since trickle ICE races the SDP exchange.
 
@@ -642,8 +702,6 @@ The device that claimed ignores its own echo by comparing `deviceId`.
 ### Role and negotiation
 
 `role` (`caller` | `callee`) is set on entering `calling`/`ringing` and cleared on return to `idle`. On entering `negotiating`, the caller makes the offer; the callee waits for it and answers. This asymmetry lives in the phase-entry handlers, not in the wire protocol.
-
-Gaps: ICE connection-state and candidate-type logging for diagnosing NAT failures, an ICE-restart retry path, and UI messaging that distinguishes "still trying" from "this NAT pairing will not connect".
 
 ---
 
@@ -706,11 +764,11 @@ A checkbox in the edit-contact panel (self entry only) controls a **per-device**
 
 The service worker (`sw.js`) handles `push` (a generic "MeshChat — tap to check" notification; `event.data` is always null) and `notificationclick` (focus an existing tab, else open a new one).
 
-### Gaps
+### Limitations
 
-- Anything that distinguishes a call notice from a text in the push itself (the payload is deliberately generic).
-- A push for `call:invite`/`data:invite`: both are live-only and never buffered, so a push for a missed call would need its own trigger at delivery-failure time.
-- iOS messaging: an iOS Safari tab user just sees the checkbox disabled with the generic "not supported in this browser" label.
+- The push itself cannot distinguish a call notice from a text (the payload is deliberately generic).
+- `call:invite`/`data:invite` are live-only and never buffered, so a missed call produces no push.
+- On iOS Safari outside a Home Screen PWA the checkbox is disabled with the generic "not supported in this browser" label.
 
 ---
 
@@ -720,8 +778,8 @@ The service worker (`sw.js`) handles `push` (a generic "MeshChat — tap to chec
 
 | Type | Fields | Auth | Description |
 |---|---|---|---|
-| `sig:auth_init`     | `x25519_pub`, `ed25519_pub`, `no_receive?`, `endpoint_id?` | no | Begin challenge-response, presenting both public keys. `no_receive` skips registration and buffer flush (probes). `endpoint_id` additionally registers the socket for device-targeted delivery |
-| `sig:auth_proof`    | `sig` | no | Ed25519 signature over the server's nonce |
+| `sig:auth_init`     | `auth_v`, `x25519_pub`, `ed25519_pub`, `no_receive?`, `endpoint_id?` | no | Begin challenge-response, presenting both public keys. `no_receive` skips registration and buffer flush (probes). `endpoint_id` additionally registers the socket for device-targeted delivery |
+| `sig:auth_proof`    | `sig` | no | Ed25519 signature over the relay-bound auth message |
 | `sig:announce`      | `ids[]` (max 10) | yes | Presence query — see [Online Presence](#online-presence) |
 | `app:message`       | `from`, `to`, `blob`, `sig` | yes | Encrypted message. `to` may be compound |
 | `app:migrate`       | `from`, `to`, `blob`, `sig` | yes | Relay-migration notice; `to` bare; always durably buffered |
@@ -764,7 +822,7 @@ The service worker (`sw.js`) handles `push` (a generic "MeshChat — tap to chec
 - **Which types are buffered.** `app:message`, `app:migrate`, `app:burn`, `session:propose`, `session:ack` — see [Offline Delivery](#offline-delivery). Every other type is delivered live to whoever is connected and otherwise lost; a compound `to` aimed at an offline device reaches nobody.
 - **Compound `to`** is honored on the shared delivery branch for `app:sync`, every `sync:*`, `call:*` and `data:*`, as well as for `app:message` and `session:*`. Of the shared-branch types, only some `sync:*` self-sync packets send one today.
 - **Compound `from`** is accepted only on `sync:backup_offer`, `sync:backup_accept`, `sync:backup_push`, `sync:restore_ack` and `sync:restore_push` (see [Compound Addressing](#compound-addressing)). A receiving client trusts and displays the endpoint half only once the accompanying signature has verified against a contact already on file.
-- **Signature rules differ by type.** Mandatory (drop on missing/invalid): `app:migrate`, `app:burn`, `session:*`, `app:sync`, `sync:restore_req`, `sync:token_resp` (checked client-side), `call:*`, `data:*`. Soft (processed unless *actively* wrong — a signature present, the sender's key on file, verification failing): `sync:backup_offer`/`accept`/`push` on the contact path, `sync:restore_ack`, `sync:restore_push`. None: the self-sync backup packets (tamper-evident through AES-GCM only). `app:message` is flagged, not dropped.
+- **Signature rules differ by type.** Mandatory (drop on missing/invalid): `app:migrate`, `app:burn`, `session:*`, `app:sync`, `sync:restore_req`, `sync:token_resp` (checked client-side), `call:*`, `data:*`. Soft (processed unless *actively* wrong — a signature present, the sender's key on file, verification failing): `sync:backup_offer`/`accept`/`push` on the contact path, `sync:restore_ack`, `sync:restore_push`. None: the self-sync backup packets (AAD-bound, so tamper-evident and tied to their `type`/`from`/`to`, but with no sender authentication beyond possession of the key). `app:message` is flagged, not dropped.
 - **Rate and size limits.** Each socket has its own token-bucket limiter (`RATE_LIMIT_RATE`/`RATE_LIMIT_BURST`) and shares a wider one with every other socket from the same source IP (`IP_RATE_LIMIT_RATE`/`IP_RATE_LIMIT_BURST`); either returns `error { rate_limited }`. Connections are capped in total (`MAX_CONNECTIONS`) and per IP (`MAX_CONNECTIONS_PER_IP`). A frame over `WS_MAX_SIZE` is dropped. `X-Real-IP`/`X-Forwarded-For` are honoured only when the TCP peer is inside `TRUSTED_PROXIES`.
 - Unknown packet types are dropped.
 - Sync and backup types are routed by the server without inspecting their contents.
@@ -784,11 +842,11 @@ The `sync:backup_*` types serve two jobs with different security stances: **cont
 
 **The blob carries contacts only.** For each contact: name, keys, `blocked`, state timestamp and relay info — `messages` is empty. It is encrypted under the sender's backup key, so the holder cannot read it. A peer holding your backup is a third party with an indefinitely stored copy, and the contact list is what a restore needs; message history never has to ride along.
 
-**`from` on all three carries the sender's compound `"id::endpointId"` address** — one of the five compound-`from` types (see [Compound Addressing](#compound-addressing)). Unlike self-sync (one shared key) or `app:message` (a working pairwise key by the time a message exists), this handshake may reach a contact who hasn't added the sender back, so there may be no shared key at all; the address is the one channel guaranteed to reach a stranger.
+**`from` on all three carries the sender's compound `"id::endpointId"` address** — one of the five compound-`from` types (see [Compound Addressing](#compound-addressing)). This handshake may reach a contact who hasn't added the sender back, so there may be no shared key at all; the address is the one channel guaranteed to reach a stranger.
 
 **All three are signed** with the identity's Ed25519 key, but verification is only possible once the recipient already has the sender as a contact (it needs their `signPublicKey`). An unsigned packet, or one from a sender not yet on file, is processed — bootstrap must keep working. Only an **actively wrong** signature (present, key on file, verification fails — i.e. tampered with by the untrusted relay) is dropped. This is softer than `app:migrate`/`app:burn`, which drop on any missing or invalid signature: those drive irreversible actions and have no fresh-contact case. The recipient only trusts or displays the endpoint suffix once a signature has verified.
 
-**Replies are one-to-one.** An offer is addressed to a bare identity, so it fans out to every live session under it, and each reply is wrapped for exactly one specific ephemeral. A reply therefore goes only to the device that sent the opening packet: `backup_accept`, `backup_push`, and the replies in the restore handshake below are addressed compound (`id::endpointId`) to the endpoint in the *verified* `from` of the packet they answer (`replyAddress`). When the sender's endpoint is unknown, or the packet couldn't be verified, the reply falls back to the bare identity and bootstrap works as before.
+**Replies are one-to-one.** An offer is addressed to a bare identity, so it fans out to every live session under it, and each reply is wrapped for exactly one specific ephemeral. A reply therefore goes only to the device that sent the opening packet: `backup_accept`, `backup_push`, and the replies in the restore handshake below are addressed compound (`id::endpointId`) to the endpoint in the *verified* `from` of the packet they answer (`replyAddress`). When the sender's endpoint is unknown, or the packet couldn't be verified, the reply falls back to the bare identity.
 
 **A pending offer outlives its first accept.** An identity with several devices legitimately answers one offer several times, each accept carrying its own `ek`. The sender keeps the offer for `BACKUP_OFFER_TTL` (60s) and pushes a separately-wrapped copy per accept; it is replaced by the next offer. The wrap (see [Ephemeral Wrap](#ephemeral-wrap)) is attached only when the opening packet verified.
 
@@ -796,29 +854,29 @@ The `sync:backup_*` types serve two jobs with different security stances: **cont
 
 ### Self-sync (same identity, multiple devices)
 
-There is no offer/accept; a push goes directly. Self-sync never rides the deterministic backup key alone, because a full push carries the contact store with recent messages and a recorded copy plus a later passphrase compromise would expose all of it.
+There is no offer/accept; a push goes directly. Self-sync never rides the deterministic backup key alone, because a full push carries the contact store with recent messages and a recorded copy plus a later passphrase compromise would expose all of it. Every self-sync blob is envelope-bound (`v:3`, AAD over `type`, `from`, `to`), so a relay cannot retype or redirect one.
 
 **Full push.** For each known sibling that is targetable (`endpointId` on file, seen within `FANOUT_STALE_MS`), has an X4DH self-session, and whose fingerprint doesn't already match ours, the device sends a `sync:backup_push` with a compound `to` and a `blob` encrypted under that pair's X4DH wire key:
 
 ```
-blob = AES-256-GCM( wireKey(self-session with that sibling),
+blob = AES-256-GCM( wireKey(self-session with that sibling), aad,
                     { deviceId, endpointId, fingerprint, contacts: serialiseContacts() } )
 ```
 
 The `contacts` here are the full store (messages included), unlike the contact path. `deviceId`, `endpointId` and `fingerprint` ride inside the blob, never as outer fields.
 
-**Discovery hello.** When a sibling is unknown, unresolved, stale, or has no session yet, the device instead (at most once per 60 seconds) broadcasts to its own identity a content-free hello under the backup key: `{ deviceId, endpointId, hello: true }` — no contacts, no fingerprint. Its only job is to let siblings learn the device, which can start an X4DH self-session that later pushes ride. A brand-new sibling therefore receives contacts from the first push after its session exists, not instantly; a genuinely wiped device restores immediately through the restore handshake below.
+**Discovery hello.** When a sibling is unknown, unresolved, or has no session yet, the device instead (at most once per 60 seconds) broadcasts to its own identity a content-free hello under the backup key: `{ deviceId, endpointId, hello: true }` — no contacts, no fingerprint. Its only job is to let siblings learn the device, which can start an X4DH self-session that later pushes ride. A brand-new sibling therefore receives contacts from the first push after its session exists, not instantly; a genuinely wiped device restores immediately through the restore handshake below. The hello exposes the `deviceId`↔`endpointId` link to anyone holding recorded traffic plus the passphrase — metadata only.
 
-**Receiving.** The blob carries no key hint, so the receiver tries every X4DH self-session wire key (newest session first) and then the backup key last; when a session key decrypts it, the payload's `deviceId` must match the session's device. Then:
+**Receiving.** The blob carries no key hint, so the receiver tries every X4DH self-session wire key (every live generation, newest session first) and then the backup key last; when a session key decrypts it, the payload's `deviceId` must match the session's device, and a decrypt under the current `RK1` confirms the sibling holds it. Then:
 - a **hello** teaches the sibling (`recordKnownDevice`, which can trigger X4DH bootstrap) and is answered with a small ack;
 - a **full push** from our own echo is ignored; otherwise it is merged (contact metadata, then `mergeMessages`, then delivery-status and missing-message reconciliation), saved, and — if it changed our own relay — followed by a signal reconnect. The sender's fingerprint is recorded and we ack with our own post-merge fingerprint;
-- a bare contacts map (the older slim single-contact push shape) and a full push under the static backup key from an older sibling are still accepted, the latter logged as a legacy push that keeps the deterministic-key exposure.
+- a full push decrypted under the static backup key (rather than a session key) is accepted and logged as a legacy sender; it keeps the deterministic-key exposure.
 
 **Ack.** `sync:backup_accept` with a `blob` encrypting `{ deviceId, endpointId, fingerprint? }` — under the session key (with fingerprint) when a session exists, otherwise content-free under the backup key — compound-addressed to the sender's endpoint when known. The presence of `blob` is what distinguishes it from a contact-offer accept, which never sets one.
 
 **Fingerprint.** `fingerprint = base64url( SHA-256( JSON(serialiseContacts()) )[0:12] )`. Each device keeps an in-memory table `{ deviceId → fingerprint }` of what it has heard this session; if every targetable sibling already has the current fingerprint the push is skipped. The table resets on reload — worst case is one extra push on cold start.
 
-Self-sync backup packets carry no `sig`: AES-GCM makes tampering evident but gives no sender authentication, which is sufficient for self-to-self traffic on an authenticated socket but weaker than `app:message`'s signature.
+Self-sync backup packets carry no `sig`: AES-GCM with the envelope AAD makes tampering and retargeting evident but gives no sender authentication, which is sufficient for self-to-self traffic on an authenticated socket but weaker than `app:message`'s signature.
 
 ### Short-window duplicate suppression
 
@@ -838,7 +896,7 @@ token = AES-256-GCM( key = issuer's own backup key, data = { v: 2, shareableKey:
 
 Because it is sealed under a key derived from the issuer's username and passphrase — unchanged by a wipe — the issuer, and only the issuer, can open it again after losing all local storage. The holder keeps the token it was given for each owner (`state.peerTokens`) but cannot read it.
 
-`sync:token_resp` is signed and is accepted only while a `sync:token_req` of the recipient's own is outstanding (60 seconds) and the sender is a known, non-blocked contact; a forged or replayed response is dropped. A planted token would otherwise be kept as the first one ever received per sender and permanently block the real one.
+`sync:token_resp` is signed and is accepted only while a `sync:token_req` of the recipient's own is outstanding (60 seconds) and the sender is a known, non-blocked contact; a forged or replayed response is dropped. This matters because only the first token received per sender is kept, so a planted one would permanently block the real one.
 
 **Binding.** A token is valid only if the identity it decrypts to (`tokenBoundId`, derived from the embedded `shareableKey` the way `addContact` derives a publicId) matches the packet's actual sender. A token is a bearer object once decrypted — nothing on the wire ties it to a presenter — so this check stops a token issued about one contact from being credited to another. A mismatched or malformed token is treated as no token, not as a hard failure.
 
@@ -847,13 +905,13 @@ Because it is sealed under a key derived from the issuer's username and passphra
 Roles: the **owner** is the identity whose contact store needs restoring; a **holder** is a contact storing an encrypted copy of the owner's backup.
 
 1. **`sync:restore_req`** — a client sends it to each contact it sees online (and every 10 minutes), telling it "I may be holding your backup". The `blob` (legacy pairwise key) carries `{ publicId_A, publicId_B, wss, signPublicKey, deviceId }`; the holder attaches the `token` it holds for that contact, if any. Signature is mandatory.
-2. **`sync:restore_ack`** — the owner replies, asking for the data. The recipient of a `restore_req` must already have the sender as a contact (decrypting requires their key), checks the signature, the two ids and the cooldown, and checks the token: a token only counts if it opens under the owner's backup key *and* is bound to the sender. With a valid token the relay and signing key in the blob are adopted. A **fresh** client (at most itself as a contact) with no valid token ignores the request; a known contact needs none, since the request is already signature-verified and decrypted. The ack's `to` is compound at the requester's endpoint when already known for that `deviceId`.
+2. **`sync:restore_ack`** — the owner replies, asking for the data. The recipient of a `restore_req` must already have the sender as a contact (decrypting requires their key), checks the signature, the two ids and the cooldown, and checks the token: a token only counts if it opens under the owner's backup key *and* is bound to the sender. With a valid token the relay and signing key in the blob are adopted; the relay hint is stamped with the request's own *signed* `ts` (clamped to now), not the time of receipt, so a replayed old request carries its original age. A **fresh** client (at most itself as a contact) with no valid token ignores the request; a known contact needs none, since the request is already signature-verified and decrypted. The ack's `to` is compound at the requester's endpoint when already known for that `deviceId`.
 3. **`sync:restore_push`** — whoever receives a `restore_ack` sends back its stored backup for the acker, if it has one: wrapped when the ack's signature verified and it carried an `ek`, with the token attached when the signature verified.
 4. **The owner** decrypts (unwrap, then backup key) and merges into local state.
 
 For a healthy pair the pushed backup merges to a no-op.
 
-**A wiped device cannot take part in step 1** — with no contacts it cannot decrypt a `restore_req`. It instead waits for a `sig:seen` and answers with a `restore_ack` addressed to any online id, contact or not (`sendRestoreAckPing`; bare `to`, an `ek` attached, 60s cooldown per id). Whoever receives that ack, if its signature verifies against a contact already on file, attaches the token it holds for that contact to the resulting `restore_push`. The wiped device issued that token before the wipe and can still open it (same deterministic key), recovering the sender's `signPublicKey`, checking the bound-id match, and verifying the push's own signature before trusting the restored data. Without a valid token the push is accepted but unverified. A device acking *itself* (a sibling restoring from another of its own devices) is answered with the sibling's current contact store, wrapped the same way.
+**A wiped device cannot take part in step 1** — with no contacts it cannot decrypt a `restore_req`. It instead says hi first: `sendRestoreAckPing` sends a `restore_ack` addressed to any online id, contact or not (bare `to`, an `ek` attached, 60s cooldown per id). It does so on a `sig:seen` — and, because `sig:seen` is relay-local and a holder on another relay never produces one, also when an **unknown sender reaches the fresh device directly** with a `restore_req` or `backup_offer` (arriving over the holder's outbound relay connection). The ping is gated on the device still being fresh (no contacts yet) and the sender being neither ourselves nor a known contact. Whoever receives that ack, if its signature verifies against a contact already on file, attaches the token it holds for that contact to the resulting `restore_push`. The wiped device issued that token before the wipe and can still open it (same deterministic key), recovering the sender's `signPublicKey`, checking the bound-id match, and verifying the push's own signature before trusting the restored data. Without a valid token the push is accepted but unverified. A device acking *itself* (a sibling restoring from another of its own devices) is answered with the sibling's current contact store, wrapped the same way.
 
 Restore flooding is limited by three independent 5-minute cooldowns, deliberately not one shared map:
 
@@ -892,10 +950,10 @@ The inner blob is unchanged — the recipient still decrypts it with its own pas
 The SYNC button asks one contact for its recent messages. Requires the contact to be online (per presence) and is addressed to the contact's identity (bare `to`), so every live session of the contact may answer. It uses the legacy pairwise key — there is no single device pair to derive a session key for — but the message batch itself is never carried under that key alone.
 
 ```json
-{ "type": "app:sync", "from": "<publicId>", "to": "<publicId>", "blob": { "v": 1, "iv": [...], "data": [...] }, "sig": [...] }
+{ "type": "app:sync", "from": "<publicId>", "to": "<publicId>", "blob": { "v": 2, "iv": [...], "data": [...] }, "sig": [...] }
 ```
 
-`blob` is encrypted under the pairwise key and `sig` signs the ciphertext; verification is mandatory. The payload is `{ from, to, syncId, reply, ek, wrapped? }`. The envelope's `from`/`to` are unsigned and relay-rewritable, so the receiver treats the payload copies as authoritative and drops on any mismatch (a pairwise-symmetric key would otherwise let a captured packet be reflected at its sender).
+`blob` is encrypted under the pairwise key and envelope-bound (see [Envelope Binding](#envelope-binding)); `sig` signs `{ type, from, to, blob }`; verification is mandatory. The payload is `{ from, to, syncId, reply, ek, wrapped? }`. The envelope's `from`/`to` are relay-rewritable, so the receiver treats the payload copies as authoritative and drops on any mismatch (a pairwise-symmetric key would otherwise let a captured packet be reflected at its sender).
 
 1. **Request** (`reply: false`) — the initiator generates a fresh ephemeral and a `syncId`, and holds the ephemeral private key in memory for 60 seconds (`pendingSyncs`). The request carries **no messages**, only `ek`.
 2. **Reply** (`reply: true`) — the recipient generates its own ephemeral, derives the wrap key from the two ephemerals (`deriveEphemeralWrapKey`, see [Ephemeral Wrap](#ephemeral-wrap)), and returns its own `ek` plus `wrapped` — its most recent messages for the initiator, up to 10, encrypted under that key. A request with no valid `ek` is dropped.
@@ -950,7 +1008,13 @@ Relay WSS coordinates propagate passively:
 
 A client stores `lastRelay` and `lastRelaySeen` per contact. The WSS address is a last-known location, not a permanent home, and updates as contacts move.
 
-Updates are timestamp-guarded: a new `lastRelay` is only adopted if its timestamp is newer than the stored one (`updateRelay`). This applies uniformly to relay info in messages, peer backups, restores, file imports and migration notices — local storage is the source of truth. A relay's own `sig:relay_info` is a confirmation, not an authoritative fact, except on a completely fresh identity with no local record, where it is adopted as an unconfirmed placeholder timestamped `0` so any genuinely dated record arriving later outranks it.
+Updates are timestamp-guarded: a new `lastRelay` is only adopted if its timestamp is newer than the stored one (`updateRelay`). This applies uniformly to relay info in messages, peer backups, restores, file imports and migration notices — local storage is the source of truth.
+
+**Timestamps are clamped to the receiver's clock.** The timestamp that reaches `updateRelay` is chosen by the sender (or, for a replayed packet, by whoever replays it), and a successful adoption pins `lastRelaySeen` to it. A hint stamped in the future would therefore win once and then outrank every genuine later notice until the real clock caught up. Every adoption path (`app:message`, `app:migrate`, `restore_req`) clamps the incoming timestamp to the receiver's current time; a hint can never claim to be from the future, though it can still never be older than what is already held. A non-numeric or missing timestamp is not defaulted to "now" — it is ignored.
+
+**Message-borne hints require a valid signature.** A `relay.wss` in an `app:message` steers where we send that contact's traffic, so it is adopted only from a message whose signature verified; a message that decrypts but fails or lacks the signature is still displayed, but its hint is ignored.
+
+A relay's own `sig:relay_info` is a confirmation, not an authoritative fact, except on a completely fresh identity with no local record, where it is adopted as an unconfirmed placeholder timestamped `0` so any genuinely dated record arriving later outranks it. A `wss` in `sig:relay_info` that contradicts a held `lastRelay` is logged and ignored; only a deliberate migration changes it.
 
 The relay itself is untrusted infrastructure. Cryptographic proof — signatures, encryption — is the only trust boundary. Relays never forward to one another; all topology lives in client state and spreads through ordinary traffic.
 
@@ -965,11 +1029,11 @@ The relay itself is untrusted infrastructure. Cryptographic proof — signatures
 | `meshchat_peer_tokens_v1_<publicId>`   | per identity | Restore tokens held for contacts |
 | `meshchat_known_devices_v1_<publicId>` | per identity | Device registry — `{ identityId: { deviceId: { lastSeen, lastN, missing, endpointId } } }` |
 | `meshchat_send_counters_v1_<publicId>` | per identity | Per-contact outbound `n` counters for this device |
-| `meshchat_x4dh_sessions_v1_<publicId>` | per identity | X4DH session state, including root keys — encrypted at rest under the backup key |
+| `meshchat_x4dh_sessions_v1_<publicId>` | per identity | X4DH session state, including root keys (current and retained `RK0`) and any parked `pendingAck` — encrypted at rest under the backup key |
 | `meshchat_device_seed_v1_<publicId>`   | per device   | Raw 32-byte device seed (base64). Never shared, never backed up |
 | `meshchat_push_pref_v1_<publicId>`     | per device   | Push opt-in (`"1"`/`"0"`). The `PushSubscription` itself lives in the browser's PushManager storage, not here |
 
-Held in memory only, never persisted: pending X4DH proposal ephemerals, pending wrap ephemerals (`pendingRestoreEk`, `pendingBackupEk`), pending manual-sync ephemerals, the wire-key cache, and the media caches.
+Held in memory only, never persisted: pending X4DH proposal ephemerals, retired X4DH roots (decrypt-only grace), pending wrap ephemerals (`pendingRestoreEk`, `pendingBackupEk`), pending manual-sync ephemerals, the wire-key cache, and the media caches.
 
 ---
 
@@ -979,8 +1043,9 @@ Held in memory only, never persisted: pending X4DH proposal ephemerals, pending 
 |---|---|---|
 | `HTTP_PORT`           | `8000`        | Static file server port |
 | `WS_PORT`             | `8888`        | WebSocket signal server port |
-| `RELAY_WSS_URL`       | —             | Public WSS URL of this relay (required for cross-relay) |
-| `PROTOCOL_VERSION`    | `0.5.5`       | Reported on `sig:relay_info`; informational |
+| `RELAY_WSS_URL`       | —             | Public WSS URL of this relay. **Required for auth**: its host is what clients' auth proofs are bound to, and with no valid value the relay refuses every `sig:auth_init` (`relay_not_configured`) |
+| `RELAY_AUTH_HOSTS`    | —             | Extra hostnames (bare, or full URLs; comma-separated) this relay also accepts an auth proof for, when reachable under more than one name. Only meaningful on top of a valid `RELAY_WSS_URL` |
+| `PROTOCOL_VERSION`    | `0.5.9`       | Reported on `sig:relay_info`; informational |
 | `WS_MAX_SIZE`         | `2097152`     | Maximum frame size in bytes; larger frames are dropped |
 | `MAX_CONNECTIONS`     | `100`         | Total concurrent WebSocket sessions |
 | `MAX_CONNECTIONS_PER_IP` | `15`       | Concurrent sessions per source IP |
@@ -1006,7 +1071,7 @@ Held in memory only, never persisted: pending X4DH proposal ephemerals, pending 
 | `PUSH_SUBS_DIR`       | next to `BUF_DIR` | Push subscription storage — `<dir>/<publicId>/<endpointId>.json` |
 | `PUSH_TTL_SECONDS`    | `60`          | `TTL` header sent with each push |
 
-`AUTH_TIMEOUT` (15 seconds to complete the challenge-response) is a constant, not an environment variable.
+`AUTH_TIMEOUT` (15 seconds to complete the challenge-response) and `AUTH_VERSION` (`2`) are constants, not environment variables.
 
 ---
 
