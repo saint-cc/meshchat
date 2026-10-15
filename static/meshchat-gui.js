@@ -30,8 +30,9 @@ const MODAL_CLOSE_DELAY_MS    	= 1_200;			// brief pause before closing export/i
 // AND verified it (via the auto-ack reaction, see receiveMessage in
 // meshchat.js); failed: never left the device (no open socket / no relay
 // path). Only ever shown on our own ("mine") messages.
-const STATUS_GLYPH = { sent: "✔️", delivered: "✔️✔️", failed: "✗" };
-const STATUS_TITLE = { sent: "sent", delivered: "delivered", failed: "failed to send" };
+const STATUS_GLYPH = { waiting: "⏳", sent: "✔️", delivered: "✔️✔️", failed: "✗" };
+const STATUS_TITLE = { waiting: "waiting for a secure session — it sends automatically once one is established",
+                       sent: "sent", delivered: "delivered", failed: "failed to send" };
 
 // icon per system-notice kind — keyed by payload.kind, not hardcoded to
 // calls. Add an entry here whenever a new system-notice kind is wired up
@@ -772,11 +773,11 @@ function renderMessages() {
       const statusEl = document.createElement("span");
       statusEl.className   = "msgStatus" + (m.status === "failed" ? " failed" : "");
       statusEl.title       = STATUS_TITLE[m.status] || "";
-      statusEl.textContent = STATUS_GLYPH[m.status] || "";
+      statusEl.textContent = (STATUS_GLYPH[m.status] || "") + (m.status === "waiting" ? " waiting for secure session…" : "");
       meta.appendChild(statusEl);
     }
 
-    const infoPre = document.createElement("pre");
+    const infoPre = document.createElement("div");
     infoPre.className = "packetInfoPre";
     infoPre.style.display = "none";
 
@@ -796,29 +797,111 @@ function renderMessages() {
 // hand. A message from before this session (reload, or arrived via
 // restore/backup/sync rather than a live send/receive) has no cache
 // entry — shown as unavailable rather than guessed at.
+
 function formatPacketInfo(msgId) {
   const cached = packetCache[msgId];
-  if (!cached) return "packet info unavailable — not cached this session";
+
+  if (!cached) {
+    return '<div class="mc-packet-unavailable">' +
+      'packet info unavailable — not cached this session' +
+      '</div>';
+  }
+
   const { envelope, payload } = cached;
+
   const display = { ...envelope };
   delete display.blob;
+
   if (Array.isArray(display.sig)) {
     display.sig = bytesToHex(display.sig);
   }
+
   const payloadDisplay = { ...payload };
+
   if (payloadDisplay.data) {
-    payloadDisplay.data = `<${payloadDisplay.data.length} chars omitted>`;
+    payloadDisplay.data =
+      `<${payloadDisplay.data.length} chars omitted>`;
   }
+
   display.payload = payloadDisplay;
-  return JSON.stringify(display, null, 2);
+
+  function escapeHTML(value) {
+    return String(value)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
+  }
+
+  function renderValue(value) {
+    if (value === null) {
+      return '<span class="mc-packet-null">null</span>';
+    }
+
+    if (typeof value === "object") {
+      return '<pre class="mc-packet-nested">' +
+        escapeHTML(JSON.stringify(value, null, 2)) +
+        '</pre>';
+    }
+
+    if (typeof value === "number") {
+      return '<span class="mc-packet-number">' +
+        escapeHTML(value) +
+        '</span>';
+    }
+
+    if (typeof value === "boolean") {
+      return '<span class="mc-packet-boolean">' +
+        escapeHTML(value) +
+        '</span>';
+    }
+
+    return '<span class="mc-packet-value">' +
+      escapeHTML(value) +
+      '</span>';
+  }
+
+  function renderRows(object) {
+    return Object.entries(object)
+      .map(([key, value]) => {
+        if (key === "payload" && value &&
+            typeof value === "object") {
+          return '<div class="mc-packet-section">' +
+            '<div class="mc-packet-heading">PAYLOAD</div>' +
+            renderRows(value) +
+            '</div>';
+        }
+
+        return '<div class="mc-packet-row">' +
+          '<span class="mc-packet-key">' +
+          escapeHTML(key) +
+          '</span>' +
+          '<div class="mc-packet-cell">' +
+          renderValue(value) +
+          '</div>' +
+          '</div>';
+      })
+      .join("");
+  }
+
+  return '<div class="mc-packet-info">' +
+    renderRows(display) +
+    '<details class="mc-packet-raw">' +
+    '<summary>Show raw JSON</summary>' +
+    '<pre>' +
+    escapeHTML(JSON.stringify(display, null, 2)) +
+    '</pre>' +
+    '</details>' +
+    '</div>';
 }
 
 function togglePacketInfo(msgId, wrap) {
-  const pre = wrap.querySelector(".packetInfoPre");
-  if (!pre) return;
-  const opening = pre.style.display === "none";
-  if (opening) pre.textContent = formatPacketInfo(msgId);
-  pre.style.display = opening ? "block" : "none";
+  const packetInf = wrap.querySelector(".packetInfoPre");
+  if (!packetInf) return;
+  const opening = packetInf.style.display === "none";
+  if (opening) packetInf.innerHTML = formatPacketInfo(msgId);
+  packetInf.style.display = opening ? "block" : "none";
 }
 
 function openModal() {

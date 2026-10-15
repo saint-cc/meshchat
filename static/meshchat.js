@@ -13,7 +13,7 @@
 
    Load order: meshchat-lib.js → meshchat-gui.js → meshchat.js → statemachine.js
 ═══════════════════════════════════════════════════════════════ */
-const CLIENT_VERSION = "0.5.9";
+const CLIENT_VERSION = "0.6.0";
 
 const POLL_INTERVAL_MS        	= 30_000;			// base interval between presence polls
 const POLL_JITTER_MS          	= 10_000;			// ± random jitter added to poll interval
@@ -235,6 +235,9 @@ function markOnline(id) {
   // retry only ever fires on a genuine false→true transition, never on
   // routine re-confirmation of an already-known-online peer.
   checkStuckX4DHSessions(id, !wasOnline);
+  // 6.0.0 — a contact coming online while we hold no session with one of its
+  // fresh devices is the cheapest moment to nudge the bootstrap (see HELLO).
+  if (!wasOnline) maybeHelloOnTransition(id);
 }
 
 function pruneOnline() {
@@ -481,16 +484,30 @@ function dismissMissingWarning(contactId) {
    the conversation timeline stays intact.
    Raw audio lives in audioCache (memory only).
 ══════════════════════════════════════════ */
-function serialiseContacts() {
+// { local: true } is saveContacts' own write to this device's storage — the only
+// caller that keeps status:"waiting" (see serialiseMessage). Every other caller
+// (self-sync pushes, exports, the backup fingerprint) gets the default, which
+// strips it: the safe direction to get wrong.
+function serialiseContacts({ local = false } = {}) {
   const out = {};
   for (const [id,c] of Object.entries(state.contacts))
     out[id] = { name: c.name, publicId: c.publicId, shareableKey: c.shareableKey,
-                messages: selectRetainedMessages(c.messages, RETENTION_COUNT).map(m => m.type === "audio" ? {...m, data:null, expired:true} : m),
+                messages: selectRetainedMessages(c.messages, RETENTION_COUNT).map(m => serialiseMessage(m, local)),
                 blocked: c.blocked || false,
                 lastStateChange: c.lastStateChange || 0,
                 lastRelay:       c.lastRelay       || null,
                 lastRelaySeen:   c.lastRelaySeen    || 0 };
   return out;
+}
+
+// One message as it leaves this device. status:"waiting" (6.0.0) means "THIS device
+// still has to send this" — meaningless on any other device, where a restored
+// copy would sit at "waiting" forever (and, were it ever flushed, be sent twice).
+// So it survives only in this device's own storage write (local) and is stripped
+// from everything else. The in-memory object is never touched.
+function serialiseMessage(m, local) {
+  const o = m.type === "audio" ? { ...m, data: null, expired: true } : m;
+  return (!local && o.status === "waiting") ? { ...o, status: undefined } : o;
 }
 
 // Contacts-only variant for the CONTACT-path peer backup (sync:backup_push
@@ -570,7 +587,7 @@ function saveContacts() {
   const run = _saveContactsChain.then(async () => {
     if (!state.cryptoKey) return;
     try {
-      const encrypted = await encryptObject(state.cryptoKey, serialiseContacts());
+      const encrypted = await encryptObject(state.cryptoKey, serialiseContacts({ local: true }));
       localStorage.setItem(STORAGE_KEY + "_" + state.publicId, JSON.stringify(encrypted));
       return encrypted;
     } catch(e) {
@@ -939,9 +956,10 @@ function resolveDeviceTargets(contactId) {
        renegotiated only when the underlying session itself resets (the
        existing reactive stuck-detection retry, nothing new added for
        this pass — periodic/count-based rotation was explicitly deferred).
-       A device with no session yet (or one that never bootstraps one)
-       falls back to the legacy identity-level key exactly as before —
-       this is graceful degradation, not a hard cutover.
+       As of 6.0.0 there is NO fallback: a device with no session yet
+       receives nothing until one exists (hello -> bootstrap; sendContent
+       holds the message meanwhile — see HELD OUTBOX). It used to degrade
+       gracefully to the legacy identity-level key; it is a hard cutover now.
 ══════════════════════════════════════════ */
 
 // X4DH.md §13.1 — fixed initiator per pair, eliminating proposal glare
@@ -1090,6 +1108,8 @@ async function storeX4DHSessionRK0(contactId, theirDeviceId, sessionEpoch, rk0By
   // (wire keys are cached per ROOT now — nothing to evict here, see x4dhWireKeyByRoot)
   await saveX4DHSessions();
   mlog.info(`X4DH       RK0 established  ${pid(contactId, { deviceId: theirDeviceId })}  epoch=${pid(sessionEpoch)}`);
+  // Responder side is send-ready at once (see isSessionSendReady); the initiator's RK0 is not — it waits for the ack.
+  if (!initiator) flushHeldMessages(contactId, "session established (responder)");
 }
 
 // Guards against upgrading the wrong session — if a session has already
@@ -1122,6 +1142,7 @@ async function upgradeX4DHSessionToRK1(contactId, theirDeviceId, sessionEpoch, r
   existing.retryExhaustedAt = null;
   await saveX4DHSessions();
   mlog.info(`X4DH       RK1 upgrade complete  ${pid(contactId, { deviceId: theirDeviceId })}  epoch=${pid(sessionEpoch)}`);
+  flushHeldMessages(contactId, "session upgraded");   // a session just became send-ready — release anything held for this contact
   return true;
 }
 
@@ -1804,76 +1825,344 @@ async function retryX4DHPropose(contactId, theirDeviceId) {
 }
 
 /* ══════════════════════════════════════════
-   PER-DEVICE FANOUT — X4DH-AWARE SEND (this pass)
-   Replaces the old "encrypt once, sendFanned(obj)" pattern that used to
-   live here — every ordinary message-send path (text/audio/image/
-   reaction/system call notice) now goes through this instead. Reuses
-   resolveDeviceTargets' existing targeted/broadcast split UNCHANGED —
-   only what happens to EACH targeted device is new: a device with ANY
-   X4DH session on file (rk0 or rk1 — see the design discussion this
-   pass came out of for why rk0 is included) gets its OWN ciphertext,
-   encrypted with that device's own wire key (getOrDeriveWireKey),
-   addressed directly. A device with no session yet falls back to the
-   legacy identity-level contact.encKey — still addressed directly if
-   its endpoint is known, so per-device ROUTING is unaffected either
-   way; only KEY SELECTION is new, and only once a session exists.
+   PER-DEVICE FANOUT — SESSION-ONLY (6.0.0)
+   Every app:message that carries CONTENT (text, audio, image, reaction,
+   call notice, selfsync) goes out under X4DH session keys and under
+   nothing else. The static-static identity key (contact.encKey) encrypts no
+   content any more: it is deterministic from the two identity keys, so
+   anything riding it is readable by whoever later obtains either identity
+   key. It still carries exactly one thing — the content-free HELLO further
+   down — because a first contact has no session yet and something has to
+   carry the device/endpoint discovery that session bootstrap needs.
 
-   The broadcast fallback (bare `to`, unresolved/no-known-devices case)
-   always uses the legacy key — there's no single device to derive an
-   X4DH key FOR when addressing "every live session under this identity"
-   at once, so this path is unchanged from before X4DH existed.
+   resolveDeviceTargets still decides WHO is addressed. This function
+   decides whether each target can be addressed SECURELY:
+     - a targeted device with a send-ready session (isSessionSendReady) gets
+       its OWN ciphertext under its own wire key, addressed directly;
+     - a targeted device without one is skipped and counted in
+       awaitingSession — it is never handed a legacy-key copy;
+     - the bare-addressed identity broadcast no longer exists (it could only
+       ever be legacy-keyed).
+   When some fresh device still has no session (contactNeedsHello), a
+   rate-limited hello goes out as well — that is what gets the missing
+   session built. What becomes of the MESSAGE when nobody is ready is the
+   caller's decision: sendContent holds it and the UI shows "waiting for
+   secure session". This function just sends to whoever is ready and
+   reports the rest.
 
-   blob/sig now legitimately DIFFER per destination (unlike the old
-   sendFanned, where one blob/sig pair was reused verbatim everywhere)
-   — this is the actual point of moving to per-device keys, not an
-   oversight. Callers cache only fanned.envelopes[0] in packetCache for
-   the ⓘ inspector — the payload is identical across every copy, so one
-   representative envelope is enough to inspect wire shape/sig format;
-   showing all N per-device ciphertexts wasn't judged worth the extra
-   UI complexity for a debug feature.
-
-   opts.sessionOnly — never touch the legacy static-static key. A targeted
-   device with no X4DH session is SKIPPED (counted in skippedNoSession, not
-   sent a legacy-key copy), and the identity-level broadcast fallback is
-   never sent at all (it can only ever be legacy-keyed). Used by
-   sendSelfSync: mirrored copies of our own messages carry full message
-   text, so they must not ride a key that is deterministic from the two
-   identity keys. Ordinary contact traffic leaves this off — a first
-   message to a fresh contact has nothing BUT the legacy key to ride on.
+   blob/sig legitimately differ per destination (each copy has its own
+   key) — that is the point of per-device keys, not an accident. The
+   returned `envelopes` is kept only so a caller can hand one to
+   packetCache for the ⓘ inspector: the payload is identical across every
+   copy, so one representative envelope shows the wire shape.
 ══════════════════════════════════════════ */
-async function sendFannedX4DH(contactId, payload, opts = {}) {
-  const contact = state.contacts[contactId];
-  const sessionOnly = !!opts.sessionOnly;
+
+// A session is SEND-READY when we may encrypt content under it.
+//   - rk1: ready — the ack has been processed (initiator) or sent (responder).
+//   - responder at rk0: ready at once. We only hold a session because the
+//     initiator's propose reached us, so the initiator certainly holds RK0;
+//     sendStage "rk0" keeps us on that root until it proves RK1.
+//   - initiator at rk0: NOT ready inside the handshake window
+//     (X4DH_PROPOSAL_TIMEOUT_MS, the life of its ephemeral). A message sent
+//     right after the propose can overtake it — the peer's handler stores the
+//     session only after an await, and an offline peer's buffer is flushed in
+//     no order we control — and with no legacy copy any more, a message the
+//     peer cannot decrypt is a LOST message, not a slow one. Once the window
+//     has closed the ack can no longer arrive; an RK0 session is then what the
+//     stuck-retry logic has always sent under, so it counts as ready.
+function isSessionSendReady(contactId, theirDeviceId) {
+  const s = getX4DHSession(contactId, theirDeviceId);
+  if (!s) return false;
+  if (s.stage === "rk1") return true;
+  if (!s.initiator) return true;
+  return (Date.now() - (s.establishedAt || 0)) > X4DH_PROPOSAL_TIMEOUT_MS;
+}
+
+// How many of the contact's TARGETED devices can be sent to right now.
+function readyTargetCount(contactId) {
+  return resolveDeviceTargets(contactId).targeted.filter(t => isSessionSendReady(contactId, t.deviceId)).length;
+}
+
+// Does this contact have a device we hold NO session with at all? Devices
+// stale beyond FANOUT_STALE_MS don't count — a dead device must not keep the
+// hello firing on every send until the registry prunes it (30 days). A device
+// whose handshake is merely in progress has a session record, so it doesn't
+// count either. Nothing known at all (a fresh contact) does count.
+function contactNeedsHello(contactId) {
+  const entries = Object.entries(state.knownDevices[contactId] || {})
+    .filter(([deviceId]) => !(contactId === state.publicId && deviceId === state.deviceId));
+  if (entries.length === 0) return true;
+  const now = Date.now();
+  return entries.some(([deviceId, info]) =>
+    (now - (info.lastSeen || 0)) <= FANOUT_STALE_MS && !getX4DHSession(contactId, deviceId));
+}
+
+async function sendFannedX4DH(contactId, payload) {
   const resolved = resolveDeviceTargets(contactId);
-  const targeted = resolved.targeted;
-  const needsBroadcast = sessionOnly ? false : resolved.needsBroadcast;
-  let sent = false;
-  let x4dhCount = 0, legacyCount = 0, skippedNoSession = 0;
+  let sent = false, x4dhCount = 0, awaitingSession = 0;
   const envelopes = [];
 
-  for (const { deviceId, endpointId } of targeted) {
-    const wireKey = await getOrDeriveWireKey(contactId, deviceId);
-    if (sessionOnly && !wireKey) { skippedNoSession++; continue; }
-    const key = wireKey || contact.encKey;
-    const obj = await sealEnvelope("app:message", state.publicId, buildAddress(contactId, endpointId), key, payload);
+  for (const { deviceId, endpointId } of resolved.targeted) {
+    const wireKey = isSessionSendReady(contactId, deviceId) ? await getOrDeriveWireKey(contactId, deviceId) : null;
+    if (!wireKey) { awaitingSession++; continue; }
+    const obj = await sealEnvelope("app:message", state.publicId, buildAddress(contactId, endpointId), wireKey, payload);
     const viaRelay = sendToRelay(contactId, obj, true);
     if (!viaRelay) sendSignal(obj);
     sent = sent || viaRelay || state.ws?.readyState === WebSocket.OPEN;
-    if (wireKey) x4dhCount++; else legacyCount++;
+    x4dhCount++;
     envelopes.push(obj);
   }
 
-  if (needsBroadcast) {
+  // Self fanout never says hello: sibling sessions bootstrap through the
+  // self-backup handshake and ordinary self traffic (see sendSelfSync).
+  const helloWanted = contactId !== state.publicId && contactNeedsHello(contactId);
+  if (helloWanted) sendHello(contactId, "fanout");
+
+  return { sent, targetedCount: resolved.targeted.length, x4dhCount, awaitingSession, helloWanted, envelopes };
+}
+
+// One log fragment for every send path: "2 targeted (1 x4dh, 1 awaiting session) + hello".
+function fanSummary(f) {
+  const nowhere = (!f.sent && f.x4dhCount > 0) ? " — nowhere, no open socket" : "";
+  return `${f.targetedCount} targeted (${f.x4dhCount} x4dh${f.awaitingSession ? `, ${f.awaitingSession} awaiting session` : ""})${f.helloWanted ? " + hello" : ""}${nowhere}`;
+}
+
+/* ══════════════════════════════════════════
+   HELLO (6.0.0)
+   A content-free app:message — { id, type:"hello", ts, deviceId, endpointId,
+   relay? } — sealed under the legacy static-static key, bare-addressed
+   (every device of the contact), signed like any app:message. It is the ONLY
+   thing that key still carries, and it holds nothing worth protecting beyond
+   what the relay already sees: it exists to tell the other side "this device,
+   at this endpoint, exists" so the X4DH bootstrap has the two things it
+   needs (recordKnownDevice -> maybeTriggerX4DHPropose on the initiator,
+   maybeCompleteDeferredAck on the responder).
+
+   Reply rule: a verified hello from a device we hold no session with is
+   answered with our own hello (handleHello). This is what makes it work in
+   BOTH directions — the fixed initiator (lower publicId) can only propose
+   once it knows the responder's endpoint, and the responder can only ack
+   once it knows the initiator's, so each side has to introduce itself.
+   Loops are impossible: replies stop as soon as a session record exists,
+   and sendHello is rate-limited per contact.
+
+   Triggers: sendContent / sendFannedX4DH when some fresh device has no
+   session; a contact's online transition (maybeHelloOnTransition); the
+   held outbox's slow retry (HELLO_RETRY_MS); and the reply rule above.
+   Receivers need the sender as a contact, so a hello to someone who hasn't
+   added us back is dropped there — the next trigger retries.
+
+   Relay side effects (reasoned from server.py, not observed): a hello is an
+   ordinary app:message to the relay, so (1) an OFFLINE contact gets it
+   buffered for 24h and (2) route_or_buffer fires an empty "wake up" web push
+   for it, exactly as for a real message. Both are acceptable for the first
+   hello to an offline contact (the buffer is how it finds them later), but a
+   periodic retry must not keep waking a phone — hence the retry only goes to
+   a contact currently believed online.
+══════════════════════════════════════════ */
+const HELLO_MIN_INTERVAL_MS = 20_000;        // per contact, for event-driven hellos (send, reply, online transition)
+const HELLO_RETRY_MS        = 15 * 60_000;   // per contact, the held outbox's periodic nudge — and only to a contact currently believed online (see flushHeldOnce)
+const lastHelloSent = new Map();             // contactId -> ts. Memory only: a reload may legitimately re-send one
+
+async function sendHello(contactId, reason, minIntervalMs = HELLO_MIN_INTERVAL_MS) {
+  if (!state.publicId || !contactId || contactId === state.publicId) return false;
+  const contact = state.contacts[contactId];
+  if (!contact || contact.blocked || !contact.encKey) return false;
+  const now = Date.now();
+  if (now - (lastHelloSent.get(contactId) || 0) < minIntervalMs) return false;
+  lastHelloSent.set(contactId, now);   // before any await: two callers in the same tick must not both pass
+  try {
+    const me = state.contacts[state.publicId];
+    const payload = { id: crypto.randomUUID(), type: "hello", ts: now,
+                      deviceId: state.deviceId, endpointId: state.endpointId,
+                      ...(me?.lastRelay ? { relay: { wss: me.lastRelay } } : {}) };
     const obj = await sealEnvelope("app:message", state.publicId, contactId, contact.encKey, payload);
     const viaRelay = sendToRelay(contactId, obj, true);
     if (!viaRelay) sendSignal(obj);
-    sent = sent || viaRelay || state.ws?.readyState === WebSocket.OPEN;
-    legacyCount++;
-    envelopes.push(obj);
+    mlog.info(`→ HELLO        to   ${pid(contactId)}  (${reason})  via=${viaRelay ? "relay" : "signal(fallback)"}`);
+    return true;
+  } catch(e) {
+    mlog.warn(`→ HELLO        to   ${pid(contactId)} — send failed: ${e.message}`);
+    return false;
+  }
+}
+
+function maybeHelloOnTransition(id) {
+  if (!id || id === state.publicId || !state.contacts[id]) return;
+  if (contactNeedsHello(id)) sendHello(id, "online");
+}
+
+// receive side — called from receiveMessage once decrypt + verify have run
+// (recordKnownDevice there is already valid-gated and has stored the sender's
+// deviceId/endpointId, which is the whole point of the packet)
+async function handleHello(msg, plain, valid, viaX4DH) {
+  const fromDisp = valid ? pid(msg.from, { deviceId: plain.deviceId, endpointId: plain.endpointId }) : pid(msg.from);
+  if (!valid) { mlog.warn(`← HELLO        from ${fromDisp} — signature invalid, ignored`); return; }
+  if (msg.from === state.publicId) { mlog.debug(`← HELLO        from self — ignored (siblings bootstrap through the self-backup handshake)`); return; }
+  if (!plain.deviceId || !plain.endpointId) { mlog.warn(`← HELLO        from ${fromDisp} — deviceId/endpointId missing, ignored`); return; }
+  mlog.info(`← HELLO        from ${fromDisp}  key:${viaX4DH ? "x4dh" : "legacy"}`);
+  // Reply rule — see HELLO above. A session record (even a half-built one)
+  // means the bootstrap is already under way and the peer has what it needs.
+  if (!getX4DHSession(msg.from, plain.deviceId)) sendHello(msg.from, "reply");
+}
+
+/* ══════════════════════════════════════════
+   HELD OUTBOX (6.0.0)
+   With no legacy fallback, a message to a contact we hold no send-ready
+   session with cannot go anywhere yet. It is NOT dropped and NOT downgraded:
+   it is stored locally with status:"waiting" (the UI shows "waiting for
+   secure session"), a hello starts the bootstrap, and the message goes out
+   the moment a session is ready (flushHeldMessages, hooked into
+   storeX4DHSessionRK0 / upgradeX4DHSessionToRK1, with heldTick as the
+   backstop for the one transition that has no event: an initiator's RK0
+   session ageing out of its handshake window).
+
+   - Order is kept: a new message queues behind earlier held ones even if a
+     session is ready by now, and flushing sends oldest first.
+   - Only messages THIS device composed are ours to flush (isHeld checks
+     deviceId) — a "waiting" status never leaves the device (serialiseMessage),
+     but this is the second lock on the door: a sibling must never send it too.
+   - Held TEXT survives a reload (the status is in local storage). Held
+     audio/image does not: their payload lives only in the in-memory media
+     caches, so after a reload there is nothing to send and they become
+     "failed" at the next flush.
+   - A held message gives up after HELD_MAX_AGE_MS (the relay's own 24h
+     app:message TTL) and shows as failed — a message delivered a week late
+     out of a forgotten queue is worse than one that visibly failed.
+   - Call notices and reactions are NEVER held (sendContent hold:false /
+     direct fanout): a "calling…" notice or a delivery ack that arrives hours
+     later is wrong, not merely late.
+══════════════════════════════════════════ */
+const HELD_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+const HELD_TICK_MS    = 5_000;
+const heldFlushInFlight = new Set();   // contactId — one flush at a time per contact
+const heldFlushAgain    = new Set();   // contactId — something arrived mid-flush: go round once more
+
+function isHeld(m) {
+  return m.from === state.publicId && m.status === "waiting" && m.deviceId === state.deviceId;
+}
+function hasHeld(contactId) {
+  return !!state.contacts[contactId]?.messages?.some(isHeld);
+}
+
+// Send `payload` to `contactId` if a session is ready; otherwise report that
+// it must wait. Returns { outcome: "sent" | "failed" | "waiting", fanned }.
+// The caller stores the message with status = outcome and, for "waiting",
+// does nothing else — flushHeldMessages takes it from there.
+async function sendContent(contactId, payload, { hold = true, label = "MSG" } = {}) {
+  if (contactId === state.publicId) {
+    // Self chat: there is nobody to wait for. No sibling with a session just
+    // means nothing to deliver — the note stays local until one exists.
+    const fanned = await sendFannedX4DH(contactId, payload);
+    return { outcome: (fanned.x4dhCount === 0 || fanned.sent) ? "sent" : "failed", fanned };
+  }
+  const ready  = readyTargetCount(contactId);
+  const queued = hold && hasHeld(contactId);
+  if (ready === 0 || queued) {
+    if (contactNeedsHello(contactId)) sendHello(contactId, ready === 0 ? "no session" : "queued");
+    if (!hold) {
+      mlog.warn(`→ ${label.padEnd(13)} to   ${pid(contactId)}  no send-ready session — not held (would be stale by the time it sent)`);
+      return { outcome: "failed", fanned: null };
+    }
+    mlog.info(`→ ${label.padEnd(13)} to   ${pid(contactId)}  waiting for a secure session — held (${ready === 0 ? "no session yet" : "queued behind earlier held messages"})`);
+    if (ready > 0) setTimeout(() => flushHeldMessages(contactId, "queued"), 0);   // after the caller has stored the message
+    return { outcome: "waiting", fanned: null };
+  }
+  const fanned = await sendFannedX4DH(contactId, payload);
+  return { outcome: fanned.sent ? "sent" : "failed", fanned };
+}
+
+// Rebuild the wire payload of a held message from what is stored + the media
+// caches. Mirrors exactly what each send path builds at compose time;
+// deviceId/endpointId/relay are the CURRENT ones, n/ack pointer/ts/id are the
+// ones fixed at compose time (the peer's (id, ts) duplicate guard and its n-gap
+// bookkeeping both depend on those staying put). Null when the content is gone.
+async function buildHeldPayload(m) {
+  const me    = state.contacts[state.publicId];
+  const relay = me?.lastRelay ? { wss: me.lastRelay } : undefined;
+  const base  = { id: m.id, ts: m.ts, deviceId: state.deviceId, endpointId: state.endpointId,
+                  ...(m.n != null ? { n: m.n } : {}),
+                  ...((m.ackDeviceId && m.ackN != null) ? { ackDeviceId: m.ackDeviceId, ackN: m.ackN } : {}),
+                  ...(relay ? { relay } : {}) };
+  const t = m.type || "text";
+  if (t === "text")   return typeof m.text === "string" ? { ...base, text: m.text } : null;
+  if (t === "system") return typeof m.text === "string" ? { ...base, type: "system", kind: m.kind || null, text: m.text } : null;
+  if (t === "audio" || t === "image") {
+    const cached = (t === "audio" ? audioCache : imageCache)[m.id];
+    if (!cached) return null;
+    try {
+      const p = await decryptObject(state.encKey, cached.encBlob);
+      return { ...base, type: t, data: p.data, mimeType: p.mimeType };
+    } catch(e) { return null; }
+  }
+  return null;
+}
+
+async function flushHeldMessages(contactId, reason) {
+  if (heldFlushInFlight.has(contactId)) { heldFlushAgain.add(contactId); return; }
+  heldFlushInFlight.add(contactId);
+  try {
+    do {
+      heldFlushAgain.delete(contactId);
+      await flushHeldOnce(contactId, reason);
+    } while (heldFlushAgain.has(contactId));
+  } catch(e) {
+    mlog.warn(`HELD       flush failed  ${pid(contactId)}: ${e.message}`);
+  } finally {
+    heldFlushInFlight.delete(contactId);
+  }
+}
+
+async function flushHeldOnce(contactId, reason) {
+  const contact = state.contacts[contactId];
+  if (!contact || contact.blocked) return;
+  const held = (contact.messages || []).filter(isHeld)
+    .sort((a, b) => (a.ts - b.ts) || (a.id < b.id ? -1 : 1));
+  if (!held.length) return;
+
+  let changed = false;
+  for (const m of held) {
+    if (m.status !== "waiting") continue;
+    if (Date.now() - m.ts > HELD_MAX_AGE_MS) {
+      m.status = "failed"; changed = true;
+      mlog.warn(`HELD       gave up after ${Math.round(HELD_MAX_AGE_MS / 3600000)}h  ${pid(contactId)}  id=${pid(m.id)}`);
+      continue;
+    }
+    const payload = await buildHeldPayload(m);
+    if (!payload) {
+      m.status = "failed"; changed = true;
+      mlog.warn(`HELD       content no longer available (media cache is memory-only)  ${pid(contactId)}  id=${pid(m.id)}`);
+      continue;
+    }
+    if (readyTargetCount(contactId) === 0) break;   // still no session — everything behind this one waits too
+    const fanned = await sendFannedX4DH(contactId, payload);
+    packetCache[m.id] = { envelope: fanned.envelopes[0] || null, payload };
+    m.status = fanned.sent ? "sent" : "failed";
+    changed = true;
+    mlog.info(`→ HELD→SENT    to   ${pid(contactId)}  type=${m.type || "text"}  id=${pid(m.id)}  ${fanSummary(fanned)}  (${reason})`);
+    if (m.status === "sent") sendSelfSync(contactId, m);   // mirror to our other devices now that it has really left
   }
 
-  return { sent, targetedCount: targeted.length, broadcastSent: needsBroadcast, x4dhCount, legacyCount, skippedNoSession, envelopes };
+  if (changed) {
+    await saveContacts();
+    if (state.currentChat === contactId) renderMessages();
+    updateContactPreview();
+  }
+  // Still waiting after a periodic pass: nudge the bootstrap, slowly — and only
+  // toward a contact we believe is online. An offline one already has our
+  // earlier hello buffered at the relay, and every extra one would push-notify
+  // their phone (see the relay side effects under HELLO).
+  if (reason === "tick" && state.online.has(contactId) && hasHeld(contactId) && contactNeedsHello(contactId)) sendHello(contactId, "waiting", HELLO_RETRY_MS);
 }
+
+function heldTick() {
+  if (!state.publicId) return;
+  for (const [id, c] of Object.entries(state.contacts)) {
+    if (id === state.publicId || !c.messages?.some(isHeld)) continue;
+    flushHeldMessages(id, "tick");
+  }
+}
+setInterval(heldTick, HELD_TICK_MS);
 
 /* ══════════════════════════════════════════
    PEER BACKUP DISTRIBUTION
@@ -4355,17 +4644,17 @@ async function sendImageMessage(file) {
         const encBlob = await encryptObject(state.encKey, { data: base64, mimeType });
         imageCache[id] = { encBlob, mimeType };
 
-        const fanned = await sendFannedX4DH(state.currentChat, payload);
-        packetCache[id] = { envelope: fanned.envelopes[0] || null, payload };
-        status = fanned.sent ? "sent" : "failed";
-        mlog.info(`→ IMAGE        to   ${pid(state.currentChat)}  ${w}×${h}  ${fanned.targetedCount} targeted (${fanned.x4dhCount} x4dh, ${fanned.legacyCount} legacy)${fanned.broadcastSent ? " + broadcast" : ""}${!fanned.sent ? " — nowhere, no open socket" : ""}`);
+        const res = await sendContent(state.currentChat, payload, { label: "IMAGE" });
+        packetCache[id] = { envelope: res.fanned?.envelopes[0] || null, payload };
+        status = res.outcome;
+        if (res.fanned) mlog.info(`→ IMAGE        to   ${pid(state.currentChat)}  ${w}×${h}  ${fanSummary(res.fanned)}`);
       } catch(e) {
         mlog.err(`→ IMAGE        to   ${pid(state.currentChat)} — send failed: ${e.message}`);
       }
 
       const stored = { id, from: state.publicId, type: "image", mimeType, ts, valid: true, status, deviceId: state.deviceId, n: sentN, ...ackPointer };
       contact.messages = mergeMessages(contact.messages, [stored]);
-      if (status !== "failed") sendSelfSync(contact.publicId, stored);   // stub only — see sendSelfSync
+      if (status === "sent") sendSelfSync(contact.publicId, stored);   // stub only — see sendSelfSync
       await saveContacts();
       renderMessages();
       updateContactPreview();   // sidebar preview otherwise only ever updates on incoming traffic
@@ -4402,10 +4691,10 @@ async function sendAudioMessage(blob) {
       const encBlob = await encryptObject(state.encKey, { data: base64, mimeType });
       audioCache[id] = { encBlob, mimeType };
 
-      const fanned = await sendFannedX4DH(state.currentChat, payload);
-      packetCache[id] = { envelope: fanned.envelopes[0] || null, payload };
-      status = fanned.sent ? "sent" : "failed";
-      mlog.info(`→ AUDIO        to   ${pid(state.currentChat)}  size=${blob.size}b  ${fanned.targetedCount} targeted (${fanned.x4dhCount} x4dh, ${fanned.legacyCount} legacy)${fanned.broadcastSent ? " + broadcast" : ""}${!fanned.sent ? " — nowhere, no open socket" : ""}`);
+      const res = await sendContent(state.currentChat, payload, { label: "AUDIO" });
+      packetCache[id] = { envelope: res.fanned?.envelopes[0] || null, payload };
+      status = res.outcome;
+      if (res.fanned) mlog.info(`→ AUDIO        to   ${pid(state.currentChat)}  size=${blob.size}b  ${fanSummary(res.fanned)}`);
     } catch(e) {
       mlog.err(`→ AUDIO        to   ${pid(state.currentChat)} — send failed: ${e.message}`);
     }
@@ -4413,7 +4702,7 @@ async function sendAudioMessage(blob) {
     // stub in messages — data stays in audioCache only
     const stored = { id, from: state.publicId, type: "audio", mimeType, ts, valid: true, status, deviceId: state.deviceId, n: sentN, ...ackPointer };
     contact.messages = mergeMessages(contact.messages, [stored]);
-    if (status !== "failed") sendSelfSync(contact.publicId, stored);   // stub only — see sendSelfSync
+    if (status === "sent") sendSelfSync(contact.publicId, stored);   // stub only — see sendSelfSync
     await saveContacts();
     renderMessages();
     updateContactPreview();   // sidebar preview otherwise only ever updates on incoming traffic
@@ -4594,8 +4883,9 @@ async function decryptIncomingMessage(fromId, blob, aad) {
     }
   }
 
-  // legacy identity-level key — last resort, covers any device that
-  // hasn't bootstrapped an X4DH session yet (or never will)
+  // legacy identity-level key — last resort. Since 6.0.0 only a HELLO is
+  // legitimately under it (receiveMessage drops anything else), so this is
+  // what lets a first contact with no session yet be heard at all.
   const plain = await decryptMessage(blob, contact.encKey, aad);
   return { plain, viaX4DH: false, theirDeviceId: null, keyLabel: null };
 }
@@ -4710,6 +5000,17 @@ async function receiveMessage(msg) {
     // AAD is built from the envelope AS RECEIVED — a packet retyped, reflected or
     // redirected in transit no longer decrypts (see PACKET ENVELOPE above)
     ({ plain, viaX4DH, theirDeviceId: matchedDeviceId, keyLabel } = await decryptIncomingMessage(msg.from, msg.blob, envelopeAad(msg.type, msg.from, msg.to)));
+
+    // 6.0.0 — the legacy static-static key carries HELLO and nothing else. It is
+    // deterministic from the two identity keys, so content under it would be
+    // readable by anyone who later obtains either one; a legacy-key packet of any
+    // other kind is an old client, or a downgrade attempt by whoever relays it.
+    // Dropped before it can touch the device registry, the dedup cache, unread
+    // counters or the auto-ack.
+    if (!viaX4DH && plain.type !== "hello") {
+      mlog.warn(`← MSG          from ${pid(msg.from)} — ${plain.type || "message"} under the legacy key, dropped (hello only since 6.0.0)`);
+      return;
+    }
     valid = verifyEnvelope(msg, contact.signPublicKey);
 
     // Belt-and-suspenders consistency check: a successful decrypt under
@@ -4768,7 +5069,7 @@ async function receiveMessage(msg) {
     // before decrypt/verify even ran — left over from debugging signature
     // failures early on; tightened now that it's a real trust boundary.
     if (valid && plain.deviceId) recordKnownDevice(msg.from, plain.deviceId, plain.n, plain.endpointId);
-    if (plain.id) packetCache[plain.id] = { envelope: msg, payload: plain };
+    if (plain.id && plain.type !== "hello") packetCache[plain.id] = { envelope: msg, payload: plain };
     // Relay hint rides inside the signed payload, so it carries the same
     // trust requirement as recordKnownDevice above: only a validly signed
     // message may steer where we send this contact's traffic. A message
@@ -4780,6 +5081,10 @@ async function receiveMessage(msg) {
       updateRelay(contact, plain.relay.wss, clampRelayTs(plain.ts || Date.now()));
       if (state.currentChat === msg.from) updateChatRelayInfo(msg.from);
     }
+    // Hello: nothing to display, store or ack — its whole effect (the sender's
+    // deviceId/endpointId and relay hint, both valid-gated above) has happened.
+    if (plain.type === "hello") { await handleHello(msg, plain, valid, viaX4DH); return; }
+
     // sub-id annotation only once signed+verified — same trust gate as
     // recordKnownDevice just above; an unverified plain.deviceId/endpointId
     // isn't safe to trust even for display, since the outer envelope's
@@ -5262,7 +5567,7 @@ async function commitBurn() {
        both get it — that is exactly what per-endpoint targeting fixes.
 
    SESSION-ONLY. The mirrored copy carries message text, so it goes ONLY to
-   siblings we hold an X4DH session with (sendFannedX4DH opts.sessionOnly):
+   siblings we hold an X4DH session with (as is ALL fanout since 6.0.0):
    no legacy static-static self key, and no identity-level broadcast
    fallback (which could only ever be legacy-keyed). Same rule the full
    self-backup push has followed since 0.5.5. Receive side is unchanged —
@@ -5322,14 +5627,14 @@ async function sendSelfSync(peerId, stored) {
     // for a stale duplicate of the old one.
     const payload = { id: `ss:${stored.id}`, type: "selfsync", peerId, msg: inner, ts: stored.ts,
                       deviceId: state.deviceId, endpointId: state.endpointId, ...(relay ? { relay } : {}) };
-    const fanned = await sendFannedX4DH(state.publicId, payload, { sessionOnly: true });
+    const fanned = await sendFannedX4DH(state.publicId, payload);
     if (fanned.x4dhCount === 0) {
       // Nothing went out: every known sibling lacks a session (or none is
       // targetable). Not an error — see SESSION-ONLY above.
-      mlog.debug(`SELFSYNC   no sibling with an X4DH session — skipped  id=${pid(stored.id)}  (${fanned.skippedNoSession} without a session)`);
+      mlog.debug(`SELFSYNC   no sibling with an X4DH session — skipped  id=${pid(stored.id)}  (${fanned.awaitingSession} without a send-ready session)`);
       return;
     }
-    mlog.info(`→ SELFSYNC     peer=${pid(peerId)}  type=${inner.type}  ${fanned.x4dhCount} x4dh${fanned.skippedNoSession ? `, ${fanned.skippedNoSession} skipped (no session)` : ""}${!fanned.sent ? " — nowhere, no open socket" : ""}`);
+    mlog.info(`→ SELFSYNC     peer=${pid(peerId)}  type=${inner.type}  ${fanned.x4dhCount} x4dh${fanned.awaitingSession ? `, ${fanned.awaitingSession} skipped (no send-ready session)` : ""}${!fanned.sent ? " — nowhere, no open socket" : ""}`);
   } catch(e) {
     mlog.warn(`→ SELFSYNC     peer=${pid(peerId)} — send failed: ${e.message}`);
   }
@@ -5359,10 +5664,10 @@ async function sendMessage() {
     ackPointer = getAckPointer(state.currentChat) || {};
     const payload = { id, text, ts, deviceId: state.deviceId, endpointId: state.endpointId, n: sentN, ...ackPointer, ...(relay ? { relay } : {}) };
 
-    const fanned = await sendFannedX4DH(state.currentChat, payload);
-    packetCache[id] = { envelope: fanned.envelopes[0] || null, payload };
-    status = fanned.sent ? "sent" : "failed";
-    mlog.info(`→ MSG          to   ${pid(state.currentChat)}  ${fanned.targetedCount} targeted (${fanned.x4dhCount} x4dh, ${fanned.legacyCount} legacy)${fanned.broadcastSent ? " + broadcast" : ""}${!fanned.sent ? " — nowhere, no open socket" : ""}`);
+    const res = await sendContent(state.currentChat, payload, { label: "MSG" });
+    packetCache[id] = { envelope: res.fanned?.envelopes[0] || null, payload };
+    status = res.outcome;   // "waiting" = held until a session is ready (see HELD OUTBOX)
+    if (res.fanned) mlog.info(`→ MSG          to   ${pid(state.currentChat)}  ${fanSummary(res.fanned)}`);
     mlog.debug(`MSG content: "${text.slice(0,40)}${text.length>40?"…":""}"  id=${id}`);
   } catch(e) {
     mlog.err(`→ MSG          to   ${pid(state.currentChat)} — send failed: ${e.message}`);
@@ -5374,7 +5679,7 @@ async function sendMessage() {
   input.value = "";
   renderMessages();
   updateContactPreview();   // sidebar preview otherwise only ever updates on incoming traffic
-  if (status !== "failed") sendSelfSync(contact.publicId, stored);   // mirror to our other devices — see sendSelfSync
+  if (status === "sent") sendSelfSync(contact.publicId, stored);   // mirror to our other devices — see sendSelfSync (a held message mirrors when it is really sent)
 }
 
 /* ══════════════════════════════════════════
@@ -5409,7 +5714,7 @@ async function sendReaction(targetMsgId, emoji, contactId = state.currentChat, i
   // a message that genuinely was delivered, since nothing else would
   // ever flip that status on those devices. A real emoji pick gets the
   // same treatment for consistency.
-  mlog.info(`→ REACTION     to   ${pid(contactId)}  target=${pid(targetMsgId)}  emoji=${emoji || "nil"}  ${fanned.targetedCount} targeted (${fanned.x4dhCount} x4dh, ${fanned.legacyCount} legacy)${fanned.broadcastSent ? " + broadcast" : ""}`);
+  mlog.info(`→ REACTION     to   ${pid(contactId)}  target=${pid(targetMsgId)}  emoji=${emoji || "nil"}  ${fanSummary(fanned)}`);
   await saveContacts();
   // only the currently-open chat needs a re-render — an auto-ack fired
   // for some other contact shouldn't repaint whatever chat is on screen
@@ -5508,10 +5813,10 @@ async function sendCallNotice(id) {
     const payload = { id: msgId, type: "system", kind: "call", text, ts,
                        deviceId: state.deviceId, endpointId: state.endpointId, n: sentN, ...ackPointer, ...(relay ? { relay } : {}) };
 
-    const fanned = await sendFannedX4DH(id, payload);
-    packetCache[msgId] = { envelope: fanned.envelopes[0] || null, payload };
-    status = fanned.sent ? "sent" : "failed";
-    mlog.info(`→ CALL_NOTICE  to   ${pid(id)}  ${fanned.targetedCount} targeted (${fanned.x4dhCount} x4dh, ${fanned.legacyCount} legacy)${fanned.broadcastSent ? " + broadcast" : ""}${!fanned.sent ? " — nowhere, no open socket" : ""}`);
+    const res = await sendContent(id, payload, { hold: false, label: "CALL_NOTICE" });   // never held — a "calling…" notice hours late is wrong
+    packetCache[msgId] = { envelope: res.fanned?.envelopes[0] || null, payload };
+    status = res.outcome;
+    if (res.fanned) mlog.info(`→ CALL_NOTICE  to   ${pid(id)}  ${fanSummary(res.fanned)}`);
   } catch(e) {
     mlog.err(`→ CALL_NOTICE  to   ${pid(id)} — send failed: ${e.message}`);
   }
