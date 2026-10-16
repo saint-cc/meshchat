@@ -248,6 +248,7 @@ function hideIncomingCallUI(id) {
 // updateChatRelayInfo.
 function updateCallHeaderBtn(id) {
   if (id !== state.currentChat) return;
+  refreshChatInfo(id);   // phase changed — keep the info panel in step
   const btn = document.getElementById("callBtn");
   if (!btn) return;
   const isMe    = id === state.publicId;
@@ -306,6 +307,7 @@ function hideIncomingDataUI(id) {
 // updateCallHeaderBtn.
 function updateDataHeaderBtn(id) {
   if (id !== state.currentChat) return;
+  refreshChatInfo(id);   // phase changed — keep the info panel in step
   const btn = document.getElementById("dataBtn");
   if (!btn) return;
   const isMe  = id === state.publicId;
@@ -440,21 +442,61 @@ function x4dhDotInfo(contactId, deviceId) {
     : { color: "var(--accent)", title: "X4DH: RK0, handshake in progress" };
 }
 
+// One source of truth for "what do we know about this contact's devices",
+// shared by the contact-list popover (toggleDevicePopover) and the
+// conversation info panel (renderInfoDevices) so the two can never
+// silently disagree — same reasoning as x4dhDotInfo above.
+//
+// Union of knownDevices (seen on the wire) and x4dhSessions (has a
+// session) — a device can be in one without the other. A session-only
+// device simply has lastSeen 0.
+//
+// The `session` sub-object is an explicit WHITELIST. The stored session
+// also carries rootKey / rk0Root (real key material) — nothing here may
+// ever spread or serialise the session object itself.
+function getDeviceRows(contactId) {
+  const known    = state.knownDevices[contactId] || {};
+  const sessions = state.x4dhSessions?.[contactId] || {};
+  const ids      = new Set([...Object.keys(known), ...Object.keys(sessions)]);
+
+  return Array.from(ids).map(deviceId => {
+    const info = known[deviceId];
+    const s    = sessions[deviceId];
+    return {
+      deviceId,
+      isThisDevice: contactId === state.publicId && deviceId === state.deviceId,
+      endpointId:   info?.endpointId || null,
+      lastSeen:     info?.lastSeen   || 0,
+      lastN:        info?.lastN      || 0,
+      missing:      Array.isArray(info?.missing) ? info.missing : [],
+      x4dh:         x4dhDotInfo(contactId, deviceId),
+      session: s ? {
+        stage:            s.stage,
+        initiator:        s.initiator,
+        sessionEpoch:     s.sessionEpoch,
+        establishedAt:    s.establishedAt,
+        upgradedAt:       s.upgradedAt,
+        retryAttempts:    s.retryAttempts,
+        retryExhaustedAt: s.retryExhaustedAt,
+        lastRetryAt:      s.lastRetryAt,
+      } : null,
+    };
+  }).sort((a, b) => b.lastSeen - a.lastSeen);   // most recent first
+}
+
 function toggleDevicePopover(id, li) {
   const pop = li.querySelector('.devicePopover[data-pop="' + id + '"]');
   if (!pop) return;
   const isOpen = pop.classList.contains("open");
   document.querySelectorAll(".devicePopover.open").forEach(p => p.classList.remove("open"));
   if (isOpen) return;
-  const devices = Object.entries(state.knownDevices[id] || {})
-    .sort(([, a], [, b]) => b.lastSeen - a.lastSeen);   // most recent first
+  const devices = getDeviceRows(id);
   pop.innerHTML = devices.length
-    ? devices.map(([devId, info]) => {
-        const x4dh = x4dhDotInfo(id, devId);
+    ? devices.map(d => {
         return `<div class="devicePopoverRow">` +
-          `<span class="x4dhDot" style="background:${x4dh.color}" title="${esc(x4dh.title)}"></span>` +
-          `<span>${esc(pid(devId))}</span>` +
-          `<span class="devicePopoverDate">${relativeDate(info.lastSeen)}${info.lastN ? " · n:" + info.lastN : ""}</span>` +
+          `<span class="x4dhDot" style="background:${d.x4dh.color}" title="${esc(d.x4dh.title)}"></span>` +
+          `<span>${esc(pid(d.deviceId))}</span>` +
+          `<span class="devicePopoverDate">${d.lastSeen ? relativeDate(d.lastSeen) : "—"}${d.lastN ? " · n:" + d.lastN : ""}</span>` +
         `</div>`;
       }).join("")
     : '<div class="devicePopoverRow unknown">unknown</div>';
@@ -604,6 +646,8 @@ function openChat(id) {
   document.getElementById("contactDropdown").classList.remove("open");
   renderContactList();
   renderMessages();
+  setChatInfoVisible(true);   // stays open/closed as it was — just reloads for this contact
+  refreshChatInfo(id);
   document.getElementById("chatInput").focus();
 }
 
@@ -974,7 +1018,7 @@ function formatPacketInfo(msgId) {
 
   return packetRenderBlock(
     { metadata: buildStoredMetadata(stored.msg, stored.contactId) },
-    "wire packet not cached -- showing stored metadata"
+    "wire packet not cached this session — showing stored metadata only"
   );
 }
 
@@ -985,6 +1029,196 @@ function togglePacketInfo(msgId, wrap) {
   if (opening) packetInf.innerHTML = formatPacketInfo(msgId);
   packetInf.style.display = opening ? "block" : "none";
 }
+
+/* ══════════════════════════════════════════
+   CONVERSATION INFO PANEL — the big brother of the contact-list device
+   popover. A slim toggle (v / ^) straddles the line between #chatHeader
+   and the messages; it opens #chatInfoPanel as an OVERLAY on top of the
+   message list (absolutely positioned inside #chatBody), so opening it
+   never reflows the messages — images and scroll position stay put.
+   Height is whatever the content needs, capped at 60% of the message
+   area (style.css), scrolling beyond that.
+
+   Nothing is stored here — every refresh reads live state. Refresh
+   happens on open, on switching chat, on every call/data phase change
+   (the header-button updaters call in), and on a slow tick for
+   everything without a hook of its own (X4DH state, lastSeen, …). A
+   refresh is skipped while text inside the panel is selected, so
+   copying an id doesn't get wiped by the next tick.
+
+   NEVER dump a session object here: state.x4dhSessions entries hold
+   rootKey / rk0Root. Every field shown is explicitly whitelisted (see
+   getDeviceRows). Same rule for the double ratchet when it lands —
+   counters and indices only, never key material.
+
+   Adding a section = one more entry in CHAT_INFO_SECTIONS.
+══════════════════════════════════════════ */
+const CHAT_INFO_REFRESH_MS = 3000;
+let chatInfoOpen      = false;
+let _chatInfoLastHtml = null;
+
+// relativeDate (lib) counts in days — useless for "seen 12s ago".
+function fmtAgo(ts) {
+  if (!Number.isFinite(ts) || !ts) return "—";
+  const s = Math.max(0, Math.round((Date.now() - ts) / 1000));
+  if (s < 5)     return "just now";
+  if (s < 60)    return s + "s ago";
+  if (s < 3600)  return Math.floor(s / 60) + "m ago";
+  if (s < 86400) return Math.floor(s / 3600) + "h ago";
+  return Math.floor(s / 86400) + "d ago";
+}
+
+function ciSection(title, bodyHtml) {
+  return '<div class="mc-packet-section">' +
+    '<div class="mc-packet-heading">' + packetEscapeHTML(title) + '</div>' +
+    bodyHtml +
+    '</div>';
+}
+
+function ciRow(key, value) {
+  return '<div class="mc-packet-row">' +
+    '<span class="mc-packet-key">' + packetEscapeHTML(key) + '</span>' +
+    '<div class="mc-packet-cell">' + packetRenderValue(value) + '</div>' +
+    '</div>';
+}
+
+function ciLine(key, value) {
+  return '<div class="ci-line"><span>' + packetEscapeHTML(key) + '</span>' +
+    '<span>' + packetEscapeHTML(value) + '</span></div>';
+}
+
+function renderInfoRoute(id) {
+  const c = state.contacts[id];
+  if (!c) return "";
+  const isMe  = id === state.publicId;
+  const heard = dotTimestamps[id];
+  const rows  = [
+    ciRow("id", c.publicId),
+    ciRow("relay", c.lastRelay || "—"),
+    isMe
+      ? ciRow("this device", pid(state.deviceId) + " · endpoint " + pid(state.endpointId))
+      : ciRow("last heard", heard ? fmtAgo(heard) : "—"),
+    ciRow("messages", c.messages?.length || 0),
+    ciRow("backup", state.peerBackups[id] ? "stored" : "none"),
+  ];
+  if (c.blocked) rows.push(ciRow("blocked", c.blockReason ? "yes (" + c.blockReason + ")" : "yes"));
+  return ciSection("ROUTE", rows.join(""));
+}
+
+function ciDeviceBlock(d) {
+  const s       = d.session;
+  const missing = d.missing.length
+    ? "#" + d.missing.slice(0, 8).join(", #") + (d.missing.length > 8 ? " +" + (d.missing.length - 8) : "")
+    : "none";
+
+  // status text comes from x4dhDotInfo (same wording as the dot's tooltip)
+  const x4 = [d.x4dh.title.replace(/^X4DH:\s*/, "")];
+  if (s) {
+    x4.push(s.initiator ? "we proposed" : "they proposed");
+    if (s.sessionEpoch)     x4.push("epoch " + pid(s.sessionEpoch));
+    if (s.establishedAt)    x4.push("established " + fmtAgo(s.establishedAt));
+    if (s.upgradedAt)       x4.push("upgraded " + fmtAgo(s.upgradedAt));
+    if (s.retryAttempts)    x4.push("retries " + s.retryAttempts);
+    if (s.retryExhaustedAt) x4.push("retries exhausted " + fmtAgo(s.retryExhaustedAt));
+  }
+
+  return '<div class="ci-device">' +
+    '<div class="ci-device-head">' +
+      '<span class="x4dhDot" style="background:' + packetEscapeHTML(d.x4dh.color) + '" title="' + packetEscapeHTML(d.x4dh.title) + '"></span>' +
+      '<span class="ci-device-id">' + packetEscapeHTML(pid(d.deviceId)) + '</span>' +
+      (d.isThisDevice ? '<span class="ci-tag">THIS DEVICE</span>' : '') +
+      '<span class="ci-device-seen">seen ' + packetEscapeHTML(fmtAgo(d.lastSeen)) + (d.lastN ? ' · n:' + d.lastN : '') + '</span>' +
+    '</div>' +
+    ciLine("endpoint", d.endpointId ? pid(d.endpointId) : "—") +
+    ciLine("missing", missing) +
+    ciLine("x4dh", x4.join(" · ")) +
+    '</div>';
+}
+
+function renderInfoDevices(id) {
+  const rows = getDeviceRows(id);
+  const body = rows.length
+    ? rows.map(ciDeviceBlock).join("")
+    : '<span class="mc-packet-null">no devices seen yet</span>';
+  return ciSection("DEVICES (" + rows.length + ")", body);
+}
+
+function ciSessionRows(label, conn, pc, idField) {
+  const phase = conn?.phase || "idle";
+  const parts = [phase + (conn?.role ? " (" + conn.role + ")" : "")];
+  if (phase !== "idle" && conn?.[idField]) parts.push(pid(conn[idField]));
+  let out = ciRow(label, parts.join(" · "));
+  if (pc) out += ciRow(label + " rtc", "conn " + pc.connectionState + " · ice " + pc.iceConnectionState + " · sig " + pc.signalingState);
+  return out;
+}
+
+function renderInfoSessions(id) {
+  const c = state.contacts[id];
+  if (!c || id === state.publicId) return "";   // no calls / data tests to yourself
+  // rtcConns / dataConns live in meshchat.js — fine, this only ever runs
+  // long after every script has loaded.
+  return ciSection("SESSIONS",
+    ciSessionRows("call", c.call, rtcConns[id]?.pc,  "callId") +
+    ciSessionRows("data", c.data, dataConns[id]?.pc, "sessionId"));
+}
+
+const CHAT_INFO_SECTIONS = [
+  { id: "route",    render: renderInfoRoute    },
+  { id: "devices",  render: renderInfoDevices  },
+  { id: "sessions", render: renderInfoSessions },
+  // { id: "ratchet", render: renderInfoRatchet }  — double ratchet: counters/indices only
+];
+
+function refreshChatInfo(contactId) {
+  if (!chatInfoOpen) return;
+  const id = state.currentChat;
+  if (!id || !state.contacts[id]) return;
+  if (contactId && contactId !== id) return;
+  const panel = document.getElementById("chatInfoPanel");
+  if (!panel) return;
+
+  const sel = window.getSelection?.();
+  if (sel && !sel.isCollapsed && panel.contains(sel.anchorNode)) return;
+
+  // a broken section must not take the others down with it
+  const html = CHAT_INFO_SECTIONS.map(sec => {
+    try { return sec.render(id); }
+    catch (e) {
+      return ciSection(sec.id.toUpperCase(),
+        '<span class="mc-packet-null">render error: ' + packetEscapeHTML(e.message) + '</span>');
+    }
+  }).join("");
+
+  if (html === _chatInfoLastHtml) return;
+  _chatInfoLastHtml = html;
+  const top = panel.scrollTop;
+  panel.innerHTML = html;
+  panel.scrollTop = top;
+}
+
+function setChatInfoOpen(open) {
+  chatInfoOpen = open;
+  _chatInfoLastHtml = null;
+  const btn   = document.getElementById("chatInfoToggle");
+  const panel = document.getElementById("chatInfoPanel");
+  if (btn) {
+    btn.textContent = open ? "^" : "v";
+    btn.title       = open ? "hide conversation details" : "show conversation details";
+    btn.setAttribute("aria-expanded", open ? "true" : "false");
+  }
+  if (panel) panel.classList.toggle("open", open && !!state.currentChat);
+  if (open) refreshChatInfo();
+}
+
+// The toggle only exists while a chat is open. The open/closed choice
+// itself survives switching chats (and deleting one), but not a reload.
+function setChatInfoVisible(on) {
+  document.getElementById("chatInfoToggleRow")?.classList.toggle("visible", on);
+  document.getElementById("chatInfoPanel")?.classList.toggle("open", on && chatInfoOpen);
+}
+
+document.getElementById("chatInfoToggle")?.addEventListener("click", () => setChatInfoOpen(!chatInfoOpen));
+setInterval(() => { if (!document.hidden) refreshChatInfo(); }, CHAT_INFO_REFRESH_MS);
 
 function openModal() {
   document.getElementById("myKeyDisplay").textContent = state.shareableKey;
@@ -1228,6 +1462,7 @@ function contactAction(action) {
       document.getElementById("chatHeaderId").style.display   = "none";
       document.getElementById("contactMenuBtn").classList.remove("visible");
       document.getElementById("chatMessages").innerHTML = "";
+      setChatInfoVisible(false);
       await saveContacts(); renderContactList(); closeContactAction();
     };
 

@@ -124,7 +124,14 @@ if ("serviceWorker" in navigator) {
 		
       </div>
     </div>
-    <div id="chatMessages"></div>
+    <!-- conversation info: the toggle straddles the header's bottom border (zero-height row,
+         button pulled up over the line); the panel is an OVERLAY inside #chatBody so opening it
+         never reflows the messages. See "CONVERSATION INFO PANEL" in meshchat-gui.js. -->
+    <div id="chatInfoToggleRow"><button id="chatInfoToggle" type="button" aria-expanded="false" title="show conversation details">v</button></div>
+    <div id="chatBody">
+      <div id="chatMessages"></div>
+      <div id="chatInfoPanel"></div>
+    </div>
     <div id="chatInputContainer">
 		<textarea id="chatInput" placeholder="type a message..." autocomplete="off"></textarea>
 		<button id="sendButton">SEND</button>
