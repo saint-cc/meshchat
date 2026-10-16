@@ -585,7 +585,7 @@ function openChat(id) {
   } else if (migrateBtn) {
     migrateBtn.style.display = "none";
   }
-  
+
   let burnBtn = document.getElementById("burnBtn");
   if (isMe) {
     if (!burnBtn) {
@@ -599,8 +599,8 @@ function openChat(id) {
     burnBtn.style.display = "";
   } else if (burnBtn) {
     burnBtn.style.display = "none";
-  } 
-  
+  }
+
   document.getElementById("contactDropdown").classList.remove("open");
   renderContactList();
   renderMessages();
@@ -790,110 +790,192 @@ function renderMessages() {
   container.scrollTop = container.scrollHeight;
 }
 
-// Packet inspector (ⓘ) — shows the wire envelope with the decrypted
-// payload spliced in where the ciphertext blob was, i.e. "everything
-// except the blob". Pulls from packetCache (meshchat.js), populated at
-// the same point each send/receive function already has both pieces in
-// hand. A message from before this session (reload, or arrived via
-// restore/backup/sync rather than a live send/receive) has no cache
-// entry — shown as unavailable rather than guessed at.
+// Packet inspector (ⓘ) — two views, one renderer.
+//
+//   PACKET   (packetCache hit) — the wire envelope with the decrypted
+//            payload spliced in where the ciphertext blob was, i.e.
+//            "everything except the blob". packetCache (meshchat.js) is
+//            in-memory only, populated at the same point each live
+//            send/receive function already has both pieces in hand.
+//
+//   METADATA (no cache entry) — a message from before this session
+//            (reload, or arrived via restore/backup/sync/self-sync rather
+//            than a live send/receive) has no envelope or payload to show
+//            any more, but the stored message object still carries what
+//            receiveMessage / the send functions copied onto it (id,
+//            deviceId, n, ack pointer, status, …). Shown as a METADATA
+//            section in the same row style, with a note saying why the
+//            wire packet is missing, rather than a bare "unavailable".
+//            Only a message that can't be found in storage at all falls
+//            back to the old unavailable notice.
+//
+// Everything rendered here goes through packetEscapeHTML — stored values
+// originate from decrypted peer payloads and are untrusted. The message
+// BODY is deliberately not shown in the metadata view, only its length:
+// it's already in the bubble, and this is a metadata view.
+
+const PACKET_SECTION_HEADINGS = { payload: "PAYLOAD", metadata: "METADATA" };
+
+function packetEscapeHTML(value) {
+  return String(value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function packetRenderValue(value) {
+  if (value === null) {
+    return '<span class="mc-packet-null">null</span>';
+  }
+
+  if (typeof value === "object") {
+    return '<pre class="mc-packet-nested">' +
+      packetEscapeHTML(JSON.stringify(value, null, 2)) +
+      '</pre>';
+  }
+
+  if (typeof value === "number") {
+    return '<span class="mc-packet-number">' +
+      packetEscapeHTML(value) +
+      '</span>';
+  }
+
+  if (typeof value === "boolean") {
+    return '<span class="mc-packet-boolean">' +
+      packetEscapeHTML(value) +
+      '</span>';
+  }
+
+  return '<span class="mc-packet-value">' +
+    packetEscapeHTML(value) +
+    '</span>';
+}
+
+// Keys listed in PACKET_SECTION_HEADINGS whose value is an object render as
+// a headed section (rows nested inside) instead of a single row.
+function packetRenderRows(object) {
+  return Object.entries(object)
+    .map(([key, value]) => {
+      if (Object.prototype.hasOwnProperty.call(PACKET_SECTION_HEADINGS, key) &&
+          value && typeof value === "object") {
+        return '<div class="mc-packet-section">' +
+          '<div class="mc-packet-heading">' + PACKET_SECTION_HEADINGS[key] + '</div>' +
+          packetRenderRows(value) +
+          '</div>';
+      }
+
+      return '<div class="mc-packet-row">' +
+        '<span class="mc-packet-key">' +
+        packetEscapeHTML(key) +
+        '</span>' +
+        '<div class="mc-packet-cell">' +
+        packetRenderValue(value) +
+        '</div>' +
+        '</div>';
+    })
+    .join("");
+}
+
+function packetRenderBlock(display, note) {
+  return '<div class="mc-packet-info">' +
+    (note ? '<div class="mc-packet-unavailable">' + packetEscapeHTML(note) + '</div>' : '') +
+    packetRenderRows(display) +
+    '<details class="mc-packet-raw">' +
+    '<summary>Show raw JSON</summary>' +
+    '<pre>' +
+    packetEscapeHTML(JSON.stringify(display, null, 2)) +
+    '</pre>' +
+    '</details>' +
+    '</div>';
+}
+
+// The open chat first (that's where the ⓘ was clicked), then every other
+// contact — cheap insurance in case the message lives under another thread.
+function findStoredMessage(msgId) {
+  const current = state.contacts[state.currentChat];
+  const hit = current?.messages?.find(m => m.id === msgId);
+  if (hit) return { msg: hit, contactId: state.currentChat };
+
+  for (const [contactId, contact] of Object.entries(state.contacts)) {
+    const found = contact.messages?.find(m => m.id === msgId);
+    if (found) return { msg: found, contactId };
+  }
+  return null;
+}
+
+// Stored message → flat metadata object. Only fields that actually exist
+// on the stored message are included (undefined is dropped; null is kept,
+// since emoji:null is a meaningful "reaction cleared"). ackTrusted is
+// local-only and never serialised, so it only shows up for messages that
+// were acked this session.
+function buildStoredMetadata(m, contactId) {
+  const meta = {
+    id:          m.id,
+    type:        m.type || "text",
+    direction:   m.from === state.publicId ? "sent" : "received",
+    from:        m.from,
+    chat:        contactId,
+    ts:          m.ts,
+    time:        Number.isFinite(m.ts) ? new Date(m.ts).toISOString() : undefined,
+    status:      m.status,
+    valid:       m.valid,
+    deviceId:    m.deviceId,
+    n:           m.n,
+    ackDeviceId: m.ackDeviceId,
+    ackN:        m.ackN,
+    ackTrusted:  m.ackTrusted,
+    kind:        m.kind,
+    targetId:    m.targetId,
+    emoji:       m.emoji,
+    mimeType:    m.mimeType,
+    textLength:  typeof m.text === "string" ? m.text.length : undefined,
+  };
+
+  for (const key of Object.keys(meta)) {
+    if (meta[key] === undefined) delete meta[key];
+  }
+  return meta;
+}
 
 function formatPacketInfo(msgId) {
   const cached = packetCache[msgId];
 
-  if (!cached) {
+  if (cached) {
+    const { envelope, payload } = cached;
+
+    const display = { ...envelope };
+    delete display.blob;
+
+    if (Array.isArray(display.sig)) {
+      display.sig = bytesToHex(display.sig);
+    }
+
+    const payloadDisplay = { ...payload };
+
+    if (payloadDisplay.data) {
+      payloadDisplay.data =
+        `<${payloadDisplay.data.length} chars omitted>`;
+    }
+
+    display.payload = payloadDisplay;
+
+    return packetRenderBlock(display, null);
+  }
+
+  const stored = findStoredMessage(msgId);
+
+  if (!stored) {
     return '<div class="mc-packet-unavailable">' +
       'packet info unavailable — not cached this session' +
       '</div>';
   }
 
-  const { envelope, payload } = cached;
-
-  const display = { ...envelope };
-  delete display.blob;
-
-  if (Array.isArray(display.sig)) {
-    display.sig = bytesToHex(display.sig);
-  }
-
-  const payloadDisplay = { ...payload };
-
-  if (payloadDisplay.data) {
-    payloadDisplay.data =
-      `<${payloadDisplay.data.length} chars omitted>`;
-  }
-
-  display.payload = payloadDisplay;
-
-  function escapeHTML(value) {
-    return String(value)
-      .replace(/&/g, "&amp;")
-      .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;")
-      .replace(/"/g, "&quot;")
-      .replace(/'/g, "&#39;");
-  }
-
-  function renderValue(value) {
-    if (value === null) {
-      return '<span class="mc-packet-null">null</span>';
-    }
-
-    if (typeof value === "object") {
-      return '<pre class="mc-packet-nested">' +
-        escapeHTML(JSON.stringify(value, null, 2)) +
-        '</pre>';
-    }
-
-    if (typeof value === "number") {
-      return '<span class="mc-packet-number">' +
-        escapeHTML(value) +
-        '</span>';
-    }
-
-    if (typeof value === "boolean") {
-      return '<span class="mc-packet-boolean">' +
-        escapeHTML(value) +
-        '</span>';
-    }
-
-    return '<span class="mc-packet-value">' +
-      escapeHTML(value) +
-      '</span>';
-  }
-
-  function renderRows(object) {
-    return Object.entries(object)
-      .map(([key, value]) => {
-        if (key === "payload" && value &&
-            typeof value === "object") {
-          return '<div class="mc-packet-section">' +
-            '<div class="mc-packet-heading">PAYLOAD</div>' +
-            renderRows(value) +
-            '</div>';
-        }
-
-        return '<div class="mc-packet-row">' +
-          '<span class="mc-packet-key">' +
-          escapeHTML(key) +
-          '</span>' +
-          '<div class="mc-packet-cell">' +
-          renderValue(value) +
-          '</div>' +
-          '</div>';
-      })
-      .join("");
-  }
-
-  return '<div class="mc-packet-info">' +
-    renderRows(display) +
-    '<details class="mc-packet-raw">' +
-    '<summary>Show raw JSON</summary>' +
-    '<pre>' +
-    escapeHTML(JSON.stringify(display, null, 2)) +
-    '</pre>' +
-    '</details>' +
-    '</div>';
+  return packetRenderBlock(
+    { metadata: buildStoredMetadata(stored.msg, stored.contactId) },
+    "wire packet not cached -- showing stored metadata"
+  );
 }
 
 function togglePacketInfo(msgId, wrap) {
@@ -1150,7 +1232,7 @@ function contactAction(action) {
     };
 
   } else if (action === "migrate") {
-	  
+
 	  if (migrationLocked) {
 	    title.textContent = "MIGRATE RELAY";
 	    const hint = document.createElement("div");
@@ -1351,9 +1433,9 @@ function buildBurnPanel() {
   const body  = document.getElementById("contactActionBody");
   const btns  = document.getElementById("contactActionBtns");
   body.innerHTML = btns.innerHTML = "";
- 
+
   title.textContent = "BURN IDENTITY";
- 
+
   const hint = document.createElement("div");
   hint.className = "hint";
   hint.style.cssText = "line-height:1.6";
@@ -1366,45 +1448,45 @@ function buildBurnPanel() {
     "(including you) can log back in and it will work exactly as before. Burn only wipes what's local here " +
     "and asks contacts to stop trusting it; it cannot force that anywhere else.";
   body.appendChild(hint);
- 
+
   const confirmInput = document.createElement("input");
   confirmInput.placeholder  = 'type BURN to continue';
   confirmInput.name         = "mc-burn-confirm";
   confirmInput.autocomplete = "off";
   confirmInput.spellcheck   = false;
   body.appendChild(confirmInput);
- 
+
   const proceedBtn = document.createElement("button");
   proceedBtn.className   = "btn-confirm";
   proceedBtn.style.cssText = "background:var(--danger);border-color:var(--danger)";
   proceedBtn.textContent = "CONTINUE";
   proceedBtn.disabled    = true;
- 
+
   confirmInput.addEventListener("input", () => {
     proceedBtn.disabled = confirmInput.value.trim() !== "BURN";
   });
- 
+
   const cancelBtn = document.createElement("button");
   cancelBtn.className   = "btn-cancel";
   cancelBtn.textContent = "CANCEL";
   cancelBtn.onclick     = closeContactAction;
- 
+
   proceedBtn.onclick = () => showBurnWarning();
- 
+
   btns.appendChild(cancelBtn);
   btns.appendChild(proceedBtn);
   document.getElementById("contactActionOverlay").classList.add("open");
   confirmInput.focus();
 }
- 
+
 function showBurnWarning() {
   const title = document.getElementById("contactActionTitle");
   const body  = document.getElementById("contactActionBody");
   const btns  = document.getElementById("contactActionBtns");
   body.innerHTML = btns.innerHTML = "";
- 
+
   title.textContent = "ARE YOU SURE?!";
- 
+
   const warn = document.createElement("div");
   warn.className = "hint";
   warn.style.cssText = "color:var(--danger);line-height:1.6";
@@ -1412,18 +1494,18 @@ function showBurnWarning() {
     "Last chance to back out. Once you continue, contacts are notified immediately, " +
     "this device is wiped, and you are logged out. There is no undo.";
   body.appendChild(warn);
- 
+
   const cancelBtn = document.createElement("button");
   cancelBtn.className   = "btn-cancel";
   cancelBtn.textContent = "WAIT, NO!";
   cancelBtn.onclick     = buildBurnPanel;   // back to the type-to-confirm step, fresh
- 
+
   const confirmBtn = document.createElement("button");
   confirmBtn.className   = "btn-confirm";
   confirmBtn.style.cssText = "background:var(--danger);border-color:var(--danger)";
   confirmBtn.textContent = "BURN IT DOWN";
   confirmBtn.onclick     = () => { closeContactAction(); commitBurn(); };
- 
+
   btns.appendChild(cancelBtn);
   btns.appendChild(confirmBtn);
 }
@@ -1473,7 +1555,7 @@ document.getElementById("loginButton").onclick = async (e) => {
 	state.deviceId  = await getOrCreateDeviceId(deviceSeed);
 	state.endpointId = await deriveDeviceEndpointId(deviceSeed);
 	mlog.info(`DEVICE     ${pid(state.deviceId)}  endpoint=${pid(state.endpointId)}`);
-	
+
     await loadContacts();
 	if(!state.contacts[state.publicId]){
 	  state.contacts[state.publicId]={name:state.user+" (me)",publicId:state.publicId,shareableKey:state.shareableKey,encKey:state.encKey,x25519PublicKey,signPublicKey,messages:[]};
@@ -1490,7 +1572,7 @@ document.getElementById("loginButton").onclick = async (e) => {
 	loadSendCounters();
 	await loadX4DHSessions();
 	recordKnownDevice(state.publicId, state.deviceId);
-	
+
     document.getElementById("loginScreen").style.display  = "none";
     document.getElementById("appContainer").style.display = "flex";
     mlog.info(`LOGIN      ${name}  ${pid(state.publicId)}`);
