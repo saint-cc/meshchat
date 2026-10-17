@@ -351,12 +351,123 @@ function showDataToast(text, ok) {
 ══════════════════════════════════════════ */
 let scanner = null, scannerRunning = false;
 
-function buildMyQR(key) {
+// live: the address~token string is ~25 chars longer than a plain address, and at
+// qrcodejs's default error-correction level (H) that pushes it to a denser version
+// whose modules are too small to scan off a PC screen. A screen can't be scuffed
+// the way paper can, so live QRs use level M and a bigger canvas instead.
+function buildMyQR(key, live = false) {
   const el = document.getElementById("myQrCode");
   el.innerHTML = "";
   if (!key) return;
-  try { new QRCode(el, { text: key, width: 192, height: 192, colorDark: "#000", colorLight: "#fff" }); }
+  const size = live ? 240 : 192;
+  const opts = { text: key, width: size, height: size, colorDark: "#000", colorLight: "#fff" };
+  if (live && window.QRCode?.CorrectLevel) opts.correctLevel = QRCode.CorrectLevel.M;
+  try { new QRCode(el, opts); }
   catch(e) { el.textContent = "QR unavailable"; }
+}
+
+/* ── LIVE (ONE-WAY) QR — show side ──
+   Protocol (token, arming, introduction) lives in meshchat.js; this is only
+   the dialog. OFFLINE mode is the plain address QR, unchanged. LIVE mode arms
+   a single-use token for QR_TOKEN_TTL_MS and shows <address>~<token>. It is
+   never re-armed on its own: an expired QR stays expired until NEW QR is
+   pressed, so a QR can't sit live on an unattended screen. Closing the dialog
+   or switching mode disarms at once. Nothing here is remembered across opens. */
+let qrMode = "offline", _qrLiveTick = null, _qrLiveRenderedFor = null;
+
+function qrLiveStopTick() { clearInterval(_qrLiveTick); _qrLiveTick = null; }
+
+function fmtCountdown(ms) {
+  const s = Math.max(0, Math.ceil(ms / 1000));
+  return Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0");
+}
+
+function qrLiveSetStatus(text, cls) {
+  const el = document.getElementById("qrLiveStatus");
+  el.textContent = text;
+  el.className   = cls || "";
+}
+
+// With no live token there is nothing to show or copy — hide the box rather than leave a blank QR frame.
+function qrShowBox(on) { document.getElementById("myKeyBox").style.display = on ? "" : "none"; }
+
+function setQrMode(mode) {
+  qrMode = mode === "live" ? "live" : "offline";
+  document.getElementById("qrModeOffline").classList.toggle("active", qrMode === "offline");
+  document.getElementById("qrModeLive").classList.toggle("active",    qrMode === "live");
+  renderQrShow();
+}
+
+function renderQrShow() {
+  const info = document.getElementById("qrLiveInfo"), hint = document.getElementById("qrShowHint");
+  document.getElementById("qrLiveClaimed").style.display = "none";
+  qrLiveStopTick();
+  if (qrMode !== "live") {
+    disarmQrLive("mode switched", { notify: false });
+    info.style.display = "none";
+    qrShowBox(true);
+    document.getElementById("myKeyDisplay").textContent = state.shareableKey;
+    buildMyQR(state.shareableKey);
+    hint.textContent = "let your contact scan this · or copy key above";
+    return;
+  }
+  info.style.display = "";
+  hint.textContent = "they scan this and are added on your side automatically · works once, for 2 minutes, while you stay online";
+  refreshQrLive();
+}
+
+function refreshQrLive() {
+  document.getElementById("qrLiveClaimed").style.display = "none";
+  qrLiveStopTick();
+  const btn = document.getElementById("qrLiveRefresh");
+  if (state.ws?.readyState !== WebSocket.OPEN) {
+    disarmQrLive("not connected", { notify: false });
+    document.getElementById("myQrCode").innerHTML = "";
+    document.getElementById("myKeyDisplay").textContent = "—";
+    qrShowBox(false);
+    qrLiveSetStatus("not connected to your relay — live mode needs you online", "warn");
+    btn.style.display = "";
+    return;
+  }
+  const armed = armQrLive();
+  if (!armed) { qrLiveSetStatus("couldn't create a live QR", "warn"); btn.style.display = ""; return; }
+  qrShowBox(true);
+  document.getElementById("myKeyDisplay").textContent = armed.text;
+  buildMyQR(armed.text, true);
+  btn.style.display = "none";
+  const tick = () => qrLiveSetStatus("live · valid for " + fmtCountdown(armed.expiresAt - Date.now()) + " · single use", "ok");
+  tick();
+  _qrLiveTick = setInterval(tick, 500);
+}
+
+// Called by meshchat.js when the armed token ends for a reason the dialog
+// didn't cause itself: it expired, or somebody claimed it.
+function onQrLiveEnded(reason, claimedId) {
+  qrLiveStopTick();
+  if (qrMode !== "live" || !document.getElementById("modalOverlay").classList.contains("open")) return;
+  document.getElementById("myQrCode").innerHTML = "";
+  document.getElementById("myKeyDisplay").textContent = "—";
+  qrShowBox(false);
+  const btn = document.getElementById("qrLiveRefresh");
+  btn.style.display = "";
+  if (reason === "claimed" && claimedId) {
+    qrLiveSetStatus("✓ added " + claimedId.slice(0, 8) + "… — QR closed. The person who scanned can check this id against their own.", "ok");
+    const box = document.getElementById("qrLiveClaimed"), input = document.getElementById("qrLiveName");
+    input.value = "";
+    box.style.display = "";
+    document.getElementById("qrLiveNameSave").onclick = async () => {
+      const val = input.value.trim(), c = state.contacts[claimedId];
+      if (!val || !c) return;
+      c.name = val; c.lastStateChange = Date.now();
+      await saveContacts();
+      renderContactList();
+      if (state.currentChat === claimedId) document.getElementById("chatHeaderName").textContent = val;
+      qrLiveSetStatus("✓ saved as " + val, "ok");
+      box.style.display = "none";
+    };
+  } else {
+    qrLiveSetStatus("QR expired", "warn");
+  }
 }
 
 function switchTab(tab) {
@@ -383,6 +494,7 @@ async function startScanner() {
       (decoded) => {
         document.getElementById("scanResult").textContent = "✓ key captured";
         document.getElementById("modalContactKey").value  = decoded.trim();
+        updateKeyHint();
         stopScanner();
         switchTab("paste");
         document.getElementById("modalContactName").focus();
@@ -1221,15 +1333,31 @@ document.getElementById("chatInfoToggle")?.addEventListener("click", () => setCh
 setInterval(() => { if (!document.hidden) refreshChatInfo(); }, CHAT_INFO_REFRESH_MS);
 
 function openModal() {
-  document.getElementById("myKeyDisplay").textContent = state.shareableKey;
   document.getElementById("modalContactName").value   = "";
   document.getElementById("modalContactKey").value    = "";
   document.getElementById("scanResult").textContent   = "";
-  buildMyQR(state.shareableKey);
+  updateKeyHint();
+  setQrMode("offline");   // always opens on the offline QR — a live token is only ever armed by an explicit choice
   switchTab("show");
   document.getElementById("modalOverlay").classList.add("open");
 }
-function closeModal() { if (scannerRunning) stopScanner(); document.getElementById("modalOverlay").classList.remove("open"); }
+function closeModal() {
+  if (scannerRunning) stopScanner();
+  qrLiveStopTick();
+  disarmQrLive("dialog closed", { notify: false });   // a live QR never outlives the dialog
+  document.getElementById("modalOverlay").classList.remove("open");
+}
+
+// A pasted/scanned key carrying a token is a live QR: say so, since it only works for a short while.
+function updateKeyHint() {
+  const v = document.getElementById("modalContactKey").value.trim();
+  const el = document.getElementById("modalKeyHint");
+  if (!v.includes(QR_TOKEN_SEP)) { el.textContent = ""; return; }
+  const { key } = parseOneWayKey(v);
+  el.textContent = key
+    ? "live QR — press ADD now: they add you automatically, but only for about 2 minutes after it was shown."
+    : "this looks like a live QR but is damaged — scan or copy it again.";
+}
 
 function openExportModal() {
   document.getElementById("exportPassphrase").value   = "";
@@ -1825,7 +1953,11 @@ document.getElementById("modalCancel").onclick    = closeModal;
 document.getElementById("exportBtn").onclick      = openExportModal;
 document.getElementById("exportCancel").onclick   = closeExportModal;
 document.getElementById("syncBtn").onclick        = () => { if (state.currentChat) initiateExchange(state.currentChat); };
-document.getElementById("myKeyBox").onclick       = () => navigator.clipboard.writeText(state.shareableKey).catch(()=>{});
+document.getElementById("myKeyBox").onclick       = () => {
+  const t = document.getElementById("myKeyDisplay").textContent;   // what the QR currently encodes (address, or address~token in live mode)
+  if (t && t !== "—") navigator.clipboard.writeText(t).catch(()=>{});
+};
+document.getElementById("modalContactKey").addEventListener("input", updateKeyHint);
 document.getElementById("contactMenuBtn").onclick = (e) => {
   e.stopPropagation();
   document.getElementById("contactDropdown").classList.toggle("open");
@@ -1840,8 +1972,13 @@ document.getElementById("modalConfirm").onclick = async () => {
   const name    = document.getElementById("modalContactName").value.trim();
   const key     = document.getElementById("modalContactKey").value.trim();
   if (!name || !key) return;
-  const ok = await addContact(name, key, true);
-  if (ok) closeModal();
+  const res = await addContactViaQr(name, key);
+  if (!res.ok) { document.getElementById("modalKeyHint").textContent = res.error; return; }
+  closeModal();
+  // showDataToast is just the generic toast despite its name
+  if (res.oneWay) showDataToast(res.sent
+    ? "introduction sent — they add you automatically if their live QR is still open"
+    : "added, but the introduction couldn't be sent — are you connected?", res.sent);
 };
 
 document.getElementById("exportConfirm").onclick = async () => {

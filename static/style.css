@@ -214,6 +214,24 @@
   .qr-panel.active { display: flex; }
 
   #myQrCode { background: white; padding: 12px; margin: 0 auto; }
+  #myQrCode:empty { display: none; }
+
+  /* live (one-way) QR — mode switch and status, Show tab only */
+  .qr-mode { display: flex; width: 100%; border: 1px solid var(--border); }
+  .qr-mode-btn {
+    flex: 1; padding: 6px 4px; background: none; border: none; border-right: 1px solid var(--border);
+    color: var(--muted); font-family: inherit; font-size: 10px; letter-spacing: 0.08em; cursor: pointer; transition: all 0.2s;
+  }
+  .qr-mode-btn:last-child { border-right: none; }
+  .qr-mode-btn.active { background: var(--surface2); color: var(--accent); }
+  .qr-mode-btn:hover:not(.active) { color: var(--text); }
+  .qr-live-info { width: 100%; display: flex; flex-direction: column; gap: 8px; }
+  #qrLiveStatus { font-size: 11px; line-height: 1.5; text-align: center; color: var(--muted); letter-spacing: 0.03em; min-height: 16px; }
+  #qrLiveStatus.ok   { color: var(--online); }
+  #qrLiveStatus.warn { color: var(--danger); }
+  #qrLiveClaimed { display: flex; gap: 8px; }
+  #qrLiveClaimed input { flex: 1; min-width: 0; }
+  #qrLiveClaimed .scan-btn { width: auto; padding: 9px 12px; white-space: nowrap; }
 
   #qrReader { width: 100%; border: 1px solid var(--border); }
   #qrReader video { border-radius: 0 !important; }

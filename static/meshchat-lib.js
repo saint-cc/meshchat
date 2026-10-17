@@ -607,6 +607,65 @@ function generateX25519Ephemeral() {
 }
 
 /* ══════════════════════════════════════════
+   LIVE (ONE-WAY) QR — pure helpers (see meshchat.js's LIVE QR section)
+   A live QR is the normal shareable address plus a one-time token:
+       <x25519>.<sign>[.<relay>]~<token>
+   The token is base64url of QR_TOKEN_BYTES random bytes. "~" is neither in
+   base64url nor the "." the address itself is joined with, so the split is
+   unambiguous — and an old client that is handed one fails addContact's
+   base64 parse and adds nothing, rather than misreading it.
+
+   The token is NEVER transmitted. It is mixed into the key the scanner's
+   introduction is encrypted under (deriveIntroWrapKey), so a packet only
+   decrypts for someone who actually saw the QR — and neither the relay nor
+   a later key compromise ever sees it on the wire.
+══════════════════════════════════════════ */
+const QR_TOKEN_SEP   = "~";
+const QR_TOKEN_BYTES = 16;                            // 128-bit one-time secret
+const QR_TOKEN_RE    = /^[A-Za-z0-9_-]{22}$/;         // base64url(16 bytes), unpadded
+const QR_INTRO_INFO  = "meshchat-v1:qr-intro";        // own HKDF domain, distinct from every other label in this file
+
+function formatOneWayKey(shareableKey, tokenB64) {
+  return shareableKey + QR_TOKEN_SEP + tokenB64;
+}
+
+// Pasted/scanned text -> { key, token }. token is null for a plain address.
+// A malformed token yields { key: null, token: null } — never a plain-key
+// fallback, so a mangled live QR can't half-work as an ordinary add.
+function parseOneWayKey(text) {
+  const t = String(text || "").trim();
+  const i = t.indexOf(QR_TOKEN_SEP);
+  if (i < 0) return { key: t, token: null };
+  const key = t.slice(0, i), token = t.slice(i + 1);
+  if (!key || !QR_TOKEN_RE.test(token)) return { key: null, token: null };
+  return { key, token };
+}
+
+// Shareable address -> { x25519PublicKey, signPublicKey, relayWss } or null.
+// Same rules addContact applies inline (2–3 dot-separated segments, two
+// 32-byte keys, optional base64 relay URL) — kept separate so the live-QR
+// code can validate an address WITHOUT creating a contact first.
+function parseShareableKey(key) {
+  try {
+    const parts = String(key).split(".");
+    if (parts.length < 2 || parts.length > 3) return null;
+    const x25519PublicKey = base64ToRaw(parts[0]);
+    const signPublicKey   = base64ToRaw(parts[1]);
+    if (x25519PublicKey.length !== 32 || signPublicKey.length !== 32) return null;
+    const relayWss = (parts.length === 3 && parts[2]) ? atob(parts[2]) : null;
+    return { x25519PublicKey, signPublicKey, relayWss };
+  } catch { return null; }
+}
+
+// Key an introduction is encrypted under: HKDF(salt = token, ikm = X25519
+// (scanner's ephemeral, shower's static)). Without the token the packet is
+// undecryptable, so the AES-GCM tag check IS the token check — no secret is
+// ever compared in the clear or sent anywhere.
+async function deriveIntroWrapKey(sharedSecret, tokenBytes) {
+  return importEncKey(await hkdfBits(tokenBytes, sharedSecret, QR_INTRO_INFO));
+}
+
+/* ══════════════════════════════════════════
    HELPERS
 ══════════════════════════════════════════ */
 function updateRelay(contact, wss, ts) {

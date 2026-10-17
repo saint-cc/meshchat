@@ -2007,6 +2007,182 @@ async function handleHello(msg, plain, valid, viaX4DH) {
 }
 
 /* ══════════════════════════════════════════
+   LIVE (ONE-WAY) QR   [reasoned-not-observed until run live]
+   The normal address QR is two-way: each side has to add the other, because
+   receiveMessage drops every sender who isn't a contact. A live QR lets ONE
+   side show and the other scan:
+
+     shower  arms a token (armQrLive) and shows  <address>~<token>
+     scanner adds the shower (addContact) and sends an INTRODUCTION — an
+             app:message whose blob is encrypted under
+               HKDF(salt = token, ikm = X25519(scanner ephemeral, shower static))
+             and carries { ek, intro:1 } beside iv/data. The payload is the
+             scanner's own address + deviceId/endpointId.
+     shower  (handleQrIntro) decrypts it, checks the scanner's address hashes
+             to the packet's `from`, verifies the envelope signature with the
+             key from that address, then adds the scanner and sends the usual
+             hello, which bootstraps X4DH exactly as for any new contact.
+
+   Why it can't be hijacked (the properties, and what each one stops):
+   - The token is never sent. It is only a KDF salt, so the AES-GCM tag check
+     is the token check: no token, no decrypt. The relay sees ek + ciphertext.
+   - Single use: the first introduction that fully verifies burns it. A relay
+     replaying the packet, or a later scan of a photo of the QR, finds nothing
+     armed. A fresh arm is a fresh token, so old ciphertexts stay dead.
+   - Short-lived: QR_TOKEN_TTL_MS from arming, judged on OUR clock at the time
+     the packet is processed (not on anything the sender claims) — a packet the
+     relay buffered and delivers late is rejected. Closing the Add Contact
+     dialog disarms immediately; the token lives in memory only.
+   - Self-certifying identity: the address in the payload must hash to the
+     packet's `from`, and the envelope signature must verify under the signing
+     key in that address. Nobody can be added AS someone else, and a relay
+     can't rewrite `from`, `to` or `type` (AAD + signature, as for any
+     app:message).
+   - Nothing happens unless armed: a non-contact's packet is dropped before any
+     crypto unless a live token exists, and a wrong-token junk packet costs one
+     X25519 + one failed GCM tag. It never disarms the QR, so a stranger can't
+     kill your QR by spamming it.
+   - Claims are serialised (qrLive.claiming): two valid introductions arriving
+     together can't both win; the loser is dropped.
+   - A failed verification never burns the token (only a full success does).
+
+   What it does NOT stop, by construction: anyone who gets the token itself —
+   a photo of the screen, a shoulder-surfer — and reaches us before the
+   intended scanner can add THEMSELVES as a contact (one winner, since it is
+   single use). The shower sees who was added (placeholder name + short id, and
+   a rename field in the dialog); the intended scanner sees no hello come back.
+   That is the price of a bearer token with no second step, and why it is
+   short-lived and single-use.
+
+   Needs the shower online while the QR is up — the offline two-way QR is
+   unchanged for when that isn't possible. The relay needs no change: an
+   introduction is an ordinary app:message (buffered if the shower is briefly
+   disconnected, but then rejected once the token has expired).
+══════════════════════════════════════════ */
+const QR_TOKEN_TTL_MS = 120_000;
+const qrLive = { gen: 0, tokenBytes: null, tokenB64: null, expiresAt: 0, claiming: false, timer: null };
+
+// Snapshot for the UI. Never exposes the token itself.
+function getQrLiveState() { return { armed: !!qrLive.tokenBytes, expiresAt: qrLive.expiresAt }; }
+
+// Arm a fresh token (replacing any live one). Returns { text, expiresAt } — text
+// is what the QR / copy box shows — or null when there is nothing to arm for.
+function armQrLive() {
+  if (!state.publicId || !state.shareableKey) return null;
+  disarmQrLive("re-armed", { notify: false });
+  qrLive.gen++;
+  qrLive.tokenBytes = crypto.getRandomValues(new Uint8Array(QR_TOKEN_BYTES));
+  qrLive.tokenB64   = rawToBase64(qrLive.tokenBytes);
+  qrLive.expiresAt  = Date.now() + QR_TOKEN_TTL_MS;
+  qrLive.claiming   = false;
+  qrLive.timer      = setTimeout(() => disarmQrLive("expired"), QR_TOKEN_TTL_MS);
+  mlog.info(`QR_LIVE    armed  (valid ${QR_TOKEN_TTL_MS / 1000}s, single use)`);
+  return { text: formatOneWayKey(state.shareableKey, qrLive.tokenB64), expiresAt: qrLive.expiresAt };
+}
+
+// notify:false for disarms the UI itself asked for (it already knows).
+// onQrLiveEnded is defined in meshchat-gui.js.
+function disarmQrLive(reason, { notify = true, claimedId = null } = {}) {
+  const was = !!qrLive.tokenBytes;
+  clearTimeout(qrLive.timer);
+  qrLive.timer = null;
+  if (qrLive.tokenBytes) qrLive.tokenBytes.fill(0);
+  qrLive.tokenBytes = null; qrLive.tokenB64 = null; qrLive.expiresAt = 0; qrLive.claiming = false;
+  if (!was) return;
+  mlog.info(`QR_LIVE    disarmed (${reason})`);
+  if (notify && typeof onQrLiveEnded === "function") onQrLiveEnded(reason, claimedId);
+}
+
+// SCANNER side — one entry point for every add. A plain address is just
+// addContact; an address carrying a token also sends the introduction.
+async function addContactViaQr(name, text) {
+  const { key, token } = parseOneWayKey(text);
+  if (!key) return { ok: false, error: "that isn't a valid key" };
+  if (!await addContact(name, key, true)) return { ok: false, error: "that isn't a valid key" };
+  if (!token) return { ok: true, oneWay: false };
+  const parsed = parseShareableKey(key);
+  const id = parsed && await deriveIdentityPublicId(parsed.x25519PublicKey, parsed.signPublicKey);
+  if (!id || id === state.publicId) return { ok: true, oneWay: false };
+  return { ok: true, oneWay: true, id, sent: await sendQrIntro(id, token) };
+}
+
+async function sendQrIntro(contactId, tokenB64) {
+  const contact = state.contacts[contactId];
+  if (!contact?.x25519PublicKey) return false;
+  try {
+    const tokenBytes = base64ToRaw(tokenB64);
+    if (tokenBytes.length !== QR_TOKEN_BYTES) return false;
+    const payload = { id: crypto.randomUUID(), type: "intro", ts: Date.now(), addr: state.shareableKey,
+                      deviceId: state.deviceId, endpointId: state.endpointId };
+    const eph     = generateX25519Ephemeral();
+    const wrapKey = await deriveIntroWrapKey(x25519.getSharedSecret(eph.priv, contact.x25519PublicKey), tokenBytes);
+    const type = "app:message", to = contactId;
+    const blob = await encryptMessage(wrapKey, payload, envelopeAad(type, state.publicId, to));
+    blob.intro = 1;
+    blob.ek    = Array.from(eph.pub);            // inside the signature: the sig covers the whole blob
+    const obj = { type, from: state.publicId, to, blob, sig: signEnvelope(type, state.publicId, to, blob) };
+    const viaRelay = sendToRelay(contactId, obj, true);
+    if (!viaRelay) sendSignal(obj);
+    mlog.info(`→ QR_INTRO     to   ${pid(contactId)}  via=${viaRelay ? "relay" : "signal(fallback)"}`);
+    return true;
+  } catch(e) {
+    mlog.warn(`→ QR_INTRO     to   ${pid(contactId)} — send failed: ${e.message}`);
+    return false;
+  }
+}
+
+// SHOWER side — called from receiveMessage for a packet from a NON-contact that
+// carries blob.intro. Everything below fails closed and silently (no reply to a
+// stranger: nothing to reflect, nothing for a prober to learn from).
+async function handleQrIntro(msg) {
+  const gen = qrLive.gen;
+  if (!qrLive.tokenBytes || qrLive.claiming || Date.now() >= qrLive.expiresAt) {
+    mlog.debug(`← QR_INTRO     from ${pid(msg.from)} — no live QR, dropped`);
+    return;
+  }
+  const ek = msg.blob.ek;
+  if (msg.type !== "app:message" || msg.blob.v !== 2 || !msg.sig || typeof msg.from !== "string" ||
+      !Array.isArray(ek) || ek.length !== 32 || !ek.every(b => Number.isInteger(b) && b >= 0 && b <= 255)) {
+    mlog.debug(`← QR_INTRO     from ${pid(msg.from)} — malformed, dropped`);
+    return;
+  }
+  const tokenBytes = qrLive.tokenBytes.slice();   // private copy: a disarm mid-await zeroes the original
+  let plain;
+  try {
+    const shared = x25519.getSharedSecret(state.x25519Seed, Uint8Array.from(ek));
+    plain = await decryptMessage(msg.blob, await deriveIntroWrapKey(shared, tokenBytes), envelopeAad(msg.type, msg.from, msg.to));
+  } catch(e) {
+    mlog.debug(`← QR_INTRO     from ${pid(msg.from)} — not decryptable under the live token, ignored`);
+    return;
+  } finally { tokenBytes.fill(0); }
+
+  // The token is proven. Re-check the world after the awaits, then take the claim.
+  if (gen !== qrLive.gen || !qrLive.tokenBytes || qrLive.claiming || Date.now() >= qrLive.expiresAt) return;
+  qrLive.claiming = true;
+  try {
+    if (plain?.type !== "intro" || typeof plain.addr !== "string") throw new Error("malformed payload");
+    const parsed = parseShareableKey(plain.addr);
+    if (!parsed) throw new Error("bad address");
+    const id = await deriveIdentityPublicId(parsed.x25519PublicKey, parsed.signPublicKey);
+    if (id !== msg.from)                          throw new Error("address does not match sender");
+    if (!verifyEnvelope(msg, parsed.signPublicKey)) throw new Error("signature invalid");
+    if (id === state.publicId || state.contacts[id]) throw new Error("already a contact");
+    if (gen !== qrLive.gen || Date.now() >= qrLive.expiresAt) throw new Error("expired mid-claim");
+    if (!await addContact(`QR contact ${pid(id)}`, plain.addr, true)) throw new Error("addContact refused it");
+    // deviceId/endpointId ride inside the verified payload — same facts a hello carries
+    const idLike = s => typeof s === "string" && /^[A-Za-z0-9_-]{8,64}$/.test(s);
+    if (idLike(plain.deviceId) && idLike(plain.endpointId)) recordKnownDevice(id, plain.deviceId, undefined, plain.endpointId);
+    markOnline(id);
+    mlog.info(`← QR_INTRO     from ${pid(id, { deviceId: plain.deviceId, endpointId: plain.endpointId })} — accepted, contact added`);
+    disarmQrLive("claimed", { claimedId: id });   // burn: single use
+    sendHello(id, "qr-intro", 0);
+  } catch(e) {
+    if (gen === qrLive.gen) qrLive.claiming = false;   // a failed check never burns the token
+    mlog.warn(`← QR_INTRO     from ${pid(msg.from)} — rejected: ${e.message}`);
+  }
+}
+
+/* ══════════════════════════════════════════
    HELD OUTBOX (6.0.0)
    With no legacy fallback, a message to a contact we hold no send-ready
    session with cannot go anywhere yet. It is NOT dropped and NOT downgraded:
@@ -4993,6 +5169,9 @@ async function handleSelfSync(msg, plain, valid) {
 async function receiveMessage(msg) {
   if (!msg.from || !msg.blob || !isAddressedToMe(msg.to)) return;
   const contact = state.contacts[msg.from];
+  // A live-QR introduction is the one packet a non-contact may send us (see LIVE
+  // QR). Routed before the contact check; handleQrIntro drops it unless armed.
+  if (!contact && msg.blob.intro === 1) { await handleQrIntro(msg); return; }
   if (!contact || contact.blocked) return;
   markOnline(msg.from);
   try {
