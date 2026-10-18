@@ -8,7 +8,7 @@
    script on the page has finished loading, so the forward
    reference is safe.
 
-   Load order: meshchat-lib.js → meshchat-gui.js → meshchat.js → statemachine.js
+   Load order: meshchat-lib.js → meshchat-gui.js → meshchat.js → meshchat-identity.js → statemachine.js
 ═══════════════════════════════════════════════════════════════ */
 
 /* ══════════════════════════════════════════
@@ -41,6 +41,56 @@ const STATUS_TITLE = { waiting: "waiting for a secure session — it sends autom
 const SYSTEM_ICON = { call: "📞" };
 
 const MAX_DOT_AGE   			= 300_000; 			// = PRUNE_INTERVAL_MS
+
+/* ══════════════════════════════════════════
+   THEME — per identity, per device (localStorage); never synced.
+   Colour sets live in style_local.css as :root[data-theme="…"]; "default"
+   is simply no data-theme attribute. Picked in EDIT CONTACT on your own
+   contact (see contactAction("edit")); applied live on change.
+
+   Two keys:
+     meshchat-theme-<publicId>  this identity's choice on this device
+     meshchat-theme             last theme shown — what the login screen uses
+                                (no identity known yet), and the fallback for an
+                                identity that never picked one
+   Login applies the identity's theme (applyTheme at login in the login
+   handler) without pinning it: an identity only gets its own key once its
+   owner picks something.
+══════════════════════════════════════════ */
+const THEME_KEY = "meshchat-theme";
+const THEMES    = { default: "default (violet)", amber: "amber", matrix: "matrix", solarized: "solarized", dracula: "dracula", monokai: "monokai" };
+
+function themeKeyFor(publicId) { return THEME_KEY + "-" + publicId; }
+
+// `state` is declared in meshchat.js, which loads AFTER this file — at boot it
+// doesn't exist yet (typeof is safe on an undeclared name, plain access throws).
+function themeIdentity() { return typeof state !== "undefined" ? state.publicId : null; }
+
+function readTheme(key) {
+  try { const t = localStorage.getItem(key); return Object.hasOwn(THEMES, t) ? t : null; }
+  catch(e) { return null; }
+}
+
+// This identity's theme if it has picked one, else the last one shown, else default.
+function loadTheme() {
+  const id = themeIdentity();
+  return (id && readTheme(themeKeyFor(id))) || readTheme(THEME_KEY) || "default";
+}
+
+// remember: write the "last shown" key (login screen).  pin: also write this
+// identity's own key (an explicit pick).  Boot passes neither.
+function applyTheme(theme, { remember = true, pin = true } = {}) {
+  if (!Object.hasOwn(THEMES, theme)) theme = "default";
+  if (theme === "default") document.documentElement.removeAttribute("data-theme");
+  else document.documentElement.dataset.theme = theme;
+  try {
+    if (remember) localStorage.setItem(THEME_KEY, theme);
+    const id = themeIdentity();
+    if (pin && id) localStorage.setItem(themeKeyFor(id), theme);
+  } catch(e) {}
+}
+
+applyTheme(loadTheme(), { remember: false, pin: false });   // boot: apply only, no identity yet
 
 const mlog = (() => {
   const ts    = () => new Date().toLocaleTimeString([], { hour:"2-digit", minute:"2-digit", second:"2-digit", hour12:false });
@@ -1130,7 +1180,7 @@ function formatPacketInfo(msgId) {
 
   return packetRenderBlock(
     { metadata: buildStoredMetadata(stored.msg, stored.contactId) },
-    "wire packet not cached — showing stored metadata only"
+    "wire packet not cached this session — showing stored metadata only"
   );
 }
 
@@ -1468,6 +1518,23 @@ function contactAction(action) {
         supported ? "push notifications on this device" : "push notifications — not supported in this browser"
       ));
       editForm.appendChild(pushRow);
+    }
+
+    // theme — self only, per identity on this device, applied live (CANCEL doesn't revert).
+    if (isMe) {
+      const themeRow = document.createElement("label");
+      themeRow.style.cssText = "display:flex;align-items:center;gap:8px;font-size:11px;color:var(--muted)";
+      themeRow.appendChild(document.createTextNode("theme (this identity, this device)"));
+      const themeSelect = document.createElement("select");
+      for (const [value, label] of Object.entries(THEMES)) {
+        const o = document.createElement("option");
+        o.value = value; o.textContent = label;
+        themeSelect.appendChild(o);
+      }
+      themeSelect.value = loadTheme();
+      themeSelect.addEventListener("change", () => applyTheme(themeSelect.value));
+      themeRow.appendChild(themeSelect);
+      editForm.appendChild(themeRow);
     }
 
     // datalist — unique WSS values collected from all contacts
@@ -1901,6 +1968,10 @@ document.getElementById("loginButton").onclick = async (e) => {
 	// publicId binds BOTH keys (deriveIdentityPublicId, lib.js) — see the
 	// comment there for why hashing only the X25519 key would be exploitable.
 	state.publicId=await deriveIdentityPublicId(x25519PublicKey,signPublicKey);
+	// one identity, one tab per browser profile — see meshchat-identity.js.
+	// Before anything touches storage or the network.
+	if (!(await claimIdentityOrAsk())) { status.textContent = "identity already open in another tab"; btn.disabled = false; return; }
+	applyTheme(loadTheme(), { pin: false });   // this identity's theme (or the last shown one) — see THEME above
 	state.shareableKey=rawToBase64(x25519PublicKey)+"."+rawToBase64(signPublicKey);
 	state.cryptoKey=await importEncKey(keys.backupKey);
 	// "our own" AES key, for self-targeted traffic (multi-device sync,
@@ -1941,7 +2012,7 @@ document.getElementById("loginButton").onclick = async (e) => {
     mlog.info(`LOGIN      ${name}  ${pid(state.publicId)}`);
     renderContactList();
     connectSignal();
-  } catch(e) { status.textContent = e.message || "error during login"; btn.disabled = false; }
+  } catch(e) { releaseIdentity(); status.textContent = e.message || "error during login"; btn.disabled = false; }
 };
 
 /* ══════════════════════════════════════════

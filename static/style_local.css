@@ -1,14 +1,111 @@
-  :root {
-    --bg:       #0d0d0d;
-    --surface:  #141414;
-    --surface2: #1a1a1a;
-    --border:   #2a2a2a;
-    --muted:    #555;
-    --dim:      #888;
-    --text:     #e0e0e0;
-    --accent:   #4fc3f7;
-    --online:   #4caf50;
-    --mine:     #1e3a4a;
-    --theirs:   #1e1e1e;
-    --danger:   #e57373; 
-  }
+:root {
+  --bg:       #0b0b12;
+  --surface:  #12121c;
+  --surface2: #191927;
+  --border:   #30304a;
+  --muted:    #5f5f78;
+  --dim:      #9090a8;
+  --text:     #e6e6f0;
+  --accent:   #a78bfa;
+  --online:   #5ee6a8;
+  --mine:     #292044;
+  --theirs:   #20202b;
+  --danger:   #ff7b8a;
+}
+
+/* ── themes — picked per device in EDIT CONTACT (own contact), stored in
+   localStorage "meshchat-theme" (see applyTheme in meshchat-gui.js).
+   "default" is no data-theme attribute at all, i.e. the :root above.
+   Each theme sets the full variable set: a theme that left --muted/--dim/
+   --online/--danger alone would keep the violet-tinted defaults. ── */
+:root[data-theme="amber"] {
+  --bg:       #111210;
+  --surface:  #1b1c18;
+  --surface2: #252720;
+  --border:   #383a30;
+  --muted:    #7a7866;
+  --dim:      #aaa793;
+  --text:     #e6e5d8;
+  --accent:   #e4b363;
+  --online:   #a8d672;
+  --mine:     #34372a;
+  --theirs:   #20221d;
+  --danger:   #e8766a;
+}
+
+:root[data-theme="matrix"] {
+  --bg:       #050b08;
+  --surface:  #0b1510;
+  --surface2: #102019;
+  --border:   #1b3b2b;
+  --muted:    #3f6b55;
+  --dim:      #7fb596;
+  --text:     #c8f7d5;
+  --accent:   #00ff99;
+  --online:   #00ff99;
+  --mine:     #103b29;
+  --theirs:   #101a14;
+  --danger:   #ff6b7a;
+}
+
+
+/* ── Solarized Dark ──
+   Classic low-contrast blue-green terminal palette */
+:root[data-theme="solarized"] {
+  --bg:       #002b36;
+  --surface:  #073642;
+  --surface2: #0b3d49;
+  --border:   #31545b;
+  --muted:    #657b83;
+  --dim:      #839496;
+  --text:     #93a1a1;
+  --accent:   #268bd2;
+  --online:   #859900;
+  --mine:     #094451;
+  --theirs:   #073642;
+  --danger:   #dc322f;
+}
+
+/* ── Dracula ──
+   Purple accents, cool greys, vivid status colours */
+:root[data-theme="dracula"] {
+  --bg:       #282a36;
+  --surface:  #21222c;
+  --surface2: #343746;
+  --border:   #44475a;
+  --muted:    #6272a4;
+  --dim:      #bd93f9;
+  --text:     #f8f8f2;
+  --accent:   #bd93f9;
+  --online:   #50fa7b;
+  --mine:     #403650;
+  --theirs:   #30323f;
+  --danger:   #ff5555;
+}
+
+/* ── Monokai ──
+   Warm charcoal, pink accents, lime-green status */
+:root[data-theme="monokai"] {
+  --bg:       #272822;
+  --surface:  #1e1f1c;
+  --surface2: #34352f;
+  --border:   #49483e;
+  --muted:    #75715e;
+  --dim:      #a6a28c;
+  --text:     #f8f8f2;
+  --accent:   #f92672;
+  --online:   #a6e22e;
+  --mine:     #40342e;
+  --theirs:   #2d2e27;
+  --danger:   #f92672;
+}
+
+/* theme picker in EDIT CONTACT */
+select {
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  font-family: inherit;
+  font-size: 11px;
+  padding: 4px 6px;
+}
