@@ -11,6 +11,58 @@ work, not yet cut as a numbered release.
 
 ---
 
+## Unreleased
+
+Dev-cycle work on top of `0.6.0`, not yet cut as a numbered release.
+
+- **New: live (one-way) QR for adding a contact.** The address QR is two-way: each
+  side has to add the other, because `receiveMessage` drops every sender who isn't
+  a contact — so a phone and a PC with no camera could never complete an exchange.
+  The Add Contact dialog's MY QR tab now has an **OFFLINE · two-way** / **LIVE ·
+  one-way** switch (offline stays the default and is exactly the old flow). A live
+  QR is `<address>~<token>`: one side shows it, the other scans or pastes it, and
+  the shower adds the scanner automatically. It needs the shower online while the
+  QR is up; it works once, for 2 minutes (`QR_TOKEN_TTL_MS`).
+  - **Mechanism.** The scanner adds the shower, then sends an *introduction*: an
+    ordinary `app:message` whose blob is encrypted under
+    `HKDF(salt = token, ikm = X25519(scanner ephemeral, shower static))` and
+    carries `{ intro: 1, ek }` beside `iv`/`data`. Its payload is the scanner's own
+    address plus `deviceId`/`endpointId`. The shower (`handleQrIntro`) decrypts it,
+    requires the address to hash to the packet's `from`, verifies the envelope
+    signature with the signing key from that address, then adds the contact and
+    sends the usual hello, which bootstraps X4DH. **No relay change** — an
+    introduction is an `app:message`, buffered if the shower is briefly offline.
+  - **Hijack resistance.** The token is never transmitted, only a KDF salt, so the
+    AES-GCM tag check *is* the token check. Single use: only a fully verified
+    introduction burns it (a failed one never does, so strangers can't kill a QR by
+    spamming it). Expiry is judged on the shower's own clock when the packet is
+    processed, so a packet a relay buffered and flushes late is rejected. Closing
+    the dialog or switching mode disarms at once; an expired QR is not re-armed
+    automatically (NEW QR). Identity is self-certifying (address must hash to
+    `from`, signature must verify under that address's key) and the packet is bound
+    to `[type, from, to]` like any envelope. Claims are serialised, so two valid
+    introductions arriving together cannot both win. Non-contact packets are
+    dropped before any crypto unless a token is armed.
+  - **Residual risk, by construction.** Whoever gets the token itself — a photo of
+    the screen, a shoulder-surfer — and reaches the shower first can add *themselves*
+    (one winner, single use). The shower sees who was added (placeholder name plus
+    short id, with a rename field in the dialog) and the intended scanner sees no
+    hello come back. Never sent: the scanner's username (a derivation input), so
+    the placeholder name is local.
+  - **UI.** A pasted/scanned live key says so and warns it expires. Live QRs are
+    drawn larger with a lower error-correction level (M, 240px) because the longer
+    string at the default level (H) gave modules too small to scan off a PC screen.
+  - **Tests.** Two simulated clients running the real `meshchat.js` functions:
+    happy path, replay, wrong token, junk flood, expiry, forged `from`/address/
+    signature, ten relay tamperings, two simultaneous claims, malformed ids.
+    Removing any one of the signature, address-binding, burn, claim-lock, expiry or
+    token-in-KDF checks makes a test fail. Not yet run against a live relay.
+- **Added:** `parseOneWayKey`, `formatOneWayKey`, `parseShareableKey`,
+  `deriveIntroWrapKey` (lib); `armQrLive`/`disarmQrLive`/`addContactViaQr`/
+  `sendQrIntro`/`handleQrIntro` (meshchat.js).
+
+---
+
 ## 0.5.9
 
 Rolls up the 0.5.6–0.5.9 work as one entry (as with `0.5.5`, the individual cut
