@@ -1180,7 +1180,7 @@ function formatPacketInfo(msgId) {
 
   return packetRenderBlock(
     { metadata: buildStoredMetadata(stored.msg, stored.contactId) },
-    "wire packet not cached this session — showing stored metadata only"
+    "wire packet not cached — showing stored metadata only"
   );
 }
 
