@@ -60,7 +60,71 @@ Dev-cycle work on top of `0.6.0`, not yet cut as a numbered release.
 - **Added:** `parseOneWayKey`, `formatOneWayKey`, `parseShareableKey`,
   `deriveIntroWrapKey` (lib); `armQrLive`/`disarmQrLive`/`addContactViaQr`/
   `sendQrIntro`/`handleQrIntro` (meshchat.js).
-
+- **New: auto login ("remember me on this device") and logout.** The login screen
+  has an **Auto login** checkbox and the sidebar footer has a **LOGOUT** button.
+  Files: `index.html`, `meshchat-identity.js`, plus one-line hooks in
+  `meshchat-gui.js` (login handler calls `deriveMasterSecretOrRemembered`) and
+  `meshchat.js` (`selfDestruct()` calls `forgetRemembered()`). LOGOUT lives in the
+  settings panel (below).
+  - **Why not browser autofill.** The first attempt waited for the password
+    manager to fill the form and then pressed ENTER. It cannot work: Chrome keeps
+    an autofilled password hidden from scripts until a user gesture, phones need a
+    tap on the suggestion, and Safari has no silent credential API. Dropped.
+  - **What is stored.** Not the passphrase: the 32-byte PBKDF2 master secret and the
+    username, in IndexedDB (`meshchat-remember`), AES-GCM-encrypted under a
+    non-extractable WebCrypto key kept beside it; the username is bound as
+    additional data. With the box ticked a typed login is remembered once the
+    identity lock is won; the next page load logs in with no input and skips the
+    1,000,000-iteration derivation. Checkbox state is `localStorage["meshchat_autologin"]`.
+  - **Forgetting.** Logout, BURN (`selfDestruct`) and unticking the box all delete
+    the record. Logout is therefore also "forget this device". No expiry.
+  - **Safety, honestly.** The master secret *is* the identity and cannot be
+    revoked. The non-extractable key stops a script or a storage dump from copying
+    the key bytes; it does not stop a script asking the page to decrypt, and it is
+    no protection against someone with the browser profile. A remembered login also
+    drops the passphrase-derived at-rest encryption of contacts and sessions on that
+    device. Off by default; the checkbox says what it stores.
+  - **Never asks, never fights.** An auto login that finds the identity open in
+    another tab does not show the take-over `confirm()`: it retries the lock once,
+    then gives up and leaves manual ENTER (which asks as before). Logout and being
+    displaced by another tab mark that tab "no auto login"
+    (`sessionStorage["meshchat_no_autologin"]`); a manual login lifts the mark.
+  - **Fails closed.** Missing either hook, no IndexedDB/WebCrypto, or a private
+    mode that blocks storage disables the checkbox with a note, instead of letting
+    the placeholder passphrase reach the real KDF (which would log into a different,
+    empty identity with no error). A failed remembered login keeps the record: one
+    page load makes one attempt, so nothing loops.
+  - **Logout** is a full reload that keeps all local data: it ends or declines live
+    call / data sessions, awaits `saveContacts` and `saveX4DHSessions`, pauses
+    300 ms (as `commitBurn` does), closes the socket without its reconnect handler,
+    forgets the remembered login, releases the identity lock and reloads. Held
+    messages go out at the next login.
+  - **Not observed.** Tested against a stubbed DOM / Web Locks / IndexedDB with real
+    WebCrypto, not in a browser. Reasoned from the APIs: storing a `CryptoKey` in
+    IndexedDB on iOS Safari, and Safari clearing site storage after ~7 days without
+    a visit unless the app is on the Home Screen (the remembered login then simply
+    disappears).
+- **Changed: one settings panel, split by scope.** Everything about *you* or *this
+  device* moved out of the sidebar header buttons and the ⋯ menu on your own chat
+  into a single panel (⚙, or tap your name in the sidebar header):
+  - **This device** (local, never synced): push notifications, theme,
+    backup/restore, log, logout.
+  - **Identity** (shared with your other devices): relay override, MIGRATE. Hint
+    text spells out the difference — the override tells nobody, MIGRATE notifies
+    contacts and devices.
+  - **Danger:** BURN.
+  - The sidebar header is now `[title/meta] [+] [⚙]`; the footer keeps only the
+    connection dot and label. The ⋯ menu on a *contact* is SYNC / EDIT / BLOCK; your
+    own chat has no ⋯ menu, so editing your own contact's display name is gone
+    (it was `<user> (me)`).
+  - Push and theme apply immediately; the relay has its own SAVE (restarts the
+    connection, like the old EDIT-on-self did). `contactAction("migrate"|"burn")`
+    no longer needs a chat to be open.
+- **Removed: DELETE contact.** Not a real feature yet; BLOCK is the model ("block,
+  not forget"). The branch in `contactAction` and the button are gone.
+- **Fixed: EDIT CONTACT stored `wss://` as a relay.** The relay field's default for
+  a contact with no relay is the bare string `wss://`, which a plain rename-and-save
+  stored as the contact's `lastRelay`. Untouched `wss://` now means "no override".
 ---
 
 ## 0.5.9
