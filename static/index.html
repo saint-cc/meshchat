@@ -2,7 +2,7 @@
 <html id="htmlRoot">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0"> 
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>MeshChat</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' fill='%23000'/%3E%3Cpath d='M3 8h10' stroke='%2300ffcc' stroke-width='2'/%3E%3Ccircle cx='8' cy='8' r='2' fill='%2300ffcc'/%3E%3C/svg%3E">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
@@ -44,6 +44,32 @@ if ("serviceWorker" in navigator) {
   text-align: center;
   white-space: pre-line;
 }
+
+/* ── login checkboxes: "show password" and "auto login" ──
+   #loginBox input (style.css) styles every input as a text field — padding,
+   border, background — which is wrong for a checkbox. The rule below is
+   scoped to checkboxes inside the login box only. */
+#loginBox label.loginOpt {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 12px; color: var(--dim); cursor: pointer;
+}
+#loginBox label.loginOpt input[type="checkbox"] {
+  padding: 0; margin: 0; width: auto; accent-color: var(--accent); cursor: pointer;
+}
+#autoLoginHint {
+  font-size: 10px; color: var(--muted); line-height: 1.5; letter-spacing: 0.03em;
+  margin-top: -6px;
+}
+
+/* ── logout button (sidebar footer, right of the connection dot + label) ── */
+#logoutBtn {
+  margin-left: auto; flex-shrink: 0;
+  background: none; border: 1px solid var(--border); color: var(--dim);
+  padding: 3px 10px; font-family: inherit; font-size: 10px; letter-spacing: 0.12em;
+  cursor: pointer; transition: border-color 0.2s, color 0.2s;
+}
+#logoutBtn:hover:not(:disabled) { border-color: var(--danger); color: var(--danger); }
+#logoutBtn:disabled { opacity: 0.4; cursor: default; }
 </style>
 </head>
 <body>
@@ -56,17 +82,27 @@ if ("serviceWorker" in navigator) {
       <div class="subtitle">decentralised · encrypted · yours</div>
       <input id="inputName" placeholder="user" autocomplete="username" spellcheck="false">
       <input id="inputPassphrase" type="password" placeholder="passphrase" autocomplete="current-password">
-	  <label>
-		<input type="checkbox" onchange="togglePw(this)">
-		Show password
-	  </label>
+      <label class="loginOpt">
+        <input type="checkbox" onchange="togglePw(this)">
+        Show password
+      </label>
+      <!-- auto login = "remember me on this device": the checkbox state lives in localStorage
+           (meshchat_autologin), the secret (PBKDF2 master secret, wrapped under a non-extractable
+           key) in IndexedDB, the logic in meshchat-identity.js — see AUTO LOGIN there. -->
+      <label class="loginOpt">
+        <input type="checkbox" id="autoLoginChk">
+        Auto login
+      </label>
+      <div id="autoLoginHint">
+        keeps you logged in on this device until you log out. stores a login secret (not your passphrase) in this browser — anyone with access to this browser can open your identity.
+      </div>
 
       <button id="loginButton" type="button">ENTER</button>
       <div id="loginStatus"></div>
-	  <div class="bar-container">
+      <div class="bar-container">
         <div id="barEntr" class="barEntr"></div>
       </div>
-	  <div class="labelEntr" id="labelEntr">entropy: 0 bits</div>
+      <div class="labelEntr" id="labelEntr">entropy: 0 bits</div>
       <div id="loginNotice">
         <strong>note —</strong> your name and passphrase are your identity.<br>
         choose something unique. no recovery without them.
@@ -83,18 +119,22 @@ if ("serviceWorker" in navigator) {
         <div id="sidebarTitle">MESHCHAT</div>
         <div id="sidebarMeta">not connected</div>
       </div>
-	  <button id="exportBtn" class="chat-action-btn">💾</button>
-	  <button id="meshLogToggle" onclick="mlog.toggle()">>_</button>
+      <button id="exportBtn" class="chat-action-btn">💾</button>
+      <button id="meshLogToggle" onclick="mlog.toggle()">>_</button>
       <button id="addContactBtn" title="Add contact">+</button>
     </div>
     <ul id="contactList"></ul>
-	<div id="showBlockedToggle" style="display:none">
+    <div id="showBlockedToggle" style="display:none">
       <button id="showBlockedBtn"></button>
-	</div>
+    </div>
     <div id="syncStatus"></div>
     <div id="connectionStatus">
       <div id="connDot"></div>
       <span id="connLabel">disconnected</span>
+      <!-- logout: nothing is wiped (that is BURN) — contacts, sessions and held messages stay
+           encrypted in localStorage and are picked up again at the next login. See logout()
+           in meshchat-identity.js. -->
+      <button id="logoutBtn" type="button" title="Log out — keeps everything on this device, returns to the login screen">LOGOUT</button>
     </div>
   </div>
 
@@ -110,18 +150,18 @@ if ("serviceWorker" in navigator) {
           <div id="emptyChat">select a contact to start chatting</div>
           <div id="chatHeaderName" style="display:none"></div>
           <div id="chatHeaderId"   style="display:none"></div>
-          <div id="chatHeaderRelay" style="display:none;font-size:10px;color:var(--muted);margin-top:2px;letter-spacing:0.05em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis"></div>		  
-        </div>		
-		<button id="callBtn" title="Call">☎</button>
-		<button id="dataBtn" title="Test data channel">⇄</button>
-		<button id="contactMenuBtn" title="Contact options">⋯</button>
+          <div id="chatHeaderRelay" style="display:none;font-size:10px;color:var(--muted);margin-top:2px;letter-spacing:0.05em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis"></div>
+        </div>
+        <button id="callBtn" title="Call">☎</button>
+        <button id="dataBtn" title="Test data channel">⇄</button>
+        <button id="contactMenuBtn" title="Contact options">⋯</button>
       </div>
       <div class="contact-dropdown" id="contactDropdown">
-	    <button id="syncBtn"   class="chat-action-btn">SYNC</button>
+        <button id="syncBtn"   class="chat-action-btn">SYNC</button>
         <button onclick="contactAction('edit')">EDIT</button>
         <button id="blockToggleBtn" onclick="contactAction('block')">BLOCK</button>
         <button class="danger" onclick="contactAction('delete')">DELETE</button>
-		
+
       </div>
     </div>
     <!-- conversation info: the toggle straddles the header's bottom border (zero-height row,
@@ -194,7 +234,7 @@ if ("serviceWorker" in navigator) {
     <div class="qr-tabs">
       <button class="qr-tab active" id="tabShow"  onclick="switchTab('show')">MY QR</button>
       <button class="qr-tab"        id="tabScan"  onclick="switchTab('scan')">SCAN</button>
-      <button class="qr-tab"        id="tabPaste" onclick="switchTab('paste')">PASTE</button>      
+      <button class="qr-tab"        id="tabPaste" onclick="switchTab('paste')">PASTE</button>
     </div>
     <div class="qr-panel active" id="panelShow">
       <div class="qr-mode" id="qrMode">
@@ -224,7 +264,7 @@ if ("serviceWorker" in navigator) {
     </div>
     <div class="qr-panel" id="panelPaste">
       <div class="hint">paste their key below</div>
-    </div>   
+    </div>
     <input id="modalContactName" placeholder="contact name" autocomplete="off">
     <input id="modalContactKey"  placeholder="their key" autocomplete="off" spellcheck="false">
     <div class="hint" id="modalKeyHint"></div>

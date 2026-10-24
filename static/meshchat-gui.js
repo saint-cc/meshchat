@@ -1952,7 +1952,7 @@ document.getElementById("loginButton").onclick = async (e) => {
   btn.disabled = true;
   status.textContent = "deriving keys…";
   try {
-    const master = await deriveMasterSecret(name, pass);
+    const master = await deriveMasterSecretOrRemembered(name, pass);
     const keys   = await hkdfExpand(master);
 	state.user=name;
 	state.keys=keys;

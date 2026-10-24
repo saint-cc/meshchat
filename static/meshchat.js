@@ -5582,6 +5582,7 @@ async function burnBlockContact(id) {
    extra needed for it.
 ══════════════════════════════════════════ */
 function selfDestruct() {
+  forgetRemembered();
   const suffix = "_" + state.publicId;
   [STORAGE_KEY, PEER_BACKUP_KEY, PEER_TOKEN_KEY, DEVICE_REGISTRY_KEY, DEVICE_KEY_STORAGE, X4DH_SESSION_KEY]
     .forEach(key => localStorage.removeItem(key + suffix));
