@@ -765,46 +765,13 @@ function openChat(id) {
   updateDataHeaderBtn(id);
   const menuBtn = document.getElementById("contactMenuBtn");
   const isMe    = c.publicId === state.publicId;
-  menuBtn.classList.add("visible");
-  document.getElementById("syncBtn").style.display          = isMe ? "none" : "";
-  document.getElementById("blockToggleBtn").style.display   = isMe ? "none" : "";
-  document.querySelector("#contactDropdown .danger").style.display = isMe ? "none" : "";
+  // The ⋯ menu is for CONTACT actions (SYNC / EDIT / BLOCK). Your own chat has none —
+  // everything about you or this device lives in the settings panel (see SETTINGS below).
+  menuBtn.classList.toggle("visible", !isMe);
   document.addEventListener("click", () => {
     document.querySelectorAll(".devicePopover.open").forEach(p => p.classList.remove("open"));
   });
   if (!isMe) document.getElementById("blockToggleBtn").textContent = c.blocked ? "UNBLOCK" : "BLOCK";
-  // MIGRATE is self-only — inverse of sync/block/delete above. Injected
-  // dynamically rather than added to the static markup, since it didn't
-  // exist when the dropdown was originally built.
-  let migrateBtn = document.getElementById("migrateBtn");
-  if (isMe) {
-    if (!migrateBtn) {
-      migrateBtn = document.createElement("button");
-      migrateBtn.id = "migrateBtn";
-      migrateBtn.textContent = "MIGRATE";
-      migrateBtn.onclick = () => contactAction("migrate");
-      document.getElementById("contactDropdown").appendChild(migrateBtn);
-    }
-    migrateBtn.style.display = "";
-  } else if (migrateBtn) {
-    migrateBtn.style.display = "none";
-  }
-
-  let burnBtn = document.getElementById("burnBtn");
-  if (isMe) {
-    if (!burnBtn) {
-      burnBtn = document.createElement("button");
-      burnBtn.id = "burnBtn";
-      burnBtn.textContent = "BURN";
-      burnBtn.style.color = "var(--danger)";
-      burnBtn.onclick = () => contactAction("burn");
-      document.getElementById("contactDropdown").appendChild(burnBtn);
-    }
-    burnBtn.style.display = "";
-  } else if (burnBtn) {
-    burnBtn.style.display = "none";
-  }
-
   document.getElementById("contactDropdown").classList.remove("open");
   renderContactList();
   renderMessages();
@@ -1423,7 +1390,8 @@ function closeExportModal() { document.getElementById("exportOverlay").classList
 function contactAction(action) {
   document.getElementById("contactDropdown").classList.remove("open");
   const c = state.contacts[state.currentChat];
-  if (!c) return;
+  // migrate / burn are about YOU, not about the open chat — the settings panel calls them with none open
+  if (!c && action !== "migrate" && action !== "burn") return;
   const title = document.getElementById("contactActionTitle");
   const body  = document.getElementById("contactActionBody");
   const btns  = document.getElementById("contactActionBtns");
@@ -1431,7 +1399,7 @@ function contactAction(action) {
 
   if(action === "edit"){
     title.textContent="EDIT CONTACT";
-    const isMe = c.publicId === state.publicId;
+    // contacts only: your own chat has no ⋯ menu, your settings are in the settings panel
 
     // info display
     const info = document.createElement("div");
@@ -1463,18 +1431,14 @@ function contactAction(action) {
 
     // key field — not applicable to self. Changing your OWN key isn't a
     // contact edit, it's effectively a different identity (new encKey,
-    // new derived publicId) — that's a re-login, not something this modal
-    // should offer. Same reasoning as why sync/block/delete are hidden
-    // for self elsewhere in this menu.
-    let keyInput = null;
-    if (!isMe) {
-      keyInput = document.createElement("input");
-      keyInput.placeholder  = "paste new key to update (optional)";
-      keyInput.name         = "mc-edit-key";
-      keyInput.autocomplete = "off";
-      keyInput.spellcheck   = false;
-      editForm.appendChild(keyInput);
-    }
+    // new derived publicId) — that's a re-login. (Your own contact is no
+    // longer editable here at all; see SETTINGS.)
+    const keyInput = document.createElement("input");
+    keyInput.placeholder  = "paste new key to update (optional)";
+    keyInput.name         = "mc-edit-key";
+    keyInput.autocomplete = "off";
+    keyInput.spellcheck   = false;
+    editForm.appendChild(keyInput);
 
     // relay override — useful for contacts without wss in their key.
     // Chrome's credential-suggestion dropdown ignores autocomplete="off" on
@@ -1498,44 +1462,6 @@ function contactAction(action) {
     relayInput.readOnly = true;
     relayInput.addEventListener("focus", () => { relayInput.readOnly = false; }, { once: true });
     editForm.appendChild(relayInput);
-
-    // push notification opt-in — self only. Per-device:
-    // this reflects/controls THIS browser's subscription, not a global
-    // setting for the identity — see meshchat.js's loadPushPref/
-    // togglePushPref for why that's the deliberate scope.
-    let pushCheckbox = null;
-    const initialPushPref = isMe ? loadPushPref() : false;
-    if (isMe) {
-      const pushRow = document.createElement("label");
-      pushRow.style.cssText = "display:flex;align-items:center;gap:8px;font-size:11px;color:var(--muted)";
-      pushCheckbox = document.createElement("input");
-      pushCheckbox.type = "checkbox";
-      pushCheckbox.checked = initialPushPref;
-      const supported = pushSupported();
-      pushCheckbox.disabled = !supported;
-      pushRow.appendChild(pushCheckbox);
-      pushRow.appendChild(document.createTextNode(
-        supported ? "push notifications on this device" : "push notifications — not supported in this browser"
-      ));
-      editForm.appendChild(pushRow);
-    }
-
-    // theme — self only, per identity on this device, applied live (CANCEL doesn't revert).
-    if (isMe) {
-      const themeRow = document.createElement("label");
-      themeRow.style.cssText = "display:flex;align-items:center;gap:8px;font-size:11px;color:var(--muted)";
-      themeRow.appendChild(document.createTextNode("theme (this identity, this device)"));
-      const themeSelect = document.createElement("select");
-      for (const [value, label] of Object.entries(THEMES)) {
-        const o = document.createElement("option");
-        o.value = value; o.textContent = label;
-        themeSelect.appendChild(o);
-      }
-      themeSelect.value = loadTheme();
-      themeSelect.addEventListener("change", () => applyTheme(themeSelect.value));
-      themeRow.appendChild(themeSelect);
-      editForm.appendChild(themeRow);
-    }
 
     // datalist — unique WSS values collected from all contacts
     const datalist = document.createElement("datalist");
@@ -1562,18 +1488,18 @@ function contactAction(action) {
       c.name = val;
       c.lastStateChange = Date.now();
 
-      // relay override
-      const relayVal  = relayInput.value.trim();
-      const prevRelay = c.lastRelay;
+      // relay override. "wss://" is only the field's placeholder-ish default for a
+      // contact with no relay — leaving it untouched must not store it as a relay.
+      let relayVal = relayInput.value.trim();
+      if (relayVal === "wss://") relayVal = "";
       if (relayVal && relayVal !== c.lastRelay) {
         c.lastRelay = relayVal;
         mlog.info(`CONTACT    relay updated  ${pid(c.publicId)}  wss=${relayVal}`);
       } else if (!relayVal) {
         c.lastRelay = null;
       }
-      const ownRelayChanged = c.publicId === state.publicId && c.lastRelay !== prevRelay;
 
-      const newKey = keyInput ? keyInput.value.trim() : "";
+      const newKey = keyInput.value.trim();
       if (newKey) {
         try {
           const parts = newKey.split(".");
@@ -1593,16 +1519,11 @@ function contactAction(action) {
         }
       }
 
-      if (pushCheckbox && pushCheckbox.checked !== initialPushPref) {
-        await togglePushPref(pushCheckbox.checked);
-      }
-
       await saveContacts();
       document.getElementById("chatHeaderName").textContent = val;
       updateChatRelayInfo(state.currentChat);
       renderContactList();
       closeContactAction();
-      if (ownRelayChanged) rebootSignal();
     };
     nameInput.onkeydown = (e) => { if (e.key === "Enter") document.getElementById("contactActionConfirm").click(); };
 
@@ -1634,31 +1555,6 @@ function contactAction(action) {
       await saveContacts();
       document.getElementById("blockToggleBtn").textContent = c.blocked ? "UNBLOCK" : "BLOCK";
       renderContactList(); closeContactAction();
-    };
-
-  } else if (action === "delete") {
-    title.textContent = "DELETE CONTACT";
-    const hint = document.createElement("div");
-    hint.className = "hint";
-    hint.innerHTML =
-      "<strong style='color:var(--danger)'>Only delete if their key is permanently lost.</strong><br><br>" +
-      "If they might still be reachable, use <em>Block</em> instead — " +
-      "deleted contacts cannot be recovered without their key.";
-    body.appendChild(hint);
-    btns.innerHTML =
-      '<button class="btn-cancel" onclick="closeContactAction()">CANCEL — KEEP</button>' +
-      '<button class="btn-confirm" style="background:var(--danger);border-color:var(--danger)" id="contactActionConfirm">DELETE</button>';
-    document.getElementById("contactActionOverlay").classList.add("open");
-    document.getElementById("contactActionConfirm").onclick = async () => {
-      delete state.contacts[state.currentChat];
-      state.currentChat = null;
-      document.getElementById("emptyChat").style.display      = "block";
-      document.getElementById("chatHeaderName").style.display = "none";
-      document.getElementById("chatHeaderId").style.display   = "none";
-      document.getElementById("contactMenuBtn").classList.remove("visible");
-      document.getElementById("chatMessages").innerHTML = "";
-      setChatInfoVisible(false);
-      await saveContacts(); renderContactList(); closeContactAction();
     };
 
   } else if (action === "migrate") {
@@ -1952,7 +1848,7 @@ document.getElementById("loginButton").onclick = async (e) => {
   btn.disabled = true;
   status.textContent = "deriving keys…";
   try {
-    const master = await deriveMasterSecretOrRemembered(name, pass);
+    const master = await deriveMasterSecretOrRemembered(name, pass);   // meshchat-identity.js: stored master secret when auto-logging in, else the real KDF
     const keys   = await hkdfExpand(master);
 	state.user=name;
 	state.keys=keys;
@@ -2016,12 +1912,101 @@ document.getElementById("loginButton").onclick = async (e) => {
 };
 
 /* ══════════════════════════════════════════
+   SETTINGS — everything that is about YOU or THIS DEVICE, rather than about a
+   conversation, in one panel (⚙ in the sidebar header, or tap your name there).
+   Three scopes, three sections:
+     THIS DEVICE  local, never synced     push · theme · backup/restore · log · logout
+     IDENTITY     synced to your devices  relay (+ MIGRATE, which also tells your contacts)
+     DANGER       BURN
+   Contact-scoped actions (SYNC / EDIT / BLOCK) stay in the ⋯ menu on a contact; your own
+   chat has no ⋯ menu. The markup is static in index.html because
+   meshchat-identity.js wires #logoutBtn at load. Settings apply live — there is no SAVE
+   button except for the relay, which restarts the connection.
+   MIGRATE / BURN / BACKUP open their own dialogs on top of nothing: the panel closes first
+   and is not re-opened afterwards.
+══════════════════════════════════════════ */
+function openSettings() {
+  if (!state.publicId) return;                       // not logged in
+  const me = state.contacts[state.publicId];
+  document.getElementById("settingsWho").textContent = state.user + " · " + state.publicId.slice(0, 16) + "…";
+
+  const supported = pushSupported();
+  const push = document.getElementById("settingsPush");
+  push.disabled = !supported;
+  push.checked  = supported && loadPushPref();
+  document.getElementById("settingsPushLabel").textContent =
+    supported ? "push notifications on this device" : "push notifications — not supported in this browser";
+
+  document.getElementById("settingsTheme").value = loadTheme();
+
+  // Same Chrome credential-dropdown dodge as the EDIT relay field: readonly until focused.
+  const relay = document.getElementById("settingsRelay");
+  relay.value    = me?.lastRelay || "wss://";
+  relay.readOnly = true;
+  relay.addEventListener("focus", () => { relay.readOnly = false; }, { once: true });
+  document.getElementById("settingsRelayStatus").textContent = "";
+
+  document.getElementById("settingsOverlay").classList.add("open");
+}
+function closeSettings() { document.getElementById("settingsOverlay").classList.remove("open"); }
+
+// Own relay override. Same fields the old EDIT-on-self touched (lastRelay + lastStateChange, then a
+// reconnect) — no lastRelaySeen bump, no notice to contacts: that is what MIGRATE is for.
+async function saveOwnRelay() {
+  const me     = state.contacts[state.publicId];
+  const status = document.getElementById("settingsRelayStatus");
+  if (!me) return;
+  let v = document.getElementById("settingsRelay").value.trim();
+  if (v === "wss://") v = "";                        // untouched default = no override
+  const next = v || null, prev = me.lastRelay || null;
+  if (next === prev) { status.textContent = "unchanged"; return; }
+  if (next && !/^wss?:\/\/\S+$/i.test(next)) { status.textContent = "must look like wss://host"; return; }
+  me.lastRelay = next;
+  me.lastStateChange = Date.now();
+  mlog.info(`SETTINGS   own relay ${next ? "set  wss=" + next : "cleared (default relay)"}`);
+  await saveContacts();
+  if (state.currentChat) updateChatRelayInfo(state.currentChat);
+  renderContactList();
+  status.textContent = next ? "saved — reconnecting" : "cleared — reconnecting";
+  rebootSignal();
+}
+
+(function wireSettings() {
+  const $ = (id) => document.getElementById(id);
+  const theme = $("settingsTheme");
+  for (const [value, label] of Object.entries(THEMES)) {
+    const o = document.createElement("option");
+    o.value = value; o.textContent = label;
+    theme.appendChild(o);
+  }
+  theme.addEventListener("change", () => applyTheme(theme.value));   // this identity, this device — see THEME above
+
+  $("settingsPush").addEventListener("change", async (e) => {
+    const chk = e.target;
+    chk.disabled = true;
+    try { await togglePushPref(chk.checked); }
+    catch(err) { mlog.warn("SETTINGS   push toggle failed: " + err.message); chk.checked = loadPushPref(); }
+    chk.disabled = !pushSupported();
+  });
+
+  $("settingsBackupBtn").onclick  = () => { closeSettings(); openExportModal(); };
+  $("settingsLogBtn").onclick     = () => mlog.toggle();     // the log sits above the panel (z-index), so it stays open
+  $("settingsRelaySave").onclick  = saveOwnRelay;
+  $("settingsRelay").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); saveOwnRelay(); } });
+  $("settingsMigrateBtn").onclick = () => { closeSettings(); contactAction("migrate"); };
+  $("settingsBurnBtn").onclick    = () => { closeSettings(); contactAction("burn"); };
+  $("settingsClose").onclick      = closeSettings;
+  $("settingsOverlay").onclick    = (e) => { if (e.target === $("settingsOverlay")) closeSettings(); };
+  $("settingsBtn").onclick        = openSettings;
+  $("sidebarWho").onclick         = openSettings;
+})();
+
+/* ══════════════════════════════════════════
    EVENTS
 ══════════════════════════════════════════ */
 document.getElementById("addContactBtn").onclick  = openModal;
 document.getElementById("showBlockedBtn").onclick = toggleShowBlocked;
 document.getElementById("modalCancel").onclick    = closeModal;
-document.getElementById("exportBtn").onclick      = openExportModal;
 document.getElementById("exportCancel").onclick   = closeExportModal;
 document.getElementById("syncBtn").onclick        = () => { if (state.currentChat) initiateExchange(state.currentChat); };
 document.getElementById("myKeyBox").onclick       = () => {

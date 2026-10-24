@@ -61,15 +61,43 @@ if ("serviceWorker" in navigator) {
   margin-top: -6px;
 }
 
-/* ── logout button (sidebar footer, right of the connection dot + label) ── */
-#logoutBtn {
-  margin-left: auto; flex-shrink: 0;
+/* ── sidebar header: [title / meta (opens settings)] [+] [⚙] ── */
+#sidebarHeader { gap: 8px; align-items: center; }
+#sidebarWho { flex: 1; min-width: 0; cursor: pointer; }
+#sidebarWho:hover #sidebarTitle { opacity: 0.8; }
+#sidebarMeta { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#settingsBtn {
   background: none; border: 1px solid var(--border); color: var(--dim);
-  padding: 3px 10px; font-family: inherit; font-size: 10px; letter-spacing: 0.12em;
-  cursor: pointer; transition: border-color 0.2s, color 0.2s;
+  width: 28px; height: 28px; font-size: 16px; cursor: pointer; flex-shrink: 0;
+  display: flex; align-items: center; justify-content: center;
+  transition: border-color 0.2s, color 0.2s;
 }
+#settingsBtn:hover { border-color: var(--accent); color: var(--accent); }
+
+/* ── settings panel ── */
+#settingsBox { gap: 14px; }
+.settings-section { display: flex; flex-direction: column; gap: 10px; padding: 12px; border: 1px solid var(--border); background: var(--bg); }
+.settings-heading { font-size: 11px; letter-spacing: 0.2em; color: var(--accent); }
+.settings-heading span { color: var(--muted); letter-spacing: 0.05em; font-size: 10px; }
+.settings-row { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--dim); cursor: pointer; }
+.settings-row input[type="checkbox"] { padding: 0; margin: 0; width: auto; accent-color: var(--accent); cursor: pointer; }
+.settings-row select { margin-left: auto; background: var(--surface); color: var(--text); border: 1px solid var(--border); padding: 6px 8px; font-family: inherit; font-size: 12px; }
+.settings-btns { display: flex; gap: 8px; }
+.settings-btns button, .settings-relay button {
+  flex: 1; padding: 9px; font-family: inherit; font-size: 11px; letter-spacing: 0.12em;
+  cursor: pointer; border: 1px solid var(--border); background: none; color: var(--dim); transition: all 0.2s;
+}
+.settings-btns .btn-alt, .settings-relay .btn-alt { color: var(--accent); }
+.settings-btns button:hover, .settings-relay button:hover { background: var(--surface2); }
+.settings-relay { display: flex; gap: 8px; }
+.settings-relay input { flex: 1; min-width: 0; }
+.settings-relay button { flex: 0 0 auto; padding: 9px 14px; }
 #logoutBtn:hover:not(:disabled) { border-color: var(--danger); color: var(--danger); }
 #logoutBtn:disabled { opacity: 0.4; cursor: default; }
+.settings-danger { border-color: var(--danger); }
+.settings-danger .settings-heading { color: var(--danger); }
+#settingsBurnBtn { color: var(--danger); border-color: var(--danger); }
+#settingsBurnBtn:hover { background: var(--danger); color: #000; }
 </style>
 </head>
 <body>
@@ -115,13 +143,12 @@ if ("serviceWorker" in navigator) {
 <div id="appContainer">
   <div id="sidebar">
     <div id="sidebarHeader">
-      <div>
+      <div id="sidebarWho" title="Settings">
         <div id="sidebarTitle">MESHCHAT</div>
         <div id="sidebarMeta">not connected</div>
       </div>
-      <button id="exportBtn" class="chat-action-btn">💾</button>
-      <button id="meshLogToggle" onclick="mlog.toggle()">>_</button>
       <button id="addContactBtn" title="Add contact">+</button>
+      <button id="settingsBtn" title="Settings">⚙</button>
     </div>
     <ul id="contactList"></ul>
     <div id="showBlockedToggle" style="display:none">
@@ -131,10 +158,6 @@ if ("serviceWorker" in navigator) {
     <div id="connectionStatus">
       <div id="connDot"></div>
       <span id="connLabel">disconnected</span>
-      <!-- logout: nothing is wiped (that is BURN) — contacts, sessions and held messages stay
-           encrypted in localStorage and are picked up again at the next login. See logout()
-           in meshchat-identity.js. -->
-      <button id="logoutBtn" type="button" title="Log out — keeps everything on this device, returns to the login screen">LOGOUT</button>
     </div>
   </div>
 
@@ -160,7 +183,6 @@ if ("serviceWorker" in navigator) {
         <button id="syncBtn"   class="chat-action-btn">SYNC</button>
         <button onclick="contactAction('edit')">EDIT</button>
         <button id="blockToggleBtn" onclick="contactAction('block')">BLOCK</button>
-        <button class="danger" onclick="contactAction('delete')">DELETE</button>
 
       </div>
     </div>
@@ -217,6 +239,61 @@ if ("serviceWorker" in navigator) {
 
 <!-- result line for the data-channel test (both sides) — transient, never stored -->
 <div id="dataToast"></div>
+
+<!-- SETTINGS — everything about YOU or THIS DEVICE (see SETTINGS in meshchat-gui.js).
+     Static markup on purpose: meshchat-identity.js wires #logoutBtn when it loads. -->
+<div id="settingsOverlay" class="overlay">
+  <div class="modal-box" id="settingsBox">
+    <h3>SETTINGS</h3>
+    <div class="hint" id="settingsWho"></div>
+
+    <div class="settings-section">
+      <div class="settings-heading">THIS DEVICE <span>· stays on this device</span></div>
+      <label class="settings-row">
+        <input type="checkbox" id="settingsPush">
+        <span id="settingsPushLabel">push notifications on this device</span>
+      </label>
+      <label class="settings-row">
+        <span>theme</span>
+        <select id="settingsTheme"></select>
+      </label>
+      <div class="settings-btns">
+        <button type="button" class="btn-alt" id="settingsBackupBtn">BACKUP / RESTORE</button>
+        <button type="button" class="btn-alt" id="settingsLogBtn">LOG</button>
+      </div>
+      <!-- logout: nothing is wiped (that is BURN) — contacts, sessions and held messages stay
+           encrypted in localStorage and are picked up again at the next login; the remembered
+           login (auto login) is forgotten. See logout() in meshchat-identity.js. -->
+      <div class="settings-btns">
+        <button type="button" id="logoutBtn" title="Log out — keeps everything on this device, forgets the remembered login">LOGOUT</button>
+      </div>
+    </div>
+
+    <div class="settings-section">
+      <div class="settings-heading">IDENTITY <span>· shared with your other devices</span></div>
+      <div class="hint">relay override changes where YOU connect and tells nobody. MIGRATE moves your identity to a new relay and notifies your contacts and devices.</div>
+      <div class="settings-relay">
+        <input id="settingsRelay" type="url" name="mc-settings-relay" placeholder="relay wss://… (empty = default)" autocomplete="off" spellcheck="false" autocapitalize="off" data-lpignore="true" data-1p-ignore="true">
+        <button type="button" class="btn-alt" id="settingsRelaySave">SAVE</button>
+      </div>
+      <div class="hint" id="settingsRelayStatus"></div>
+      <div class="settings-btns">
+        <button type="button" class="btn-alt" id="settingsMigrateBtn">MIGRATE RELAY…</button>
+      </div>
+    </div>
+
+    <div class="settings-section settings-danger">
+      <div class="settings-heading">DANGER</div>
+      <div class="settings-btns">
+        <button type="button" id="settingsBurnBtn">BURN IDENTITY…</button>
+      </div>
+    </div>
+
+    <div class="modal-btns">
+      <button class="btn-cancel" id="settingsClose">CLOSE</button>
+    </div>
+  </div>
+</div>
 
 <!-- CONTACT ACTION MODAL -->
 <div id="contactActionOverlay" class="overlay">
