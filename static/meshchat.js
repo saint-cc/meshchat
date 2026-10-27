@@ -13,7 +13,7 @@
 
    Load order: meshchat-lib.js → meshchat-gui.js → meshchat.js → statemachine.js
 ═══════════════════════════════════════════════════════════════ */
-const CLIENT_VERSION = "0.6.0";
+const CLIENT_VERSION = "0.6.1";
 
 const POLL_INTERVAL_MS        	= 30_000;			// base interval between presence polls
 const POLL_JITTER_MS          	= 10_000;			// ± random jitter added to poll interval
@@ -3589,16 +3589,25 @@ async function handleRestoreAck(msg) {
     // already attached an `ek` and the asking device already holds the matching
     // private half in pendingRestoreEk — this branch just never used it before.
     //
-    // Self-specific: `verified` is effectively always true here. The ack is signed
-    // by a device of OUR OWN identity, and our self contact always carries
-    // signPublicKey (derived at login, even on a freshly wiped device), so the
-    // "unverifiable fresh sender" case that forces the peer branch to be lenient
-    // does not exist for self. An ack that fails verification was already dropped
-    // above, and `ek` is inside the signed set, so a relay cannot strip or swap it
-    // without that check failing.
+    // Self-specific: this branch REQUIRES `verified` (enforced just below). The ack
+    // must be signed by a device of OUR OWN identity, and our self contact always
+    // carries signPublicKey (derived at login, even on a freshly wiped device), so
+    // the "unverifiable fresh sender" case that forces the peer branch to be
+    // lenient does not exist for self — every real sibling signs. The check above
+    // only drops an ack whose signature is PRESENT and WRONG; an ack with no
+    // signature at all is merely "not verifiable" and used to fall through to here,
+    // so anyone able to inject a packet with from=<our id> and no sig (a relay, or
+    // a client that dialled it) could make us push our FULL store — unwrapped,
+    // under the passphrase-derived key only, addressed to a bare self address.
+    // `ek` is inside the signed set, so once verified a relay cannot strip or swap
+    // it without the check failing.
     //
     // Wrap failure (malformed ek) falls back to the plain backup-key blob, same as
     // the peer branch — the asking device still needs its data.
+    if (!verified) {
+      mlog.warn(`← RESTORE_ACK  from self  ${fromDisp} — unsigned, dropped (a self restore_ack must be signed)`);
+      return;
+    }
     const pushTs    = Date.now();
     const freshBlob = await encryptObject(state.cryptoKey, serialiseContacts());
     let outBlob = freshBlob, ek = null;

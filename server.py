@@ -58,7 +58,7 @@ RELAY_AUTH_HOSTS_RAW = os.environ.get("RELAY_AUTH_HOSTS", "")
 # Protocol version — informational only for now, surfaced in sig:relay_info
 # so client/server version drift shows up in both logs. Not enforced yet;
 # room to add real backwards-compat handling once this is actually needed.
-PROTOCOL_VERSION = os.environ.get("PROTOCOL_VERSION", "0.6.0")
+PROTOCOL_VERSION = os.environ.get("PROTOCOL_VERSION", "0.6.1")
 
 # Connection limits
 MAX_CONNECTIONS        = int(os.environ.get("MAX_CONNECTIONS",        100))   # total WS sessions
@@ -736,7 +736,7 @@ async def route_or_buffer(kind, frm, to_id, to_endpoint, msg, ws):
     this packet type exists to survive. The overwrite-per-sender,
     long-TTL semantics in buf_write already make this free when nobody
     ends up needing the buffered copy.
-    
+
     app:burn follows the identical exception as app:migrate, for the
     identical reason: it must survive being "reached" by a stale session
     of the same identity that's mid-disconnect. Kept as its own kind
@@ -940,10 +940,21 @@ async def auth_challenge(ws, x25519_pub: bytes, ed25519_pub: bytes, bits: int, n
     log.info("AUTH       challenge sent  bits=%d  peer=%s%s", bits, peer_info(ws),
               "  [no_receive]" if no_receive else "")
 
-async def auth_verify(ws, sig_bytes: list, addr: str) -> str | None:
+async def auth_verify(ws, sig_bytes: list, addr: str, authed_as: str | None = None) -> str | None:
     """Verify the Ed25519 signature over the domain-separated auth message
     (build_auth_message), register identity, flush buffer. Returns
-    public_id or None on failure."""
+    public_id or None on failure.
+
+    authed_as: the identity this SOCKET already authenticated as, if any
+    (handler's client_ids[0]). A socket is exactly one identity: a second
+    proof that is valid for a DIFFERENT identity is refused here, BEFORE
+    anything is registered. This used to be checked by the caller after
+    auth_verify returned — by which point the socket was already in
+    `connected` / `ws_to_ids` under the second identity, so a client could
+    stack up any number of identities on one socket (all inflating
+    session_count() toward MAX_CONNECTIONS, none ever cleaned up on close,
+    since cleanup only walked client_ids). The same identity again is still
+    an idempotent no-op re-auth, as before."""
     entry = pending_auth.pop(id(ws), None)
     if not entry:
         log.warning("AUTH       proof with no pending challenge  peer=%s", addr)
@@ -979,6 +990,18 @@ async def auth_verify(ws, sig_bytes: list, addr: str) -> str | None:
         await send_to(ws, {"type": "sig:auth_fail", "reason": "proof_invalid"})
         return None
 
+    public_id = derive_public_id(entry["x25519_pub"], entry["ed25519_pub"])
+
+    # One socket, one identity — see the authed_as note in the docstring.
+    # Checked right after the proof, before the admission gate (a refused
+    # second identity should not spend from the shared budget) and, above
+    # all, before any registration below.
+    if authed_as is not None and public_id != authed_as:
+        log.warning("AUTH       socket already authed as %s, rejecting %s  peer=%s",
+                    short(authed_as), short(public_id), addr)
+        await send_to(ws, {"type": "sig:auth_fail", "reason": "already_authenticated"})
+        return None
+
     # Global admission gate — checked only after the proof is confirmed
     # valid, so a flood of garbage/incorrect proofs doesn't spend from the
     # shared budget, only completions that would actually have succeeded.
@@ -991,7 +1014,6 @@ async def auth_verify(ws, sig_bytes: list, addr: str) -> str | None:
         await send_to(ws, {"type": "sig:auth_fail", "reason": "server_busy"})
         return None
 
-    public_id  = derive_public_id(entry["x25519_pub"], entry["ed25519_pub"])
     no_receive = entry.get("no_receive", False)
     endpoint_id = entry.get("endpoint_id")
     if not no_receive:
@@ -1081,7 +1103,7 @@ def _buf_write_sync(to_id, msg, endpoint_id=None):
     packet from a given sender is kept (any older buffered migrate from
     that same sender is dropped first), and they're tagged with
     MIGRATE_SUFFIX so buf_expire applies the longer TTL bucket.
-    
+
     app:burn uses the same overwrite-per-sender + own-suffix treatment as
     app:migrate, kept as a fully separate bucket — the overwrite scan below
     only ever drops files carrying the SAME suffix as the incoming packet,
@@ -1586,15 +1608,14 @@ async def handler(ws):
                 if not sig_back:
                     log.warning("AUTH       empty proof  peer=%s", addr)
                     continue
-                public_id = await auth_verify(ws, sig_back, addr)
-                if public_id:
-                    if not client_ids:
-                        client_ids.append(public_id)
-                    elif client_ids[0] != public_id:
-                        log.warning("AUTH       socket already authed as %s, rejecting %s  peer=%s",
-                                    short(client_ids[0]), short(public_id), addr)
-                        await send_to(ws, {"type": "sig:auth_fail", "reason": "already_authenticated"})
-                    # else: re-auth with same identity — no-op (idempotent), useful for session refresh)
+                # authed_as: a socket already authed as one identity may only
+                # re-auth as that SAME identity — auth_verify refuses any
+                # other one before registering anything (see its docstring).
+                public_id = await auth_verify(ws, sig_back, addr,
+                                              authed_as=client_ids[0] if client_ids else None)
+                if public_id and not client_ids:
+                    client_ids.append(public_id)
+                # else: re-auth with the same identity — no-op (idempotent), useful for session refresh
 
             # ── everything below requires at least one authed identity ──
             elif not is_authed():
@@ -1810,8 +1831,18 @@ async def handler(ws):
                 ip_limiters.pop(addr, None)
         # clean up any pending challenge if socket dropped mid-auth
         pending_auth.pop(id(ws), None)
-        # unregister all authed identities on this socket
-        for cid in client_ids:
+        # unregister every identity this socket is REGISTERED under. The
+        # authority is ws_to_ids (what auth_verify actually put in
+        # `connected`), not client_ids: client_ids is only appended to AFTER
+        # auth_verify returns, so a socket that dropped mid-auth_verify (e.g.
+        # while its buffer flush was awaiting) is registered but not yet in
+        # client_ids — walking client_ids alone left it in `connected` until
+        # some later send_to() happened to fail on it. client_ids is kept in
+        # the union only as a belt-and-braces fallback. A no_receive probe is
+        # in client_ids but was never registered, so it's correctly skipped
+        # here rather than logging a bogus session drop.
+        registered = ws_to_ids.pop(ws, set())
+        for cid in registered:
             if cid in connected:
                 connected[cid].discard(ws)
                 remaining = len(connected[cid])
@@ -1822,8 +1853,6 @@ async def handler(ws):
                 else:
                     log.info("SESSION-   id=%s  peer=%s  sessions_left=%d",
                              short(cid), addr, remaining)
-        # drop reverse-map entry (send_to's failure path may have popped it already)
-        ws_to_ids.pop(ws, None)
         # same for the routing-id map — a clean close reaches here without
         # ever going through send_to's failure branch, so this path needs
         # its own cleanup rather than relying on that one
@@ -1885,7 +1914,7 @@ def run_http_server():
     def no_cache(r):
         r.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
         return r
-        
+
     @app.route("/")
     def index():
         return send_from_directory(app.static_folder, "index.html")

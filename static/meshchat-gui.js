@@ -97,12 +97,25 @@ const mlog = (() => {
   const lines = [];
   let visible = false;
 
+  // DOM nodes + textContent, never innerHTML. Log lines are built from
+  // strings a contact or a relay controls (a system-message kind/text, a
+  // reaction emoji, a migrate's new relay address, a relay's version/reason
+  // field, …), and this renders even while the panel is hidden — so
+  // interpolating them into markup meant any contact could run script in
+  // the page that holds state.keys and the remembered-login secret.
+  // textContent makes "is this string escaped?" a question that can no longer
+  // be answered wrongly by a future log call. `level` is only ever one of
+  // the three literals below, but goes in via className all the same.
   function render() {
     const body = document.getElementById("meshLogBody");
     if (!body) return;
-    body.innerHTML = lines.map(l =>
-      `<div class="mlog-line ${l.level}">${l.text}</div>`
-    ).join("");
+    body.textContent = "";
+    for (const l of lines) {
+      const row = document.createElement("div");
+      row.className   = "mlog-line " + l.level;
+      row.textContent = l.text;
+      body.appendChild(row);
+    }
     body.scrollTop = body.scrollHeight;
   }
 
