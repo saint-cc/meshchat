@@ -2487,6 +2487,32 @@ function verifyHandshakePacket(obj, contactSignPublicKey) {
   return verifyBlob(payload, obj.sig, contactSignPublicKey);
 }
 
+// Known-sender rule for the contact-path handshake packets (offer / accept /
+// push / restore_ack / restore_push). `key` is whatever signPublicKey we hold
+// for the claimed sender (contact record, or the opened token on restore_push);
+// `verified` is the result of verifyHandshakePacket against it.
+//   - no key on file  -> null: a fresh / not-yet-mutual sender cannot be
+//     verified and this handshake has always had to let it bootstrap.
+//   - key on file     -> the packet MUST verify. Every legitimate sender signs
+//     these, so a MISSING signature is as wrong as an invalid one. Treating
+//     "no sig" as "unverifiable" let a relay strip `sig` (and `ek`, which is
+//     inside the signed set) from a known contact's packet and have it taken
+//     down the unverified path: overwrite the backup we hold for them
+//     (backup_push), or make us send a backup unwrapped (accept / restore_ack).
+// Returns null when the packet may proceed, else a short reason for the log.
+function handshakeSigProblem(msg, key, verified) {
+  if (!key || verified) return null;
+  return msg.sig ? "signature invalid" : "unsigned";
+}
+
+// Upper bound on a backup blob we are willing to hold for a contact
+// (ciphertext bytes, i.e. blob.data.length). Real backups are kilobytes; this
+// only exists so a stored-blob overwrite can't also be used to fill storage.
+const MAX_PEER_BACKUP_BYTES = 1024 * 1024;
+function peerBackupBlobOk(blob) {
+  return !!blob && typeof blob === "object" && Array.isArray(blob.data) && blob.data.length <= MAX_PEER_BACKUP_BYTES;
+}
+
 // Tracks which peers we have a pending offer waiting for accept. Bare
 // identity, deliberately NOT per-device — the blob offered is the same
 // regardless of which of that identity's devices ends up accepting it,
@@ -2690,8 +2716,9 @@ async function handleBackupOffer(msg) {
   const contact    = state.contacts[fromId];
   const verifiable = !!(msg.sig && contact?.signPublicKey);
   const verified   = verifiable && verifyHandshakePacket(msg, contact.signPublicKey);
-  if (verifiable && !verified) {
-    mlog.warn(`← BACKUP_OFFER from ${pid(fromId)} — signature invalid, dropped`);
+  const sigProblem = handshakeSigProblem(msg, contact?.signPublicKey, verified);
+  if (sigProblem) {
+    mlog.warn(`← BACKUP_OFFER from ${pid(fromId)} — ${sigProblem}, dropped`);
     return;
   }
 
@@ -2784,6 +2811,14 @@ async function handleBackupAccept(msg) {
   const contact    = state.contacts[fromId];
   const verifiable = !!(msg.sig && contact?.signPublicKey);
   const verified   = verifiable && verifyHandshakePacket(msg, contact.signPublicKey);
+  // Known sender => must verify (see handshakeSigProblem). Dropped BEFORE the
+  // dedup stamp below: isDuplicateInbound stamps on every call, so an unsigned
+  // packet reaching it would burn the bare-identity slot.
+  const sigProblem = handshakeSigProblem(msg, contact?.signPublicKey, verified);
+  if (sigProblem) {
+    mlog.warn(`BACKUP_ACCEPT  from ${pid(fromId)} — ${sigProblem}, dropped`);
+    return;
+  }
   // Endpoint-aware once verified — otherwise a second of the sender's own
   // devices genuinely accepting within the same few seconds would collapse
   // into one identity-level dedup slot and get silently swallowed as a
@@ -2793,10 +2828,6 @@ async function handleBackupAccept(msg) {
   const dedupKey = `backup_accept:${fromId}${verified && fromEndpoint ? ":" + fromEndpoint : ""}`;
   if (isDuplicateInbound(dedupKey)) {
     mlog.debug(`BACKUP_ACCEPT  from ${pid(fromId, verified ? { endpointId: fromEndpoint } : {})} — duplicate within ${DEDUP_WINDOW_MS}ms, suppressed`);
-    return;
-  }
-  if (verifiable && !verified) {
-    mlog.warn(`BACKUP_ACCEPT  from ${pid(fromId)} — signature invalid, dropped`);
     return;
   }
 
@@ -2994,16 +3025,25 @@ async function handleBackupPush(msg) {
   const contact    = state.contacts[fromId];
   const verifiable = !!(msg.sig && contact.signPublicKey);
   const verified   = verifiable && verifyHandshakePacket(msg, contact.signPublicKey);
+  // Known sender => must verify (see handshakeSigProblem). This is the packet
+  // that OVERWRITES the backup we hold for them, and on the unwrapped path
+  // nothing else authenticates it. Dropped before the dedup stamp, which
+  // would otherwise be burned by an unsigned packet.
+  const sigProblem = handshakeSigProblem(msg, contact.signPublicKey, verified);
+  if (sigProblem) {
+    mlog.warn(`← BACKUP_PUSH  from ${pid(fromId)} — ${sigProblem}, dropped`);
+    return;
+  }
+  if (!peerBackupBlobOk(msg.blob)) {
+    mlog.warn(`← BACKUP_PUSH  from ${pid(fromId)} — blob malformed or over ${MAX_PEER_BACKUP_BYTES} bytes, dropped`);
+    return;
+  }
   // Endpoint-aware once verified — see handleBackupAccept's dedupKey
   // comment for why bare fromId alone would risk swallowing a second,
   // genuinely distinct sibling device's push.
   const dedupKey = `backup_push:${fromId}${verified && fromEndpoint ? ":" + fromEndpoint : ""}${ekDedupTag(msg.ek)}`;
   if (isDuplicateInbound(dedupKey)) {
     mlog.debug(`← BACKUP_PUSH  from ${pid(fromId, verified ? { endpointId: fromEndpoint } : {})} — duplicate within ${DEDUP_WINDOW_MS}ms, suppressed`);
-    return;
-  }
-  if (verifiable && !verified) {
-    mlog.warn(`← BACKUP_PUSH  from ${pid(fromId)} — signature invalid, dropped`);
     return;
   }
 
@@ -3048,6 +3088,10 @@ async function handleBackupPush(msg) {
     }
   }
 
+  if (!peerBackupBlobOk(storedBlob)) {
+    mlog.warn(`← BACKUP_PUSH  from ${pid(fromId)} — unwrapped blob malformed or over ${MAX_PEER_BACKUP_BYTES} bytes, dropped`);
+    return;
+  }
   state.peerBackups[fromId] = storedBlob;
   savePeerBackups();
   mlog.info(`← BACKUP_PUSH  from ${pid(fromId, verified ? { endpointId: fromEndpoint } : {})}  sig:${verified ? "✓" : "·"} — stored${viaWrap ? "  +wrap" : ""}`);
@@ -3684,6 +3728,14 @@ async function handleRestoreAck(msg) {
   const contact    = state.contacts[fromId];
   const verifiable = !!(msg.sig && contact?.signPublicKey);
   const verified   = verifiable && verifyHandshakePacket(msg, contact.signPublicKey);
+  // Known sender => must verify (see handshakeSigProblem). Without this a
+  // relay could strip sig+ek from a contact's ack and have us send their
+  // backup unwrapped. Dropped before the dedup stamp (stamped on every call).
+  const sigProblem = handshakeSigProblem(msg, contact?.signPublicKey, verified);
+  if (sigProblem) {
+    mlog.warn(`← RESTORE_ACK  from ${pid(fromId)} — ${sigProblem}, dropped`);
+    return;
+  }
   // Endpoint-aware once verified, same reasoning as the backup handshake
   // pair's dedup keys above — a second of the sender's own devices acking
   // within the same few seconds is a genuinely distinct, real ack, not a
@@ -3691,10 +3743,6 @@ async function handleRestoreAck(msg) {
   const dedupKey = `restore_ack:${fromId}${verified && fromEndpoint ? ":" + fromEndpoint : ""}`;
   if (isDuplicateInbound(dedupKey)) {
     mlog.debug(`← RESTORE_ACK  from ${pid(fromId, verified ? { endpointId: fromEndpoint } : {})} — duplicate within ${DEDUP_WINDOW_MS}ms, suppressed`);
-    return;
-  }
-  if (verifiable && !verified) {
-    mlog.warn(`← RESTORE_ACK  from ${pid(fromId)} — signature invalid, dropped`);
     return;
   }
   const fromDisp = pid(fromId, verified ? { endpointId: fromEndpoint } : {});
@@ -3833,14 +3881,14 @@ async function handleRestorePush(msg) {
   }
   const verifiable = !!(msg.sig && verifyKey);
   const verified   = verifiable && verifyHandshakePacket(msg, verifyKey);
-  if (verifiable && !verified) {
-    mlog.warn(`← RESTORE_PUSH from ${pid(fromId)} — signature invalid${viaToken ? " (via token)" : ""}, dropped`);
+  // Any key we hold for the sender (contact record OR the opened token) makes
+  // the signature mandatory — see handshakeSigProblem. Holders always sign
+  // their restore_push (the token rides outside the signed set), so an
+  // unsigned push with a bound token is a stripped one, not a legacy one.
+  const sigProblem = handshakeSigProblem(msg, verifyKey, verified);
+  if (sigProblem) {
+    mlog.warn(`← RESTORE_PUSH from ${pid(fromId)} — ${sigProblem}${viaToken ? " (via token)" : ""}, dropped`);
     return;
-  }
-  if (viaToken && !verified) {
-    // token opened fine but the push carried no signature — nothing to
-    // verify, so this is exactly today's unverified path.
-    mlog.info(`← RESTORE_PUSH from ${pid(fromId)} — token ✓ bound, but push unsigned — unverified`);
   }
   const fromDisp = pid(fromId, verified ? { endpointId: fromEndpoint } : {});
   // Only trust the endpoint suffix for cooldown-keying once signed+verified
