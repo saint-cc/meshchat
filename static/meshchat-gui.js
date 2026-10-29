@@ -1490,7 +1490,7 @@ function contactAction(action) {
     }
     body.appendChild(datalist);
 
-    btns.innerHTML = '<button class="btn-cancel" onclick="closeContactAction()">CANCEL</button>' +
+    btns.innerHTML = '<button class="btn-cancel" data-close-action>CANCEL</button>' +
                      '<button class="btn-confirm" id="contactActionConfirm">SAVE</button>';
     document.getElementById("contactActionOverlay").classList.add("open");
     nameInput.focus();
@@ -1550,7 +1550,7 @@ function contactAction(action) {
       : "You will start receiving messages from this contact again.";
     body.appendChild(hint);
     btns.innerHTML =
-      '<button class="btn-cancel" onclick="closeContactAction()">CANCEL</button>' +
+      '<button class="btn-cancel" data-close-action>CANCEL</button>' +
       '<button class="btn-confirm" id="contactActionConfirm">' + (blocking ? "BLOCK" : "UNBLOCK") + '</button>';
     document.getElementById("contactActionOverlay").classList.add("open");
     document.getElementById("contactActionConfirm").onclick = async () => {
@@ -1578,7 +1578,7 @@ function contactAction(action) {
 	    hint.className = "hint";
 	    hint.textContent = "A migration was just committed and the old relay is still being checked for stragglers. Try again in a few seconds.";
 	    body.appendChild(hint);
-	    btns.innerHTML = '<button class="btn-cancel" onclick="closeContactAction()">CLOSE</button>';
+	    btns.innerHTML = '<button class="btn-cancel" data-close-action>CLOSE</button>';
 	    document.getElementById("contactActionOverlay").classList.add("open");
 	    return;
 	  }
@@ -1723,7 +1723,7 @@ function contactAction(action) {
     }
     listWrap.appendChild(buildRow(null, true));
 
-    btns.innerHTML = '<button class="btn-cancel" onclick="closeContactAction()">CLOSE</button>';
+    btns.innerHTML = '<button class="btn-cancel" data-close-action>CLOSE</button>';
     document.getElementById("contactActionOverlay").classList.add("open");
   } else if (action === "burn") {
     buildBurnPanel();
@@ -1733,6 +1733,16 @@ function contactAction(action) {
 function closeContactAction() {
   document.getElementById("contactActionOverlay").classList.remove("open");
 }
+
+// The CANCEL / CLOSE buttons of the simple contact dialogs (EDIT, BLOCK, and the two
+// read-only views) are built with innerHTML and used to carry onclick="closeContactAction()".
+// The page's Content-Security-Policy (index.html) forbids inline event-handler attributes, so
+// they are marked data-close-action instead and one delegated listener on the static container
+// does the closing. Deliberately NOT keyed on .btn-cancel: the MIGRATE / BURN dialogs build
+// their own cancel buttons with their own handlers and must keep them.
+document.getElementById("contactActionBtns").addEventListener("click", (e) => {
+  if (e.target.closest("[data-close-action]")) closeContactAction();
+});
 
 function showMigrateWarning(url) {
   const title = document.getElementById("contactActionTitle");

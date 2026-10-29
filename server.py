@@ -2,6 +2,7 @@ import asyncio
 import base64
 import glob
 import hashlib
+import http.client
 import ipaddress
 import json
 import logging
@@ -9,10 +10,10 @@ import multiprocessing
 import os
 import re
 import secrets
+import socket
+import ssl
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
 import uuid
 
 from cryptography.hazmat.primitives import hashes
@@ -305,6 +306,64 @@ PUSH_SUBS_DIR    = os.environ.get("PUSH_SUBS_DIR",
                                    os.path.join(os.path.dirname(os.path.abspath(BUF_DIR)), "push_subs"))
 PUSH_TTL_SECONDS = int(os.environ.get("PUSH_TTL_SECONDS", 60))   # how long the push service should hold this if the device is unreachable
 
+# ── push endpoint policy (SSRF) ──
+# A push subscription's `endpoint` is a URL chosen by the CLIENT, and this
+# relay later POSTs to it. Taken as-is that makes the relay an HTTP client any
+# authed identity (free to create) can aim wherever it likes: internal
+# services, cloud metadata, other hosts it wants to hammer. The old check was
+# just startswith("https://"), and the sender used urllib, which also FOLLOWS
+# redirects — a POST to a public endpoint answering 302 → http://127.0.0.1/…
+# became a GET on the internal address (with the VAPID Authorization header
+# along for the ride), so even a perfect check at subscribe time was not enough.
+#
+# Real browser push endpoints only ever live on a handful of vendor hosts, so
+# the policy is an ALLOWLIST (below), enforced at subscribe time AND again at
+# send time, on top of the address checks in _send_web_push_sync. An entry is
+# an exact hostname, or — with a leading dot — a suffix that needs at least one
+# more label in front (".push.services.mozilla.com" matches
+# "updates.push.services.mozilla.com", not the bare name). Deliberately no
+# ".googleapis.com": anyone can get a hostname under it.
+# PUSH_ALLOWED_HOSTS REPLACES the defaults (comma-separated); a push service
+# that isn't listed is rejected and the rejected HOST is logged, so adding one
+# is a config change. Empty = push effectively off.
+PUSH_ALLOWED_HOSTS_DEFAULT = ",".join((
+    "fcm.googleapis.com", "android.googleapis.com",   # Chrome / Edge / Brave / Opera / Samsung (FCM)
+    ".push.services.mozilla.com",                      # Firefox (updates.push.services.mozilla.com)
+    ".notify.windows.com",                             # Edge on Windows (WNS)
+    "web.push.apple.com",                              # Safari
+))
+PUSH_MAX_ENDPOINT_LEN        = 2048   # characters; real endpoints are a few hundred
+PUSH_MAX_KEY_LEN             = 256    # p256dh / auth are ~87 / ~22 base64url chars
+PUSH_MAX_SUBS_PER_IDENTITY   = int(os.environ.get("PUSH_MAX_SUBS_PER_IDENTITY", 10))   # one file per endpointId, and an identity costs nothing to make
+PUSH_TIMEOUT_SECONDS         = 10     # per connect / read
+PUSH_MAX_ADDRS_TRIED         = 3      # resolved addresses attempted per send (all must be public — see _send_web_push_sync)
+
+# A plain DNS name: at least two labels, ASCII letters/digits/hyphens, and a
+# TLD that starts with a letter — which is what keeps dotted-quad, decimal
+# ("2130706433") and hex ("0x7f.1") spellings of an IP out, however a resolver
+# would read them. IDN hosts must arrive in punycode.
+_PUSH_HOST_RE = re.compile(r'^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]{0,61}[a-z0-9]$')
+_PUSH_ALLOWLIST_INVALID = []   # entries that failed to parse — logged once the logger exists, below
+
+def _parse_push_allowlist(raw):
+    exact, suffixes = set(), []
+    for entry in raw.split(","):
+        entry = entry.strip().lower()
+        if not entry:
+            continue
+        bare = entry[1:] if entry.startswith(".") else entry
+        if not _PUSH_HOST_RE.match(bare):
+            _PUSH_ALLOWLIST_INVALID.append(entry)
+            continue
+        if entry.startswith("."):
+            suffixes.append(entry)
+        else:
+            exact.add(entry)
+    return frozenset(exact), tuple(suffixes)
+
+PUSH_ALLOWED_EXACT, PUSH_ALLOWED_SUFFIXES = _parse_push_allowlist(
+    os.environ.get("PUSH_ALLOWED_HOSTS", PUSH_ALLOWED_HOSTS_DEFAULT))
+
 # Logging
 LOG_FORMAT   = "%(asctime)s  %(levelname)-8s  %(message)s"
 LOG_DATE_FMT = "%H:%M:%S"
@@ -333,6 +392,9 @@ log = logging.getLogger("signal")
 
 for _bad_entry in _TRUSTED_PROXIES_INVALID:
     log.warning("CONFIG     TRUSTED_PROXIES invalid entry skipped: %r", _bad_entry)
+
+for _bad_entry in _PUSH_ALLOWLIST_INVALID:
+    log.warning("CONFIG     PUSH_ALLOWED_HOSTS invalid entry skipped: %r", _bad_entry)
 
 # ══════════════════════════════════════════
 #   SIGNAL SERVER STATE
@@ -507,31 +569,175 @@ def _vapid_jwt(aud: str) -> str:
     raw_sig = r.to_bytes(32, "big") + s.to_bytes(32, "big")
     return f"{header}.{claims}.{_b64url(raw_sig)}"
 
+# ── push endpoint validation + SSRF-safe sender ──
+
+class PushEndpointRejected(ValueError):
+    """An endpoint failed the policy. .reason is safe to log; .host is the
+    hostname if one could be parsed (the URL itself is never logged — path and
+    query carry the device's push token)."""
+    def __init__(self, reason, host=None):
+        super().__init__(reason)
+        self.reason = reason
+        self.host = host
+
+def push_host_allowed(host):
+    return host in PUSH_ALLOWED_EXACT or any(host.endswith(sfx) for sfx in PUSH_ALLOWED_SUFFIXES)
+
+def parse_push_endpoint(endpoint):
+    """Validate a push endpoint against the policy. Returns (host, target) —
+    the lowercase hostname and the request target (path + query) to POST to —
+    or raises PushEndpointRejected. Strict on purpose: https only, port 443
+    only, no userinfo, ASCII only (no unicode lookalike dots or normalisation
+    games; urlsplit would also silently drop tabs/newlines, so control
+    characters are refused up front), a plain DNS name (never an IP literal),
+    and on the allowlist."""
+    if not isinstance(endpoint, str):
+        raise PushEndpointRejected("not a string")
+    if not endpoint or len(endpoint) > PUSH_MAX_ENDPOINT_LEN:
+        raise PushEndpointRejected("empty or too long")
+    if any(ord(c) <= 0x20 or ord(c) >= 0x7f for c in endpoint):
+        raise PushEndpointRejected("control, space or non-ASCII character")
+    try:
+        parts = urllib.parse.urlsplit(endpoint)
+        port  = parts.port
+    except ValueError:
+        raise PushEndpointRejected("unparseable URL")
+    if parts.scheme != "https":
+        raise PushEndpointRejected("not https")
+    if "@" in parts.netloc:
+        raise PushEndpointRejected("userinfo in URL")
+    host = parts.hostname
+    if not host:
+        raise PushEndpointRejected("no host")
+    if port not in (None, 443):
+        raise PushEndpointRejected("non-default port", host)
+    if not _PUSH_HOST_RE.match(host):
+        raise PushEndpointRejected("not a plain DNS name", host)
+    if not push_host_allowed(host):
+        raise PushEndpointRejected("host not on the push allowlist", host)
+    target = parts.path or "/"
+    if parts.query:
+        target += "?" + parts.query
+    return host, target
+
+_NON_PUBLIC_V6_PREFIXES = tuple(ipaddress.ip_network(n) for n in (
+    "64:ff9b::/96",     # NAT64 well-known prefix — embeds ANY v4 address, private ones included (is_global says True)
+    "64:ff9b:1::/48",   # local-use NAT64
+    "2002::/16",        # 6to4 — embeds a v4 address
+    "2001::/32",        # Teredo — embeds a v4 address
+))
+
+def ip_is_public(addr):
+    """True only for an address that is plain, globally routable unicast.
+    IPv4-mapped IPv6 is unwrapped first (::ffff:127.0.0.1 must be judged as
+    127.0.0.1, and ipaddress doesn't do that consistently across versions),
+    and the v6 transition prefixes that can smuggle in a v4 address are refused
+    outright. A scope id (fe80::1%eth0) is stripped before parsing."""
+    try:
+        ip = ipaddress.ip_address(str(addr).split("%", 1)[0])
+    except ValueError:
+        return False
+    if ip.version == 6 and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    if ip.version == 6 and any(ip in net for net in _NON_PUBLIC_V6_PREFIXES):
+        return False
+    return ip.is_global and not ip.is_multicast
+
+def _push_resolve(host, port):
+    """Every distinct address the name resolves to, as strings. Its own
+    function so a test can stand in for DNS."""
+    seen = []
+    for family, _t, _p, _c, sockaddr in socket.getaddrinfo(host, port, type=socket.SOCK_STREAM):
+        ip = sockaddr[0]
+        if ip not in seen:
+            seen.append(ip)
+    return seen
+
+def _push_ssl_context():
+    return ssl.create_default_context()
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    """HTTPS to `host` (Host header, SNI and certificate check all use the
+    NAME) over a socket opened to one specific, already-vetted IP. Resolving
+    the name a second time inside http.client would leave a window for DNS
+    rebinding: the first lookup answers with a public address that passes the
+    check, the second with 127.0.0.1."""
+    def __init__(self, host, pinned_ip, port=443, timeout=PUSH_TIMEOUT_SECONDS, context=None):
+        super().__init__(host, port=port, timeout=timeout, context=context)
+        self._pinned_ip = pinned_ip
+
+    def connect(self):
+        sock = socket.create_connection((self._pinned_ip, self.port), self.timeout)
+        try:
+            self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
+        except Exception:
+            sock.close()
+            raise
+
 def _send_web_push_sync(endpoint: str) -> tuple[bool, int | None]:
-    """Sync body — runs in a worker thread (urllib is blocking). Sends an
+    """Sync body — runs in a worker thread (blocking sockets). Sends an
     empty-body push: no content, no aes128gcm encryption layer, purely a
     wake-up. Returns (permanent_failure, http_status). permanent_failure
     is True only on 404/410 — the push service telling us the subscription
-    itself is dead, not just that this one attempt failed."""
+    itself is dead, not just that this one attempt failed — or when the stored
+    endpoint no longer passes the policy at all (a subscription from before
+    the allowlist existed, or one for a service since removed from it): that
+    one is dropped rather than re-tried and re-logged on every push, and the
+    client re-subscribes at its next login.
+
+    SSRF defences, in order: the endpoint is re-validated (see
+    parse_push_endpoint); the host is resolved here and EVERY address must be
+    public (ip_is_public) — one private answer among public ones fails the
+    send, since which one a client would pick is not ours to gamble on; the
+    connection is made to a vetted address, not to the name (see
+    _PinnedHTTPSConnection); and redirects are NEVER followed — a 3xx is just
+    a failed push. Nothing of the response beyond its status line is read."""
     try:
-        parsed = urllib.parse.urlparse(endpoint)
-        aud = f"{parsed.scheme}://{parsed.netloc}"
-        jwt = _vapid_jwt(aud)
-        req = urllib.request.Request(
-            endpoint, data=b"", method="POST",
-            headers={
-                "TTL": str(PUSH_TTL_SECONDS),
-                "Authorization": f"vapid t={jwt}, k={VAPID_PUBLIC_KEY_B64}",
-                "Content-Length": "0",
-            },
-        )
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            return False, resp.status
-    except urllib.error.HTTPError as e:
-        return e.code in (404, 410), e.code
-    except Exception as e:
-        log.debug("PUSH       send error  endpoint=%s…  err=%s", endpoint[:40], e)
+        host, target = parse_push_endpoint(endpoint)
+    except PushEndpointRejected as e:
+        log.warning("PUSH       stored endpoint no longer allowed (%s)  host=%s — dropping it", e.reason, e.host or "?")
+        return True, None
+    try:
+        addrs = _push_resolve(host, 443)
+    except OSError as e:
+        log.debug("PUSH       resolve failed  host=%s  err=%s", host, e)
         return False, None
+    if not addrs or not all(ip_is_public(a) for a in addrs):
+        log.warning("PUSH       %s resolves to a non-public address (%s) — not sending", host, ", ".join(addrs) or "nothing")
+        return False, None
+    try:
+        jwt = _vapid_jwt(f"https://{host}")
+    except Exception as e:
+        log.warning("PUSH       VAPID signing failed: %s", e)
+        return False, None
+    headers = {
+        "TTL": str(PUSH_TTL_SECONDS),
+        "Authorization": f"vapid t={jwt}, k={VAPID_PUBLIC_KEY_B64}",
+        "User-Agent": "meshchat-relay",
+    }
+    ctx = _push_ssl_context()
+    last_err = None
+    for ip in addrs[:PUSH_MAX_ADDRS_TRIED]:
+        conn = _PinnedHTTPSConnection(host, ip, context=ctx)
+        try:
+            conn.connect()                       # only a failed CONNECT moves on to the next address
+        except (OSError, ssl.SSLError) as e:
+            last_err = e
+            conn.close()
+            continue
+        try:
+            conn.request("POST", target, body=b"", headers=headers)
+            status = conn.getresponse().status
+        except (OSError, http.client.HTTPException) as e:
+            log.debug("PUSH       send error  host=%s  err=%s", host, e)
+            return False, None
+        finally:
+            conn.close()
+        if 300 <= status < 400:
+            log.info("PUSH       redirect not followed  host=%s  status=%s", host, status)
+        return status in (404, 410), status
+    log.debug("PUSH       connect failed  host=%s  err=%s", host, last_err)
+    return False, None
 
 # ══════════════════════════════════════════
 #   PUSH SUBSCRIPTION STORAGE
@@ -579,6 +785,15 @@ def _push_sub_write_sync(to_id, endpoint_id, subscription):
                     log.info("PUSH_SUB   dropped stale duplicate  id=%s  file=%s", short(to_id), os.path.basename(fpath)[:12])
             except Exception:
                 continue
+        # Cap per identity — counted AFTER the stale-duplicate sweep above, which
+        # may have just freed a slot, and excluding this device's own file (a
+        # re-subscribe replaces it). Not locked: two subscribes racing in worker
+        # threads can overshoot by a file or two; this is a brake on unbounded
+        # growth, not an exact quota.
+        others = [fp for fp in glob.glob(os.path.join(d, "*.json")) if os.path.basename(fp) != fname]
+        if len(others) >= PUSH_MAX_SUBS_PER_IDENTITY:
+            log.warning("PUSH_SUB   subscription cap reached (%d)  id=%s — rejecting", PUSH_MAX_SUBS_PER_IDENTITY, short(to_id))
+            return
         with open(os.path.join(d, fname), "w") as f:
             json.dump(subscription, f)
         log.info("PUSH_SUB   subscribed  id=%s  endpoint=%s", short(to_id), short(endpoint_id))
@@ -1672,20 +1887,28 @@ async def handler(ws):
                     continue
                 endpoint = sub.get("endpoint")
                 keys     = sub.get("keys") if isinstance(sub.get("keys"), dict) else {}
-                # https-only — a ws://, http://, or garbage endpoint has no
-                # business being POSTed to later; WS_MAX_SIZE already caps
-                # the overall frame this arrives in, so no separate size
-                # check is needed on top of that for now.
-                if not isinstance(endpoint, str) or not endpoint.startswith("https://"):
-                    log.warning("PUSH_SUB   from=%s  endpoint not https, dropped", short(frm))
+                # The endpoint is a URL the client chose and this relay will
+                # later POST to: full policy check (https, port 443, plain DNS
+                # name, on the allowlist — see parse_push_endpoint and the
+                # "push endpoint policy" config above), repeated at send time.
+                # Only the HOST is logged on a rejection: the path is the
+                # device's push token.
+                try:
+                    parse_push_endpoint(endpoint)
+                except PushEndpointRejected as e:
+                    log.warning("PUSH_SUB   from=%s  endpoint rejected (%s)  host=%s, dropped", short(frm), e.reason, e.host or "?")
                     continue
-                if not keys.get("p256dh") or not keys.get("auth"):
+                p256dh, auth_key = keys.get("p256dh"), keys.get("auth")
+                if not (isinstance(p256dh, str) and isinstance(auth_key, str) and p256dh and auth_key):
                     log.warning("PUSH_SUB   from=%s  missing keys.p256dh/auth, dropped", short(frm))
+                    continue
+                if len(p256dh) > PUSH_MAX_KEY_LEN or len(auth_key) > PUSH_MAX_KEY_LEN:
+                    log.warning("PUSH_SUB   from=%s  oversized keys.p256dh/auth, dropped", short(frm))
                     continue
                 await asyncio.to_thread(_push_sub_write_sync, frm, endpoint_id, {
                     "endpoint": endpoint,
-                    "p256dh":   keys["p256dh"],
-                    "auth":     keys["auth"],
+                    "p256dh":   p256dh,
+                    "auth":     auth_key,
                 })
 
             elif kind == "sig:push_unsubscribe":
@@ -1891,6 +2114,9 @@ async def run_signal_server():
                   "(relay_not_configured). Set RELAY_WSS_URL (e.g. wss://yourrelay.example.com/ws/).", AUTH_VERSION)
     log.info("Push: subs_dir=%s  vapid_key=%s  vapid_pub=%s…  ttl=%ds  subject=%s",
              PUSH_SUBS_DIR, VAPID_KEY_FILE, VAPID_PUBLIC_KEY_B64[:16], PUSH_TTL_SECONDS, VAPID_SUBJECT)
+    log.info("Push policy: allowed hosts=%s  max_subs_per_identity=%d",
+             ", ".join(sorted(PUSH_ALLOWED_EXACT) + list(PUSH_ALLOWED_SUFFIXES)) or "(none — every push endpoint is rejected)",
+             PUSH_MAX_SUBS_PER_IDENTITY)
     log.info("=" * 50)
     async with websockets.serve(handler, WS_HOST, WS_PORT, max_size=WS_MAX_SIZE):
         asyncio.create_task(log_stats())

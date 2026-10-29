@@ -3,25 +3,35 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<!-- CONTENT SECURITY POLICY. A <meta> CSP only covers what comes after it, so it must stay
+     the first thing in <head> after the charset/viewport. Everything the page runs is now
+     same-origin: the three libraries are vendored under ./vendor/ (see vendor/README.md),
+     there are no inline <script> blocks and no inline event-handler attributes (wiring lives
+     in meshchat-boot.js), and nothing needs eval — script-src is plain 'self'.
+       style-src keeps 'unsafe-inline' because of the many style="" attributes and the two
+         <style> blocks below; that is tolerable ONLY because img/font/connect/etc. are locked
+         down, so injected CSS has nowhere to send anything.
+       connect-src: relays are arbitrary user-chosen hosts, hence ws:/wss: without a host list
+         (ws: is for LAN/dev relays; an https page's browser blocks ws: as mixed content anyway).
+       media-src/img-src blob: are the decrypted audio/image messages; data: is the favicon and
+         html5-qrcode's built-in icons.
+       frame-ancestors, report-uri and sandbox are ignored in a <meta> policy — set those as
+         a real header (nginx/Flask) if you want them. -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; font-src 'self'; connect-src 'self' ws: wss:; worker-src 'self'; manifest-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'">
 <title>MeshChat</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' fill='%23000'/%3E%3Cpath d='M3 8h10' stroke='%2300ffcc' stroke-width='2'/%3E%3Ccircle cx='8' cy='8' r='2' fill='%2300ffcc'/%3E%3C/svg%3E">
-<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
-<script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
-<script type="module">
-  import { ed25519, x25519 } from 'https://esm.sh/@noble/curves@1.4.0/ed25519';
-  window.ed25519 = ed25519;
-  window.x25519 = x25519;
-</script>
+<!-- vendored, pinned copies (was: cdnjs, unpkg and esm.sh at runtime) — vendor/README.md has
+     versions, hashes and how to rebuild. noble-ed25519.js is @noble/curves 1.4.0 bundled into one
+     classic script that sets window.ed25519 / window.x25519, so unlike the old deferred module it
+     is ready before any other script runs. -->
+<script src="./vendor/qrcode.min.js"></script>
+<script src="./vendor/html5-qrcode.min.js"></script>
+<script src="./vendor/noble-ed25519.js"></script>
 
 <link rel="stylesheet" href="./style.css">
 <link rel="stylesheet" href="./style_local.css">
 <link rel="manifest" href="./manifest.json">
 
-<script>
-if ("serviceWorker" in navigator) {
-  navigator.serviceWorker.register("./sw.js");
-}
-</script>
 <style>
 
 .bar-container {
@@ -111,7 +121,7 @@ if ("serviceWorker" in navigator) {
       <input id="inputName" placeholder="user" autocomplete="username" spellcheck="false">
       <input id="inputPassphrase" type="password" placeholder="passphrase" autocomplete="current-password">
       <label class="loginOpt">
-        <input type="checkbox" onchange="togglePw(this)">
+        <input type="checkbox" id="showPwChk">
         Show password
       </label>
       <!-- auto login = "remember me on this device": the checkbox state lives in localStorage
@@ -164,7 +174,6 @@ if ("serviceWorker" in navigator) {
   <div id="chatContainer">
     <div id="chatHeader" style="position:relative">
       <button id="backBtn"
-        onclick="document.getElementById('appContainer').classList.remove('chatOpen')"
         style="display:none;background:none;border:none;color:var(--accent);font-family:inherit;font-size:12px;letter-spacing:0.1em;cursor:pointer;margin-bottom:6px">
         ← BACK
       </button>
@@ -181,8 +190,8 @@ if ("serviceWorker" in navigator) {
       </div>
       <div class="contact-dropdown" id="contactDropdown">
         <button id="syncBtn"   class="chat-action-btn">SYNC</button>
-        <button onclick="contactAction('edit')">EDIT</button>
-        <button id="blockToggleBtn" onclick="contactAction('block')">BLOCK</button>
+        <button id="contactEditBtn">EDIT</button>
+        <button id="blockToggleBtn">BLOCK</button>
 
       </div>
     </div>
@@ -210,8 +219,8 @@ if ("serviceWorker" in navigator) {
 <div id="meshLog">
   <div id="meshLogHeader">
     <span>MESHCHAT LOG</span>
-    <button onclick="mlog.clear()">CLR</button>
-    <button onclick="mlog.hide()">✕</button>
+    <button id="meshLogClear">CLR</button>
+    <button id="meshLogHide">✕</button>
   </div>
   <div id="meshLogBody"></div>
 </div>
@@ -309,14 +318,14 @@ if ("serviceWorker" in navigator) {
   <div class="modal-box">
     <h3>ADD CONTACT</h3>
     <div class="qr-tabs">
-      <button class="qr-tab active" id="tabShow"  onclick="switchTab('show')">MY QR</button>
-      <button class="qr-tab"        id="tabScan"  onclick="switchTab('scan')">SCAN</button>
-      <button class="qr-tab"        id="tabPaste" onclick="switchTab('paste')">PASTE</button>
+      <button class="qr-tab active" id="tabShow">MY QR</button>
+      <button class="qr-tab"        id="tabScan">SCAN</button>
+      <button class="qr-tab"        id="tabPaste">PASTE</button>
     </div>
     <div class="qr-panel active" id="panelShow">
       <div class="qr-mode" id="qrMode">
-        <button type="button" class="qr-mode-btn active" id="qrModeOffline" onclick="setQrMode('offline')" title="works with no connection: you each scan or paste the other's key">OFFLINE · two-way</button>
-        <button type="button" class="qr-mode-btn"        id="qrModeLive"    onclick="setQrMode('live')"    title="one scan is enough, but you must stay online while it is shown">LIVE · one-way</button>
+        <button type="button" class="qr-mode-btn active" id="qrModeOffline" title="works with no connection: you each scan or paste the other's key">OFFLINE · two-way</button>
+        <button type="button" class="qr-mode-btn"        id="qrModeLive"    title="one scan is enough, but you must stay online while it is shown">LIVE · one-way</button>
       </div>
       <div id="myKeyBox" title="click to copy">
         <span>your key — click to copy</span>
@@ -325,7 +334,7 @@ if ("serviceWorker" in navigator) {
       <div id="myQrCode"></div>
       <div id="qrLiveInfo" class="qr-live-info" style="display:none">
         <div id="qrLiveStatus"></div>
-        <button type="button" class="scan-btn" id="qrLiveRefresh" onclick="refreshQrLive()">NEW QR</button>
+        <button type="button" class="scan-btn" id="qrLiveRefresh">NEW QR</button>
         <div id="qrLiveClaimed" style="display:none">
           <input id="qrLiveName" placeholder="name this contact" autocomplete="off">
           <button type="button" class="scan-btn" id="qrLiveNameSave">SAVE NAME</button>
@@ -336,7 +345,7 @@ if ("serviceWorker" in navigator) {
     <div class="qr-panel" id="panelScan">
       <div id="qrReader" style="width:100%"></div>
       <div id="scanResult"></div>
-      <button class="scan-btn" id="scanToggleBtn" onclick="toggleScanner()">START CAMERA</button>
+      <button class="scan-btn" id="scanToggleBtn">START CAMERA</button>
       <div class="hint" style="text-align:center">point camera at contact's QR code</div>
     </div>
     <div class="qr-panel" id="panelPaste">
@@ -408,5 +417,6 @@ if ("serviceWorker" in navigator) {
 <script type="text/javascript" src="meshchat.js"></script>
 <script type="text/javascript" src="meshchat-identity.js"></script>
 <script type="text/javascript" src="statemachine.js"></script>
+<script type="text/javascript" src="meshchat-boot.js"></script>
 </body>
 </html>

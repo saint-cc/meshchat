@@ -668,8 +668,76 @@ async function deriveIntroWrapKey(sharedSecret, tokenBytes) {
 /* ══════════════════════════════════════════
    HELPERS
 ══════════════════════════════════════════ */
+/* ── RELAY HINT SHAPE ──
+   A relay hint is a URL a CONTACT chose (inside a signed message, a migrate
+   notice, or the key they handed us), and this client will open a WebSocket to
+   it. Signature checks decide WHO may steer our traffic; they say nothing about
+   WHERE. A WebSocket handshake is an ordinary HTTP GET with the URL's own path
+   and query, so "wss://" is not the only thing a hostile hint can do: observed
+   in Chromium, ws://127.0.0.1:PORT/admin/stop?x=1 reaches a local HTTP service
+   as exactly `GET /admin/stop?x=1` — from an https page too, because loopback is
+   exempt from mixed-content blocking (a LAN address is not: that throws). The
+   WebSocket constructor is also no validator: it takes http://, and it takes
+   user:pw@host. This is where a hint's shape is judged; updateRelay applies it
+   to every hint path (messages, hello, migrate, restore, backup merge), and
+   addContact to the relay segment of a pasted key.
+
+   Always: a string of printable ASCII (IDN hosts arrive as punycode), at most
+   RELAY_HINT_MAX_LEN, ws: or wss:, no credentials, no fragment, a host.
+   STRICT (the default, and always on an https page): wss: only, and the host
+   must be a public DNS name or public IPv4 literal — no localhost, single-label
+   names, local-only suffixes, private/loopback/link-local/reserved IPv4, or any
+   IPv6 literal. The hostname is judged AFTER the URL parser has normalised it,
+   so 2130706433 / 0x7f.1 / 017700000001 are seen as the 127.0.0.1 they are.
+   Loose: only on a page served over plain http (local development), where ws:
+   and LAN hosts are what a dev setup is made of.
+   What no client-side rule can see: a public-looking DNS name whose A record
+   points inside the network. */
+const RELAY_HINT_MAX_LEN = 512;
+const RELAY_HINT_LOCAL_SUFFIX_RE = /(^|\.)(localhost|local|localdomain|internal|intranet|lan|home|corp|home\.arpa)$/;
+const NON_PUBLIC_IPV4 = [   // [base, prefix bits]
+  [[0,0,0,0],8], [[10,0,0,0],8], [[100,64,0,0],10], [[127,0,0,0],8], [[169,254,0,0],16],
+  [[172,16,0,0],12], [[192,0,0,0],24], [[192,0,2,0],24], [[192,168,0,0],16], [[198,18,0,0],15],
+  [[198,51,100,0],24], [[203,0,113,0],24], [[224,0,0,0],4], [[240,0,0,0],4],
+];
+function isPublicIPv4(o) {
+  const n = ((o[0] << 24) | (o[1] << 16) | (o[2] << 8) | o[3]) >>> 0;
+  return !NON_PUBLIC_IPV4.some(([b, bits]) => {
+    const base = ((b[0] << 24) | (b[1] << 16) | (b[2] << 8) | b[3]) >>> 0;
+    const mask = bits === 0 ? 0 : (0xFFFFFFFF << (32 - bits)) >>> 0;
+    return (n & mask) === (base & mask);
+  });
+}
+function relayHintProblem(url, strict = !(typeof location !== "undefined" && location.protocol === "http:")) {
+  if (typeof url !== "string" || !url || url.length > RELAY_HINT_MAX_LEN) return "empty, not a string, or too long";
+  if (/[^\x21-\x7e]/.test(url)) return "control, space or non-ASCII character";
+  let u;
+  try { u = new URL(url); } catch (e) { return "unparseable"; }
+  if (u.protocol !== "wss:" && u.protocol !== "ws:") return "not ws:// or wss://";
+  if (u.username || u.password) return "credentials in URL";
+  if (u.hash) return "fragment in URL";
+  if (!u.hostname) return "no host";
+  if (!strict) return null;
+  if (u.protocol !== "wss:") return "plain ws:// (only wss:// is accepted here)";
+  const h = u.hostname.toLowerCase().replace(/\.$/, "");
+  if (h.startsWith("[")) return "IPv6 literal";
+  const v4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(h);
+  if (v4) return isPublicIPv4(v4.slice(1).map(Number)) ? null : "non-public IP address";
+  if (!h.includes(".")) return "single-label host";
+  if (RELAY_HINT_LOCAL_SUFFIX_RE.test(h)) return "local-only host name";
+  return null;
+}
+
 function updateRelay(contact, wss, ts) {
   if (wss && (ts || 0) > (contact.lastRelaySeen || 0)) {
+    // Shape first, and a refusal touches NOTHING — in particular not
+    // lastRelaySeen, or a rejected hint with a fresh ts would shut out the
+    // genuine one that follows.
+    const problem = relayHintProblem(wss);
+    if (problem) {
+      if (typeof mlog !== "undefined") mlog.warn(`RELAY      hint rejected (${problem})  ${String(wss).slice(0, 80)}`);
+      return;
+    }
     contact.lastRelay     = wss;
     contact.lastRelaySeen = ts || Date.now();
   }

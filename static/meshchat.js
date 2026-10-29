@@ -583,11 +583,45 @@ async function deserialiseContacts(raw){
 ══════════════════════════════════════════ */
 let _saveContactsChain = Promise.resolve();
 
+/* ══════════════════════════════════════════
+   PERSISTENCE HALT (0.6.2) — set once, by selfDestruct, never cleared
+   Every save is asynchronous somewhere (encryptObject awaits crypto.subtle
+   and gzip), so a save started before selfDestruct() removes the storage keys
+   can finish AFTER it and write the identity straight back — contacts,
+   session roots, all of it — onto a device that was just told it was wiped.
+   The page reloads 300ms later, but a wipe that can be undone by a late
+   write is not a wipe. So: selfDestruct raises this flag first, and every
+   writer checks it at the last synchronous moment before localStorage.setItem
+   (i.e. AFTER its own awaits, not just on entry — a check on entry alone is
+   exactly the hole). Check-then-write is one synchronous stretch, so nothing
+   can slip in between. Reload resets it, which is when it should reset.
+══════════════════════════════════════════ */
+let persistenceHalted = false;
+
+/* ══════════════════════════════════════════
+   UNREADABLE-BLOB QUARANTINE
+   loadContacts / loadX4DHSessions fall back to an EMPTY state when the stored
+   blob fails to decrypt or parse (corruption, a half-written value, a format
+   we no longer understand). The very next save then replaces that blob with
+   the empty state — a transient read problem became permanent data loss.
+   Before falling back, the raw stored string is copied to "<key>_unreadable"
+   (one slot per store, newest wins; same ciphertext, so it needs no extra
+   protection, and selfDestruct removes it with the rest). Recovery is manual
+   — nothing reads it back — but the data is no longer gone.
+══════════════════════════════════════════ */
+const UNREADABLE_SUFFIX = "_unreadable";
+function quarantineUnreadable(storageKey, raw) {
+  if (!raw || persistenceHalted) return;
+  try { localStorage.setItem(storageKey + UNREADABLE_SUFFIX, raw); mlog.warn(`STORAGE    unreadable blob kept as ${storageKey}${UNREADABLE_SUFFIX}`); }
+  catch(e) { mlog.err(`STORAGE    could not quarantine unreadable blob: ${e.message}`); }
+}
+
 function saveContacts() {
   const run = _saveContactsChain.then(async () => {
-    if (!state.cryptoKey) return;
+    if (!state.cryptoKey || persistenceHalted) return;
     try {
       const encrypted = await encryptObject(state.cryptoKey, serialiseContacts({ local: true }));
+      if (persistenceHalted) return undefined;   // wiped while we were encrypting — see PERSISTENCE HALT
       localStorage.setItem(STORAGE_KEY + "_" + state.publicId, JSON.stringify(encrypted));
       return encrypted;
     } catch(e) {
@@ -638,7 +672,9 @@ async function loadContacts() {
       mlog.info("STORAGE    no local data — fresh start");
       return;
     }
-    state.contacts = await deserialiseContacts(await decryptObject(state.cryptoKey, JSON.parse(raw)));
+    try {
+      state.contacts = await deserialiseContacts(await decryptObject(state.cryptoKey, JSON.parse(raw)));
+    } catch(e) { quarantineUnreadable(STORAGE_KEY + "_" + state.publicId, raw); throw e; }
     const contactIds = Object.keys(state.contacts).filter(id => id !== state.publicId);
     mlog.info(`STORAGE    loaded ${Object.keys(state.contacts).length} contact(s)`);
     if (contactIds.length > 0) sessionFresh = false;
@@ -657,6 +693,7 @@ function loadPeerBackups() {
 }
 
 function savePeerBackups() {
+  if (persistenceHalted) return;
   try { localStorage.setItem(PEER_BACKUP_KEY + "_" + state.publicId, JSON.stringify(state.peerBackups)); }
   catch(e) {}
 }
@@ -669,6 +706,7 @@ function loadPeerTokens() {
 }
 
 function savePeerTokens() {
+  if (persistenceHalted) return;
   try { localStorage.setItem(PEER_TOKEN_KEY + "_" + state.publicId, JSON.stringify(state.peerTokens)); }
   catch(e) {}
 }
@@ -735,6 +773,7 @@ function loadDeviceRegistry() {
 }
 
 function saveDeviceRegistry() {
+  if (persistenceHalted) return;
   try { localStorage.setItem(DEVICE_REGISTRY_KEY + "_" + state.publicId, JSON.stringify(state.knownDevices)); }
   catch(e) {}
 }
@@ -803,6 +842,7 @@ function loadSendCounters() {
 }
 
 function saveSendCounters() {
+  if (persistenceHalted) return;
   try { localStorage.setItem(SEND_COUNTER_KEY + "_" + state.publicId, JSON.stringify(state.sendCounters)); }
   catch(e) {}
 }
@@ -1042,7 +1082,9 @@ async function loadX4DHSessions() {
     if (!state.cryptoKey) { state.x4dhSessions = {}; return; }
     const raw = localStorage.getItem(X4DH_SESSION_KEY + "_" + state.publicId);
     if (!raw) { state.x4dhSessions = {}; return; }
-    state.x4dhSessions = await decryptObject(state.cryptoKey, JSON.parse(raw));
+    try {
+      state.x4dhSessions = await decryptObject(state.cryptoKey, JSON.parse(raw));
+    } catch(e) { quarantineUnreadable(X4DH_SESSION_KEY + "_" + state.publicId, raw); throw e; }
     mlog.debug(`STORAGE    X4DH sessions loaded: ${Object.keys(state.x4dhSessions).length} contact(s)`);
   } catch(e) {
     mlog.warn(`STORAGE    X4DH session load failed: ${e.message}`);
@@ -1050,14 +1092,35 @@ async function loadX4DHSessions() {
   }
 }
 
-async function saveX4DHSessions() {
-  if (!state.cryptoKey) return;
-  try {
-    const encrypted = await encryptObject(state.cryptoKey, state.x4dhSessions);
-    localStorage.setItem(X4DH_SESSION_KEY + "_" + state.publicId, JSON.stringify(encrypted));
-  } catch(e) {
-    mlog.err(`STORAGE    X4DH session save failed: ${e.message}`);
-  }
+// Serialised exactly like saveContacts (see "saveContacts() SERIALIZATION"), and
+// for the same reason — this was the one writer left without it. Callers fire it
+// from many handlers (RK0 stored, RK1 upgrade, peer-key confirmation, retry
+// bookkeeping, deferred ack…), several of them without awaiting, so two saves
+// regularly overlap. encryptObject snapshots its argument at call time but only
+// finishes after async crypto + gzip, and nothing orders those finishes: an
+// older, smaller snapshot could land SECOND and overwrite the newer one. The
+// damage is invisible until a reload brings back a session at an older stage —
+// an RK1 upgrade forgotten, a retired RK0 resurrected, a retry budget reset —
+// and the two sides then disagree about which root is current.
+// Here every call queues behind the previous one, and the snapshot is taken
+// INSIDE the queued step, so each write carries the latest in-memory state at
+// the moment it runs — the last write in the queue is always the freshest.
+// Resolves once THIS call's write has landed (or been skipped), as before.
+let _saveX4DHChain = Promise.resolve();
+
+function saveX4DHSessions() {
+  const run = _saveX4DHChain.then(async () => {
+    if (!state.cryptoKey || persistenceHalted) return;
+    try {
+      const encrypted = await encryptObject(state.cryptoKey, state.x4dhSessions);
+      if (persistenceHalted) return;   // wiped while we were encrypting — see PERSISTENCE HALT
+      localStorage.setItem(X4DH_SESSION_KEY + "_" + state.publicId, JSON.stringify(encrypted));
+    } catch(e) {
+      mlog.err(`STORAGE    X4DH session save failed: ${e.message}`);
+    }
+  });
+  _saveX4DHChain = run.catch(() => {});   // one failed save must not wedge every later one
+  return run;
 }
 
 function getX4DHSession(contactId, theirDeviceId) {
@@ -3399,6 +3462,62 @@ function clampRelayTs(ts, now = Date.now()) {
   return Math.min(ts, now);
 }
 
+/* ══════════════════════════════════════════
+   MESSAGE IDS AND TIMESTAMPS — receive-side hygiene (0.6.2)
+   A conversation's messages are keyed by `id` alone (mergeMessages), and a
+   same-id collision is resolved by `ts` — both chosen by whoever sent the
+   packet. So a contact could (a) reuse the id of a message already in the
+   conversation — ours included — and replace it, (b) compute our reaction
+   id (deriveReactionId is a hash of public values) and overwrite our
+   reaction, (c) stamp a future ts so that copy outranks every genuine later
+   one, and (d) overwrite the audio/image/packet cache entry for a message
+   id BEFORE any merge-level rule could object. Everything here runs before
+   the receive path touches any of that:
+     - ids must be well-formed (uuid / base64url, <= 64 chars);
+     - a message may reuse an id on file only as a REACTION from the same
+       sender (the one deliberate collide-and-replace case); anything else
+       is dropped — another sender's id, a different type, changed content;
+     - a reaction's id must be exactly deriveReactionId(its sender, its
+       target), so it can only ever occupy its own sender's slot for that
+       target;
+     - ts is clamped to our clock + MSG_TS_SKEW_MS. The clamp is on OUR clock
+       (same idea as clampRelayTs) — a sender can't claim to be from the
+       future, only a little ahead to absorb ordinary clock skew.
+   Immutable-content messages keep their FIRST copy: a redelivery (targeted
+   copy + broadcast copy, buffer flush after a reconnect) is a harmless
+   duplicate and is dropped before it can bump unread or re-ack. */
+const MSG_ID_RE      = /^[A-Za-z0-9_-]{1,64}$/;
+const MSG_TS_SKEW_MS = 5 * 60 * 1000;
+
+function isWellFormedMsgId(id) { return typeof id === "string" && MSG_ID_RE.test(id); }
+
+// Missing / non-numeric / non-positive ts becomes "now" (the receive path's
+// old `plain.ts || Date.now()` default); anything else is capped at now + skew.
+function clampMsgTs(ts, now = Date.now()) {
+  return (Number.isFinite(ts) && ts > 0) ? Math.min(ts, now + MSG_TS_SKEW_MS) : now;
+}
+
+async function reactionIdMatches(senderId, id, targetId) {
+  if (!isWellFormedMsgId(id) || !isWellFormedMsgId(targetId)) return false;
+  return id === await deriveReactionId(senderId, targetId);
+}
+
+// null = nothing in the way, let it through. Otherwise { reason, loud }:
+// the incoming message must be dropped; loud=false marks the benign case
+// (an exact redelivery) so it logs at debug instead of warn.
+function incomingIdConflict(contact, msgObj) {
+  const existing = (contact.messages || []).find(x => x.id === msgObj.id);
+  if (!existing) return null;
+  if (existing.from !== msgObj.from) return { reason: "id belongs to a message from the other party", loud: true };
+  const eType = existing.type || "text", nType = msgObj.type || "text";
+  if (eType !== nType) return { reason: `id belongs to an existing ${eType} message`, loud: true };
+  if (nType === "reaction") return null;   // same sender, same type: a newer ts replaces — the one intended collision
+  const same = (existing.text ?? null) === (msgObj.text ?? null) && (existing.mimeType ?? null) === (msgObj.mimeType ?? null);
+  if (same && existing.valid === false && msgObj.valid) return null;   // identical copy, now verified: let it upgrade the unverified one
+  return same ? { reason: "duplicate of a message already on file", loud: false }
+              : { reason: "id reused with different content (messages are immutable)", loud: true };
+}
+
 async function handleRestoreRequest(msg) {
   if (!msg.from || !msg.blob || !isAddressedToMe(msg.to)) return;
   const contact = state.contacts[msg.from];
@@ -3930,16 +4049,27 @@ function buildSyncPacket(contact, { syncId, reply, ek, wrapped }) {
 // a synced copy of our own message would replace the local object and lose
 // its delivery status. Reactions are the exception — same id across states,
 // newer ts must win, which mergeMessages already does.
-function sanitizeSyncedMessages(raw, peerId, existing) {
+//
+// 0.6.2 — the peer's batch is also held to the receive path's id rules (see
+// MESSAGE IDS AND TIMESTAMPS): well-formed ids, ts clamped to our clock + skew,
+// a reaction's id must be deriveReactionId(its sender, its target), and
+// incomingIdConflict decides whether an id already on file may be touched at
+// all — checked against the batch built so far as well as the conversation,
+// so a batch can't contradict itself either. On top of that: a peer's claim
+// about what WE said never replaces anything of ours already on file, reaction
+// or not — it can only fill a gap (the restore-after-wipe case this exists for).
+// Entries claiming from=us are still accepted on trust of the peer's signature
+// over the whole batch; that is a provenance question, not an id question.
+async function sanitizeSyncedMessages(raw, peerId, existing) {
   if (!Array.isArray(raw)) return [];
-  const have = new Set((existing || []).map(m => m.id));
+  const pool = (existing || []).slice();   // conversation + whatever this batch has already contributed
+  const now  = Date.now();
   const out  = [];
   for (const m of raw.slice(0, MAX_SYNC_MSGS)) {
-    if (!m || typeof m.id !== "string" || m.id.length > 64 || !Number.isFinite(m.ts)) continue;
+    if (!m || !isWellFormedMsgId(m.id) || !Number.isFinite(m.ts)) continue;
     if (m.from !== peerId && m.from !== state.publicId) continue;   // only the two parties of THIS conversation
     const t = m.type || "text";
-    if (t !== "reaction" && have.has(m.id)) continue;
-    const o = { id: m.id, from: m.from, ts: m.ts, valid: m.valid !== false };
+    const o = { id: m.id, from: m.from, ts: clampMsgTs(m.ts, now), valid: m.valid !== false };
     if (t === "text") {
       if (typeof m.text !== "string") continue;
       o.text = m.text;
@@ -3957,7 +4087,18 @@ function sanitizeSyncedMessages(raw, peerId, existing) {
     if (typeof m.deviceId === "string") o.deviceId = m.deviceId;
     if (Number.isFinite(m.n)) o.n = m.n;
     if (typeof m.ackDeviceId === "string" && Number.isFinite(m.ackN)) { o.ackDeviceId = m.ackDeviceId; o.ackN = m.ackN; }
+    if (o.type === "reaction" && !(await reactionIdMatches(o.from, o.id, o.targetId))) {
+      mlog.debug(`SYNC       dropped a reaction whose id isn't its sender's slot for the target  id=${pid(o.id)}`);
+      continue;
+    }
+    const ownIdOnFile = o.from === state.publicId && pool.some(x => x.id === o.id);
+    const conflict    = incomingIdConflict({ messages: pool }, o);
+    if (ownIdOnFile || conflict) {
+      if (conflict?.loud) mlog.warn(`SYNC       dropped a synced message — ${conflict.reason}  id=${pid(o.id)}`);
+      continue;
+    }
     out.push(o);
+    pool.push(o);
   }
   return out;
 }
@@ -4059,7 +4200,7 @@ async function handleMsgExchange(msg) {
     return;
   }
 
-  const incoming = sanitizeSyncedMessages(msgs, msg.from, contact.messages);
+  const incoming = await sanitizeSyncedMessages(msgs, msg.from, contact.messages);
   const before = contact.messages.length;
   contact.messages = mergeMessages(contact.messages, incoming);
   reconcileDeliveryStatus(contact);
@@ -5219,6 +5360,23 @@ async function receiveMessage(msg) {
     // switch our send key on the strength of an unverified packet.
     if (viaX4DH && valid && keyLabel === "current") confirmX4DHPeerKey(msg.from, matchedDeviceId);
 
+    // 0.6.2 — shape of what is about to become part of the conversation (see
+    // MESSAGE IDS AND TIMESTAMPS). Content messages only: a hello's id is never
+    // stored, and a selfsync's inner message gets its own checks in handleSelfSync.
+    // Runs BEFORE the duplicate guard so a rejected packet can't stamp its window,
+    // and before anything below can touch a cache, the device registry's n-gap
+    // bookkeeping, unread or the auto-ack.
+    if (plain.type !== "hello" && plain.type !== "selfsync") {
+      let bad = null;
+      if (!isWellFormedMsgId(plain.id)) bad = "malformed message id";
+      else if ((plain.type === undefined || plain.type === "text" || plain.type === "system") && typeof plain.text !== "string") bad = "text missing";
+      else if (plain.type === "reaction" && !(await reactionIdMatches(msg.from, plain.id, plain.targetId))) bad = "reaction id is not its sender's slot for the target";
+      if (bad) {
+        mlog.warn(`← MSG          from ${pid(msg.from)} — ${bad}, dropped`);
+        return;
+      }
+    }
+
     // Duplicate-delivery guard (0.4.9) — a targeted send and the
     // identity-level broadcast fallback are NOT mutually exclusive: a
     // device resolved enough to get its own targeted copy (see
@@ -5244,7 +5402,9 @@ async function receiveMessage(msg) {
     // sharing its stable derived id (see deriveReactionId — the same id
     // deliberately persists across every emoji state) is never mistaken
     // for a stale duplicate of an older one.
-    if (plain.id && isDuplicateInbound(`app_message:${plain.id}:${plain.ts}`)) {
+    // Keyed on the sender too (0.6.2): id+ts alone let one contact's packet land in
+    // the window of — and suppress — a different contact's message with the same id.
+    if (plain.id && isDuplicateInbound(`app_message:${msg.from}:${plain.id}:${plain.ts}`)) {
       mlog.debug(`← MSG          from ${pid(msg.from)} — duplicate delivery within ${DEDUP_WINDOW_MS}ms, suppressed`);
       return;
     }
@@ -5257,7 +5417,9 @@ async function receiveMessage(msg) {
     // before decrypt/verify even ran — left over from debugging signature
     // failures early on; tightened now that it's a real trust boundary.
     if (valid && plain.deviceId) recordKnownDevice(msg.from, plain.deviceId, plain.n, plain.endpointId);
-    if (plain.id && plain.type !== "hello") packetCache[plain.id] = { envelope: msg, payload: plain };
+    // (packetCache for this message is written below, once its id has cleared
+    // incomingIdConflict — a rejected packet must not replace the inspector
+    // entry of the message whose id it borrowed.)
     // Relay hint rides inside the signed payload, so it carries the same
     // trust requirement as recordKnownDevice above: only a validly signed
     // message may steer where we send this contact's traffic. A message
@@ -5289,7 +5451,10 @@ async function receiveMessage(msg) {
       return;
     }
 
-    const msgObj = { id: plain.id, from: msg.from, ts: plain.ts || Date.now(), valid };
+    // ts is clamped to our clock + skew (clampMsgTs): it decides which copy wins a
+    // reaction's collide-and-replace and where the message sorts, and the sender
+    // chooses it.
+    const msgObj = { id: plain.id, from: msg.from, ts: clampMsgTs(plain.ts), valid };
     // persist the sender's per-device send counter locally too, not just
     // in the wire payload — needed both for the gap/"missing" display
     // (recordKnownDevice above only tracks it on the registry side) and
@@ -5307,13 +5472,12 @@ async function receiveMessage(msg) {
     if (plain.ackDeviceId) msgObj.ackDeviceId = plain.ackDeviceId;
     if (plain.ackN != null) msgObj.ackN = plain.ackN;
 
+    // The media caches are written further down, AFTER the id has cleared
+    // incomingIdConflict — they are keyed by id alone, so writing them here
+    // would let a colliding packet swap the audio/image of a message already on file.
     if (plain.type === "audio") {
-      const encBlob = await encryptObject(state.encKey, { data: plain.data, mimeType: plain.mimeType });
-      audioCache[plain.id] = { encBlob, mimeType: plain.mimeType };
       msgObj.type = "audio"; msgObj.mimeType = plain.mimeType;
     } else if (plain.type === "image") {
-      const encBlob = await encryptObject(state.encKey, { data: plain.data, mimeType: plain.mimeType });
-      imageCache[plain.id] = { encBlob, mimeType: plain.mimeType };
       msgObj.type = "image"; msgObj.mimeType = plain.mimeType;
     } else if (plain.type === "reaction") {
       msgObj.type = "reaction"; msgObj.targetId = plain.targetId; msgObj.emoji = plain.emoji || null;
@@ -5324,6 +5488,30 @@ async function receiveMessage(msg) {
     } else {
       msgObj.text = plain.text;
       mlog.debug(`MSG content: "${(plain.text||"").slice(0,40)}${(plain.text||"").length>40?"…":""}"  id=${plain.id}`);
+    }
+
+    // 0.6.2 — may this id be (re)used here at all? Anything but a same-sender
+    // reaction replacing its own earlier state is refused: another party's id, a
+    // different type, changed content, or an exact redelivery. Everything with a
+    // side effect — caches, merge, unread, auto-ack — comes after this line.
+    const conflict = incomingIdConflict(contact, msgObj);
+    if (conflict) {
+      const line = `← MSG          from ${pid(msg.from)}  id=${pid(plain.id)} — ${conflict.reason}, dropped`;
+      if (conflict.loud) mlog.warn(line); else mlog.debug(line);
+      // An exact redelivery still gets its delivery ack, as it always did: the copy on
+      // file may have arrived by another route (SYNC, a sibling) before this live one,
+      // and the sender's "sent" only flips to "delivered" on our ack. Nothing else
+      // happens — no merge, no cache write, no unread bump. A refused collision
+      // (loud) gets nothing: never ack an id we are rejecting.
+      if (!conflict.loud && valid && msg.from !== state.publicId && msgObj.type !== "reaction") {
+        sendReaction(plain.id, null, msg.from, true);
+      }
+      return;
+    }
+    packetCache[plain.id] = { envelope: msg, payload: plain };
+    if (plain.type === "audio" || plain.type === "image") {
+      const encBlob = await encryptObject(state.encKey, { data: plain.data, mimeType: plain.mimeType });
+      (plain.type === "audio" ? audioCache : imageCache)[plain.id] = { encBlob, mimeType: plain.mimeType };
     }
 
     // ── merge + reconcile happens BEFORE any ack is sent — see below ──
@@ -5591,10 +5779,17 @@ async function burnBlockContact(id) {
    extra needed for it.
 ══════════════════════════════════════════ */
 function selfDestruct() {
+  // FIRST, before any key is removed: from here on no save may write anything
+  // back — saves already in flight finish their async encrypt, see this flag
+  // and discard (see PERSISTENCE HALT). Without it the removals below were only
+  // a suggestion: a contacts/session save started a moment earlier, or one
+  // triggered by a packet arriving during the 300ms before the reload, could
+  // recreate the very data this function exists to remove.
+  persistenceHalted = true;
   forgetRemembered();
   const suffix = "_" + state.publicId;
   [STORAGE_KEY, PEER_BACKUP_KEY, PEER_TOKEN_KEY, DEVICE_REGISTRY_KEY, DEVICE_KEY_STORAGE, X4DH_SESSION_KEY]
-    .forEach(key => localStorage.removeItem(key + suffix));
+    .forEach(key => { localStorage.removeItem(key + suffix); localStorage.removeItem(key + suffix + UNREADABLE_SUFFIX); });
  
   mlog.warn("BURN       self-destruct — all local identity data wiped, reloading");
   try { state.ws?.close(1000, "burned"); } catch(e) {}
@@ -6881,6 +7076,10 @@ async function addContact(name,shareableKey,save=true){
     if(parts.length===3&&parts[2])relayWss=atob(parts[2]);
   }
   catch(e){return false;}
+  // The relay segment of a key somebody handed us is a URL this client will open a
+  // socket to — judged like any other relay hint (relayHintProblem, meshchat-lib.js).
+  // A bad one is dropped, the contact is still added.
+  if(relayWss){const problem=relayHintProblem(relayWss);if(problem){mlog.warn(`CONTACT    key carries a relay hint that was rejected (${problem}) — adding ${name} without it`);relayWss=null;}}
   const publicId=await deriveIdentityPublicId(x25519PublicKey,signPublicKey);
   if(publicId===state.publicId||state.contacts[publicId])return!!state.contacts[publicId];
   // encKey is derived via ECDH, not imported off the wire — this contact's
