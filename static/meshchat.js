@@ -13,7 +13,7 @@
 
    Load order: meshchat-lib.js → meshchat-gui.js → meshchat.js → statemachine.js
 ═══════════════════════════════════════════════════════════════ */
-const CLIENT_VERSION = "0.6.1";
+const CLIENT_VERSION = "0.6.2";
 
 const POLL_INTERVAL_MS        	= 30_000;			// base interval between presence polls
 const POLL_JITTER_MS          	= 10_000;			// ± random jitter added to poll interval
@@ -317,6 +317,88 @@ function signBlob(blob){
   const bytes=new TextEncoder().encode(JSON.stringify(blob));
   const sig=ed25519.sign(bytes,state.keys.signingKeySeed);
   return Array.from(sig);
+}
+
+/* ══════════════════════════════════════════
+   PER-MESSAGE SIGNATURES (0.6.2)
+   Every message we compose carries its own ed25519 signature, made with the
+   identity key (so any of our devices can sign, and any holder can verify
+   against the sender's public key). It exists for one reason: a SYNC batch
+   (app:sync) is signed by the peer as a whole, which proves the BATCH came
+   from them — not that every message in it is something we said. Without a
+   per-message signature a peer could slip entries with from=<us> into our own
+   conversation history. With it, an entry claiming to be ours is accepted as
+   verified only if WE signed it; the peer can only relay what we signed.
+   The signature lives inside the encrypted payload and on the stored record
+   (`sig`, base64url), so the receiver keeps the SENDER's signature next to the
+   copy it holds — which is what lets a wiped device restore its own sent
+   messages, verified, from the peer.
+   Signed: label, id, from, to, ts, type and the type's content (text; kind +
+   text; mimeType; targetId + emoji). `to` is the other party of the
+   conversation, so a message signed for one contact cannot be replayed into
+   another conversation — it is NOT stored; the verifier supplies it from the
+   conversation it is checking. NOT signed: deviceId / n / ack pointers
+   (ordering hints, never authorship), status, valid, and media bytes (media is
+   transient; the stub's mimeType is covered, the payload is not).
+   A record whose stored ts was clamped on receipt (clampMsgTs) no longer
+   matches what was signed, so it is stored without a signature.
+   SYNC_ACCEPT_UNSIGNED_OWN is the transition switch: while true, an UNSIGNED
+   entry with from=<us> in a peer's sync batch (a message from before this
+   existed) is still accepted, stored valid:false and shown with the usual
+   "⚠ unverified" tag. Set it false and such entries are dropped. An entry whose
+   signature is present but WRONG is always dropped.
+══════════════════════════════════════════ */
+const MSG_SIG_LABEL = "meshchat/msg/1";
+const SYNC_ACCEPT_UNSIGNED_OWN = true;
+
+function ownSignPublicKey() { return state.contacts?.[state.publicId]?.signPublicKey || null; }
+
+// The exact object that is signed / verified. null = this record is not signable.
+function msgSigBody(m, toId) {
+  if (!m || typeof m.id !== "string" || typeof m.from !== "string" || typeof toId !== "string" || !Number.isFinite(m.ts)) return null;
+  const t = m.type || "text";
+  const b = { l: MSG_SIG_LABEL, id: m.id, from: m.from, to: toId, ts: m.ts, type: t };
+  if (t === "text") {
+    if (typeof m.text !== "string") return null;
+    b.text = m.text;
+  } else if (t === "system") {
+    if (typeof m.text !== "string") return null;
+    b.kind = typeof m.kind === "string" ? m.kind : null; b.text = m.text;
+  } else if (t === "audio" || t === "image") {
+    b.mimeType = typeof m.mimeType === "string" ? m.mimeType : null;
+  } else if (t === "reaction") {
+    if (typeof m.targetId !== "string") return null;
+    b.targetId = m.targetId; b.emoji = (typeof m.emoji === "string" && m.emoji) ? m.emoji : null;
+  } else return null;
+  return b;
+}
+
+// Sign a message WE are composing. `toId` = the contact it goes to (our own id
+// for the self chat). Returns a base64url string, or undefined if it can't be
+// signed — callers then simply send/store it unsigned, as before.
+function signMessage(m, toId) {
+  try {
+    const body = msgSigBody(m, toId);
+    return body ? rawToBase64(Uint8Array.from(signBlob(body))) : undefined;
+  } catch(e) { return undefined; }
+}
+
+function verifyMessageSig(m, sig, signerKey, toId) {
+  try {
+    if (typeof sig !== "string" || sig.length > 100 || !signerKey) return false;
+    const body = msgSigBody(m, toId);
+    if (!body) return false;
+    const raw = base64ToRaw(sig);
+    return raw.length === 64 && verifyBlob(body, raw, signerKey);
+  } catch(e) { return false; }
+}
+
+// Who must have signed a message claiming `from`, in the conversation with
+// `peerId`, and who it was addressed to. null = `from` is not a party to it.
+function msgSigSigner(from, peerId) {
+  if (from === state.publicId) return { key: ownSignPublicKey(), to: peerId };
+  if (from === peerId)         return { key: state.contacts[peerId]?.signPublicKey || null, to: state.publicId };
+  return null;
 }
 
 /* ══════════════════════════════════════════
@@ -2319,7 +2401,7 @@ async function sendContent(contactId, payload, { hold = true, label = "MSG" } = 
 async function buildHeldPayload(m) {
   const me    = state.contacts[state.publicId];
   const relay = me?.lastRelay ? { wss: me.lastRelay } : undefined;
-  const base  = { id: m.id, ts: m.ts, deviceId: state.deviceId, endpointId: state.endpointId,
+  const base  = { id: m.id, ts: m.ts, ...(m.sig ? { sig: m.sig } : {}), deviceId: state.deviceId, endpointId: state.endpointId,
                   ...(m.n != null ? { n: m.n } : {}),
                   ...((m.ackDeviceId && m.ackN != null) ? { ackDeviceId: m.ackDeviceId, ackN: m.ackN } : {}),
                   ...(relay ? { relay } : {}) };
@@ -4106,8 +4188,12 @@ function buildSyncPacket(contact, { syncId, reply, ek, wrapped }) {
 // so a batch can't contradict itself either. On top of that: a peer's claim
 // about what WE said never replaces anything of ours already on file, reaction
 // or not — it can only fill a gap (the restore-after-wipe case this exists for).
-// Entries claiming from=us are still accepted on trust of the peer's signature
-// over the whole batch; that is a provenance question, not an id question.
+// Provenance is the per-message signature's job (see PER-MESSAGE SIGNATURES):
+// a signed entry must verify against the key of the party it claims to be from,
+// or it is dropped; an UNSIGNED entry claiming from=us is, during the transition
+// (SYNC_ACCEPT_UNSIGNED_OWN), accepted as valid:false — the "⚠ unverified" tag.
+// An unverified copy of our own message is replaced by an identical, verified
+// one if a later sync brings it.
 async function sanitizeSyncedMessages(raw, peerId, existing) {
   if (!Array.isArray(raw)) return [];
   const pool = (existing || []).slice();   // conversation + whatever this batch has already contributed
@@ -4135,11 +4221,40 @@ async function sanitizeSyncedMessages(raw, peerId, existing) {
     if (typeof m.deviceId === "string") o.deviceId = m.deviceId;
     if (Number.isFinite(m.n)) o.n = m.n;
     if (typeof m.ackDeviceId === "string" && Number.isFinite(m.ackN)) { o.ackDeviceId = m.ackDeviceId; o.ackN = m.ackN; }
+    if (typeof m.sig === "string") {
+      const who = msgSigSigner(o.from, peerId);
+      // verified against the ts as signed; o.ts is the clamped one
+      if (!who || !verifyMessageSig({ ...o, ts: m.ts }, m.sig, who.key, who.to)) {
+        mlog.warn(`SYNC       dropped a synced message — signature invalid  id=${pid(o.id)}`);
+        continue;
+      }
+      o.valid = true;
+      if (o.ts === m.ts) o.sig = m.sig;
+    } else if (o.from === state.publicId) {
+      if (!SYNC_ACCEPT_UNSIGNED_OWN) {
+        mlog.debug(`SYNC       dropped an unsigned message claiming to be ours  id=${pid(o.id)}`);
+        continue;
+      }
+      o.valid = false;   // shown with the usual "⚠ unverified" tag
+    }
     if (o.type === "reaction" && !(await reactionIdMatches(o.from, o.id, o.targetId))) {
       mlog.debug(`SYNC       dropped a reaction whose id isn't its sender's slot for the target  id=${pid(o.id)}`);
       continue;
     }
-    const ownIdOnFile = o.from === state.publicId && pool.some(x => x.id === o.id);
+    const onFile = pool.find(x => x.id === o.id);
+    // Identical content, same ts, same sender: a verified copy may replace an
+    // unverified one (e.g. a restored-unsigned entry of ours, once the signed
+    // original turns up). Nothing else about an id already on file changes.
+    if (onFile && o.sig && o.type !== "reaction" && onFile.from === o.from && onFile.valid === false && !onFile.sig
+        && onFile.ts === o.ts && (onFile.type || "text") === (o.type || "text")
+        && (onFile.text ?? null) === (o.text ?? null) && (onFile.mimeType ?? null) === (o.mimeType ?? null)) {
+      if (onFile.status) o.status = onFile.status;
+      mlog.info(`SYNC       unverified message upgraded by a signed copy  id=${pid(o.id)}`);
+      pool[pool.indexOf(onFile)] = o;
+      out.push(o);
+      continue;
+    }
+    const ownIdOnFile = o.from === state.publicId && !!onFile;
     const conflict    = incomingIdConflict({ messages: pool }, o);
     if (ownIdOnFile || conflict) {
       if (conflict?.loud) mlog.warn(`SYNC       dropped a synced message — ${conflict.reason}  id=${pid(o.id)}`);
@@ -4254,8 +4369,9 @@ async function handleMsgExchange(msg) {
   reconcileDeliveryStatus(contact);
   reconcileMissingDevices(contact);
   const added = contact.messages.length - before;
-  mlog.info(`\u2190 SYNC_REPLY   from ${pid(msg.from)} \u2014 +${added} msgs  +wrap`);
-  setSyncStatus("synced with " + contact.name + " \u2713");
+  const unsigned = incoming.filter(x => x.from === state.publicId && x.valid === false && !x.sig).length;
+  mlog.info(`\u2190 SYNC_REPLY   from ${pid(msg.from)} \u2014 +${added} msgs  +wrap${unsigned ? `  (${unsigned} of ours unsigned \u2192 unverified)` : ""}`);
+  setSyncStatus("synced with " + contact.name + " \u2713" + (unsigned ? ` \u2014 ${unsigned} unverified (unsigned)` : ""));
   await saveContacts();
   if (state.currentChat === msg.from) renderMessages();
 }
@@ -5003,6 +5119,7 @@ async function sendImageMessage(file) {
       const mimeType = "image/jpeg";
       const ts       = Date.now();
       const id       = crypto.randomUUID();
+      const sig      = signMessage({ id, from: state.publicId, type: "image", mimeType, ts }, state.currentChat);
 
       let status = "failed";
       let sentN  = null;
@@ -5013,7 +5130,7 @@ async function sendImageMessage(file) {
 
         sentN = nextSendCounter(state.currentChat);
         ackPointer = getAckPointer(state.currentChat) || {};
-        const payload = { id, type: "image", data: base64, mimeType, ts, deviceId: state.deviceId, endpointId: state.endpointId, n: sentN, ...ackPointer, ...(relay ? { relay } : {}) };
+        const payload = { id, type: "image", data: base64, mimeType, ts, ...(sig ? { sig } : {}), deviceId: state.deviceId, endpointId: state.endpointId, n: sentN, ...ackPointer, ...(relay ? { relay } : {}) };
 
         const encBlob = await encryptObject(state.encKey, { data: base64, mimeType });
         imageCache[id] = { encBlob, mimeType };
@@ -5026,7 +5143,7 @@ async function sendImageMessage(file) {
         mlog.err(`→ IMAGE        to   ${pid(state.currentChat)} — send failed: ${e.message}`);
       }
 
-      const stored = { id, from: state.publicId, type: "image", mimeType, ts, valid: true, status, deviceId: state.deviceId, n: sentN, ...ackPointer };
+      const stored = { id, from: state.publicId, type: "image", mimeType, ts, ...(sig ? { sig } : {}), valid: true, status, deviceId: state.deviceId, n: sentN, ...ackPointer };
       contact.messages = mergeMessages(contact.messages, [stored]);
       if (status === "sent") sendSelfSync(contact.publicId, stored);   // stub only — see sendSelfSync
       await saveContacts();
@@ -5049,6 +5166,7 @@ async function sendAudioMessage(blob) {
     const ts       = Date.now();
     const id       = crypto.randomUUID();
     const mimeType = blob.type;
+    const sig      = signMessage({ id, from: state.publicId, type: "audio", mimeType, ts }, state.currentChat);
 
     let status = "failed";
     let sentN  = null;
@@ -5059,7 +5177,7 @@ async function sendAudioMessage(blob) {
 
       sentN = nextSendCounter(state.currentChat);
       ackPointer = getAckPointer(state.currentChat) || {};
-      const payload = { id, type: "audio", data: base64, mimeType, ts, deviceId: state.deviceId, endpointId: state.endpointId, n: sentN, ...ackPointer, ...(relay ? { relay } : {}) };
+      const payload = { id, type: "audio", data: base64, mimeType, ts, ...(sig ? { sig } : {}), deviceId: state.deviceId, endpointId: state.endpointId, n: sentN, ...ackPointer, ...(relay ? { relay } : {}) };
 
       // store encrypted in memory cache — never raw
       const encBlob = await encryptObject(state.encKey, { data: base64, mimeType });
@@ -5074,7 +5192,7 @@ async function sendAudioMessage(blob) {
     }
 
     // stub in messages — data stays in audioCache only
-    const stored = { id, from: state.publicId, type: "audio", mimeType, ts, valid: true, status, deviceId: state.deviceId, n: sentN, ...ackPointer };
+    const stored = { id, from: state.publicId, type: "audio", mimeType, ts, ...(sig ? { sig } : {}), valid: true, status, deviceId: state.deviceId, n: sentN, ...ackPointer };
     contact.messages = mergeMessages(contact.messages, [stored]);
     if (status === "sent") sendSelfSync(contact.publicId, stored);   // stub only — see sendSelfSync
     await saveContacts();
@@ -5344,6 +5462,10 @@ async function handleSelfSync(msg, plain, valid) {
   if (typeof inner.deviceId === "string") m.deviceId = inner.deviceId;
   if (Number.isFinite(inner.n)) m.n = inner.n;
   if (typeof inner.ackDeviceId === "string" && Number.isFinite(inner.ackN)) { m.ackDeviceId = inner.ackDeviceId; m.ackN = inner.ackN; }
+  // Our own signature, made by whichever of our devices composed it. Kept only
+  // if it checks out; a sibling's copy without one is accepted as before (it is
+  // authenticated by the decrypt itself), it just can't be forwarded as signed.
+  if (typeof inner.sig === "string" && verifyMessageSig({ ...m, ts: inner.ts }, inner.sig, ownSignPublicKey(), peerId)) m.sig = inner.sig;
 
   // Immutable-content ids (text/audio/image) already on file are left
   // alone — mergeMessages' same-id rule would let this copy's status:"sent"
@@ -5536,6 +5658,18 @@ async function receiveMessage(msg) {
     } else {
       msgObj.text = plain.text;
       mlog.debug(`MSG content: "${(plain.text||"").slice(0,40)}${(plain.text||"").length>40?"…":""}"  id=${plain.id}`);
+    }
+
+    // Per-message signature (see PER-MESSAGE SIGNATURES): keep the SENDER's
+    // signature on our copy, but only a verified one, so that a later sync can
+    // hand it back to them. A missing one (older client) is simply not stored —
+    // the envelope above is what authenticated this delivery. Verified against
+    // the ts as sent: if clampMsgTs moved it, the stored copy can no longer
+    // match what was signed, so it is stored without one.
+    if (typeof plain.sig === "string") {
+      if (msgObj.ts !== plain.ts) mlog.debug(`← MSG          from ${pid(msg.from)}  id=${pid(plain.id)} — ts clamped, signature not kept`);
+      else if (verifyMessageSig({ ...msgObj, ts: plain.ts }, plain.sig, contact.signPublicKey, state.publicId)) msgObj.sig = plain.sig;
+      else mlog.warn(`← MSG          from ${pid(msg.from)}  id=${pid(plain.id)} — inner message signature invalid, not kept`);
     }
 
     // 0.6.2 — may this id be (re)used here at all? Anything but a same-sender
@@ -6045,6 +6179,7 @@ async function sendSelfSync(peerId, stored) {
   else if (inner.type === "audio" || inner.type === "image") inner.mimeType = stored.mimeType || null;
   else if (inner.type === "reaction")                { inner.targetId = stored.targetId; inner.emoji = stored.emoji ?? null; }
   else return;
+  if (stored.sig) inner.sig = stored.sig;
   if (stored.deviceId) inner.deviceId = stored.deviceId;
   if (stored.n != null) inner.n = stored.n;
   if (stored.ackDeviceId && stored.ackN != null) { inner.ackDeviceId = stored.ackDeviceId; inner.ackN = stored.ackN; }
@@ -6080,6 +6215,7 @@ async function sendMessage() {
   if (!contact?.encKey) return;
   const ts = Date.now(), id = crypto.randomUUID();
   const fromId = state.publicId;
+  const sig = signMessage({ id, from: fromId, ts, text }, state.currentChat);
 
   // status is purely client-side optimism — "did this packet genuinely
   // leave the device" (a live relay connection, or the main signal socket
@@ -6094,7 +6230,7 @@ async function sendMessage() {
     const relay  = me?.lastRelay ? { wss: me.lastRelay } : undefined;
     sentN = nextSendCounter(state.currentChat);
     ackPointer = getAckPointer(state.currentChat) || {};
-    const payload = { id, text, ts, deviceId: state.deviceId, endpointId: state.endpointId, n: sentN, ...ackPointer, ...(relay ? { relay } : {}) };
+    const payload = { id, text, ts, ...(sig ? { sig } : {}), deviceId: state.deviceId, endpointId: state.endpointId, n: sentN, ...ackPointer, ...(relay ? { relay } : {}) };
 
     const res = await sendContent(state.currentChat, payload, { label: "MSG" });
     packetCache[id] = { envelope: res.fanned?.envelopes[0] || null, payload };
@@ -6105,7 +6241,7 @@ async function sendMessage() {
     mlog.err(`→ MSG          to   ${pid(state.currentChat)} — send failed: ${e.message}`);
   }
 
-  const stored = { id, from: fromId, text, ts, valid: true, status, deviceId: state.deviceId, n: sentN, ...ackPointer };
+  const stored = { id, from: fromId, text, ts, ...(sig ? { sig } : {}), valid: true, status, deviceId: state.deviceId, n: sentN, ...ackPointer };
   contact.messages = mergeMessages(contact.messages, [stored]);
   await saveContacts();
   input.value = "";
@@ -6132,12 +6268,13 @@ async function sendReaction(targetMsgId, emoji, contactId = state.currentChat, i
 
   const id  = await deriveReactionId(state.publicId, targetMsgId);
   const ts  = Date.now();
+  const sig = signMessage({ id, from: state.publicId, type: "reaction", targetId: targetMsgId, emoji, ts }, contactId);
   const me    = state.contacts[state.publicId];
   const relay = me?.lastRelay ? { wss: me.lastRelay } : undefined;
-  const payload = { id, type: "reaction", targetId: targetMsgId, emoji, ts, deviceId: state.deviceId, endpointId: state.endpointId, ...(relay ? { relay } : {}) };
+  const payload = { id, type: "reaction", targetId: targetMsgId, emoji, ts, ...(sig ? { sig } : {}), deviceId: state.deviceId, endpointId: state.endpointId, ...(relay ? { relay } : {}) };
 
   const fanned = await sendFannedX4DH(contactId, payload);
-  const msgObj = { id, from: state.publicId, type: "reaction", targetId: targetMsgId, emoji, ts, valid: true, deviceId: state.deviceId };
+  const msgObj = { id, from: state.publicId, type: "reaction", targetId: targetMsgId, emoji, ts, ...(sig ? { sig } : {}), valid: true, deviceId: state.deviceId };
   contact.messages = mergeMessages(contact.messages, [msgObj]);
   if (!isAuto) sendSelfSync(contactId, msgObj);
   // Fanned deliberately, same as the other send paths — a RECEIVED
@@ -6233,6 +6370,7 @@ async function sendCallNotice(id) {
   const ts    = Date.now();
   const callerName = state.user || "Someone";
   const text  = `${callerName} is attempting a WebRTC connection`;
+  const sig   = signMessage({ id: msgId, from: state.publicId, type: "system", kind: "call", text, ts }, id);
 
   let status = "failed";
   let sentN  = null;
@@ -6242,7 +6380,7 @@ async function sendCallNotice(id) {
     const relay = me?.lastRelay ? { wss: me.lastRelay } : undefined;
     sentN = nextSendCounter(id);
     ackPointer = getAckPointer(id) || {};
-    const payload = { id: msgId, type: "system", kind: "call", text, ts,
+    const payload = { id: msgId, type: "system", kind: "call", text, ts, ...(sig ? { sig } : {}),
                        deviceId: state.deviceId, endpointId: state.endpointId, n: sentN, ...ackPointer, ...(relay ? { relay } : {}) };
 
     const res = await sendContent(id, payload, { hold: false, label: "CALL_NOTICE" });   // never held — a "calling…" notice hours late is wrong
@@ -6253,7 +6391,7 @@ async function sendCallNotice(id) {
     mlog.err(`→ CALL_NOTICE  to   ${pid(id)} — send failed: ${e.message}`);
   }
 
-  contact.messages = mergeMessages(contact.messages, [{ id: msgId, from: state.publicId, type: "system", kind: "call", text, ts, valid: true, status, deviceId: state.deviceId, n: sentN, ...ackPointer }]);
+  contact.messages = mergeMessages(contact.messages, [{ id: msgId, from: state.publicId, type: "system", kind: "call", text, ts, ...(sig ? { sig } : {}), valid: true, status, deviceId: state.deviceId, n: sentN, ...ackPointer }]);
   await saveContacts();
   if (state.currentChat === id) renderMessages();
   updateContactPreview();
