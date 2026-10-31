@@ -2,7 +2,7 @@
 
 A decentralised, encrypted messaging protocol built on WebSocket relay servers. No accounts, no central authority, no plaintext.
 
-Implementation version: `0.6.0`, reported informationally in the `version` field of `sig:relay_info` (not enforced). This document specifies the protocol as implemented, in enough detail to build an interoperable client. Packet shapes, key rules and signed field sets are exact; a peer that deviates will have its packets dropped. `X4DH.md` is the authoritative source for session establishment, session keys and send-readiness. `known-limitations.md` lists the permanent trade-offs.
+Implementation version: `0.6.2`, reported informationally in the `version` field of `sig:relay_info` (not enforced). This document specifies the protocol as implemented, in enough detail to build an interoperable client. Packet shapes, key rules and signed field sets are exact; a peer that deviates will have its packets dropped. `X4DH.md` is the authoritative source for session establishment, session keys and send-readiness. `known-limitations.md` lists the permanent trade-offs.
 
 ---
 
@@ -47,6 +47,7 @@ Implementation version: `0.6.0`, reported informationally in the `version` field
 | `sync:backup_offer`, `sync:backup_accept`, `sync:backup_push`, `sync:restore_ack`, `sync:restore_push` | `{ type, from, to, size, ts, blob }` (`size`, `blob` or `null`), then `ek` appended as a final key **only if the packet carries one** |
 | `sync:restore_req` | `{ type, from, to, ts, blob }` |
 | `sync:token_resp` | `{ type, from, to, ts, token }` (`token` or `null`) |
+| per-message signature (a field inside an `app:message` payload, not a packet) | `{ l, id, from, to, ts, type, …content }` — see [Per-message signatures](#per-message-signatures). Serialised as a base64url string, not an integer array |
 
 Fields outside these sets are not signed and must not be trusted: notably the `token` attached to `sync:restore_req` and `sync:restore_push`.
 
@@ -101,7 +102,7 @@ deviceId = base64url( SHA-256( Ed25519.getPublicKey(seed) )[0:12] )
 - **inside encrypted payloads** — `app:message` payloads (including `selfsync`, `hello`), self-sync backup blobs, the `restore_req` blob;
 - **as a signed plaintext field** on `call:*`, `data:*` and `session:*` packets. Relay-visible; see the consequence under [Device Endpoint ID](#device-endpoint-id).
 
-**One device, one running instance.** Two browser tabs of the same profile share the device seed, so they are the same `deviceId` and `endpointId` to everyone, but each tab holds its own in-memory ephemerals and held outbox and both write the same local storage. A client must therefore allow only one live instance per (storage partition, identity): the reference client holds a Web Lock named `meshchat-identity-<publicId>` for the life of the tab, offers takeover with `{ steal: true }` at login, and a displaced tab closes its socket and reloads to the login screen.
+**One device, one running instance.** Two browser tabs of the same profile share the device seed, so they are the same `deviceId` and `endpointId` to everyone, but each tab holds its own in-memory ephemerals and held outbox and both write the same local storage. A client must therefore allow only one live instance per (storage partition, identity): the reference client holds a Web Lock named `meshchat-identity-<publicId>` for the life of the tab, offers takeover with `{ steal: true }` at login, and a displaced tab closes its socket and reloads to the login screen (and does not auto-login straight back — see [Local Session](#local-session-auto-login-and-logout)).
 
 ### Device Endpoint ID
 
@@ -340,11 +341,26 @@ sig = Ed25519.sign( UTF-8(JSON.stringify({ type, from, to, blob })), senderSigni
 
 For `app:message`, an invalid or missing signature on a packet whose ciphertext nevertheless decrypts is flagged, not dropped: a content message is displayed with an "unverified" warning. A HELLO or selfsync with an invalid signature is ignored/dropped, and every packet type that drives state rather than display drops on an invalid signature.
 
+### Per-message signatures
+
+The envelope signature proves a *packet* came from its sender; it says nothing about a message once that message has been copied somewhere else. A manual-sync batch (`app:sync`) is signed by the peer as a whole, which proves the batch is theirs — not that every entry in it is something *we* said. Without more, a peer could slip entries with `from` set to us into our own conversation history. So every message a client composes also carries its own signature, made with the identity signing key (any device of the identity can sign; any holder can verify against the signer's public key).
+
+```
+body = { l: "meshchat/msg/1", id, from, to, ts, type, …content }
+sig  = base64url( Ed25519.sign( UTF-8(JSON.stringify(body)), signingSeed ) )      // 64 raw bytes
+```
+
+`type` is `"text"` when the payload has none. Content, in this key order: text → `text`; system → `kind` (or `null`), `text`; audio/image → `mimeType` (or `null`); reaction → `targetId`, `emoji` (or `null`). `to` is the **other party of the conversation** (our own id for the self chat). It is not stored with the message: the verifier supplies it from the conversation it is checking, so a message signed for one contact cannot be replayed into another conversation. Not signed: `deviceId`, `n` and the ack pointer (ordering hints, never authorship), `status`, `valid`, and media bytes (the stub's `mimeType` is covered, the payload is not).
+
+The signature travels as `sig` inside the encrypted payload (every content payload type, and the inner message of a `selfsync`) and is stored on the record, so a receiver keeps the **sender's** signature next to its own copy. That is what lets a wiped device get its own sent messages back from a peer's sync batch and verify them. The receiver keeps it only if it verifies against the sender's key (with `to` = the receiver) **and** the stored `ts` is unchanged: a record whose `ts` was clamped on receipt (see [Message ids and timestamps](#message-ids-and-timestamps)) no longer matches what was signed and is stored without one. A `hello`, a QR introduction and the outer payload of a `selfsync` carry none. A payload without one (an older client) is still accepted on the strength of its envelope; it simply cannot be vouched for in a later sync.
+
+The signature is checked where it matters — in a sync batch (see [Manual Sync](#manual-sync-appsync)), in a `selfsync` copy, and on receipt — never trusted from its mere presence. `SYNC_ACCEPT_UNSIGNED_OWN` is the transition switch (reference client: `true`): while set, an *unsigned* entry in a peer's sync batch claiming `from` = us (a message from before this existed) is accepted but stored `valid: false` and shown "⚠ unverified"; unset, it is dropped. An entry whose signature is present but wrong is always dropped.
+
 ### Packet security matrix
 
 | Packet | Content protection | Signature | Buffered offline |
 |---|---|---|---|
-| `app:message` — content | session wire key, message blob `v:2` bound | mandatory to *trust*; invalid ⇒ shown flagged | yes (+ push) |
+| `app:message` — content | session wire key, message blob `v:2` bound | mandatory to *trust*; invalid ⇒ shown flagged. Plus an inner per-message signature | yes (+ push) |
 | `app:message` — `hello` | static pairwise key, message blob `v:2` bound | invalid ⇒ ignored | yes (+ push) |
 | `app:message` — QR intro | token-derived key, `v:2` bound, plus `intro`/`ek` | mandatory | yes |
 | `app:migrate` | static pairwise key, `v:2` bound | mandatory | yes — always, overwrite per sender, 7 d |
@@ -353,12 +369,14 @@ For `app:message`, an invalid or missing signature on a packet whose ciphertext 
 | `session:propose` / `session:ack` | none (public keys) | mandatory | yes — always; propose overwrites per sender |
 | `call:invite/claim/cancel/end`, `data:…` equivalents | none | mandatory | no |
 | `call:offer/answer/ice`, `data:offer/answer/ice` | static pairwise key, message blob `v:1` unbound, inside the signature | mandatory | no |
-| `sync:backup_offer/accept/push` (contact path) | backup-key object blob `v:2` (+ ephemeral wrap on push) | soft | no |
+| `sync:backup_offer/accept/push` (contact path) | backup-key object blob `v:2` (+ ephemeral wrap on push) | conditional | no |
 | `sync:restore_req` | static pairwise key, object blob `v:2` unbound | mandatory | no |
-| `sync:restore_ack/push` | backup-key object blob (+ ephemeral wrap) | soft | no |
+| `sync:restore_ack/push` | backup-key object blob (+ ephemeral wrap) | conditional (self `restore_ack`: mandatory) | no |
 | `sync:token_req` | none | none | no |
 | `sync:token_resp` | token sealed under backup key | mandatory (client-checked) | no |
 | self-sync `sync:backup_push/accept` | session wire key or backup key, object blob `v:3` bound | none (tamper-evident only) | no |
+
+**Conditional signature.** If we hold a signing key for the claimed sender — a contact on file or, for `restore_push`, one recovered from an opened restore token — the packet **must** verify, and a missing or invalid signature is dropped. If we hold no key for the sender (a fresh or not-yet-mutual device bootstrapping) the packet is processed unverified, as this handshake has always had to allow. A *missing* signature from a known sender is treated as tampering, not as "unverifiable": otherwise a relay could strip `sig` (and `ek`, which the signature covers) from a known contact's packet and have it processed on the unverified path — overwriting the backup we hold for them, or making us send a backup unwrapped.
 
 ---
 
@@ -401,6 +419,7 @@ The plaintext payload of a text message:
   "id":          "<uuid>",
   "text":        "hello",
   "ts":          1234567890123,
+  "sig":         "<base64url per-message signature>",
   "deviceId":    "<deviceId>",
   "endpointId":  "<endpointId>",
   "n":           17,
@@ -412,6 +431,8 @@ The plaintext payload of a text message:
 
 A text payload carries no `type`; absence means text. Other payloads set `type`.
 
+- `id` must match `[A-Za-z0-9_-]{1,64}` (a uuid for ordinary messages), and `ts` is clamped by the receiver — see [Message ids and timestamps](#message-ids-and-timestamps).
+- `sig` is the [per-message signature](#per-message-signatures). Optional on the wire only for compatibility with older clients; every current client sends it on text, audio, image, system and reaction payloads.
 - `relay.wss` is the sender's current relay. Recipients update their routing table for the sender from it **only when the message's signature verified**, timestamp-guarded and clamped (see [Relay Discovery](#relay-discovery)).
 - `endpointId` travels alongside `deviceId`; a contact learns a sender's endpoint from it, recorded in the device registry only after signature verification. An omitted value leaves what is on file untouched.
 - `n` is a per-(sending device, contact) send counter, local to the sender, never synced between a sender's own devices. It counts text, audio, image and system payloads (assigned when the message is composed, even if it is then held); reactions and hellos carry none. Recipients use it for gap detection.
@@ -466,7 +487,7 @@ A message or manual reaction composed on one device is mirrored to the identity'
   "id":         "ss:<inner id>",
   "type":       "selfsync",
   "peerId":     "<contact the message belongs to>",
-  "msg":        { "id", "type", "ts", "text" | "mimeType" | "targetId" + "emoji", "deviceId", "n", "ackDeviceId", "ackN" },
+  "msg":        { "id", "type", "ts", "text" | "mimeType" | "targetId" + "emoji", "sig", "deviceId", "n", "ackDeviceId", "ackN" },
   "ts":         <inner message's ts>,
   "deviceId":   "<deviceId>", "endpointId": "<endpointId>", "relay": { ... }
 }
@@ -479,6 +500,7 @@ What is mirrored: text, audio/image as a stub only (`id`, `type`, `mimeType` —
 - Our own echo (`deviceId` equal to ours) is ignored. A `peerId` that is unknown, blocked or ourselves is ignored.
 - Inner message needs a string `id` ≤ 64 chars and a finite `ts`.
 - Fields are copied from a whitelist, never spread. Stored copy: `from` = us, `valid: true`, `status: "sent"`. A non-reaction already on file is skipped (a mirrored copy must not replace the local object and lose its delivery status); reactions are the exception since the same id carries newer state.
+- The inner `sig`, when present, is kept only if it verifies against **our own** signing key (with `peerId` as the conversation's other party). A sibling's copy without a valid one is still accepted — the decrypt authenticated it — it just cannot be forwarded later as signed.
 - Never sends anything back (no ack, no re-fan), never bumps unread, never sets the local-only `ackTrusted` flag, and the embedded `n` is stored but never fed to gap detection.
 
 ### Delivery acknowledgement (RECEIVED)
@@ -504,7 +526,7 @@ Only our own messages carry a status. `waiting` is meaningful only on the device
 
 The id is `base64url(SHA-256("reaction:" + myPublicId + ":" + targetMsgId)[0:12])` and is identical for an ordinary emoji reaction, a cleared one and the auto-ack, so each replaces the previous state on merge. The sender treats *any* reaction targeting one of its own outbound messages as proof of delivery and sets that message's status to `delivered` (whatever it was before). This reconciliation runs after every merge, whichever path (live, backup, restore, sync) delivered the reaction.
 
-The ack never fires for self-targeted traffic, for a message that failed verification, for hello or selfsync packets, or in response to a reaction. It goes through the normal per-device fanout (every known device of the original sender gets its own copy, so every sending device's status flips) and is **never held**: a device with no send-ready session simply does not receive it. READ status is not implemented.
+The ack never fires for self-targeted traffic, for a message that failed verification, for hello or selfsync packets, or in response to a reaction. It goes through the normal per-device fanout (every known device of the original sender gets its own copy, so every sending device's status flips) and is **never held**: a device with no send-ready session simply does not receive it. It is also sent for an **exact redelivery** of a message already on file (the copy on file may have arrived by another route first — a sync, a sibling — and the sender's `sent` only flips to `delivered` on our ack); a refused id collision (see [Message ids and timestamps](#message-ids-and-timestamps)) is never acked. READ status is not implemented.
 
 ### Outer envelope (`app:message`)
 
@@ -532,12 +554,24 @@ Normative order:
 6. Verify the signature (`valid`).
 7. If decrypted under a session key and valid, `plain.deviceId` must equal the session's device; a mismatch sets `valid = false`.
 8. If valid and decrypted under the session's **current** `RK1`, confirm the peer holds `RK1` (see `X4DH.md` §7).
-9. Drop if `(plain.id, plain.ts)` was seen within the last 3 s (a targeted copy and another path can both arrive).
-10. If valid and `plain.deviceId`: record the device (`deviceId`, `n`, `endpointId`). If valid and `plain.relay.wss`: adopt it as a relay hint (clamped, timestamp-guarded).
-11. `hello` → hello handler, stop. `selfsync` → self-sync handler, stop.
-12. Build the stored message (copy `n`, `deviceId`, ack pointer from the payload; media goes to the in-memory caches, the stored copy is a stub), merge, reconcile delivery status and missing numbers, bump unread if the chat is not open.
-13. **Persist**, then trigger a backup round.
-14. Only now send the RECEIVED auto-ack (if not a reaction, `valid`, and `from` is not ourselves).
+9. **Shape check, content messages only** (not `hello`, not `selfsync`): `id` well-formed, `text` a string for text/system payloads, and for a reaction `id` equal to the derived reaction id of `(from, targetId)`. Otherwise drop. This runs before the duplicate guard so a rejected packet cannot stamp the window.
+10. Drop if `(from, plain.id, plain.ts)` was seen within the last 3 s (a targeted copy and another path can both arrive). The sender is part of the key so one contact's packet cannot suppress another's.
+11. If valid and `plain.deviceId`: record the device (`deviceId`, `n`, `endpointId`). If valid and `plain.relay.wss`: adopt it as a relay hint (clamped, timestamp-guarded).
+12. `hello` → hello handler, stop. `selfsync` → self-sync handler, stop.
+13. Build the stored message: `ts` clamped (see below), `n`, `deviceId` and ack pointer copied from the payload, media as a stub. Keep the payload's per-message `sig` only if it verifies (`to` = us) and `ts` was not clamped.
+14. **Id check** (see below): drop if this id may not be used here. An exact redelivery is dropped quietly but still gets the RECEIVED ack (if valid, not from ourselves, not a reaction); a refused collision gets nothing.
+15. Only now write the media caches and the packet-inspector cache (both are keyed by id), merge, reconcile delivery status and missing numbers, bump unread if the chat is not open.
+16. **Persist**, then trigger a backup round.
+17. Only now send the RECEIVED auto-ack (if not a reaction, `valid`, and `from` is not ourselves).
+
+### Message ids and timestamps
+
+A conversation's messages are keyed by `id` alone, and a same-id collision is resolved by `ts` — both chosen by whoever sent the packet. Left alone that lets a contact replace a message already in the conversation (ours included) by reusing its id, overwrite one of our reactions (the reaction id is a hash of public values), stamp a future `ts` so its copy outranks every genuine later one, and overwrite the audio/image cache entry of a message id before any merge rule could object. These rules run before the receive path touches any cache or merges anything:
+
+- **Well-formed ids.** `[A-Za-z0-9_-]{1,64}`.
+- **Reaction ids are slots.** A reaction's `id` must equal `base64url(SHA-256("reaction:" + senderId + ":" + targetId)[0:12])`, so it can only occupy its own sender's slot for that target.
+- **An id already on file is refused**, except as a reaction replacing its own earlier state. Refused: an id belonging to a message from the other party; an id belonging to a message of a different type; an id reused with different content (messages are immutable). Allowed: same sender, same type, `reaction` (the newer `ts` wins, see [Message Merging](#message-merging)); and an identical copy that is now verified, which may upgrade an existing `valid: false` copy. An identical unverified redelivery is dropped quietly (debug log); the others are logged as warnings.
+- **`ts` is clamped to the receiver's clock plus 5 minutes** (`MSG_TS_SKEW_MS`); a missing, non-numeric or non-positive `ts` becomes "now". A sender cannot claim to be from the future, only slightly ahead to absorb ordinary clock skew. The clamp is on the receiver's clock, the same idea as the relay-hint clamp under [Relay Discovery](#relay-discovery).
 
 ---
 
@@ -593,7 +627,7 @@ The caller stores the message with `status = outcome`. Rules:
 - **Order is kept.** A new message queues behind earlier held ones even if a session is ready by now; flushing sends oldest first (`ts`, then `id`).
 - **Only this device's messages are flushed.** A held message is `from` us, `status: "waiting"`, and `deviceId` equal to this device's.
 - **Flush triggers:** a responder `RK0` session is stored, a session is upgraded to `RK1`, the post-store schedule above, and a 5 s tick for contacts with held messages (the one transition with no event is an initiator's `RK0` ageing out of its window). Flushes are single-flight per contact; a trigger arriving mid-flush causes one more pass.
-- **Flush:** for each held message, in order: if older than 24 h → `failed`; rebuild the wire payload from storage and caches; if the content is gone (audio/image media is memory-only) → `failed`; if no target is ready, stop (everything behind it waits too); otherwise fan out and set `sent`/`failed`, cache the packet for the inspector, and mirror to siblings via self-sync on `sent`. The rebuilt payload keeps the original `id`, `ts`, `n` and ack pointer (the peer's duplicate guard and gap bookkeeping depend on them) and uses the current `deviceId`, `endpointId` and `relay`.
+- **Flush:** for each held message, in order: if older than 24 h → `failed`; rebuild the wire payload from storage and caches; if the content is gone (audio/image media is memory-only) → `failed`; if no target is ready, stop (everything behind it waits too); otherwise fan out and set `sent`/`failed`, cache the packet for the inspector, and mirror to siblings via self-sync on `sent`. The rebuilt payload keeps the original `id`, `ts`, `sig`, `n` and ack pointer (the peer's duplicate guard and gap bookkeeping depend on `id`/`ts`/`n`, and the signature covers `id` and `ts`) and uses the current `deviceId`, `endpointId` and `relay`.
 - **Slow nudge:** on a tick pass, if a message is still held, the contact is believed online and `contactNeedsHello` holds, a hello is sent at most every 15 min. Offline contacts are not nudged: their earlier hello is already buffered at the relay and each extra one would push-notify them.
 - **Persistence:** held text survives a reload (status is in local storage). Held audio/image does not (their payload lives only in memory) and fails at the next flush.
 - **Never held:** call notices (`hold: false`), reactions and RECEIVED acks (sent directly through the fanout).
@@ -705,9 +739,11 @@ A deliberate, irreversible local action — "stop trusting this identity" — an
 ### Self-Destruct
 
 Not cryptographic revocation — it can't be: identity is deterministic from `(username, passphrase)`, so anyone who still knows the credentials (including the user) can log back in and re-derive the same keys. Burn is a **local wipe plus a social signal**. On receiving a self-targeted burn, or triggering one locally, the client:
-1. Removes the identity-scoped storage keys: contact store, peer backups, peer tokens, device registry, device seed (so this device cannot quietly re-announce its old `deviceId`) and X4DH sessions. (Send counters and the push preference are not cleared.)
-2. Closes the signal socket.
-3. Reloads to the login screen.
+1. **Halts persistence first**, before any key is removed: every storage writer re-checks a halt flag immediately before its `localStorage.setItem` (after its own async encryption), so a save already in flight when the wipe starts cannot write the identity straight back. Without this the removals below would only be a suggestion. The flag is cleared only by the reload.
+2. Deletes the remembered login ([auto login](#local-session-auto-login-and-logout)).
+3. Removes the identity-scoped storage keys: contact store, peer backups, peer tokens, device registry, device seed (so this device cannot quietly re-announce its old `deviceId`) and X4DH sessions, together with the `_unreadable` quarantine copy of any of them. (Send counters, the push preference and the theme are not cleared.)
+4. Closes the signal socket.
+5. Reloads to the login screen (after ~300 ms).
 
 No trace is kept that a burn happened.
 
@@ -844,17 +880,39 @@ Each relay generates its own EC P-256 keypair on first boot and persists it (`VA
 
 Stored at `PUSH_SUBS_DIR/<publicId>/<endpointId>.json` as `{ endpoint, p256dh, auth }` — one file per (identity, device). It is keyed by `endpointId`, not `deviceId`: the relay already sees `endpointId` at auth, and storing push state under `deviceId` would let it join its view to a contact's. On subscribe, any other file for the same identity holding the same browser `endpoint` URL is a stale duplicate and is removed. `sig:push_unsubscribe { from, endpointId }` deletes the file.
 
-Neither type requires a signature (they redirect no routing and drive no irreversible action) but both require an authenticated socket with `from` matching it. The relay rejects a subscription whose `endpoint` isn't `https://` or that lacks `keys.p256dh`/`keys.auth`.
+Neither type requires a signature (they redirect no routing and drive no irreversible action) but both require an authenticated socket with `from` matching it. A subscription must pass the [endpoint policy](#push-endpoint-policy) and carry non-empty string `keys.p256dh` and `keys.auth` of at most 256 characters each; anything else is dropped without a reply (the log records the rejection reason and the endpoint's *host* only — the path is the device's push token).
+
+Each identity may hold at most `PUSH_MAX_SUBS_PER_IDENTITY` subscription files (default 10; an identity costs nothing to create). The cap is counted after the stale-duplicate sweep, excluding the subscribing device's own file (a re-subscribe replaces it), and is not exact under concurrent subscribes — a brake on unbounded growth, not a quota. A new subscription beyond it is rejected.
+
+### Push endpoint policy
+
+A subscription's `endpoint` is a URL chosen by the client that the relay later POSTs to. Taken as-is that would make the relay an HTTP client any authenticated identity could aim at internal services, cloud metadata or other hosts. Real browser push endpoints live on a handful of vendor hosts, so the policy is an **allowlist**, enforced when the subscription arrives *and again on every send*.
+
+An endpoint is accepted only if all of these hold:
+
+- a string of at most 2048 characters containing only printable ASCII (no control characters, spaces or non-ASCII; IDN hosts must arrive in punycode);
+- scheme `https`, no userinfo, port absent or `443`;
+- the host is a plain DNS name — at least two labels of ASCII letters, digits and hyphens, with a TLD that starts with a letter (this is what keeps dotted-quad, decimal and hex spellings of an IP out, however a resolver would read them);
+- the host is on the allowlist: an exact name, or an entry with a leading dot, which matches any name with at least one more label in front (`.push.services.mozilla.com` matches `updates.push.services.mozilla.com`, not the bare name).
+
+Default allowlist (`PUSH_ALLOWED_HOSTS` **replaces** it): `fcm.googleapis.com` and `android.googleapis.com` (Chrome, Edge, Brave, Opera, Samsung, via FCM), `.push.services.mozilla.com` (Firefox), `.notify.windows.com` (Edge on Windows, WNS), `web.push.apple.com` (Safari). There is deliberately no `.googleapis.com` suffix: anyone can obtain a hostname under it. A push service that is not listed is rejected and its host logged, so supporting a new one is a configuration change. An empty list turns push off.
+
+At **send time**, in addition:
+
+1. The stored endpoint is re-validated. One that no longer passes (stored before the allowlist existed, or for a service since removed) has its subscription file dropped, like a dead subscription.
+2. The host is resolved and **every** returned address must be a public, globally routable unicast address. IPv4-mapped IPv6 is judged as the IPv4 address it wraps; NAT64 (`64:ff9b::/96`, `64:ff9b:1::/48`), 6to4 (`2002::/16`) and Teredo (`2001::/32`) addresses are refused outright because they can embed a private IPv4 address; multicast is refused. A single non-public answer among public ones fails the send.
+3. The connection is made to one vetted IP address, not to the name — resolving again inside the HTTP client would leave a DNS-rebinding window — while the `Host` header, SNI and certificate check all use the name. At most 3 addresses are tried, only a failed *connect* moves on to the next, and connect and read time out after 10 s.
+4. **Redirects are never followed.** A 3xx is just a failed push. Nothing of the response beyond its status line is read.
 
 ### Firing a push
 
 Triggered from the offline-buffering path for an `app:message` that missed live delivery and is not self-addressed. `app:migrate`, `app:burn`, `session:*` and everything live-only never push. A hello and the call notice are ordinary `app:message`s and do push.
 
-Each subscription on file gets its own bodyless HTTPS POST to `endpoint` with `TTL: PUSH_TTL_SECONDS` and `Authorization: vapid t=<jwt>, k=<vapidPublicKey>`. The JWT (`ES256`, claims `{ aud, exp, sub }`, `exp` 12 h out) is signed fresh per push; `aud` is the scheme and host of that endpoint; the signature is raw `r||s`. Pushes are best-effort: a transient failure is not retried. A `404`/`410` deletes the subscription file.
+Each subscription on file gets its own bodyless HTTPS POST to `endpoint` with `TTL: PUSH_TTL_SECONDS` and `Authorization: vapid t=<jwt>, k=<vapidPublicKey>`. The JWT (`ES256`, claims `{ aud, exp, sub }`, `exp` 12 h out) is signed fresh per push; `aud` is the scheme and host of that endpoint; the signature is raw `r||s`. The POST is made under the defences in the [endpoint policy](#push-endpoint-policy). Pushes are best-effort: a transient failure — network error, 5xx, a redirect, a non-public resolution — is not retried and leaves the file. A `404`/`410`, or an endpoint that no longer passes the policy, deletes the subscription file (the client re-subscribes at its next login).
 
 ### Client-side opt-in
 
-A checkbox in the edit-contact panel (own entry only) controls a **per-device** local preference (`meshchat_push_pref_v1_<publicId>`), not part of backups. Toggling on subscribes immediately; toggling off unsubscribes the browser and sends `sig:push_unsubscribe` to the current relay.
+A checkbox in the settings panel (the gear in the sidebar header) controls a **per-device** local preference (`meshchat_push_pref_v1_<publicId>`), not part of backups. Toggling on subscribes immediately; toggling off unsubscribes the browser and sends `sig:push_unsubscribe` to the current relay.
 
 The service worker handles `push` (always shows a generic "MeshChat — tap to check" notification with a collapsing tag and re-alert; `event.data` is always null) and `notificationclick` (focus an existing window, else open one). It must show a notification for every push (`userVisibleOnly: true`). Its `fetch` handler is network-only and returns a 504 on network error.
 
@@ -893,7 +951,7 @@ The service worker handles `push` (always shows a generic "MeshChat — tap to c
 | `call:offer` / `call:answer` / `call:ice` | as above plus `blob` | yes | WebRTC SDP / ICE |
 | `data:invite` / `data:claim` / `data:cancel` / `data:end` | `from`, `to`, `sessionId`, `ts`, `deviceId`, `sig` | yes | Data-channel test signaling |
 | `data:offer` / `data:answer` / `data:ice` | as above plus `blob` | yes | WebRTC SDP / ICE |
-| `sig:push_subscribe`   | `from`, `endpointId`, `subscription` | yes | Register a per-device push subscription |
+| `sig:push_subscribe`   | `from`, `endpointId`, `subscription` | yes | Register a per-device push subscription (endpoint policy-checked) |
 | `sig:push_unsubscribe` | `from`, `endpointId` | yes | Remove it |
 | `sig:relay_req`     | — | yes | Request the relay's own WSS URL |
 | `sig:ping`          | — | yes | Keepalive |
@@ -916,7 +974,7 @@ The service worker handles `push` (always shows a generic "MeshChat — tap to c
 - **Buffered types.** `app:message`, `app:migrate`, `app:burn`, `session:propose`, `session:ack` — see [Offline Delivery](#offline-delivery). Every other type is delivered live to whoever is connected and otherwise lost; a compound `to` aimed at an offline device reaches nobody.
 - **Compound `to`** is honoured on the shared delivery branch for `app:sync`, every `sync:*`, `call:*` and `data:*`, as well as for `app:message` and `session:*`. Of the shared-branch types only some `sync:*` self-sync packets send one today.
 - **Compound `from`** is accepted only on `sync:backup_offer`, `sync:backup_accept`, `sync:backup_push`, `sync:restore_ack` and `sync:restore_push`. A receiving client trusts and displays the endpoint half only once the accompanying signature has verified against a contact already on file.
-- **Signature rules differ by type.** Mandatory (drop on missing/invalid): `app:migrate`, `app:burn`, `session:*`, `app:sync`, `sync:restore_req`, `sync:token_resp` (checked client-side), `call:*`, `data:*`. Soft (processed unless *actively* wrong — signature present, sender's key on file, verification failing): contact-path `sync:backup_offer`/`accept`/`push`, `sync:restore_ack`, `sync:restore_push`. None: the self-sync backup packets. `app:message`: flagged, not dropped.
+- **Signature rules differ by type.** Mandatory (drop on missing/invalid): `app:migrate`, `app:burn`, `session:*`, `app:sync`, `sync:restore_req`, `sync:token_resp` (checked client-side), `call:*`, `data:*`. Conditional (must verify whenever we hold a signing key for the claimed sender; an unknown sender is still let through, because bootstrap has to work): contact-path `sync:backup_offer`/`accept`/`push`, `sync:restore_ack`, `sync:restore_push`. A `restore_ack` from ourselves (a sibling device) is always checked, because our own key is always on file. None: the self-sync backup packets. `app:message`: flagged, not dropped.
 - **Rate and size limits.** Each socket has its own token-bucket limiter (`RATE_LIMIT_RATE`/`RATE_LIMIT_BURST`) and shares a wider one with every other socket from the same IP (`IP_RATE_LIMIT_*`); either returns `error { rate_limited }`. Connections are capped in total (`MAX_CONNECTIONS`) and per IP (`MAX_CONNECTIONS_PER_IP`). A frame over `WS_MAX_SIZE` is dropped. `X-Real-IP`/`X-Forwarded-For` are honoured only when the TCP peer is inside `TRUSTED_PROXIES`.
 - Unknown packet types are dropped. Sync and backup types are routed without inspecting their contents.
 
@@ -935,7 +993,14 @@ The `sync:backup_*` types serve two jobs with different security stances: **cont
 
 **The blob carries contacts only**: for each contact, name, keys, `blocked`, state timestamp and relay info; `messages` is empty. It is an object blob under the sender's backup key. A peer holding your backup is a third party with an indefinitely stored copy; the contact list is what a restore needs, and message history never has to ride along.
 
-**`from` on all three is the sender's compound `"id::endpointId"`.** All three are signed with the identity's Ed25519 key, but verification is only possible once the recipient already has the sender as a contact. An unsigned packet, or one from a sender not on file, is processed — bootstrap must keep working. Only an **actively wrong** signature (present, key on file, fails) is dropped. The recipient trusts or displays the endpoint suffix only once a signature has verified.
+**`from` on all three is the sender's compound `"id::endpointId"`.** All three are signed with the identity's Ed25519 key, but verification is only possible once the recipient already has the sender as a contact. The rule is conditional:
+
+- **Sender on file** (we hold a `signPublicKey` for them): the packet must verify. A missing signature is as wrong as an invalid one, and either is dropped. Every legitimate sender signs these, so an unsigned packet from a known contact is a stripped one. Letting it through would let a relay remove `sig` and `ek` (both are inside the signed set) from a contact's packet and have it processed as unverified: overwriting the backup we hold for that contact (`backup_push`), or making us answer with a backup that is not wrapped (`backup_accept`).
+- **Sender not on file**: processed regardless. A fresh or not-yet-mutual sender cannot be verified, and bootstrap must keep working.
+
+The recipient trusts or displays the endpoint suffix only once a signature has verified.
+
+**Held backups are capped at 1 MiB** (`MAX_PEER_BACKUP_BYTES`, counted as the length of the ciphertext array). A `backup_push` blob must be an object with a `data` array of at most that length, checked once on arrival and again after the transport wrap is removed; anything else is dropped before it can replace the blob already stored. Real contact-only backups are kilobytes. The cap exists so that overwriting a stored blob cannot also be used to fill the holder's storage.
 
 **Replies are one-to-one.** An offer is addressed to a bare identity, so it fans out to every live session under it, and each reply is wrapped for exactly one ephemeral. A reply therefore goes only to the device that sent the opening packet: `backup_accept`, `backup_push` and the restore-handshake replies are addressed compound (`id::endpointId`) to the endpoint in the *verified* `from` of the packet they answer. When the sender's endpoint is unknown or unverified, the reply falls back to the bare identity.
 
@@ -971,7 +1036,7 @@ Self-sync backup packets carry no `sig`: AES-GCM with the envelope AAD makes tam
 
 ### Short-window duplicate suppression
 
-All five handshake packet types (`backup_offer`/`accept`/`push`, `restore_ack`/`push`) pass a 3-second duplicate window before other processing, purely to skip redundant work. Once a packet's signature verifies, the key is `type:senderId:endpointId` (plus a short fingerprint of the push's `ek` on the two push types), so a genuinely distinct sibling's packet isn't mistaken for a duplicate, and a push never addressed to us cannot suppress the one that was. Unverified traffic keys on the bare sender id; the self-sync paths key on the decrypted `deviceId`. The window is separate from, and much shorter than, the restore cooldowns below.
+All five handshake packet types (`backup_offer`/`accept`/`push`, `restore_ack`/`push`) pass a 3-second duplicate window before other processing, purely to skip redundant work. Once a packet's signature verifies, the key is `type:senderId:endpointId` (plus a short fingerprint of the push's `ek` on the two push types), so a genuinely distinct sibling's packet isn't mistaken for a duplicate, and a push never addressed to us cannot suppress the one that was. Unverified traffic keys on the bare sender id; the self-sync paths key on the decrypted `deviceId`. A packet dropped for a missing or invalid signature never reaches the window, so a forged packet cannot occupy a key and suppress the genuine one that follows. The window is separate from, and much shorter than, the restore cooldowns below.
 
 ### Restore Token
 
@@ -1000,7 +1065,7 @@ Roles: the **owner** is the identity whose contact store needs restoring; a **ho
 
 For a healthy pair the pushed backup merges to a no-op.
 
-**A wiped device cannot take part in step 1** — with no contacts it cannot decrypt a `restore_req`. It instead says hi first: a `restore_ack` addressed to any online id, contact or not (bare `to`, an `ek` attached, 60 s cooldown per id). It does so while its session is *fresh* (no contacts beyond itself yet), on a `sig:seen` — and, because `sig:seen` is relay-local and a holder on another relay never produces one, also when an **unknown sender reaches the fresh device directly** with a `restore_req` or `backup_offer` (arriving over the holder's outbound relay connection); the ping is skipped if the sender is ourselves or already a contact. Whoever receives that ack, if its signature verifies against a contact already on file, attaches the token it holds for that contact to the resulting `restore_push`. The wiped device issued that token and can still open it (same deterministic key), recovering the sender's `signPublicKey`, checking the bound-id match, and verifying the push's own signature before trusting the restored data. Without a valid token the push is accepted but unverified. A device acking *itself* (a sibling restoring from another of its own devices) is answered with the sibling's current full contact store, wrapped the same way.
+**A wiped device cannot take part in step 1** — with no contacts it cannot decrypt a `restore_req`. It instead says hi first: a `restore_ack` addressed to any online id, contact or not (bare `to`, an `ek` attached, 60 s cooldown per id). It does so while its session is *fresh* (no contacts beyond itself yet), on a `sig:seen` — and, because `sig:seen` is relay-local and a holder on another relay never produces one, also when an **unknown sender reaches the fresh device directly** with a `restore_req` or `backup_offer` (arriving over the holder's outbound relay connection); the ping is skipped if the sender is ourselves or already a contact. Whoever receives that ack, if its signature verifies against a contact already on file, attaches the token it holds for that contact to the resulting `restore_push`. The wiped device issued that token and can still open it (same deterministic key), recovering the sender's `signPublicKey`, checking the bound-id match, and verifying the push's own signature before trusting the restored data. Without a valid token the push is accepted but unverified. A device acking *itself* (a sibling restoring from another of its own devices) is answered with the sibling's current full contact store, wrapped the same way, but only if the ack verifies against our own signing key. Our own key is always on file, so an unsigned or invalid self-ack is dropped like any other ack from a known sender.
 
 `sessionFresh` starts true, is cleared when a loaded local store holds any contact other than ourselves, and when a restore push is processed.
 
@@ -1011,7 +1076,7 @@ Restore flooding is limited by three independent 5-minute cooldowns, deliberatel
 
 `deviceId` and `endpointId` are kept in separate maps to preserve their unlinkable namespaces.
 
-**Trust shapes differ across these types.** `restore_req` can only be processed by a recipient who already has the sender as a contact, so it is mandatory-signed. `restore_ack` and `restore_push` can legitimately reach, or be answered by, someone with no shared key material (the bootstrap ping), so they are signed unconditionally but soft-verified, like the backup handshake.
+**Trust shapes differ across these types.** `restore_req` can only be processed by a recipient who already has the sender as a contact, so it is mandatory-signed. `restore_ack` and `restore_push` can legitimately reach, or be answered by, someone with no shared key material (the bootstrap ping), so they are signed unconditionally but verified conditionally, like the backup handshake: when we hold a key for the sender, the signature must verify, and when we do not, the packet proceeds unverified. For `restore_push` the key can come from the contact record or from the opened token. Holders always sign their push, and the token rides outside the signed set, so an unsigned push with a bound token is a stripped one and is dropped.
 
 ### Ephemeral Wrap
 
@@ -1052,7 +1117,18 @@ The signature covers `{ type, from, to, syncId, reply, ek, wrapped }` (`wrapped`
 
 **One-directional:** only the side that pressed SYNC receives; press it on both sides for a two-way exchange.
 
-**Inbound sanitising.** Messages are copied from a whitelist, never spread; a batch is capped at 50; only messages whose sender is one of the two parties of this conversation are kept; entries already on file are skipped (so a synced copy can't replace a local object and lose its delivery status) except reactions, where newer state must win; local-only fields (`status`, `ackTrusted`) never come in from the wire. Accepted types: text, audio/image (stub), reaction, system. The result goes through `mergeMessages` and the usual reconciliation.
+**Inbound sanitising** (`sanitizeSyncedMessages`). The peer's batch is held to the same id and timestamp rules as a live message (see [Message ids and timestamps](#message-ids-and-timestamps)), and per-message signatures decide provenance:
+
+- **Whitelist.** Messages are copied field by field, never spread. Local-only fields (`status`, `ackTrusted`) never come in from the wire. Accepted types: text, audio/image (stub), reaction, system.
+- **Cap.** A batch is capped at 50 messages (`MAX_SYNC_MSGS`).
+- **Parties.** Only messages whose sender is one of the two parties of this conversation are kept.
+- **Ids and timestamps.** An id must match the message id pattern, and `ts` is clamped to our clock plus 5 minutes. A reaction's id must be exactly the one derived from its sender and its target. Conflicts are judged against the conversation *and* the batch built so far, so a batch cannot contradict itself.
+- **Our own messages are never replaced.** A peer's claim about something *we* said can only fill a gap (the restore-after-wipe case this exists for). It never replaces an id of ours already on file, reaction or not.
+- **Signatures.** A signed entry must verify against the key of the party it claims to be from (the peer's key, or our own), over the timestamp as signed, or it is dropped. Verified entries are `valid: true` and keep their `sig`.
+- **Unsigned entries.** An unsigned entry claiming to be from the peer is kept with the `valid` flag it arrived with (it is the peer's own word about the peer's own message). An unsigned entry claiming to be from *us* is accepted as `valid: false` (shown with the "⚠ unverified" tag) while `SYNC_ACCEPT_UNSIGNED_OWN` is on, and dropped when it is off. The switch exists for the transition: our own older messages predate signatures.
+- **Upgrade.** A signed copy upgrades an unverified one only when it is the same sender, type, text and `ts`; the delivery status is kept. Nothing else about an id already on file changes, so a synced copy cannot replace a local object and lose its status. Reactions are the exception: newer state wins, as in `mergeMessages`.
+
+The result goes through `mergeMessages` and the usual reconciliation.
 
 ---
 
@@ -1104,9 +1180,67 @@ Updates are timestamp-guarded: a new `lastRelay` is adopted only if its timestam
 
 **Message-borne hints require a valid signature.** A `relay.wss` steers where we send that contact's traffic, so it is adopted only from a message whose signature verified; a message that decrypts but fails the signature is still displayed, but its hint is ignored.
 
+**Relay hints are shape-checked** (`relayHintProblem`, applied inside `updateRelay`, so it covers every adoption path above, and to the relay segment of a pasted key in `addContact`). A hint is a URL a contact chose, and this client will open a WebSocket to it. The signature check decides *who* may steer our traffic; it says nothing about *where*. A WebSocket handshake is an ordinary HTTP GET with the URL's own path and query, so a hostile hint can aim a request at a local service. It can be reached even from an https page, because loopback is exempt from mixed-content blocking.
+
+- **Always:** a string of at most 512 characters, printable ASCII only (IDN hosts arrive as punycode), scheme `ws:` or `wss:`, no credentials, no fragment, a host.
+- **Strict** (the default, and always on an https page): `wss:` only, and the host must be a public DNS name or a public IPv4 literal. Refused: `localhost`, single-label names, the local-only suffixes `localhost`, `local`, `localdomain`, `internal`, `intranet`, `lan`, `home`, `corp` and `home.arpa`, non-public IPv4 ranges (private, loopback, link-local, CGNAT, documentation, multicast, reserved), and any IPv6 literal. The host is judged *after* URL normalisation, so `2130706433` and `0x7f.1` are seen as the `127.0.0.1` they are.
+- **Loose:** only when the page itself is served over plain http (local development), where `ws:` and LAN hosts are what a dev setup is made of.
+
+A rejected hint is logged and changes nothing, in particular not `lastRelaySeen`: otherwise a rejected hint with a fresh timestamp would shut out the genuine one that follows. What no client-side rule can see is a public-looking DNS name whose record points inside the network.
+
 A relay's own `sig:relay_info` is a confirmation, not an authoritative fact, except on a completely fresh identity with no local record, where it is adopted as an unconfirmed placeholder with `lastRelaySeen = 0` so any genuinely dated record arriving later outranks it. A `wss` in `sig:relay_info` that contradicts a held `lastRelay` is logged and ignored; only a deliberate migration changes it. On each `sig:relay_info` the client also closes any outbound connection it holds to the host it is already signal-connected to.
 
 The relay is untrusted infrastructure. Relays never forward to one another; all topology lives in client state and spreads through ordinary traffic.
+
+---
+
+## Local Session: Auto Login and Logout
+
+Both live in `meshchat-identity.js` and never touch the wire. They exist because an identity is derived from a name and passphrase, and a page reload otherwise means typing them again.
+
+### Auto login
+
+An opt-in checkbox on the login screen (stored as `meshchat_autologin`) remembers the login on this device, so a page load logs straight in. It does not use the browser's password autofill, which cannot work here: Chrome withholds an autofilled password from scripts until a user gesture, phones want a tap, and Safari has no silent credential API.
+
+**What is stored.** Not the passphrase. The 32-byte PBKDF2 master secret and the username go into IndexedDB (database `meshchat-remember`, store `kv`, record `remembered`), AES-GCM-encrypted under a **non-extractable** WebCrypto key kept beside it as a `CryptoKey`. The username rides as additional authenticated data, so a record whose name was swapped fails to decrypt instead of logging in under another name. Consequences:
+
+- The master secret *is* the identity. Whoever holds it can log in as you, indefinitely, and identities cannot be revoked.
+- It is not the passphrase, so a leak does not expose a passphrase reused elsewhere, and login skips the 1,000,000-iteration derivation.
+- The non-extractable key stops a script or a storage dump from copying the key bytes. It does not stop a script from asking the page to decrypt, and it is no protection against someone with real access to the browser profile, because key and ciphertext both live in it.
+- A normal login protects contacts and sessions at rest with a key derived from the passphrase. A remembered login drops that layer on this device.
+
+**Flow.**
+
+1. Login with the box ticked: once the identity lock is won, the master secret is remembered (`persistRememberCandidate`). A lock that was refused stores nothing.
+2. Page load with a record present: the name field is filled, the passphrase field gets a placeholder that contains a NUL (so nobody can type it), and ENTER is pressed. The login handler sees that placeholder and takes the stored master secret instead of running the KDF.
+3. If the user has typed anything in the meantime, or the login button is disabled, nothing fires.
+4. A failed auto login does not delete the record. One page load makes one attempt, so nothing can loop, and a transient storage error should not cost the user their remembered login.
+
+**An auto login never takes over.** It does not show the "take over?" confirm. Nobody is looking at the screen, and two auto-login tabs would otherwise steal the identity from each other forever. If the identity lock is held elsewhere it retries once after 1 s (a reload can race the old page's lock release), then gives up with "identity already open in another tab". A manual ENTER asks as usual.
+
+**Suppression.** Two events stop the next page load of *this tab* from logging straight back in, by setting `meshchat_no_autologin` in `sessionStorage` (per tab, survives the reload, gone with the tab): being displaced by another tab, and logout. A login a human chose lifts the mark.
+
+**Deletion.** The record is deleted by: unticking the checkbox, logout, and self-destruct (fire-and-forget there, since the page reloads after 300 ms). On load, if the checkbox is off but a record is left over (unticked in another tab), it is deleted.
+
+**Disabled when unavailable.** The checkbox is disabled, with a reason, when IndexedDB or WebCrypto is missing, when IndexedDB is unusable (private modes), or when either of the two one-line hooks (the login handler calling the remembered-aware derivation, `selfDestruct` calling `forgetRemembered`) is absent. Without both, a remembered login would feed the placeholder to the real KDF and silently log in to a different, empty identity.
+
+Not yet observed on real devices: storing a `CryptoKey` in IndexedDB on iOS Safari, and Safari clearing site storage after about 7 days without a visit unless the app is on the Home Screen (the remembered login would then simply disappear and the login screen shows).
+
+### Logout
+
+A full page reload, the same way self-destruct and a displacement end a session: the client keeps far too much module-level state (pending X4DH ephemerals, retired roots, the wire-key cache, media caches, timers) to reset in place. Unlike BURN it wipes nothing: contacts, device seed, X4DH sessions and held messages stay in storage, encrypted as before, and logging back in picks up where this left off (held messages go out then). That is why it asks for no confirmation.
+
+Order:
+
+1. End or decline anything in flight (calls and data tests), so the peer does not ring until its own timeout.
+2. Flush storage: `saveContacts` and `saveX4DHSessions`, awaited.
+3. Pause 300 ms, so what step 1 queued can leave the socket.
+4. Close the socket without its `onclose` handler (which would schedule a reconnect).
+5. Forget the remembered login, release the identity lock, mark the tab no-auto-login, reload. The login screen then says "logged out".
+
+### Settings panel
+
+Everything about *you* or *this device* sits in one panel (the gear in the sidebar header, or tapping your name there): push, theme, backup export/import, the in-page log, logout; your relay override and MIGRATE; and BURN. Contact-scoped actions (SYNC, EDIT, BLOCK) stay in the contact's menu, and your own chat has none. Settings apply live. The only SAVE is the relay field, which restarts the connection, sets `lastRelay` and `lastStateChange`, and does not bump `lastRelaySeen` or notify contacts; that is what MIGRATE is for. The theme is per identity and per device, and is never synced.
 
 ---
 
@@ -1122,8 +1256,19 @@ The relay is untrusted infrastructure. Relays never forward to one another; all 
 | `meshchat_x4dh_sessions_v1_<publicId>` | per identity | X4DH session state including root keys, encrypted at rest under the backup key |
 | `meshchat_device_seed_v1_<publicId>`   | per device   | Raw 32-byte device seed (base64url). Never shared, never backed up |
 | `meshchat_push_pref_v1_<publicId>`     | per device   | Push opt-in (`"1"`/`"0"`). The `PushSubscription` lives in the browser |
+| `<key>_unreadable`                     | per store    | Quarantined copy of a contact-store or X4DH-session blob that failed to decrypt or parse (see below) |
+| `meshchat_autologin`                   | per device   | Auto-login checkbox state (`"1"`). The intent only, not the secret |
+| IndexedDB `meshchat-remember` → `kv` → `remembered` | per device | The remembered login: username plus the master secret, encrypted under a non-extractable key (see [Auto login](#auto-login)) |
+| `meshchat_no_autologin`                | per tab (`sessionStorage`) | This tab must not auto-login (`"logout"` or `"displaced"`) |
+| `meshchat_identity_displaced`          | per tab (`sessionStorage`) | Shows the displacement notice after the reload |
+| `meshchat-theme-<publicId>`            | per device   | This identity's theme choice |
+| `meshchat-theme`                       | per device   | Last theme shown. Used by the login screen and as the fallback |
 
 The contact store written locally keeps `status: "waiting"` on held messages; every other serialisation strips it.
+
+**Unreadable blobs.** When the contact store or the X4DH sessions fail to decrypt or parse (corruption, a half-written value, a format no longer understood), loading falls back to an empty state. The next save would then replace the stored blob with that empty state, turning a transient read problem into permanent data loss. So the raw stored string is first copied to `<key>_unreadable` (one slot per store, newest wins; it is the same ciphertext and needs no extra protection). Recovery is manual: nothing reads it back. Self-destruct removes it with the rest.
+
+**Write ordering.** Contact-store saves and X4DH-session saves are each serialised through a promise chain, and the snapshot is taken inside the queued step, so the last write in the queue always carries the freshest state. Every save also checks the persistence-halt flag set by [self-destruct](#self-destruct) at the last synchronous moment before `localStorage.setItem`, after its own awaits, so a save that started before a wipe cannot finish after it and write the identity back.
 
 Held in memory only, never persisted: pending X4DH proposal ephemerals, retired X4DH roots (decrypt-only grace), pending wrap ephemerals, pending manual-sync ephemerals, the wire-key cache, the armed live-QR token, the hello rate-limit table, and the media caches.
 
@@ -1137,7 +1282,7 @@ Held in memory only, never persisted: pending X4DH proposal ephemerals, retired 
 | `WS_PORT`             | `8888`        | WebSocket signal server port |
 | `RELAY_WSS_URL`       | —             | Public WSS URL of this relay. **Required for auth**: its host is what clients' auth proofs are bound to; with no valid value the relay refuses every `sig:auth_init` (`relay_not_configured`) |
 | `RELAY_AUTH_HOSTS`    | —             | Extra hostnames (bare, or full URLs; comma-separated) this relay also accepts an auth proof for. Only meaningful on top of a valid `RELAY_WSS_URL` |
-| `PROTOCOL_VERSION`    | `0.6.0`       | Reported on `sig:relay_info`; informational |
+| `PROTOCOL_VERSION`    | `0.6.2`       | Reported on `sig:relay_info`; informational |
 | `WS_MAX_SIZE`         | `2097152`     | Maximum frame size in bytes; larger frames are dropped |
 | `MAX_CONNECTIONS`     | `100`         | Total concurrent WebSocket sessions |
 | `MAX_CONNECTIONS_PER_IP` | `15`       | Concurrent sessions per source IP |
@@ -1162,8 +1307,10 @@ Held in memory only, never persisted: pending X4DH proposal ephemerals, retired 
 | `VAPID_KEY_FILE`      | next to `BUF_DIR` | Persisted VAPID EC P-256 private key (PEM); generated on first boot if missing |
 | `PUSH_SUBS_DIR`       | next to `BUF_DIR` | Push subscription storage |
 | `PUSH_TTL_SECONDS`    | `60`          | `TTL` header sent with each push |
+| `PUSH_ALLOWED_HOSTS`  | the defaults listed under [Push endpoint policy](#push-endpoint-policy) | Comma-separated allowlist of push-service hosts (an entry is an exact hostname, or a leading-dot suffix that needs at least one more label). **Replaces** the defaults rather than adding to them. A rejected endpoint's host is logged, so adding a service is a config change. Empty turns push off |
+| `PUSH_MAX_SUBS_PER_IDENTITY` | `10`   | Push subscriptions kept per identity (one file per endpoint id). A further new endpoint is rejected |
 
-`AUTH_TIMEOUT` (15 s) and `AUTH_VERSION` (`2`) are constants, not environment variables.
+`AUTH_TIMEOUT` (15 s), `AUTH_VERSION` (`2`) and the push request limits (endpoint at most 2048 characters, each key at most 256, 10 s timeout per connect and read, at most 3 resolved addresses tried per send) are constants, not environment variables.
 
 ---
 
@@ -1171,7 +1318,7 @@ Held in memory only, never persisted: pending X4DH proposal ephemerals, retired 
 
 | Constant | Value | Used for |
 |---|---|---|
-| Dedup window | 3 s | Duplicate suppression of handshake packets, hellos, `(id, ts)` messages, X4DH proposes |
+| Dedup window | 3 s | Duplicate suppression of handshake packets, hellos, `(from, id, ts)` messages, X4DH proposes |
 | Presence poll | 30 s ± 5 s | `sig:announce` |
 | Presence expiry / prune | 300 s / 30 s | Online set |
 | Backup timer / threshold | 10 min / every 2nd received message | Contact-path backup offers (+ restore requests on the timer) |
@@ -1184,6 +1331,15 @@ Held in memory only, never persisted: pending X4DH proposal ephemerals, retired 
 | Self-backup hello cooldown | 60 s | Discovery hello |
 | Retention / sync window | 15 / 10 messages | Persistence / manual sync |
 | Sync batch cap | 50 messages | Inbound sanitising |
+| Message timestamp skew | +5 min on our clock | `ts` clamp on every received message and synced entry |
+| Message id pattern | `[A-Za-z0-9_-]{1,64}` | Received and synced message ids |
+| Held peer backup cap | 1 MiB | Ciphertext length of a stored backup blob |
+| Relay hint length | 512 characters | Relay hint shape check |
+| Push endpoint / key length | 2048 / 256 characters | Subscription validation |
+| Push subs per identity | 10 | `PUSH_MAX_SUBS_PER_IDENTITY` |
+| Push send timeout / addresses tried | 10 s / 3 | Per connect and read; per send |
+| Logout flush pause | 300 ms | Lets queued packets leave the socket |
+| Auto-login lock retry | 1 s | One retry when the identity lock is still held |
 | `FANOUT_STALE_MS` | 7 d | Targeted send to a session-less device |
 | Device registry cutoff / cap / sweep | 30 d / 20 per identity / 10 min | Registry retention |
 | HELLO interval | 20 s per contact | Event-driven hellos |
@@ -1200,5 +1356,5 @@ Held in memory only, never persisted: pending X4DH proposal ephemerals, retired 
 
 ---
 
-*MeshChat Protocol v1 — implementation 0.6.0 — experimental, subject to change*
+*MeshChat Protocol v1 — implementation 0.6.2 — experimental, subject to change*
 *Last updated: October 2026*

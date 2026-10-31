@@ -1,4 +1,3 @@
-````markdown
 # MeshChat
 
 Decentralised, end-to-end encrypted messaging built around cryptographic identities rather than accounts.
@@ -18,17 +17,18 @@ credentials always produce the same cryptographic identity.
 There are no accounts to create and no passwords stored on any server. Your passphrase **is** your identity.
 
 Contacts are added by exchanging a shareable address (QR code or copy-paste). This contains your X25519 
-public key (used for message encryption), your Ed25519 public key (used for signing), and your current relay address. No registration or central directory is required.
+public key (used for key agreement), your Ed25519 public key (used for signing), and your current relay address. No registration or central directory is required.
 
-Messages are encrypted with AES-256-GCM using a per-contact key agreed via X25519 Diffie-Hellman, and signed with Ed25519 before leaving your device.
+Message content is encrypted with AES-256-GCM under a per-device-pair session key agreed through X4DH (see `X4DH.md`), and every message is signed with Ed25519 before it leaves your device. The static key derived from your two identity keys is used only for the content-free HELLO and a few signalling blobs, never for message content.
 
 ---
 
 ## Features
 
 - End-to-end encrypted text, image and audio messages
-- Message signing and verification
-- Per-device session establishment (X4DH) with opportunistic, partial forward secrecy — see `known-limitations.md` for exactly what this does and doesn't cover
+- Per-message Ed25519 signatures, verified on receipt (an unverified message is shown with a warning, not hidden)
+- Per-device session establishment (X4DH) with partial forward secrecy. Message content is session-only: there is no fallback to the static identity key, and a message to a device without a ready session is held on your device and sent automatically once one exists. See `known-limitations.md` for exactly what this does and doesn't cover
+- Held outbox: messages wait locally (up to 24 hours) for a secure session instead of being sent under a weaker key
 - Peer-to-peer voice calling over WebRTC (STUN only, no TURN, by design — see `known-limitations.md`)
 - Agent contacts: a bounded command whitelist over ordinary encrypted messages, plus interactive shell access over a WebRTC data channel for contacts on a separate, stricter allowlist
 - No accounts, email addresses or phone numbers
@@ -38,8 +38,10 @@ Messages are encrypted with AES-256-GCM using a per-contact key agreed via X2551
 - Offline delivery through temporary encrypted relay buffers
 - Multi-device synchronization
 - Peer backup of encrypted data
-- QR code contact exchange
+- QR code contact exchange, including a one-way live QR (one scan is enough; single use, valid for about 2 minutes while you stay online)
 - Encrypted backup export / import
+- Optional auto login on a device you trust, and a logout that keeps your data on the device
+- Settings panel for per-device options (push, theme, backup, relay override, migrate, burn)
 - Progressive Web App (PWA)
 - Installable and offline-capable for reading conversations
 - Opt-in push notifications (per device, content-free — a push only ever means "open the app and check")
@@ -83,7 +85,9 @@ export BUF_MAX_MB=10
 python3 server.py
 ```
 
-`RELAY_WSS_URL` is the relay address clients distribute when sharing their identity.
+`RELAY_WSS_URL` is required. It is the relay address clients distribute when sharing their identity, and its host is what clients' authentication proofs are bound to. Without a valid value the relay refuses every client with `relay_not_configured`.
+
+Push notifications are only sent to push services on an allowlist, `PUSH_ALLOWED_HOSTS`. The defaults cover the services used by Chrome, Edge, Brave, Opera, Firefox and Safari. Setting the variable replaces the defaults; see `protocol.md` for the full configuration table.
 
 ### Nginx reverse proxy
 
@@ -157,19 +161,24 @@ server {
 
 ### Static files
 
-The client files (`index.html`, `style.css`, `script.js`, `manifest.json`, `sw.js`) are inside a `static/` 
-directory next to `server.py`.
+The client files are inside a `static/` 
+directory next to `server.py`:
+
+* `index.html`, `style.css`, `style_local.css` (themes), `manifest.json`, `sw.js`
+* `meshchat-lib.js`, `meshchat-gui.js`, `meshchat.js`, `meshchat-identity.js`, `statemachine.js`, `meshchat-boot.js`
+* `vendor/` with the three bundled libraries (`qrcode.min.js`, `html5-qrcode.min.js`, `noble-ed25519.js`)
+
+The page runs entirely from its own origin: the libraries are bundled rather than loaded from a CDN, and the Content-Security-Policy in `index.html` allows scripts from `'self'` only, with no inline scripts or event-handler attributes.
 
 ---
 
 ## Relay authentication
 
-When a client connects, the relay authenticates the session by verifying ownership of the presented public 
-key through 
-a challenge-response exchange.
+When a client connects, the relay authenticates the session by checking a signature that proves possession of the presented keys, made over a challenge it issues.
 
-This allows the relay to associate active connections and offline message buffers with authenticated 
-identities without ever learning private keys or passphrases.
+The signature is bound to the relay: it covers a fixed label, the relay's own host name (the one the client dialed), the challenge, both public keys and the device's routing id. A relay therefore cannot be used as a signing oracle for your identity key, and a proof made for one relay is useless at another. The relay checks the proof against the host names in its own configuration, never against anything the connecting party claims.
+
+This lets the relay associate active connections and offline message buffers with authenticated identities without ever learning private keys or passphrases.
 
 Relay authentication protects against identity spoofing while preserving end-to-end encryption.
 
@@ -199,6 +208,7 @@ while remaining reachable.
 * message timing
 * approximate message size
 * relay currently used by connected clients
+* a per-device routing id (it cannot be linked to the device id your contacts see)
 
 ### Relay operators cannot see
 
@@ -212,8 +222,9 @@ while remaining reachable.
 ### Important limitations
 
 * Passphrase security is everything.
-* Forward secrecy is **partial**: device pairs that have completed X4DH session establishment (see `protocol.md`/`X4DH.md`) get real, per-device-pair protection once the session upgrades live — but a device pair without a completed session still falls back to a static identity-level key with none, and nothing here is a full per-message ratchet yet. See `known-limitations.md` for the complete picture.
+* Forward secrecy is **partial**: message content only ever travels under per-device-pair X4DH session keys, and a session that has completed its live upgrade also protects against a later compromise of your identity keys (see `X4DH.md`). There is no per-message ratchet yet: one key is used for every message under a session. A device pair without a session cannot exchange content at all; messages are held until one is established. See `known-limitations.md` for the complete picture.
 * Relay operators can observe IP addresses.
+* **Auto login is a convenience with a cost.** When ticked, the browser keeps your identity's master secret (not your passphrase) encrypted under a key stored beside it. Anyone with access to that browser profile can open your identity. Leave it off on shared or untrusted devices. Logout and BURN remove it.
 * MeshChat is **not** an anonymity network and is not a replacement for Tor.
 
 See `known-limitations.md` for a complete discussion.

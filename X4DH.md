@@ -6,7 +6,7 @@
 
 X4DH establishes a cryptographic session between **two specific devices** and yields the root key from which the AES-256-GCM key for all `app:message` content between them is derived. It establishes a usable session immediately when the responder is offline, and opportunistically upgrades that session when both devices are online.
 
-This document specifies the cryptography and the state machine. `protocol.md` specifies the surrounding wire protocol (envelopes, routing, the held outbox, HELLO). Implementation version `0.6.0`.
+This document specifies the cryptography and the state machine. `protocol.md` specifies the surrounding wire protocol (envelopes, routing, the held outbox, HELLO). Implementation version `0.6.2`.
 
 **Session-only content.** Every message that carries content is encrypted under a session wire key (§5.3) and under nothing else. There is no fallback to any identity-level key: if no send-ready session exists with a device (§7.2), content is not sent to it. The one thing the identity-level static key still carries is the content-free HELLO (`protocol.md`), which exists to give the two sides what this handshake needs (§3.3).
 
@@ -220,6 +220,8 @@ Storing a new `RK0` fully replaces the record **but carries `retryAttempts`, `re
 
 Held in memory only, never persisted: pending initiator ephemerals (`EK_A_priv`), the in-flight guards, retired roots, the wire-key cache.
 
+**Write ordering and failure handling.** Session saves are serialised through a promise chain, and the snapshot is taken *inside* the queued step, so the last write in the queue always carries the freshest in-memory state. Without that, two overlapping saves could finish out of order and an older snapshot would overwrite a newer one. That damage stays invisible until a reload brings back a session at an older stage: an RK1 upgrade forgotten, a retired RK0 resurrected, a retry budget reset, and the two sides then disagree about which root is current. Every save also checks the persistence-halt flag that self-destruct raises (see `protocol.md`), at the last moment before writing, so a save that started before a wipe cannot finish after it and write the sessions back. If the stored blob fails to decrypt or parse, it is copied to `meshchat_x4dh_sessions_v1_<publicId>_unreadable` before loading falls back to an empty store. Nothing reads that copy back (recovery is manual), and self-destruct removes it.
+
 ---
 
 ## 7. Key Generations and Send-Readiness
@@ -357,4 +359,4 @@ HKDF labels: `MeshChat-X4DH-v1/root`, `MeshChat-X4DH-v1/root-v2`, `MeshChat-X4DH
 
 ---
 
-*MeshChat X4DH — implementation 0.6.0 — experimental*
+*MeshChat X4DH — implementation 0.6.2 — experimental*
