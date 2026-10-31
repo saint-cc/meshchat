@@ -914,6 +914,7 @@ function renderMessages() {
         const img = document.createElement("img");
         img.style.cssText = "max-width:200px;display:block;border-radius:2px";
         img.alt = "image";
+		img.onload = () => { if (container.scrollHeight - container.scrollTop - container.clientHeight <= img.offsetHeight + 40) container.scrollTop = container.scrollHeight; };  // dont jump up
         (async () => {
           try {
             const plain = await decryptObject(state.encKey, imageCache[m.id].encBlob);
