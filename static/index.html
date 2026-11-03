@@ -185,6 +185,7 @@
           <div id="chatHeaderRelay" style="display:none;font-size:10px;color:var(--muted);margin-top:2px;letter-spacing:0.05em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis"></div>
         </div>
         <button id="callBtn" title="Call">☎</button>
+        <button id="videoBtn" title="Video call"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6.5A1.5 1.5 0 0 1 4.5 5h9A1.5 1.5 0 0 1 15 6.5v2.6l5.2-2.9a.5.5 0 0 1 .8.4v10.8a.5.5 0 0 1-.8.4L15 14.9v2.6a1.5 1.5 0 0 1-1.5 1.5h-9A1.5 1.5 0 0 1 3 17.5z"/></svg></button>
         <button id="dataBtn" title="Test data channel">⇄</button>
         <button id="contactMenuBtn" title="Contact options">⋯</button>
       </div>
@@ -228,9 +229,26 @@
 <!-- incoming Call -->
 <div id="incomingCallBanner">
   <div id="incomingCallName"></div>
+  <div id="incomingCallHint">answering shares your network address with them</div>
   <div class="incomingCallBtns">
     <button id="answerCallBtn">ANSWER</button>
+    <button id="answerCallAudioBtn">AUDIO ONLY</button>
     <button id="declineCallBtn">DECLINE</button>
+  </div>
+</div>
+
+<!-- video call overlay: full-window while a video call is negotiating/connected.
+     Remote video is muted on purpose — the call's audio plays through the hidden
+     <audio> element (see createPeerConnection), so un-muting this would double it. -->
+<div id="callOverlay">
+  <video id="callRemoteVideo" autoplay playsinline muted></video>
+  <div id="callRemoteOff"></div>
+  <video id="callLocalVideo" autoplay playsinline muted></video>
+  <div id="callOverlayName"></div>
+  <div id="callOverlayBtns">
+    <button id="callMicBtn">MIC</button>
+    <button id="callCamBtn">CAMERA</button>
+    <button id="callHangupBtn">HANG UP</button>
   </div>
 </div>
 

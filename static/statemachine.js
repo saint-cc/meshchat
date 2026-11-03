@@ -116,10 +116,15 @@ function transition(id, event, kind = "call") {
 
 
 /* ══════════════════════════════════════════
-   ON STATE ENTER — voice calls
+   ON STATE ENTER — voice and video calls
    Side effects on phase entry. Called by transition(), never directly.
    role disambiguates "negotiating" — caller makes the offer once claimed,
    callee waits for it and answers.
+
+   Timers live here, on phase entry, like the data path below: "calling"
+   and "ringing" get the ring timeout, "negotiating" the connect timeout,
+   and every way out (connected/failed/idle) clears it. What a timeout does
+   is onCallTimeout's job (meshchat.js).
 ══════════════════════════════════════════ */
 function onStateEnter(id, oldPhase, newPhase, role) {
   switch (newPhase) {
@@ -127,36 +132,43 @@ function onStateEnter(id, oldPhase, newPhase, role) {
     case "calling":
       sendCallInvite(id);
       sendCallNotice(id);
+      armCallTimer(id, CALL_RING_TIMEOUT_MS);
       break;
 
     case "ringing":
       showIncomingCallUI(id);
+      armCallTimer(id, CALL_RING_TIMEOUT_MS);
       break;
 
     case "negotiating":
       if (oldPhase === "ringing") hideIncomingCallUI(id);
       if (role === "caller") rtcOffer(id);
-      // callee waits for the offer to arrive, then calls rtcAnswer(id)
-      // itself from the signal handler — nothing to do on entry here
+      // callee waits for the offer to arrive, then answers it from the
+      // signal handler (handleCallOffer) — nothing to do on entry here
+      armCallTimer(id, CALL_NEGOTIATE_TIMEOUT_MS);
       break;
 
     case "connected":
       mlog.info(`CALL UP  ${pid(id)}`);
+      clearCallTimer(id);   // a connected call is allowed to last
       hideIncomingCallUI(id);
       break;
 
     case "failed":
       mlog.warn(`CALL FAILED  ${pid(id)}`);
+      clearCallTimer(id);
       rtcClose(id);
       break;
 
     case "idle":
+      clearCallTimer(id);
       if (oldPhase === "ringing" || oldPhase === "calling")
         hideIncomingCallUI(id);
-	  rtcClose(id);   // ← added — safe no-op if no pc exists for this contact
+      rtcClose(id);   // safe no-op if no pc exists for this contact
       break;
   }
   updateCallHeaderBtn(id);
+  updateCallOverlay(id);   // video overlay follows the phase (shown while negotiating/connected on a video call)
 }
 
 /* ══════════════════════════════════════════

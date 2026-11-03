@@ -13,7 +13,7 @@
 
    Load order: meshchat-lib.js → meshchat-gui.js → meshchat.js → statemachine.js
 ═══════════════════════════════════════════════════════════════ */
-const CLIENT_VERSION = "0.6.2";
+const CLIENT_VERSION = "0.6.3";
 
 const POLL_INTERVAL_MS        	= 30_000;			// base interval between presence polls
 const POLL_JITTER_MS          	= 10_000;			// ± random jitter added to poll interval
@@ -242,14 +242,16 @@ function markOnline(id) {
 
 function pruneOnline() {
   const now = Date.now();
+  let pruned = false;
   for (const id of state.online) {
     if (!onlineTimestamps[id] || (now - onlineTimestamps[id]) > ONLINE_EXPIRY) {
       state.online.delete(id);
-      clearDot(id);   // gui.js — fading-dot timestamp
+      clearDot(id);
+      pruned = true;
       mlog.info(`○ GONE(prune)  ${pid(id)}`);
     }
   }
-  renderContactList();
+  if (pruned) renderContactList();
 }
 setInterval(pruneOnline, PRUNE_INTERVAL_MS);
 
@@ -6333,8 +6335,11 @@ function verifyDataPacket(obj, contactSignPublicKey) {
   const { type, from, to, sessionId, deviceId, ts, blob } = obj;
   return verifyBlob({ type, from, to, sessionId, deviceId: deviceId || null, ts, blob: blob || null }, obj.sig, contactSignPublicKey);
 }
-function sendCallPacket(toId, type, callId) {
-  const obj = { type, from: state.publicId, to: toId, callId, ts: Date.now(), deviceId: state.deviceId };
+// blob is optional and only call:invite uses it (see sendCallInvite). It is
+// part of the signed body (signCallPacket covers it), so it cannot be swapped
+// in transit.
+function sendCallPacket(toId, type, callId, blob) {
+  const obj = { type, from: state.publicId, to: toId, callId, ts: Date.now(), deviceId: state.deviceId, ...(blob ? { blob } : {}) };
   obj.sig = signCallPacket(obj);
   const viaRelay = sendToRelay(toId, obj, false);
   if (!viaRelay) sendSignal(obj);
@@ -6360,16 +6365,24 @@ function sendCallPacket(toId, type, callId) {
    state-aware (e.g. update the same id's text as the call phase
    advances) once that's actually wanted; no need to build that now.
 
-   Deliberately only wired for voice calls, never the data session
-   kind — that one has no conversational surface to leave a notice for. ── */
+   WHO the text names: the caller's network ID (state.publicId), never the
+   login name (state.user). A contact's name is a purely local label — the
+   receiver already has its own name for this ID, and meshchat-gui.js swaps
+   the leading ID for it at render time (callNoticeText). The login name is
+   not a secret, but there is no reason to put it on the wire. The format is
+   rendered by an exact-match pattern in the GUI, so change both together.
+
+   Covers voice and video calls ("…WebRTC connection" / "…WebRTC video
+   connection"); never the data session kind — that one has no
+   conversational surface to leave a notice for. ── */
 async function sendCallNotice(id) {
   const contact = state.contacts[id];
   if (!contact || contact.blocked || !contact.encKey) return;
 
   const msgId = crypto.randomUUID();
   const ts    = Date.now();
-  const callerName = state.user || "Someone";
-  const text  = `${callerName} is attempting a WebRTC connection`;
+  const kind  = contact.call?.media === "video" ? "WebRTC video connection" : "WebRTC connection";
+  const text  = `${state.publicId} is attempting a ${kind}`;
   const sig   = signMessage({ id: msgId, from: state.publicId, type: "system", kind: "call", text, ts }, id);
 
   let status = "failed";
@@ -6397,28 +6410,139 @@ async function sendCallNotice(id) {
   updateContactPreview();
 }
 
-/* ── send side — called from onStateEnter / user actions ── */
+/* ══════════════════════════════════════════
+   CALL GUARDS — timers, busy, replay, "is this packet allowed right now"
+   The call path used to trust packet order: an offer was accepted whenever
+   the callId matched, which let a contact open our microphone (and now
+   camera) while the call was still only RINGING, and nothing ever timed a
+   call out. The data-session path (handleData*, armDataTimer) already
+   does all of this; these mirror it.
 
-function sendCallInvite(id) {
-  const contact = state.contacts[id];
-  if (!contact?.call?.callId) return;
-  sendCallPacket(id, "call:invite", contact.call.callId);
+   Rule of thumb used by every handler below: media is only touched, and an
+   RTCPeerConnection only built, while contact.call.phase is "negotiating"
+   for the callId in the packet — i.e. after the user answered (callee) or
+   the callee claimed (caller).
+══════════════════════════════════════════ */
+// RING covers invite→answer (the callee is a human with a banner to look
+// at); NEGOTIATE covers answer→connected (offer, answer, ICE over STUN).
+const CALL_RING_TIMEOUT_MS      = 45_000;
+const CALL_NEGOTIATE_TIMEOUT_MS = 25_000;
+// Early-ICE queue cap (candidates that overtake the offer) — a handful of
+// candidates, not a stream. Same figure as the data path.
+const CALL_EARLY_ICE_MAX        = 50;
+// An SDP with audio+video+ICE is a few KB; anything this big is not one.
+const CALL_SDP_MAX_CHARS        = 100_000;
+const CALL_ICE_MAX_CHARS        = 1_024;
+// How many finished/seen callIds to remember for replay rejection. Memory
+// only: it bounds replays within a session, which is the realistic case
+// (a signed invite captured off the relay and re-sent).
+const CALL_SEEN_MAX             = 200;
+
+const callTimers     = {};            // contactId → timeout handle (at most one per call)
+const callEarlyIce   = {};            // contactId → candidates that arrived before the pc existed
+const seenCallIds    = new Set();     // callIds this device has already accepted an invite for
+
+const callPeerName = (id) => state.contacts[id]?.name || pid(id);
+
+// True while this device is party to a call with anyone (other than exceptId).
+// The media layer is one shared localStream, and the GUI has one banner, so
+// the state machine's "one call at a time" assumption is enforced here
+// rather than hoped for.
+function anyCallActive(exceptId = null) {
+  return Object.keys(state.contacts).some(k =>
+    k !== exceptId && (state.contacts[k].call?.phase || "idle") !== "idle");
 }
 
-// user-facing: initiate a call
-function startCall(contactId) {
+// The call is exactly the one the packet/async step belongs to, and it is
+// in the window where media may be open.
+function callIsNegotiating(id, callId) {
+  const c = state.contacts[id]?.call;
+  return !!c && c.callId === callId && c.phase === "negotiating";
+}
+
+function rememberCallId(callId) {
+  seenCallIds.add(callId);
+  if (seenCallIds.size > CALL_SEEN_MAX) seenCallIds.delete(seenCallIds.values().next().value);
+}
+
+function clearCallTimer(id) {
+  clearTimeout(callTimers[id]);
+  delete callTimers[id];
+}
+function armCallTimer(id, ms) {
+  clearCallTimer(id);
+  callTimers[id] = setTimeout(() => { delete callTimers[id]; onCallTimeout(id); }, ms);
+}
+
+// What each phase's timeout means, and who tells the peer:
+//   ringing      callee never answered — nothing to send (the caller's own
+//                timer or its cancel covers its side); stop ringing silently
+//   calling      no answer — tell the callee to stop ringing (call:cancel)
+//   negotiating  never connected — tell the peer (call:end)
+// "connected" has no timer: a call is allowed to last.
+function onCallTimeout(id) {
+  const c = state.contacts[id]?.call;
+  if (!c || !c.callId) return;
+  const phase = c.phase;
+  if (phase === "ringing") {
+    mlog.info(`CALL       ring timeout (callee side)  ${pid(id)}`);
+    transition(id, { type: "call_cancelled" });
+  } else if (phase === "calling") {
+    mlog.info(`CALL       no answer from ${callPeerName(id)}`);
+    showDataToast(`no answer from ${callPeerName(id)}`, false);
+    sendCallPacket(id, "call:cancel", c.callId);
+    transition(id, { type: "no_answer" });
+  } else if (phase === "negotiating") {
+    mlog.warn(`CALL       couldn't connect to ${callPeerName(id)} in time`);
+    showDataToast(`couldn't connect to ${callPeerName(id)} in time — a firewall/NAT may be blocking the direct path (there is no relay for calls)`, false);
+    sendCallPacket(id, "call:end", c.callId);
+    transition(id, { type: "idle_timeout" });
+  }
+}
+
+/* ── send side — called from onStateEnter / user actions ── */
+
+// The invite carries the media kind. Voice invites stay exactly as they
+// always were (no blob), so an older peer sees nothing new; a video invite
+// carries { media: "video" } encrypted under the pairwise key like every
+// other call blob, and is covered by the invite's signature.
+async function sendCallInvite(id) {
+  const contact = state.contacts[id];
+  const callId  = contact?.call?.callId;
+  if (!callId) return;
+  let blob = null;
+  if (contact.call.media === "video" && contact.encKey) {
+    try { blob = await encryptMessage(contact.encKey, { media: "video" }); }
+    catch(e) { mlog.warn(`→ CALL INVITE  to ${pid(id)} — blob encrypt failed (${e.message}), sending as voice`); }
+  }
+  // The call may have been cancelled while we were encrypting.
+  const c = state.contacts[id]?.call;
+  if (!c || c.callId !== callId || c.phase !== "calling") return;
+  sendCallPacket(id, "call:invite", callId, blob);
+}
+
+// user-facing: initiate a call (withVideo: a video call)
+function startCall(contactId, withVideo = false) {
   const contact = state.contacts[contactId];
   if (!contact || contact.blocked) return;
   if (contact.call && contact.call.phase !== "idle") return;
-  contact.call = { callId: crypto.randomUUID(), phase: "idle", role: null };
+  if (anyCallActive(contactId)) {
+    mlog.warn(`CALL       not starting — another call is in progress`);
+    showDataToast("finish the current call first", false);
+    return;
+  }
+  contact.call = { callId: crypto.randomUUID(), phase: "idle", role: null, media: withVideo ? "video" : "audio" };
   transition(contactId, { type: "call_started" });
 }
 
-// user-facing: answer an incoming call on THIS device
-function answerCall(contactId) {
+// user-facing: answer an incoming call on THIS device. withVideo is only
+// honoured if the caller actually offered video — an "answer with video"
+// can't upgrade a voice call.
+function answerCall(contactId, withVideo = false) {
   const contact = state.contacts[contactId];
   if (!contact?.call?.callId || contact.call.phase !== "ringing") return;
   const callId = contact.call.callId;
+  contact.call.answerMedia = (withVideo && contact.call.media === "video") ? "video" : "audio";
   transition(contactId, { type: "claimed_here" });
   sendCallPacket(contactId, "call:claim", callId);          // tell the caller
   sendCallPacket(state.publicId, "call:claim", callId);     // tell our other devices to stop ringing
@@ -6451,16 +6575,48 @@ async function handleCallInvite(msg) {
   }
   markOnline(msg.from);
 
-  // A second invite while we're already past idle with this contact isn't
-  // a new call — could be a retry or a duplicate in-flight packet. Don't
-  // let it stomp a callId we (or another of our devices) may already be
-  // mid-negotiation on.
-  if (contact.call && contact.call.phase !== "idle") {
-    mlog.debug(`← CALL INVITE  from ${pid(msg.from)} — already in call (phase=${contact.call.phase}), ignored`);
-    return;
-  }
+  // Admission checks — run once now and once more after the (async) blob
+  // decrypt below, since the state can change across the await.
+  //  · A second invite while we're already past idle with this contact isn't
+  //    a new call — could be a retry or a duplicate in-flight packet. Don't
+  //    let it stomp a callId we (or another of our devices) may already be
+  //    mid-negotiation on.
+  //  · Busy: a call with someone else is in progress. Ignored silently — NOT
+  //    answered with call:cancel, which would end the call at the caller for
+  //    our other devices too. The caller's own ring timeout covers it, and the
+  //    call notice message still lands in the chat as a missed-call record.
+  //  · Replay: a callId we've already accepted once can't ring again, so a
+  //    captured signed invite re-sent later is inert.
+  const admissible = () => {
+    if (contact.call && contact.call.phase !== "idle") {
+      mlog.debug(`← CALL INVITE  from ${pid(msg.from)} — already in call (phase=${contact.call.phase}), ignored`);
+      return false;
+    }
+    if (anyCallActive(msg.from)) {
+      mlog.info(`← CALL INVITE  from ${pid(msg.from)} — busy with another call, ignored`);
+      return false;
+    }
+    if (seenCallIds.has(msg.callId)) {
+      mlog.debug(`← CALL INVITE  from ${pid(msg.from)} — callId already seen, ignored`);
+      return false;
+    }
+    return true;
+  };
+  if (!admissible()) return;
 
-  contact.call = { callId: msg.callId, phase: "idle", role: null };
+  // Media kind. Only "video" in a valid blob makes it a video call; a missing,
+  // undecryptable or odd blob is a plain voice call (what an older peer sends).
+  let media = "audio";
+  if (msg.blob) {
+    try {
+      const plain = await decryptMessage(msg.blob, contact.encKey);
+      if (plain?.media === "video") media = "video";
+    } catch(e) { mlog.debug(`← CALL INVITE  from ${pid(msg.from)} — blob unreadable, treated as voice`); }
+  }
+  if (!admissible()) return;
+
+  rememberCallId(msg.callId);
+  contact.call = { callId: msg.callId, phase: "idle", role: null, media };
   transition(msg.from, { type: "invite_received" });
 }
 
@@ -6753,25 +6909,54 @@ async function handleCallOffer(msg) {
     mlog.warn(`← CALL OFFER   from ${pid(msg.from)} — signature invalid, dropped`);
     return;
   }
-  if (contact.call?.callId !== msg.callId || contact.call.role !== "callee") {
+  // Strict, like handleDataOffer: only while we have ANSWERED (negotiating).
+  // Without the phase check a contact could send an offer while the call was
+  // merely ringing and have us open the microphone — and now the camera —
+  // before the user had agreed to anything.
+  if (contact.call?.callId !== msg.callId || contact.call.role !== "callee" || contact.call.phase !== "negotiating") {
     mlog.debug(`← CALL OFFER   from ${pid(msg.from)} — not expecting offer (phase=${contact.call?.phase}, role=${contact.call?.role}), ignored`);
     return;
   }
+  if (rtcConns[msg.from]) { mlog.debug(`← CALL OFFER   from ${pid(msg.from)} — already have a connection, duplicate ignored`); return; }
   markOnline(msg.from);
   let plain;
   try { plain = await decryptMessage(msg.blob, contact.encKey); }
   catch(e) { mlog.warn(`← CALL OFFER   from ${pid(msg.from)} — decrypt failed`); return; }
+  if (typeof plain?.sdp !== "string" || plain.sdp.length > CALL_SDP_MAX_CHARS) {
+    mlog.warn(`← CALL OFFER   from ${pid(msg.from)} — no/oversized sdp, dropped`);
+    return;
+  }
+  // State may have moved on while we were decrypting (cancel, timeout).
+  if (!callIsNegotiating(msg.from, msg.callId) || rtcConns[msg.from]) return;
 
+  // What WE send is the user's choice (the button they pressed), and is only
+  // ever video if the invite said video. Whatever the offer SDP contains
+  // beyond that is answered "inactive" below, never trusted.
+  const wantVideo = contact.call.answerMedia === "video" && contact.call.media === "video";
   try {
     const pc = await createPeerConnection(msg.from);
     await pc.setRemoteDescription({ type: "offer", sdp: plain.sdp });
+    const stream = await acquireMedia(msg.from, msg.callId, wantVideo);
+    if (!stream) return;   // call ended while the permission prompt was up — media already released
+
+    stream.getAudioTracks().forEach(t => pc.addTrack(t, stream));
+    const camTrack = wantVideo ? stream.getVideoTracks()[0] : null;
+    if (camTrack) rtcConns[msg.from].camSender = pc.addTrack(camTrack, stream);
+    // Any m-section we are not sending on: a video one is recvonly if the
+    // user chose video (we can still watch even without a camera), everything
+    // else is inactive — an audio-only answer receives no video either.
+    for (const t of pc.getTransceivers()) {
+      if (t.sender.track) continue;
+      t.direction = (t.receiver.track.kind === "video" && wantVideo) ? "recvonly" : "inactive";
+    }
+    callMedia.camOn = !!camTrack;
     await flushIceQueue(msg.from);
-    const stream = await getLocalStream();
-    stream.getTracks().forEach(t => pc.addTrack(t, stream));
+
     const answer = await pc.createAnswer();
     await pc.setLocalDescription(answer);
     await sendCallSDP(msg.from, "call:answer", answer.sdp);
-    mlog.info(`← CALL OFFER   from ${pid(msg.from)} — answered`);
+    mlog.info(`← CALL OFFER   from ${pid(msg.from)} — answered${wantVideo ? (camTrack ? " (video)" : " (video, no camera — receive only)") : ""}`);
+    callOverlayChanged(msg.from);
   } catch(e) {
     mlog.err(`RTC        answer failed: ${e.message}`);
     transition(msg.from, { type: "rtc_failed" });
@@ -6786,18 +6971,31 @@ async function handleCallAnswer(msg) {
     mlog.warn(`← CALL ANSWER  from ${pid(msg.from)} — signature invalid, dropped`);
     return;
   }
-  if (contact.call?.callId !== msg.callId || contact.call.role !== "caller") {
-    mlog.debug(`← CALL ANSWER  from ${pid(msg.from)} — not expecting answer, ignored`);
+  if (contact.call?.callId !== msg.callId || contact.call.role !== "caller" || contact.call.phase !== "negotiating") {
+    mlog.debug(`← CALL ANSWER  from ${pid(msg.from)} — not expecting answer (phase=${contact.call?.phase}), ignored`);
     return;
   }
   markOnline(msg.from);
   const entry = rtcConns[msg.from];
   if (!entry) { mlog.warn(`← CALL ANSWER  from ${pid(msg.from)} — no pc, dropped`); return; }
+  // A duplicate/replayed answer would make setRemoteDescription throw and
+  // take down a call that is working — only the first one, while we are
+  // actually waiting for it, is applied.
+  if (entry.pc.signalingState !== "have-local-offer") {
+    mlog.debug(`← CALL ANSWER  from ${pid(msg.from)} — not waiting for an answer (signaling=${entry.pc.signalingState}), ignored`);
+    return;
+  }
   try {
     const plain = await decryptMessage(msg.blob, contact.encKey);
+    if (typeof plain?.sdp !== "string" || plain.sdp.length > CALL_SDP_MAX_CHARS) {
+      mlog.warn(`← CALL ANSWER  from ${pid(msg.from)} — no/oversized sdp, dropped`);
+      return;
+    }
+    if (entry.pc.signalingState !== "have-local-offer" || rtcConns[msg.from] !== entry) return;   // changed during decrypt
     await entry.pc.setRemoteDescription({ type: "answer", sdp: plain.sdp });
     await flushIceQueue(msg.from);
     mlog.info(`← CALL ANSWER  from ${pid(msg.from)} — remote set`);
+    await reconcileVideoAfterAnswer(msg.from, entry);
   } catch(e) {
     mlog.err(`← CALL ANSWER  from ${pid(msg.from)} — failed: ${e.message}`);
     transition(msg.from, { type: "rtc_failed" });
@@ -6812,28 +7010,51 @@ async function handleCallIce(msg) {
     mlog.warn(`← CALL ICE     from ${pid(msg.from)} — signature invalid, dropped`);
     return;
   }
-  if (contact.call?.callId !== msg.callId) return; // stale/unrelated call
+  // Candidates only mean something once the call has been answered — the
+  // offer (and with it any peer connection) doesn't exist before that.
+  const iceAllowed = () => {
+    const c = contact.call;
+    return c?.callId === msg.callId && (c.phase === "negotiating" || c.phase === "connected");
+  };
+  if (!iceAllowed()) return; // stale/unrelated call, or not answered yet
 
   let plain;
   try { plain = await decryptMessage(msg.blob, contact.encKey); }
   catch(e) { mlog.warn(`← CALL ICE     from ${pid(msg.from)} — decrypt failed`); return; }
+  if (typeof plain?.candidate !== "string" || plain.candidate.length > CALL_ICE_MAX_CHARS) return;
+  if (!iceAllowed()) return;   // call ended during the decrypt — don't leave a queue behind
 
   const entry = rtcConns[msg.from];
-  if (!entry) return;
+  if (!entry) {
+    // Callee side: the caller's candidates can overtake its offer (trickle
+    // ICE starts the moment setLocalDescription runs, while the offer still
+    // has to be encrypted and signed). Hold them instead of dropping them;
+    // createPeerConnection adopts the queue. Capped, and rtcClose clears it.
+    const q = (callEarlyIce[msg.from] ||= []);
+    if (q.length < CALL_EARLY_ICE_MAX) q.push(plain);
+    return;
+  }
   if (entry.pc.remoteDescription) {
     try { await entry.pc.addIceCandidate(plain); }
     catch(e) { mlog.debug(`RTC        addIceCandidate failed: ${e.message}`); }
-  } else {
+  } else if (entry.iceQueue.length < CALL_EARLY_ICE_MAX) {
     entry.iceQueue.push(plain);
   }
 }
 
 /* ══════════════════════════════════════════
-   RTC — audio only for now (video deliberately
-   deferred). One RTCPeerConnection per contact,
-   keyed by contactId. iceQueue holds candidates
-   that arrive before the remote description is
-   set (trickle ICE races the SDP exchange).
+   RTC — voice, plus video when both sides want it. One
+   RTCPeerConnection per contact, keyed by contactId.
+   iceQueue holds candidates that arrive before the remote
+   description is set (trickle ICE races the SDP exchange).
+
+   Video rides the SAME peer connection and the same signalling as voice:
+   the caller's offer simply has a video m-section when the invite said
+   video, and the callee's answer fills it in (or sets it inactive for an
+   "audio only" answer). There is no renegotiation after that — camera
+   on/off is a track swap on an existing sender (replaceTrack), so it needs
+   no signalling at all. Consequence: a call that starts audio-only can't be
+   upgraded to video mid-call; start a new one.
 ══════════════════════════════════════════ */
 const RTC_CONFIG = {
   iceServers: [
@@ -6842,25 +7063,75 @@ const RTC_CONFIG = {
     { urls: "stun:global.stun.twilio.com:3478" }
   ]
 };
-const rtcConns   = {};   // contactId → { pc, iceQueue: [] }
+// Tunables for the local media. Ideal, not exact: the browser picks the
+// nearest the camera can do, and WebRTC adapts the bitrate to the path
+// (there is no TURN, so a direct path with unknown headroom is the norm).
+const AUDIO_CONSTRAINTS = { echoCancellation: true, noiseSuppression: true, autoGainControl: true };
+const VIDEO_CONSTRAINTS = { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 }, facingMode: "user" };
 
-// Single shared local stream — fine under the current manual-only,
-// one-call-at-a-time assumption baked into the state machine. If that
-// assumption ever changes (concurrent calls to different contacts),
+const rtcConns   = {};   // contactId → { pc, iceQueue: [], camSender, remoteAudio, remoteVideo }
+
+// Single shared local stream — safe because anyCallActive() now enforces
+// one call at a time (startCall refuses, handleCallInvite ignores a second
+// invite). If that ever changes (concurrent calls to different contacts),
 // this needs to become per-call.
 let localStream = null;
 
-async function getLocalStream() {
+// Per-call media state the overlay reads (see getCallView). Reset by rtcClose.
+const callMedia = { camOn: false, micOn: true, camBusy: false, localPreview: null };
+function resetCallMedia() {
+  callMedia.camOn = false; callMedia.micOn = true; callMedia.camBusy = false; callMedia.localPreview = null;
+}
+
+// Is THIS side sending/receiving video on this call? Derived from what the
+// user chose (caller: the button pressed; callee: the answer button) and, on
+// the caller, whether the callee's answer actually kept video (videoDeclined).
+function isVideoCall(id) {
+  const c = state.contacts[id]?.call;
+  if (!c) return false;
+  if (c.role === "caller") return c.media === "video" && !c.videoDeclined;
+  return c.media === "video" && c.answerMedia === "video";
+}
+
+function callOverlayChanged(id) { updateCallOverlay(id); }
+
+// Camera and microphone. With wantVideo the first attempt asks for both in
+// one request (one permission prompt); if that fails each is retried on its
+// own so a missing camera doesn't cost us the microphone or vice versa.
+// A missing/denied microphone still falls back to the synthetic track, as
+// before, so signalling can be tested on a machine with no hardware; a
+// missing camera just means no video from this side.
+async function getLocalStream(wantVideo = false) {
   if (localStream) return localStream;
-  try {
-    localStream = await navigator.mediaDevices.getUserMedia({
-      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
-    });
-    mlog.info("RTC        mic acquired");
-  } catch(e) {
-    mlog.warn(`RTC        mic unavailable (${e.message}) — using synthetic test track`);
-    localStream = createSyntheticAudioStream();
+  let stream = null;
+  if (wantVideo) {
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: AUDIO_CONSTRAINTS, video: VIDEO_CONSTRAINTS });
+      mlog.info("RTC        mic + camera acquired");
+    } catch(e) {
+      mlog.warn(`RTC        mic+camera request failed (${e.message}) — trying them separately`);
+    }
   }
+  if (!stream) {
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: AUDIO_CONSTRAINTS });
+      mlog.info("RTC        mic acquired");
+    } catch(e) {
+      mlog.warn(`RTC        mic unavailable (${e.message}) — using synthetic test track`);
+      stream = createSyntheticAudioStream();
+    }
+    if (wantVideo) {
+      try {
+        const v = await navigator.mediaDevices.getUserMedia({ video: VIDEO_CONSTRAINTS });
+        v.getVideoTracks().forEach(t => stream.addTrack(t));
+        mlog.info("RTC        camera acquired");
+      } catch(e) {
+        mlog.warn(`RTC        camera unavailable (${e.message}) — no video from this side`);
+        showDataToast(`camera unavailable — ${e.message}`, false);
+      }
+    }
+  }
+  localStream = stream;
   return localStream;
 }
 
@@ -6885,27 +7156,75 @@ function releaseLocalStream() {
   if (localStream) {
     localStream.getTracks().forEach(t => t.stop());
     localStream = null;
-    mlog.debug("RTC        mic released");
+    mlog.debug("RTC        mic/camera released");
   }
+  callMedia.localPreview = null;
+}
+
+// THE choke point for opening the microphone/camera for a call. Both the
+// caller (rtcOffer) and the callee (handleCallOffer) go through here, and
+// it re-checks the phase on both sides of the permission prompt: the prompt
+// can stay open for as long as the user likes, and if the call was
+// cancelled/timed out meanwhile, rtcClose has already run (and found nothing
+// to release) — so whatever the prompt yields afterwards has to be released
+// here, or the mic/camera would stay live with no call.
+async function acquireMedia(id, callId, wantVideo) {
+  if (!callIsNegotiating(id, callId)) return null;
+  const stream = await getLocalStream(wantVideo);
+  if (!callIsNegotiating(id, callId)) {
+    if (!anyCallActive()) releaseLocalStream();
+    return null;
+  }
+  callMedia.micOn = true;
+  refreshLocalPreview();
+  return stream;
+}
+
+function refreshLocalPreview() {
+  const t = localStream?.getVideoTracks()[0];
+  callMedia.localPreview = t ? new MediaStream([t]) : null;
 }
 
 async function createPeerConnection(id) {
   if (rtcConns[id]?.pc) return rtcConns[id].pc;
   const pc = new RTCPeerConnection(RTC_CONFIG);
-  rtcConns[id] = { pc, iceQueue: [] };
+  // Adopt candidates that overtook the offer (see handleCallIce).
+  const entry = { pc, iceQueue: callEarlyIce[id] || [], camSender: null, remoteAudio: null, remoteVideo: null };
+  delete callEarlyIce[id];
+  rtcConns[id] = entry;
 
   pc.onicecandidate = (e) => { if (e.candidate) sendCallIce(id, e.candidate); };
 
+  // Remote tracks are collected into our own MediaStreams by kind rather than
+  // relying on e.streams[0]: the stream id travels in the SDP (msid), and
+  // this way a peer that doesn't set one still works. Audio plays through a
+  // hidden <audio>; video goes to the overlay's <video> via getCallView, and
+  // only on a call where video was agreed — a video m-section in an offer
+  // for a voice call is never rendered.
   pc.ontrack = (e) => {
-    let audioEl = document.getElementById("remoteAudio_" + id);
-    if (!audioEl) {
-      audioEl = document.createElement("audio");
-      audioEl.id = "remoteAudio_" + id;
-      audioEl.autoplay = true;
-      document.body.appendChild(audioEl);
+    if (rtcConns[id] !== entry) return;
+    if (e.track.kind === "audio") {
+      entry.remoteAudio ||= new MediaStream();
+      entry.remoteAudio.addTrack(e.track);
+      let audioEl = document.getElementById("remoteAudio_" + id);
+      if (!audioEl) {
+        audioEl = document.createElement("audio");
+        audioEl.id = "remoteAudio_" + id;
+        audioEl.autoplay = true;
+        document.body.appendChild(audioEl);
+      }
+      audioEl.srcObject = entry.remoteAudio;
+      mlog.info(`RTC        remote audio attached  ${pid(id)}`);
+    } else if (e.track.kind === "video") {
+      if (!isVideoCall(id)) { mlog.debug(`RTC        remote video ignored (not a video call)  ${pid(id)}`); return; }
+      entry.remoteVideo ||= new MediaStream();
+      entry.remoteVideo.addTrack(e.track);
+      // The remote camera going off/on shows up as the track muting/unmuting.
+      e.track.onmute   = () => callOverlayChanged(id);
+      e.track.onunmute = () => callOverlayChanged(id);
+      mlog.info(`RTC        remote video attached  ${pid(id)}`);
+      callOverlayChanged(id);
     }
-    audioEl.srcObject = e.streams[0];
-    mlog.info(`RTC        remote track attached  ${pid(id)}`);
   };
 
   pc.onconnectionstatechange = () => {
@@ -6928,29 +7247,138 @@ async function flushIceQueue(id) {
   entry.iceQueue = [];
 }
 
-// real implementation — replaces the old stub
+// Caller side. Media is opened only through acquireMedia (phase-checked).
+// With a video call and no usable camera we still offer video as recvonly —
+// we can watch them even though they can't see us.
 async function rtcOffer(id) {
+  const call      = state.contacts[id]?.call;
+  const callId    = call?.callId;
+  const wantVideo = call?.media === "video";
   try {
     const pc     = await createPeerConnection(id);
-    const stream = await getLocalStream();
-    stream.getTracks().forEach(t => pc.addTrack(t, stream));
+    const entry  = rtcConns[id];
+    const stream = await acquireMedia(id, callId, wantVideo);
+    if (!stream) return;   // call ended while the permission prompt was up — media already released
+    if (rtcConns[id] !== entry) return;
+
+    stream.getAudioTracks().forEach(t => pc.addTrack(t, stream));
+    const cam = wantVideo ? stream.getVideoTracks()[0] : null;
+    if (wantVideo) {
+      if (cam) entry.camSender = pc.addTrack(cam, stream);
+      else     pc.addTransceiver("video", { direction: "recvonly" });
+    }
+    callMedia.camOn = !!cam;
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
     await sendCallSDP(id, "call:offer", offer.sdp);
-    mlog.info(`RTC        offer sent  ${pid(id)}`);
+    mlog.info(`RTC        offer sent  ${pid(id)}${wantVideo ? (cam ? " (video)" : " (video, no camera — receive only)") : ""}`);
+    callOverlayChanged(id);
   } catch(e) {
     mlog.err(`RTC        offer failed: ${e.message}`);
     transition(id, { type: "rtc_failed" });
   }
 }
 
+// After the callee's answer is applied: did video survive? The answer's
+// direction for the video m-section tells us. "inactive" = they answered
+// audio-only, so the call is voice-only from here and our camera has no
+// reason to stay on; anything without "send" means they won't receive our
+// video, same conclusion for the camera. currentDirection being null (not
+// reported) leaves everything as it is.
+async function reconcileVideoAfterAnswer(id, entry) {
+  const c = state.contacts[id]?.call;
+  if (!c || c.role !== "caller" || c.media !== "video") return;
+  const vt  = entry.pc.getTransceivers().find(t => t.receiver.track.kind === "video");
+  const dir = vt?.currentDirection;
+  if (!vt || dir === "inactive") {
+    c.videoDeclined = true;
+    mlog.info(`CALL       ${callPeerName(id)} answered audio only`);
+    showDataToast(`${callPeerName(id)} answered audio only`, true);
+  }
+  if (!vt || (dir && !dir.includes("send"))) await dropCamera(entry);
+  callOverlayChanged(id);
+}
+
+// Really stops the camera (track.stop() — the hardware light goes out), then
+// detaches it from the sender. replaceTrack(null) needs no renegotiation.
+function stopLocalCameraTracks() {
+  if (!localStream) return;
+  localStream.getVideoTracks().forEach(t => { t.stop(); localStream.removeTrack(t); });
+  refreshLocalPreview();
+}
+async function dropCamera(entry) {
+  stopLocalCameraTracks();
+  callMedia.camOn = false;
+  const sender = entry.camSender;
+  entry.camSender = null;          // nothing left to toggle
+  try { await sender?.replaceTrack(null); } catch(e) { mlog.debug(`RTC        replaceTrack(null) failed: ${e.message}`); }
+}
+
+// User-facing (overlay button): camera off = stop the track for real; camera
+// on = a fresh getUserMedia (which may re-prompt on some browsers) swapped
+// into the same sender. Only possible when a video send direction was
+// negotiated (entry.camSender) — see the header comment on upgrades.
+async function setCameraEnabled(id, on) {
+  const entry = rtcConns[id];
+  if (!entry?.camSender || callMedia.camBusy) return;
+  callMedia.camBusy = true;
+  try {
+    if (!on) {
+      stopLocalCameraTracks();
+      callMedia.camOn = false;
+      await entry.camSender.replaceTrack(null);
+      mlog.info(`RTC        camera off  ${pid(id)}`);
+    } else {
+      const s     = await navigator.mediaDevices.getUserMedia({ video: VIDEO_CONSTRAINTS });
+      const track = s.getVideoTracks()[0];
+      if (rtcConns[id] !== entry || !localStream) { track.stop(); return; }   // call ended meanwhile
+      localStream.addTrack(track);
+      refreshLocalPreview();
+      await entry.camSender.replaceTrack(track);
+      callMedia.camOn = true;
+      mlog.info(`RTC        camera on  ${pid(id)}`);
+    }
+  } catch(e) {
+    mlog.warn(`RTC        camera ${on ? "on" : "off"} failed: ${e.message}`);
+    showDataToast(`camera: ${e.message}`, false);
+  } finally {
+    callMedia.camBusy = false;
+    callOverlayChanged(id);
+  }
+}
+
+// Mic mute is enabled=false (silence, track stays) — only the camera needs
+// the hardware actually released.
+function setMicEnabled(id, on) {
+  if (!rtcConns[id] || !localStream) return;
+  localStream.getAudioTracks().forEach(t => { t.enabled = on; });
+  callMedia.micOn = on;
+  callOverlayChanged(id);
+}
+
+// Everything the overlay needs, in one read.
+function getCallView(id) {
+  const entry = rtcConns[id];
+  const vt    = entry?.remoteVideo?.getVideoTracks()[0];
+  return {
+    video:        isVideoCall(id),
+    camOn:        callMedia.camOn,
+    camCanToggle: !!entry?.camSender,
+    micOn:        callMedia.micOn,
+    localVideo:   callMedia.camOn ? callMedia.localPreview : null,
+    remoteVideo:  entry?.remoteVideo || null,
+    remoteLive:   !!vt && !vt.muted && vt.readyState === "live",
+  };
+}
+
 // real implementation — replaces the old stub
 function rtcClose(id) {
   const entry = rtcConns[id];
   if (entry) { entry.pc.close(); delete rtcConns[id]; }
+  delete callEarlyIce[id];
   const audioEl = document.getElementById("remoteAudio_" + id);
   if (audioEl) { audioEl.srcObject = null; audioEl.remove(); }
-  releaseLocalStream();
+  if (!anyCallActive(id)) { releaseLocalStream(); resetCallMedia(); }
   mlog.debug(`RTC        closed  ${pid(id)}`);
 }
 

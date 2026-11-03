@@ -284,16 +284,23 @@ function showReactionPicker(anchor, msgId, current) {
   }, 0);
 }
 
-/* ── RTC/UI stubs — statemachine.js's onStateEnter already calls these
-   unconditionally; real implementations are the NEXT step, not this one.
-   Kept as visible no-ops so entering ringing/negotiating/failed doesn't
-   throw before that work happens. ── */
+/* ══════════════════════════════════════════
+   CALL UI — incoming banner, header buttons, video overlay
+   statemachine.js's onStateEnter calls these on phase entry; media itself
+   lives in meshchat.js (getCallView is the one read the overlay needs, and
+   setCameraEnabled / setMicEnabled the only writes).
+══════════════════════════════════════════ */
 let incomingCallContactId = null;
 
 function showIncomingCallUI(id) {
   incomingCallContactId = id;
   const contact = state.contacts[id];
-  document.getElementById("incomingCallName").textContent = (contact?.name || pid(id)) + " is calling…";
+  const video   = contact?.call?.media === "video";
+  document.getElementById("incomingCallName").textContent =
+    (contact?.name || pid(id)) + (video ? " is video calling…" : " is calling…");
+  // A video invite has two ways to answer; a voice invite just one.
+  document.getElementById("answerCallBtn").textContent = video ? "ANSWER WITH VIDEO" : "ANSWER";
+  document.getElementById("answerCallAudioBtn").hidden = !video;
   document.getElementById("incomingCallBanner").classList.add("open");
   updateCallHeaderBtn(id);
 }
@@ -306,7 +313,7 @@ function hideIncomingCallUI(id) {
   updateCallHeaderBtn(id);
 }
 
-// Reflects call.phase on the header button — only touches the DOM if the
+// Reflects call.phase on the header buttons — only touches the DOM if the
 // contact in question is the one currently open, same guard pattern as
 // updateChatRelayInfo.
 function updateCallHeaderBtn(id) {
@@ -324,6 +331,15 @@ function updateCallHeaderBtn(id) {
   btn.textContent = GLYPH[phase]  || "☎";
   btn.title       = TITLE[phase]  || "Call";
   btn.disabled    = phase === "ringing";   // answer/decline only via the popup, to avoid two conflicting controls
+
+  // The video button only STARTS a video call; once any call is up, the
+  // one call button above is the cancel / hang-up control for both kinds.
+  const vbtn = document.getElementById("videoBtn");
+  if (vbtn) {
+    vbtn.classList.toggle("visible", !isMe);
+    vbtn.disabled = phase !== "idle";
+    vbtn.title    = phase === "idle" ? "Video call" : "Use the call button to cancel / hang up";
+  }
 }
 
 document.getElementById("callBtn").onclick = () => {
@@ -336,8 +352,122 @@ document.getElementById("callBtn").onclick = () => {
   else if (phase === "failed")                       transition(id, { type: "reset" });
 };
 
-document.getElementById("answerCallBtn").onclick  = () => { if (incomingCallContactId) answerCall(incomingCallContactId); };
-document.getElementById("declineCallBtn").onclick = () => { if (incomingCallContactId) cancelCall(incomingCallContactId); };
+document.getElementById("videoBtn").onclick = () => {
+  const id = state.currentChat;
+  if (!id || id === state.publicId) return;
+  if ((state.contacts[id]?.call?.phase || "idle") === "idle") startCall(id, true);
+};
+
+document.getElementById("answerCallBtn").onclick      = () => { if (incomingCallContactId) answerCall(incomingCallContactId, true); };   // answerCall ignores "true" on a voice invite
+document.getElementById("answerCallAudioBtn").onclick = () => { if (incomingCallContactId) answerCall(incomingCallContactId, false); };
+document.getElementById("declineCallBtn").onclick     = () => { if (incomingCallContactId) cancelCall(incomingCallContactId); };
+
+/* ── video overlay ──
+   Shown for a VIDEO call while it is negotiating or connected, hidden
+   otherwise; a voice call never opens it. Called on every phase entry and
+   whenever the media layer changes something (camera toggled, remote
+   track muted/unmuted, video declined). Idempotent: it only touches
+   srcObject when the stream actually changed, so repeated updates don't
+   restart playback. */
+let callOverlayContactId = null;
+let _wakeLock = null;
+
+async function holdScreenAwake(on) {
+  try {
+    if (on && !_wakeLock && navigator.wakeLock) {
+      _wakeLock = await navigator.wakeLock.request("screen");
+      _wakeLock.addEventListener("release", () => { _wakeLock = null; });
+    } else if (!on && _wakeLock) {
+      await _wakeLock.release();
+      _wakeLock = null;
+    }
+  } catch(e) { /* best-effort — a denied/unsupported wake lock is not an error */ }
+}
+// The browser drops a wake lock when the tab is hidden; take it back on return.
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible" && callOverlayContactId) holdScreenAwake(true);
+});
+
+function setVideoSrc(el, stream) {
+  if (el.srcObject === stream) return;
+  el.srcObject = stream || null;
+  if (stream) el.play?.().catch(() => {});   // iOS/Safari sometimes needs the nudge despite autoplay
+}
+
+function updateCallOverlay(id) {
+  const ov = document.getElementById("callOverlay");
+  if (!ov) return;
+  const phase = state.contacts[id]?.call?.phase || "idle";
+  const view  = getCallView(id);
+  const show  = view.video && (phase === "negotiating" || phase === "connected");
+
+  if (!show) {
+    if (callOverlayContactId !== id) return;   // some other contact's call owns the overlay
+    callOverlayContactId = null;
+    ov.classList.remove("open", "remote-off", "local-on");
+    setVideoSrc(document.getElementById("callRemoteVideo"), null);
+    setVideoSrc(document.getElementById("callLocalVideo"),  null);
+    holdScreenAwake(false);
+    return;
+  }
+
+  if (callOverlayContactId !== id) {
+    callOverlayContactId = id;
+    holdScreenAwake(true);
+  }
+  ov.classList.add("open");
+  document.getElementById("callOverlayName").textContent = state.contacts[id]?.name || pid(id);
+  setVideoSrc(document.getElementById("callRemoteVideo"), view.remoteVideo);
+  setVideoSrc(document.getElementById("callLocalVideo"),  view.localVideo);
+  ov.classList.toggle("remote-off", !view.remoteLive);
+  ov.classList.toggle("local-on",   !!view.localVideo);
+  // Before connect there is nothing to show yet; after, no frames = their camera is off.
+  document.getElementById("callRemoteOff").textContent = phase === "connected" ? "camera off" : "connecting…";
+
+  const mic = document.getElementById("callMicBtn");
+  mic.textContent = view.micOn ? "MIC ON" : "MIC OFF";
+  mic.classList.toggle("off", !view.micOn);
+  const cam = document.getElementById("callCamBtn");
+  cam.textContent = view.camOn ? "CAMERA ON" : "CAMERA OFF";
+  cam.classList.toggle("off", !view.camOn);
+  cam.disabled = !view.camCanToggle;   // no camera / audio-only answer: nothing to toggle
+  cam.title    = view.camCanToggle ? "" : "No outgoing video on this call";
+}
+
+document.getElementById("callMicBtn").onclick = () => {
+  const id = callOverlayContactId;
+  if (id) setMicEnabled(id, !getCallView(id).micOn);
+};
+document.getElementById("callCamBtn").onclick = () => {
+  const id = callOverlayContactId;
+  if (id) setCameraEnabled(id, !getCallView(id).camOn);
+};
+document.getElementById("callHangupBtn").onclick = () => {
+  const id = callOverlayContactId;
+  if (!id) return;
+  const phase = state.contacts[id]?.call?.phase;
+  if (phase === "connected") endCall(id);
+  else if (phase === "negotiating") cancelCall(id);
+};
+
+// Call notices carry the caller's network ID, not a name (see
+// sendCallNotice in meshchat.js); we show OUR name for that contact instead.
+// Exact-match on purpose, and only when the ID IS the message's sender —
+// otherwise a contact could put someone else's ID in the text and have it
+// shown under that person's name. Anything that doesn't match (older notices
+// that carry a login name, other system texts) is shown verbatim.
+const CALL_NOTICE_RE = /^(\S+) is attempting a (WebRTC(?: video)? connection)$/;
+function systemMsgText(m) {
+  const t = m.text || "";
+  if (m.kind === "call") {
+    const r = CALL_NOTICE_RE.exec(t);
+    if (r && r[1] === m.from) {
+      const who = m.from === state.publicId ? "You are" : (state.contacts[m.from]?.name || pid(m.from)) + " is";
+      return `${who} attempting a ${r[2]}`;
+    }
+  }
+  return t;
+}
 
 /* ══════════════════════════════════════════
    DATA-CHANNEL TEST — header button, accept banner, result toast
@@ -724,7 +854,7 @@ function renderContactList() {
         : last.type === "image"
         ? "🖼 image"
         : last.type === "system"
-        ? (SYSTEM_ICON[last.kind] || "•") + " " + (last.text || "").slice(0, 26) + ((last.text || "").length > 26 ? "…" : "")
+        ? (SYSTEM_ICON[last.kind] || "•") + " " + systemMsgText(last).slice(0, 26) + (systemMsgText(last).length > 26 ? "…" : "")
         : (last.text || "").slice(0, 28) + (last.text?.length > 28 ? "…" : "")
       : "";
     const hasBackup = !!state.peerBackups[c.publicId];
@@ -872,7 +1002,7 @@ function renderMessages() {
       const icon = SYSTEM_ICON[m.kind] || "•";
       const d = new Date(m.ts);
       const timeStr = d.toLocaleTimeString([], { hour:"2-digit", minute:"2-digit", hour12:false });
-      sysLine.textContent = `${icon}  ${m.text || ""}`
+      sysLine.textContent = `${icon}  ${systemMsgText(m)}`
         + (m.valid === false ? "  ·  ⚠ unverified" : "")
         + `  ·  ${timeStr}`;
       sysWrap.appendChild(sysLine);

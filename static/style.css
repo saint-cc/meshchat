@@ -634,6 +634,56 @@
 #callBtn.state-failed { color: var(--danger); border-color: var(--danger); animation: none; }
 #callBtn:disabled { opacity: 0.5; cursor: default; animation: none; }
 
+/* video-call header button — same family as #callBtn */
+#videoBtn {
+  background: none; border: 1px solid var(--border); color: var(--online);
+  width: 28px; height: 28px; font-size: 13px; cursor: pointer;
+  display: none; align-items: center; justify-content: center;
+  transition: border-color 0.2s, color 0.2s, background 0.2s;
+  flex-shrink: 0; margin-right: 8px;
+}
+#videoBtn.visible { display: flex; }
+#videoBtn:hover { border-color: var(--online); background: var(--surface2); }
+#videoBtn:disabled { opacity: 0.5; cursor: default; }
+/* line-art camera in currentColor, so it takes the button colour like the ☎ / ⇄ glyphs do
+   (the 🎥 emoji ignored `color` and brought its own background) */
+#videoBtn svg { width: 16px; height: 16px; fill: currentColor; }
+
+/* video-call overlay — covers the window while a video call is up */
+#callOverlay {
+  display: none; position: fixed; inset: 0; z-index: 550; background: #000;
+}
+#callOverlay.open { display: block; }
+#callRemoteVideo { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; background: #000; }
+#callRemoteOff {
+  display: none; position: absolute; inset: 0; align-items: center; justify-content: center;
+  color: var(--muted); font-size: 14px; letter-spacing: 0.15em; text-align: center; padding: 0 16px;
+}
+#callOverlay.remote-off #callRemoteOff { display: flex; }
+#callOverlay.remote-off #callRemoteVideo { visibility: hidden; }
+#callLocalVideo {
+  position: absolute; right: 16px; bottom: 96px; width: min(28vw, 220px); aspect-ratio: 4 / 3;
+  object-fit: cover; background: #111; border: 1px solid var(--border);
+  transform: scaleX(-1);   /* mirror the self-view, like every video app */
+}
+#callOverlay:not(.local-on) #callLocalVideo { display: none; }
+#callOverlayName {
+  position: absolute; top: 12px; left: 16px; font-size: 12px; letter-spacing: 0.1em; color: var(--accent);
+  text-shadow: 0 1px 4px #000; max-width: calc(100% - 32px); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+#callOverlayBtns {
+  position: absolute; left: 50%; bottom: calc(24px + env(safe-area-inset-bottom, 0px)); transform: translateX(-50%);
+  display: flex; gap: 8px;
+}
+#callOverlayBtns button {
+  padding: 10px 16px; font-family: inherit; font-size: 11px; letter-spacing: 0.1em; cursor: pointer;
+  background: rgba(20,20,20,.85); color: var(--text); border: 1px solid var(--border);
+}
+#callOverlayBtns button.off { color: var(--danger); border-color: var(--danger); }
+#callOverlayBtns button:disabled { opacity: 0.4; cursor: default; }
+#callHangupBtn { background: var(--danger) !important; color: #000 !important; border-color: var(--danger) !important; font-weight: bold; }
+@media (max-width: 600px) { #callLocalVideo { bottom: 88px; width: 32vw; } }
+
 #incomingCallBanner, #incomingDataBanner {
   display: none;
   position: fixed; top: 0; left: 50%; transform: translateX(-50%);
@@ -653,8 +703,10 @@
 #declineCallBtn, #declineDataBtn { background: none; color: var(--danger); border-color: var(--danger); }
 
 /* second banner drops below the first when a call and a data test arrive together */
-#incomingCallBanner.open ~ #incomingDataBanner.open { top: 96px; }
-#incomingDataHint { font-size: 10px; color: var(--muted); letter-spacing: 0.05em; }
+#incomingCallBanner.open ~ #incomingDataBanner.open { top: 128px; }   /* call banner now has a hint line too */
+#incomingDataHint, #incomingCallHint { font-size: 10px; color: var(--muted); letter-spacing: 0.05em; }
+#answerCallAudioBtn { background: none; color: var(--online); border-color: var(--online); }
+#answerCallAudioBtn[hidden] { display: none; }
 
 #dataBtn {
   background: none; border: 1px solid var(--border); color: var(--accent);
