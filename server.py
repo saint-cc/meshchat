@@ -12,9 +12,11 @@ import re
 import secrets
 import socket
 import ssl
+import threading
 import time
 import urllib.parse
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ec
@@ -199,6 +201,144 @@ BUF_RATE_LIMITER_IDLE_S = 600
 
 # WebSocket
 WS_MAX_SIZE = int(os.environ.get("WS_MAX_SIZE", 2 * 1024 * 1024))   # 2 MB per frame
+
+# ══════════════════════════════════════════
+#   RESOURCE PROTECTION
+#   The relay is the open part of the network and identities cost nothing,
+#   so everything below bounds what ONE socket / ONE address / ONE identity
+#   can make the process spend: sockets held, bytes parsed, CPU burnt on
+#   JSON, disk written, outbound HTTP made, log lines produced. None of it
+#   changes the wire protocol — a well-behaved client never notices.
+#   Every number is a named constant; the ones worth tuning have env overrides.
+# ══════════════════════════════════════════
+
+def _env_int(name, default):
+    return int(os.environ.get(name, default))
+
+def _env_float(name, default):
+    return float(os.environ.get(name, default))
+
+# ── sockets ──
+# MAX_CONNECTIONS / MAX_CONNECTIONS_PER_IP (above) now count EVERY open
+# socket, authed or not — they used to count only registered (authed) ones,
+# so unauthenticated sockets were free to pile up without bound.
+#
+# Unauthenticated sockets get their own, much smaller, per-address cap and a
+# hard deadline: a real client sends sig:auth_init within milliseconds of
+# connecting and has its proof signed a round-trip later.
+MAX_UNAUTH_PER_IP = _env_int("MAX_UNAUTH_PER_IP", 4)         # unauthed sockets one address may hold at once
+UNAUTH_DEADLINE_S = _env_float("UNAUTH_DEADLINE_S", 10)      # seconds from connect to a COMPLETED auth, else closed
+# When the relay is full a new connection EVICTS (unauthed first, oldest
+# first; then an authed socket that has been silent longer than this)
+# instead of being refused. Clients send sig:announce about every 30 s, so a
+# live client is never silent for minutes; 180 s leaves room for a
+# backgrounded tab whose timers are throttled.
+WS_IDLE_EVICT_S = _env_float("WS_IDLE_EVICT_S", 180)
+# Sockets that are closing still hold a slot until their close handshake
+# ends (up to websockets' close_timeout). Refuse outright past this multiple
+# of MAX_CONNECTIONS so evicting can never snowball.
+CONN_HARD_CAP_FACTOR = 2
+IPV6_KEY_PREFIX = 64        # IPv6 clients are keyed by their /64 — one customer holds a whole /64, so per-address caps on /128 are meaningless
+CLOSE_GRACE_S = 5           # how long a relay-initiated close may take before the transport is aborted
+
+# One identity may be connected this many times at once (devices + tabs +
+# outbound relay connections from its contacts' clients). Past it the OLDEST
+# session is dropped. Without a cap, one free identity multiplies into
+# MAX_CONNECTIONS_PER_IP sockets per address, every one of them a
+# registered fan-out target.
+MAX_SESSIONS_PER_IDENTITY = _env_int("MAX_SESSIONS_PER_IDENTITY", 8)
+
+# A send that cannot complete in this long means the peer is not reading
+# (or is reading very slowly on purpose); the socket is closed instead of
+# letting one stalled peer hold up every handler that delivers to it.
+SEND_TIMEOUT_S = _env_float("SEND_TIMEOUT_S", 8)
+
+# ── frame size caps ──
+# Checked on the raw text BEFORE json.loads, so an oversized frame costs a
+# length comparison, not a parse. The library's own max_size (WS_MAX_SIZE)
+# stays the outer bound; before auth it is lowered to FRAME_CAP_PREAUTH on
+# the connection itself so the library refuses to even buffer more.
+#   PREAUTH   — sig:auth_init / sig:auth_proof are a few hundred bytes
+#   TINY      — id-only / key-only packets: session:*, app:burn, sig:announce,
+#               sig:ping, sig:relay_req
+#   HANDSHAKE — small encrypted/signed handshake packets: app:migrate,
+#               sync:backup_offer/accept, sync:restore_req/ack,
+#               sync:token_req/resp, sig:push_subscribe/unsubscribe
+#   SIGNAL    — call:* / data:* (SDP and ICE blobs; an int-array-encoded
+#               SDP is tens of KiB)
+#   BULK      — frames whose whole purpose is carrying a blob: app:sync,
+#               sync:backup_push, sync:restore_push (a self-sync push is the
+#               full contact store). Deliberately NOT capped at the
+#               "handshake" size — a real backup is far larger than that.
+#   MESSAGE   — app:message (media rides inside it)
+# All clamped to WS_MAX_SIZE.
+def _frame_cap(name, default):
+    return min(WS_MAX_SIZE, _env_int(name, default))
+
+FRAME_CAP_PREAUTH   = _frame_cap("FRAME_CAP_PREAUTH",   1024)
+FRAME_CAP_TINY      = _frame_cap("FRAME_CAP_TINY",      4 * 1024)
+FRAME_CAP_HANDSHAKE = _frame_cap("FRAME_CAP_HANDSHAKE", 16 * 1024)
+FRAME_CAP_SIGNAL    = _frame_cap("FRAME_CAP_SIGNAL",    128 * 1024)
+FRAME_CAP_BULK      = _frame_cap("FRAME_CAP_BULK",      WS_MAX_SIZE)
+FRAME_CAP_MESSAGE   = _frame_cap("FRAME_CAP_MESSAGE",   WS_MAX_SIZE)
+
+# ── byte budgets ──
+# Token buckets counted in BYTES (the packet-count limiters above cannot see
+# a 2 MiB frame from a 100-byte one). One per socket and one shared by every
+# socket of an address. The burst must hold at least one maximum-size frame
+# or such a frame could never be admitted at all.
+BYTE_RATE_SOCKET  = _env_float("BYTE_RATE_SOCKET",  1024 * 1024)            # bytes/s refilled, per socket
+BYTE_BURST_SOCKET = _env_float("BYTE_BURST_SOCKET", max(6 * 1024 * 1024, 3 * WS_MAX_SIZE))
+BYTE_RATE_IP      = _env_float("BYTE_RATE_IP",      2 * 1024 * 1024)        # bytes/s refilled, per address
+BYTE_BURST_IP     = _env_float("BYTE_BURST_IP",     max(12 * 1024 * 1024, 6 * WS_MAX_SIZE))
+
+# ── per-type budgets (per socket) ──
+# The general per-socket limiter treats every packet alike, so one socket
+# could spend all of it on the most expensive kind. Each class below is its
+# own bucket: (refill/s, burst). A client's normal traffic is far under all
+# of these — sig:announce, for one, is sent about every 30 s.
+# Classes with no entry here (app:message) are governed by the general
+# limiters and the byte buckets only.
+TYPE_LIMITS = {
+    "announce": (_env_float("LIMIT_ANNOUNCE_RATE", 0.1), _env_float("LIMIT_ANNOUNCE_BURST", 3)),    # 1 per 10 s, burst 3
+    "push":     (_env_float("LIMIT_PUSH_RATE",     0.2), _env_float("LIMIT_PUSH_BURST",     5)),    # push_subscribe/unsubscribe: disk + directory scans
+    "session":  (_env_float("LIMIT_SESSION_RATE",  5),   _env_float("LIMIT_SESSION_BURST",  40)),   # session:propose/ack: always durably buffered
+    "migrate":  (_env_float("LIMIT_MIGRATE_RATE",  2),   _env_float("LIMIT_MIGRATE_BURST",  60)),   # app:migrate/burn: one per contact in a burst; always durably buffered
+    "sync":     (_env_float("LIMIT_SYNC_RATE",     5),   _env_float("LIMIT_SYNC_BURST",     30)),   # app:sync, sync:*
+    "signal":   (_env_float("LIMIT_SIGNAL_RATE",   10),  _env_float("LIMIT_SIGNAL_BURST",   40)),   # call:*, data:* (ICE candidates arrive in bursts)
+    "misc":     (_env_float("LIMIT_MISC_RATE",     2),   _env_float("LIMIT_MISC_BURST",     10)),   # sig:ping, sig:relay_req
+}
+
+# ── strikes ──
+# Replying to every over-limit packet turns a flood into twice the traffic
+# and a log line per packet. Instead each violation is a STRIKE, strikes
+# leak away over time, and a socket that piles them up is closed. Only the
+# first rate-limit / unauthenticated reply on a socket is actually sent.
+STRIKE_LIMIT     = _env_float("STRIKE_LIMIT", 10)         # closed when the (decayed) count exceeds this
+STRIKE_DECAY_S   = _env_float("STRIKE_DECAY_S", 10)       # one strike forgiven per this many quiet seconds
+STRIKE_WEIGHT_IP = 0.5                                    # hitting the SHARED per-address limiter counts for less: a neighbour behind the same NAT can hit it too
+CLOSE_CODE_POLICY   = 1008   # malformed / oversized / unauthenticated abuse
+CLOSE_CODE_BUSY     = 1013   # rate limits, capacity ("try again later")
+CLOSE_CODE_BINARY   = 1003   # binary frame — the protocol is text-only
+CLOSE_CODE_TOO_BIG  = 1009   # what the library itself closes with when a frame exceeds its max size
+
+# Warning lines an attacker can trigger per packet are collapsed: at most one
+# line per key per this many seconds, carrying a "(+N suppressed)" count.
+LOG_THROTTLE_S = _env_float("LOG_THROTTLE_S", 10)
+
+# ── push ──
+# A push is outbound HTTP to a third party, each send holding a thread for
+# up to PUSH_TIMEOUT_SECONDS × PUSH_MAX_ADDRS_TRIED. It runs as a background
+# task on its OWN thread pool, never inside the sender's handler and never on
+# the default executor that buffer I/O shares.
+PUSH_COOLDOWN_S            = _env_float("PUSH_COOLDOWN_S", 45)     # at most one push per recipient per this long (a push only means "wake up and check")
+PUSH_MAX_CONCURRENT        = _env_int("PUSH_MAX_CONCURRENT", 4)    # pushes in flight (= push worker threads)
+PUSH_MAX_QUEUE             = _env_int("PUSH_MAX_QUEUE", 200)      # pushes waiting + in flight; beyond it new ones are dropped
+PUSH_COOLDOWN_MAX_ENTRIES  = 50000   # ceiling on remembered per-recipient cooldowns (see push_last)
+MAX_PUSH_IDENTITIES        = _env_int("MAX_PUSH_IDENTITIES", 10000)   # distinct identity directories under PUSH_SUBS_DIR — same role as MAX_BUF_RECIPIENTS
+
+# ── buffer sweep ──
+BUF_EXPIRE_CHUNK = _env_int("BUF_EXPIRE_CHUNK", 200)   # recipient directories swept per worker-thread call (the loop gets control between chunks)
 
 # ID validation — base64url chars only, 8–64 chars
 _ID_RE = re.compile(r'^[A-Za-z0-9\-_]{8,64}$')
@@ -418,6 +558,11 @@ ws_to_ids: dict = {}             # ws → set of publicIds (reverse of connected
 ws_to_endpoint: dict = {}         # ws → list of (publicId, endpointId) (reverse of connected_by_endpoint; O(1) cleanup)
 buf_locks: dict = {}             # to_id → asyncio.Lock (serializes per-recipient buffer writes)
 buf_recipient_limiters: dict = {}   # to_id → RateLimiter, governs rate of NEW buffer writes for that recipient
+sock_state: dict = {}            # ws → SockState — EVERY open socket, authed or not (connected/ws_to_ids only know registered ones)
+ip_byte_limiters: dict = {}      # ip key → byte RateLimiter shared across all that address's sockets (lifetime tied to ip_conns, like ip_limiters)
+push_last: dict = {}             # to_id → monotonic time of the last push scheduled for that recipient (cooldown)
+push_tasks: set = set()          # in-flight/queued push tasks — bounded by PUSH_MAX_QUEUE, held so they aren't garbage-collected
+bg_tasks: set = set()            # fire-and-forget closes — held so they aren't garbage-collected
 
 stats = {
     "bytes_in":  0, "bytes_out": 0,
@@ -430,6 +575,21 @@ stats = {
     "push_sent":    0,   # pushes that got a non-error response from the push service
     "push_pruned":  0,   # subscriptions removed after a permanent failure (404/410)
     "push_failed":  0,   # transient push failures (network error, 5xx, etc.) — left on file, no retry
+    # ── resource protection ──
+    "conn_refused":        0,   # new sockets turned away (per-IP, per-IP-unauthed, hard cap, or full with nothing evictable)
+    "conn_evicted":        0,   # sockets closed to make room for a new one
+    "unauth_deadline":     0,   # sockets closed for not completing auth in UNAUTH_DEADLINE_S
+    "rate_rejected":       0,   # frames dropped by the per-socket / per-IP packet-count limiters
+    "byte_rejected":       0,   # frames dropped by the per-socket / per-IP byte budgets
+    "type_rejected":       0,   # frames dropped by a per-type budget
+    "frame_rejected":      0,   # frames over their size cap (pre-auth cap, per-type cap, or the library's)
+    "binary_rejected":     0,   # binary frames (the protocol is text-only)
+    "malformed":           0,   # frames that were not a JSON object with a string "type"
+    "strike_closed":       0,   # sockets closed for piling up strikes
+    "session_cap_evicted": 0,   # oldest sessions dropped by MAX_SESSIONS_PER_IDENTITY
+    "send_timeout":        0,   # sockets closed because a send stalled for SEND_TIMEOUT_S
+    "push_cooldown":       0,   # pushes skipped by the per-recipient cooldown
+    "push_dropped":        0,   # pushes dropped because the push queue was full
 }
 
 # ══════════════════════════════════════════
@@ -442,7 +602,9 @@ def fmt_bytes(b):
     return f"{b/1024**2:.1f}MB"
 
 def short(id_str):
-    if not id_str: return "?"
+    # `from` / `to` are attacker-controlled and only sometimes strings — this
+    # sits in log lines on rejection paths, which must never raise.
+    if not id_str or not isinstance(id_str, str): return "?"
     return id_str[:8] + "…"
 
 def short_addr(addr):
@@ -450,7 +612,7 @@ def short_addr(addr):
     'id::endpointId' address — truncates each half independently so a log
     line still reads as 'Bob…::laptop…' rather than swallowing the
     endpoint half entirely under a flat 8-char cut of the whole string."""
-    if not addr:
+    if not addr or not isinstance(addr, str):
         return "?"
     if ADDR_SEP in addr:
         base_id, _, endpoint_id = addr.partition(ADDR_SEP)
@@ -479,9 +641,36 @@ def peer_info(ws):
     except Exception:
         return raw_addr or "unknown"
 
+def ip_key(addr):
+    """The key per-address limits are counted under. IPv4 is the address
+    itself; IPv4-mapped IPv6 is unwrapped to it; any other IPv6 address is
+    reduced to its /IPV6_KEY_PREFIX network — a single customer controls a
+    whole /64, so keying on the full /128 would hand them 2^64 "different"
+    addresses and make every per-address limit a no-op. Anything that doesn't
+    parse as an IP (the "unknown" fallback) is used as-is."""
+    if not addr:
+        return "unknown"
+    try:
+        ip = ipaddress.ip_address(str(addr).split("%", 1)[0])
+    except ValueError:
+        return str(addr)[:64]
+    if ip.version == 6:
+        if ip.ipv4_mapped is not None:
+            return str(ip.ipv4_mapped)
+        return str(ipaddress.ip_network(f"{ip}/{IPV6_KEY_PREFIX}", strict=False))
+    return str(ip)
+
 def unique_keys():
     """Number of distinct registered public IDs."""
     return len(connected)
+
+def socket_count(include_closing=True):
+    """Every open socket, registered or not. session_count() only sees the
+    ones that completed auth — which is why a pile of unauthenticated sockets
+    never showed up against MAX_CONNECTIONS."""
+    if include_closing:
+        return len(sock_state)
+    return sum(1 for st in sock_state.values() if not st.closing)
 
 def session_count():
     """Total number of active WebSocket connections (one client may have 2)."""
@@ -496,15 +685,129 @@ class RateLimiter:
         self.rate = rate; self.burst = burst
         self.tokens = burst; self.last_time = time.monotonic()
 
-    def allow(self):
+    def allow(self, cost=1):
+        """Take `cost` tokens (1 packet; or N bytes for a byte bucket).
+        cost is clamped to the burst so a misconfigured burst smaller than one
+        maximum frame degrades to "needs a full bucket" rather than "never"."""
         now = time.monotonic()
         elapsed = now - self.last_time
         self.last_time = now
         self.tokens = min(self.burst, self.tokens + elapsed * self.rate)
-        if self.tokens >= 1:
-            self.tokens -= 1
+        cost = min(cost, self.burst)
+        if self.tokens >= cost:
+            self.tokens -= cost
             return True
         return False
+
+class LogThrottle:
+    """At most one line per key per `interval` seconds. A suppressed call
+    returns False and is counted; the next line that does go out reports the
+    count. Keyed by a SHORT fixed label (never by peer or id), so its own
+    memory is bounded by the number of call sites, not by the attacker."""
+    def __init__(self, interval=LOG_THROTTLE_S):
+        self.interval = interval
+        self._state = {}   # key → [last_emit_monotonic, suppressed_since]
+
+    def ok(self, key):
+        """(emit, suppressed) — suppressed is how many calls were swallowed
+        since the last emitted line for this key."""
+        now = time.monotonic()
+        st = self._state.get(key)
+        if st is None:
+            self._state[key] = [now, 0]
+            return True, 0
+        if now - st[0] >= self.interval:
+            suppressed, st[0], st[1] = st[1], now, 0
+            return True, suppressed
+        st[1] += 1
+        return False, 0
+
+_log_throttle = LogThrottle()
+
+def warn_throttled(key, fmt, *args):
+    """log.warning(fmt, *args), collapsed per `key` — see LogThrottle."""
+    emit, suppressed = _log_throttle.ok(key)
+    if emit:
+        log.warning(fmt + ("  (+%d similar suppressed)" % suppressed if suppressed else ""), *args)
+
+class SockState:
+    """Everything the relay tracks per OPEN socket, from the moment it
+    connects (connected/ws_to_ids only learn a socket once it authenticates)."""
+    __slots__ = ("ws", "addr", "ipk", "t_connect", "t_last", "authed", "closing",
+                 "strikes", "t_strike", "replied", "limiter", "bytes", "type_limiters",
+                 "deadline")
+
+    def __init__(self, ws, addr, ipk):
+        now = time.monotonic()
+        self.ws, self.addr, self.ipk = ws, addr, ipk
+        self.t_connect = self.t_last = self.t_strike = now
+        self.authed  = False     # completed auth (set in auth_verify, before the buffer flush)
+        self.closing = False     # a close has been requested; not counted against capacity, never picked as a victim twice
+        self.strikes = 0.0
+        self.replied = set()     # reply keys already sent once on this socket (see reply_once)
+        self.limiter = RateLimiter()
+        self.bytes   = RateLimiter(rate=BYTE_RATE_SOCKET, burst=BYTE_BURST_SOCKET)
+        self.type_limiters = {}  # class → RateLimiter, created on first use
+        self.deadline = None     # asyncio.TimerHandle for the unauthenticated deadline
+
+    def type_allow(self, cls):
+        spec = TYPE_LIMITS.get(cls)
+        if spec is None:
+            return True
+        lim = self.type_limiters.get(cls)
+        if lim is None:
+            lim = self.type_limiters[cls] = RateLimiter(rate=spec[0], burst=spec[1])
+        return lim.allow()
+
+    def add_strike(self, weight=1.0):
+        """Record a violation; True once the (decayed) count is over STRIKE_LIMIT."""
+        now = time.monotonic()
+        self.strikes = max(0.0, self.strikes - (now - self.t_strike) / STRIKE_DECAY_S) + weight
+        self.t_strike = now
+        return self.strikes > STRIKE_LIMIT
+
+class DirCounter:
+    """In-memory count of the immediate subdirectories of a directory.
+    Scanned once, lazily; kept current by add() on every create/remove and
+    re-scanned by resync() on each expiry sweep to absorb drift. Replaces a
+    scandir over up to MAX_BUF_RECIPIENTS entries on EVERY write to a new
+    recipient — a cost an attacker could trigger at will. Thread-safe: it is
+    used from worker threads. Concurrent creators can overshoot the cap by a
+    few; it is a brake on unbounded growth, not an exact quota."""
+    def __init__(self, path_fn):
+        self._path_fn = path_fn     # a function, so a changed BUF_DIR is honoured
+        self._lock = threading.Lock()
+        self._n = None
+
+    def _scan(self):
+        path = self._path_fn()
+        if not os.path.isdir(path):
+            return 0
+        try:
+            with os.scandir(path) as it:
+                return sum(1 for e in it if e.is_dir())
+        except OSError:
+            return 0
+
+    def count(self):
+        with self._lock:
+            if self._n is None:
+                self._n = self._scan()
+            return self._n
+
+    def add(self, k=1):
+        with self._lock:
+            if self._n is not None:
+                self._n = max(0, self._n + k)
+
+    def resync(self):
+        n = self._scan()
+        with self._lock:
+            self._n = n
+        return n
+
+buf_recipient_count  = DirCounter(lambda: BUF_DIR)
+push_identity_count  = DirCounter(lambda: PUSH_SUBS_DIR)
 
 # Single shared instance — deliberately NOT one-per-IP or one-per-socket.
 # See GLOBAL_AUTH_RATE comment near its definition for why this needs to
@@ -767,7 +1070,19 @@ def _push_sub_write_sync(to_id, endpoint_id, subscription):
         log.warning("PUSH_SUB   rejected  to=%s  reason=%s", short(to_id), e)
         return
     try:
+        # Global cap on identity directories — same role as MAX_BUF_RECIPIENTS
+        # for the buffer. `from` is an authed identity, but identities cost
+        # nothing, so without it each fresh one can leave a directory (and a
+        # subscription file) behind forever. An identity that already has a
+        # directory is never turned away by this.
+        new_identity = not os.path.isdir(d)
+        if new_identity and push_identity_count.count() >= MAX_PUSH_IDENTITIES:
+            log.warning("PUSH_SUB   identity cap reached (%d) — rejecting new identity  id=%s",
+                        MAX_PUSH_IDENTITIES, short(to_id))
+            return
         os.makedirs(d, exist_ok=True)
+        if new_identity:
+            push_identity_count.add(1)
         fname = f"{endpoint_id}.json"
         # Same browser endpoint URL under a different filename is a stale
         # duplicate of this subscription — most importantly the old
@@ -812,6 +1127,14 @@ def _push_sub_delete_sync(to_id, endpoint_id):
         pass
     except Exception as e:
         log.warning("PUSH_SUB   unsubscribe failed  to=%s  err=%s", short(to_id), e)
+    # An identity directory with no subscriptions left still counts against
+    # MAX_PUSH_IDENTITIES — remove it once empty (rmdir fails, harmlessly, if
+    # a concurrent subscribe just put a file back).
+    try:
+        os.rmdir(d)
+        push_identity_count.add(-1)
+    except OSError:
+        pass
 
 def _push_subs_list_sync(to_id):
     """Returns [(endpointId, subscriptionDict), ...] for every subscription
@@ -835,23 +1158,85 @@ def _push_subs_list_sync(to_id):
             continue
     return out
 
+# Dedicated pool for everything push does on a thread (subscription reads,
+# the outbound HTTPS POSTs, subscription deletes). Separate from the default
+# executor on purpose: a push send can sit on a socket for
+# PUSH_TIMEOUT_SECONDS × PUSH_MAX_ADDRS_TRIED, and a handful of slow push
+# services must not be able to starve the buffer reads/writes that share the
+# default pool.
+PUSH_EXECUTOR = ThreadPoolExecutor(max_workers=PUSH_MAX_CONCURRENT, thread_name_prefix="push")
+_push_sem = None   # asyncio.Semaphore(PUSH_MAX_CONCURRENT), created on first use — needs the running loop on older Pythons
+
+async def _push_thread(fn, *args):
+    return await asyncio.get_running_loop().run_in_executor(PUSH_EXECUTOR, fn, *args)
+
+def schedule_push(to_id):
+    """Queue a push for to_id as a BACKGROUND task and return at once. The
+    sender's handler never waits on it — before, push_notify was awaited
+    inline in route_or_buffer, so every offline app:message held its sender's
+    whole receive loop (and every packet queued behind it) for the length of
+    the push round trips, which a sender could stretch by targeting a
+    recipient with slow subscriptions.
+
+    Bounded three ways: a per-recipient cooldown (a push only means "wake up
+    and check", so a second one 5 s after the first adds nothing but load on
+    the push service), a ceiling on queued+running pushes, and a concurrency
+    limit inside the task. The cooldown is claimed HERE, synchronously, so a
+    burst to one recipient schedules exactly one task."""
+    now = time.monotonic()
+    last = push_last.get(to_id)
+    if last is not None and now - last < PUSH_COOLDOWN_S:
+        stats["push_cooldown"] += 1
+        return
+    if len(push_tasks) >= PUSH_MAX_QUEUE:
+        stats["push_dropped"] += 1
+        warn_throttled("push_dropped", "PUSH       queue full (%d) — dropping push  id=%s", PUSH_MAX_QUEUE, short(to_id))
+        return
+    if len(push_last) >= PUSH_COOLDOWN_MAX_ENTRIES:
+        _prune_push_last(now)
+    push_last[to_id] = now
+    task = asyncio.create_task(_push_worker(to_id))
+    push_tasks.add(task)
+    task.add_done_callback(push_tasks.discard)
+
+def _prune_push_last(now=None):
+    """Drop cooldown entries that have expired (they no longer suppress
+    anything). Called from the expiry sweep and, as a safety valve, when the
+    table hits PUSH_COOLDOWN_MAX_ENTRIES."""
+    now = time.monotonic() if now is None else now
+    for k in [k for k, t in push_last.items() if now - t >= PUSH_COOLDOWN_S]:
+        push_last.pop(k, None)
+
+async def _push_worker(to_id):
+    global _push_sem
+    if _push_sem is None:
+        _push_sem = asyncio.Semaphore(PUSH_MAX_CONCURRENT)
+    try:
+        async with _push_sem:
+            await push_notify(to_id)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        log.warning("PUSH       worker error  id=%s  err=%s", short(to_id), e)
+
 async def push_notify(to_id):
     """Fire a best-effort, empty-payload push to every subscription on
-    file for to_id. Only called from route_or_buffer for a genuinely-
-    offline app:message delivery — never for app:migrate/app:burn (not
-    user-facing) and never when a live session was already reached.
-    Pushes are inherently best-effort: no retry on transient failure,
-    same as everything else in this protocol that isn't durably buffered."""
-    subs = await asyncio.to_thread(_push_subs_list_sync, to_id)
+    file for to_id. Only reached (via schedule_push) from route_or_buffer
+    for a genuinely-offline app:message delivery — never for
+    app:migrate/app:burn (not user-facing) and never when a live session
+    was already reached. Pushes are inherently best-effort: no retry on
+    transient failure, same as everything else in this protocol that isn't
+    durably buffered."""
+    subs = await _push_thread(_push_subs_list_sync, to_id)
     if not subs:
         return
     for endpoint_id, sub in subs:
         endpoint = sub.get("endpoint")
         if not endpoint:
             continue
-        dead, status = await asyncio.to_thread(_send_web_push_sync, endpoint)
+        dead, status = await _push_thread(_send_web_push_sync, endpoint)
         if dead:
-            await asyncio.to_thread(_push_sub_delete_sync, to_id, endpoint_id)
+            await _push_thread(_push_sub_delete_sync, to_id, endpoint_id)
             stats["push_pruned"] += 1
             log.info("PUSH       subscription dead (status=%s) — pruned  id=%s  endpoint=%s",
                       status, short(to_id), short(endpoint_id))
@@ -866,43 +1251,112 @@ async def push_notify(to_id):
 #   ROUTING HELPERS
 # ══════════════════════════════════════════
 
-async def send_to(ws, obj):
-    try:
-        raw = json.dumps(obj, separators=(",", ":"))
-        await ws.send(raw)
-        stats["bytes_out"] += len(raw)
-        stats["msgs_out"]  += 1
-        return True
-    except Exception as e:
-        log.warning("  send failed: %s", e)
-        # Prune dead socket via reverse map — O(ids_per_socket) instead of
-        # O(unique_keys). ws_to_ids is populated in auth_verify.
-        for cid in ws_to_ids.pop(ws, set()):
-            sockets = connected.get(cid)
+def wire(obj):
+    """The text frame for `obj`. A str is taken to be already-serialised (the
+    frame a sender gave us, which handler() has just parsed as a JSON object)
+    and passed through untouched; anything else is serialised here. Fan-out
+    callers do this ONCE and hand the str to every recipient, instead of
+    json.dumps per recipient."""
+    return obj if isinstance(obj, str) else json.dumps(obj, separators=(",", ":"))
+
+def _prune_dead(ws):
+    """Remove a socket from the routing maps. Via the reverse maps —
+    O(ids_per_socket) instead of O(unique_keys). ws_to_ids is populated in
+    auth_verify."""
+    for cid in ws_to_ids.pop(ws, set()):
+        sockets = connected.get(cid)
+        if sockets:
+            sockets.discard(ws)
+            if not sockets:
+                del connected[cid]
+    # same pruning for the routing-id map, via its own reverse index
+    for (cid, rid) in ws_to_endpoint.pop(ws, []):
+        devmap = connected_by_endpoint.get(cid)
+        if devmap:
+            sockets = devmap.get(rid)
             if sockets:
                 sockets.discard(ws)
                 if not sockets:
-                    del connected[cid]
-        # same pruning for the routing-id map, via its own reverse index
-        for (cid, rid) in ws_to_endpoint.pop(ws, []):
-            devmap = connected_by_endpoint.get(cid)
-            if devmap:
-                sockets = devmap.get(rid)
-                if sockets:
-                    sockets.discard(ws)
-                    if not sockets:
-                        del devmap[rid]
-                if not devmap:
-                    del connected_by_endpoint[cid]
+                    del devmap[rid]
+            if not devmap:
+                del connected_by_endpoint[cid]
+
+def _spawn(coro):
+    task = asyncio.create_task(coro)
+    bg_tasks.add(task)
+    task.add_done_callback(bg_tasks.discard)
+
+async def _close_quiet(ws, code, reason):
+    """Close a socket from outside its handler. close() already bounds itself
+    by the library's close_timeout; if it still raises, the transport is
+    aborted so the slot is not held by a peer that won't answer."""
+    try:
+        await asyncio.wait_for(ws.close(code, reason), CLOSE_GRACE_S)
+    except Exception:
+        transport = getattr(ws, "transport", None)
+        if transport is not None:
+            try: transport.abort()
+            except Exception: pass
+
+def request_close(ws, code, reason):
+    """Close `ws` in the background (never blocks the caller) and mark it
+    closing, so it stops counting against capacity and can't be picked as a
+    victim twice. Safe to call repeatedly."""
+    st = sock_state.get(ws)
+    if st is not None:
+        if st.closing:
+            return
+        st.closing = True
+    _spawn(_close_quiet(ws, code, reason))
+
+async def send_raw(ws, raw):
+    """Send an already-serialised frame. Bounded by SEND_TIMEOUT_S: a peer
+    that doesn't read can't hold up the caller (which is usually ANOTHER
+    client's handler, delivering to it) — it is closed instead."""
+    try:
+        await asyncio.wait_for(ws.send(raw), SEND_TIMEOUT_S)
+        stats["bytes_out"] += len(raw)
+        stats["msgs_out"]  += 1
+        return True
+    except asyncio.TimeoutError:
+        stats["send_timeout"] += 1
+        warn_throttled("send_timeout", "  send timed out after %.0fs — closing slow consumer  peer=%s",
+                       SEND_TIMEOUT_S, getattr(sock_state.get(ws), "addr", "?"))
+        request_close(ws, CLOSE_CODE_BUSY, "slow consumer")
+        _prune_dead(ws)
+        return False
+    except Exception as e:
+        warn_throttled("send_failed", "  send failed: %s", e)
+        _prune_dead(ws)
         return False
 
+async def send_to(ws, obj):
+    return await send_raw(ws, wire(obj))
+
+async def reply_once(ws, key, obj):
+    """Send `obj` to ws only the FIRST time `key` comes up on this socket.
+    Answering every bad packet doubles a flood's traffic; the first error
+    already told a real client everything it needs."""
+    st = sock_state.get(ws)
+    if st is not None:
+        if key in st.replied:
+            return False
+        st.replied.add(key)
+    return await send_to(ws, obj)
+
+async def _fan_out(sessions, obj, exclude):
+    targets = [ws for ws in list(sessions) if ws is not exclude]
+    if not targets:
+        return 0
+    raw = wire(obj)   # once, not per recipient
+    if len(targets) == 1:
+        return 1 if await send_raw(targets[0], raw) else 0
+    # concurrently — sequential awaits would let one slow recipient delay the rest
+    results = await asyncio.gather(*(send_raw(ws, raw) for ws in targets), return_exceptions=True)
+    return sum(1 for r in results if r is True)
+
 async def deliver(to_id, obj, exclude=None):
-    sessions = connected.get(to_id, set())
-    reached  = 0
-    for ws in list(sessions):
-        if ws is exclude: continue
-        if await send_to(ws, obj): reached += 1
-    return reached
+    return await _fan_out(connected.get(to_id, set()), obj, exclude)
 
 async def deliver_to_endpoint(to_id, endpoint_id, obj, exclude=None):
     """Same shape as deliver(), scoped to the socket(s) registered under
@@ -914,14 +1368,9 @@ async def deliver_to_endpoint(to_id, endpoint_id, obj, exclude=None):
     "offline" case route_or_buffer already handles via the shared
     identity-level buffer; broadcasting instead would silently defeat the
     whole point of asking for one device."""
-    sessions = connected_by_endpoint.get(to_id, {}).get(endpoint_id, set())
-    reached  = 0
-    for ws in list(sessions):
-        if ws is exclude: continue
-        if await send_to(ws, obj): reached += 1
-    return reached
+    return await _fan_out(connected_by_endpoint.get(to_id, {}).get(endpoint_id, set()), obj, exclude)
 
-async def route_or_buffer(kind, frm, to_id, to_endpoint, msg, ws):
+async def route_or_buffer(kind, frm, to_id, to_endpoint, msg, ws, raw=None):
     """Shared delivery path for from-authenticated, to-routed packet types
     (app:message, app:migrate, app:burn, session:propose, session:ack).
     Delivers live if the recipient is connected, otherwise falls back to
@@ -989,11 +1438,17 @@ async def route_or_buffer(kind, frm, to_id, to_endpoint, msg, ws):
     (BUF_DIR/<to_id>/_endpoints/<endpointId>/) rather than the shared
     identity-level one, and is only ever flushed to a connection that
     later presents that exact endpoint_id at auth — never to whichever
-    device happens to reconnect first."""
+    device happens to reconnect first.
+
+    raw — the frame exactly as the sender sent it (handler() has already
+    parsed it as a JSON object). When given, it is what gets forwarded: no
+    re-serialisation at all. `msg` (the parsed dict) is still what is
+    buffered."""
+    fwd = raw if raw is not None else msg
     if to_endpoint:
-        reached = await deliver_to_endpoint(to_id, to_endpoint, msg, exclude=ws)
+        reached = await deliver_to_endpoint(to_id, to_endpoint, fwd, exclude=ws)
     else:
-        reached = await deliver(to_id, msg, exclude=ws)
+        reached = await deliver(to_id, fwd, exclude=ws)
     addr_disp = build_address(to_id, to_endpoint)
     if reached:
         log.info("%-10s from=%s  to=%s  reached=%d", kind.upper(), short(frm), short_addr(addr_disp), reached)
@@ -1014,8 +1469,9 @@ async def route_or_buffer(kind, frm, to_id, to_endpoint, msg, ws):
     # push-worthy: waking a sibling to say "open the app and check" about
     # something we ourselves just sent is noise. Ordinary buffering above
     # still applies to it (that's what lets an offline sibling catch up).
+    # Scheduled, not awaited: see schedule_push.
     if not reached and kind == "app:message" and frm != to_id:
-        await push_notify(to_id)
+        schedule_push(to_id)
 
 # ══════════════════════════════════════════
 #   AUTH HELPERS
@@ -1112,6 +1568,23 @@ def derive_public_id(x25519_pub: bytes, ed25519_pub: bytes) -> str:
     keys means a valid publicId can only come from one specific pair."""
     digest = hashlib.sha256(x25519_pub + ed25519_pub).digest()[:12]
     return base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
+
+def enforce_session_cap(public_id, new_ws):
+    """Make room for `new_ws` under MAX_SESSIONS_PER_IDENTITY by dropping the
+    OLDEST existing sessions of that identity (closing ones aren't counted —
+    they're already on their way out). Oldest-first, because the likeliest
+    "extra" session is a zombie of a device that has since reconnected."""
+    live = [w for w in connected.get(public_id, ())
+            if w is not new_ws and not getattr(sock_state.get(w), "closing", False)]
+    if len(live) < MAX_SESSIONS_PER_IDENTITY:
+        return
+    live.sort(key=lambda w: getattr(sock_state.get(w), "t_connect", 0.0))
+    for victim in live[: len(live) - MAX_SESSIONS_PER_IDENTITY + 1]:
+        stats["session_cap_evicted"] += 1
+        log.info("SESSION CAP id=%s  max=%d — dropping oldest session  peer=%s",
+                 short(public_id), MAX_SESSIONS_PER_IDENTITY, getattr(sock_state.get(victim), "addr", "?"))
+        request_close(victim, CLOSE_CODE_BUSY, "too many sessions for this identity")
+        _prune_dead(victim)   # out of the routing maps now, not whenever its close handshake finishes
 
 async def auth_challenge(ws, x25519_pub: bytes, ed25519_pub: bytes, bits: int, no_receive: bool = False,
                           endpoint_id: str | None = None):
@@ -1231,7 +1704,24 @@ async def auth_verify(ws, sig_bytes: list, addr: str, authed_as: str | None = No
 
     no_receive = entry.get("no_receive", False)
     endpoint_id = entry.get("endpoint_id")
+    # Authenticated from here on: stops the unauthenticated deadline and
+    # makes the socket count as a real session for eviction. Set BEFORE the
+    # buffer flush below, which can take a while and must not be cut short by
+    # a deadline that has nothing left to wait for.
+    st = sock_state.get(ws)
+    if st is not None:
+        st.authed = True
+        if st.deadline is not None:
+            st.deadline.cancel()
+            st.deadline = None
+    # The library's own frame cap goes back up NOW — before auth_ok leaves.
+    # The library parses incoming frames as bytes arrive, not when the
+    # handler next reads: raising it only once this function returns (after
+    # the buffer flush, which can take a while) would disconnect a client
+    # that sends its first real message right after auth_ok.
+    set_max_frame(ws, WS_MAX_SIZE)
     if not no_receive:
+        enforce_session_cap(public_id, ws)   # before the set is (re)created below — it prunes victims out of `connected`
         if public_id not in connected:
             connected[public_id] = set()
         connected[public_id].add(ws)
@@ -1338,15 +1828,15 @@ def _buf_write_sync(to_id, msg, endpoint_id=None):
     # is never turned away by this; it's purely a brake on an attacker
     # fanning out to unlimited fabricated recipient IDs. See
     # MAX_BUF_RECIPIENTS comment near its definition.
-    if not os.path.isdir(top_dir):
-        try:
-            existing = sum(1 for e in os.scandir(BUF_DIR) if e.is_dir()) if os.path.isdir(BUF_DIR) else 0
-        except Exception:
-            existing = 0
-        if existing >= MAX_BUF_RECIPIENTS:
+    new_recipient = not os.path.isdir(top_dir)
+    if new_recipient:
+        # In-memory count (DirCounter) — not a scandir over up to
+        # MAX_BUF_RECIPIENTS entries per new recipient, which an attacker
+        # could make this thread do on every write.
+        if buf_recipient_count.count() >= MAX_BUF_RECIPIENTS:
             stats["buf_cap_rejected"] += 1
-            log.warning("BUF        recipient cap reached (%d) — rejecting new recipient  to=%s",
-                        MAX_BUF_RECIPIENTS, short(to_id))
+            warn_throttled("buf_cap", "BUF        recipient cap reached (%d) — rejecting new recipient  to=%s",
+                           MAX_BUF_RECIPIENTS, short(to_id))
             return
 
     # Endpoint-bucket cap — only matters for a NEW endpoint bucket under
@@ -1360,8 +1850,8 @@ def _buf_write_sync(to_id, msg, endpoint_id=None):
             existing_eps = 0
         if existing_eps >= MAX_ENDPOINTS_PER_RECIPIENT:
             stats["buf_endpoint_cap_rejected"] += 1
-            log.warning("BUF        endpoint cap reached (%d) — rejecting new endpoint bucket  to=%s  endpoint=%s",
-                        MAX_ENDPOINTS_PER_RECIPIENT, short(to_id), short(endpoint_id))
+            warn_throttled("buf_ep_cap", "BUF        endpoint cap reached (%d) — rejecting new endpoint bucket  to=%s  endpoint=%s",
+                           MAX_ENDPOINTS_PER_RECIPIENT, short(to_id), short(endpoint_id))
             return
 
     try:
@@ -1369,6 +1859,8 @@ def _buf_write_sync(to_id, msg, endpoint_id=None):
     except Exception as e:
         log.warning("BUF        mkdir failed  to=%s  err=%s", short(to_id), e)
         return
+    if new_recipient:
+        buf_recipient_count.add(1)
 
     kind       = msg.get("type")
     is_migrate = kind == "app:migrate"
@@ -1420,7 +1912,15 @@ def _buf_write_sync(to_id, msg, endpoint_id=None):
     suffix = MIGRATE_SUFFIX if is_migrate else (BURN_SUFFIX if is_burn else (X4DH_PROPOSE_SUFFIX if is_propose else ".json"))
     fname  = os.path.join(d, f"{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}{suffix}")
     try:
-        with open(fname, "w") as f:
+        try:
+            f = open(fname, "w")
+        except FileNotFoundError:
+            # The expiry sweep removes empty directories; it can have removed
+            # this one between the makedirs above and now. Recreate and retry
+            # once rather than losing the packet to that race.
+            os.makedirs(d, exist_ok=True)
+            f = open(fname, "w")
+        with f:
             json.dump(msg, f)
         stats["buf_in"] += 1
         log.info("BUF        write  to=%s  file=%s%s%s", short(to_id), os.path.basename(fname),
@@ -1497,8 +1997,8 @@ async def buf_write(to_id, msg, endpoint_id=None):
         buf_recipient_limiters[limiter_key] = limiter
     if not limiter.allow():
         stats["buf_rate_rejected"] += 1
-        log.warning("BUF        write-rate limit reached  to=%s%s — dropped", short(to_id),
-                     f"  endpoint={short(endpoint_id)}" if endpoint_id else "")
+        warn_throttled("buf_rate", "BUF        write-rate limit reached  to=%s%s — dropped", short(to_id),
+                       f"  endpoint={short(endpoint_id)}" if endpoint_id else "")
         return
 
     lock = await _acquire_buf_lock(limiter_key)
@@ -1555,74 +2055,122 @@ async def buf_deliver(to_id, ws, endpoint_id=None):
             log.warning("BUF        flush error  to=%s  file=%s  err=%s",
                         short(to_id), os.path.basename(fpath), e)
 
-async def buf_expire():
-    """Background task — remove buffer files older than their TTL bucket.
+def _buf_expire_chunk_sync(names, now):
+    """Sweep one chunk of recipient directories (names under BUF_DIR) — runs in
+    a worker thread. Returns (files_dropped, recipient_dirs_removed).
+
     Regular packets use BUF_MAX_AGE; migrate packets (tagged via
-    MIGRATE_SUFFIX) use the much longer BUF_MAX_AGE_MIGRATE. Endpoint
-    buckets (_endpoints/<endpointId>/) always use plain BUF_MAX_AGE — an
-    app:message is the only kind that ever lands there, migrate/burn are
-    never device-targeted, so MIGRATE_SUFFIX/BURN_SUFFIX simply never
-    appear under _endpoints/ in practice."""
+    MIGRATE_SUFFIX) use the much longer BUF_MAX_AGE_MIGRATE and burn packets
+    BUF_MAX_AGE_BURN. Endpoint buckets (_endpoints/<endpointId>/) always use
+    plain BUF_MAX_AGE — an app:message is the only kind that ever lands
+    there, migrate/burn are never device-targeted, so
+    MIGRATE_SUFFIX/BURN_SUFFIX simply never appear under _endpoints/ in
+    practice. Every filesystem call is individually guarded: a directory a
+    writer or the flush path is touching concurrently can vanish or change
+    under the scan, and that must cost one entry, never the sweep."""
+    dropped = 0
+    removed_dirs = 0
+    for name in names:
+        rec_path = os.path.join(BUF_DIR, name)
+        try:
+            with os.scandir(rec_path) as it:
+                entries = list(it)
+        except OSError:
+            continue
+        for entry in entries:
+            if not entry.name.endswith(".json"):
+                continue
+            if entry.name.endswith(MIGRATE_SUFFIX):
+                max_age = BUF_MAX_AGE_MIGRATE
+            elif entry.name.endswith(BURN_SUFFIX):
+                max_age = BUF_MAX_AGE_BURN
+            else:
+                max_age = BUF_MAX_AGE
+            try:
+                if now - entry.stat().st_mtime > max_age:
+                    os.remove(entry.path)
+                    dropped += 1
+            except OSError:
+                pass
+
+        # sweep this recipient's per-device endpoint buckets — same TTL
+        # logic, one directory level down. Always plain BUF_MAX_AGE (see
+        # docstring above re: migrate/burn).
+        endpoints_root = os.path.join(rec_path, "_endpoints")
+        try:
+            with os.scandir(endpoints_root) as it:
+                ep_dirs = [e for e in it if e.is_dir()]
+        except OSError:
+            ep_dirs = None
+        if ep_dirs is not None:
+            for ep_dir in ep_dirs:
+                try:
+                    with os.scandir(ep_dir.path) as it:
+                        ep_entries = list(it)
+                except OSError:
+                    continue
+                for entry in ep_entries:
+                    if not entry.name.endswith(".json"):
+                        continue
+                    try:
+                        if now - entry.stat().st_mtime > BUF_MAX_AGE:
+                            os.remove(entry.path)
+                            dropped += 1
+                    except OSError:
+                        pass
+                # clean up an emptied-out endpoint bucket (rmdir only ever
+                # removes an EMPTY directory — a concurrent write wins)
+                try: os.rmdir(ep_dir.path)
+                except OSError: pass
+            # clean up the _endpoints dir itself once every bucket under it is gone
+            try: os.rmdir(endpoints_root)
+            except OSError: pass
+
+        # clean up empty recipient dirs — checked last, after _endpoints/ has
+        # had a chance to empty out above, so a recipient with nothing left in
+        # EITHER bucket is correctly pruned rather than kept alive by a
+        # now-empty _endpoints/ directory still sitting inside it.
+        try:
+            os.rmdir(rec_path)
+            removed_dirs += 1
+        except OSError:
+            pass
+    return dropped, removed_dirs
+
+def _buf_recipient_names_sync():
+    try:
+        with os.scandir(BUF_DIR) as it:
+            return [e.name for e in it if e.is_dir()]
+    except OSError:
+        return []
+
+async def buf_expire_sweep():
+    """One full expiry pass. The directory listing and every chunk of
+    BUF_EXPIRE_CHUNK recipients run in a worker thread; the event loop gets
+    control back between chunks. This used to be one synchronous scandir tree
+    walk ON the loop — with MAX_BUF_RECIPIENTS directories and a full bucket
+    each, every connection stalled for the length of it, every
+    BUF_EXPIRE_INTERVAL."""
+    now = time.time()
+    names = await asyncio.to_thread(_buf_recipient_names_sync)
+    dropped = 0
+    for i in range(0, len(names), BUF_EXPIRE_CHUNK):
+        chunk_dropped, chunk_dirs = await asyncio.to_thread(_buf_expire_chunk_sync, names[i:i + BUF_EXPIRE_CHUNK], now)
+        dropped += chunk_dropped
+        buf_recipient_count.add(-chunk_dirs)
+        await asyncio.sleep(0)
+    # absorb any drift (a writer that re-created a directory the sweep had
+    # just removed, a directory deleted by hand) — cheap, and off the loop
+    await asyncio.to_thread(buf_recipient_count.resync)
+    return dropped
+
+async def buf_expire():
+    """Background task — see buf_expire_sweep / _buf_expire_chunk_sync."""
     while True:
         await asyncio.sleep(BUF_EXPIRE_INTERVAL)
-        now     = time.time()
         dropped = 0
         try:
-            if os.path.isdir(BUF_DIR):
-                for rec_dir in os.scandir(BUF_DIR):
-                    if not rec_dir.is_dir():
-                        continue
-                    for entry in os.scandir(rec_dir.path):
-                        if not entry.name.endswith(".json"):
-                            continue
-                        if entry.name.endswith(MIGRATE_SUFFIX):
-                            max_age = BUF_MAX_AGE_MIGRATE
-                        elif entry.name.endswith(BURN_SUFFIX):
-                            max_age = BUF_MAX_AGE_BURN
-                        else:
-                            max_age = BUF_MAX_AGE
-                        if now - entry.stat().st_mtime > max_age:
-                            try:
-                                os.remove(entry.path)
-                                dropped += 1
-                            except Exception:
-                                pass
-
-                    # sweep this recipient's per-device endpoint buckets —
-                    # same TTL logic, one directory level down. Always plain
-                    # BUF_MAX_AGE (see docstring above re: migrate/burn).
-                    endpoints_root = os.path.join(rec_dir.path, "_endpoints")
-                    if os.path.isdir(endpoints_root):
-                        for ep_dir in os.scandir(endpoints_root):
-                            if not ep_dir.is_dir():
-                                continue
-                            for entry in os.scandir(ep_dir.path):
-                                if not entry.name.endswith(".json"):
-                                    continue
-                                if now - entry.stat().st_mtime > BUF_MAX_AGE:
-                                    try:
-                                        os.remove(entry.path)
-                                        dropped += 1
-                                    except Exception:
-                                        pass
-                            # clean up an emptied-out endpoint bucket
-                            if not os.listdir(ep_dir.path):
-                                try: os.rmdir(ep_dir.path)
-                                except Exception: pass
-                        # clean up the _endpoints dir itself once every
-                        # bucket under it is gone
-                        if not os.listdir(endpoints_root):
-                            try: os.rmdir(endpoints_root)
-                            except Exception: pass
-
-                    # clean up empty recipient dirs — checked last, after
-                    # _endpoints/ has had a chance to empty out above, so a
-                    # recipient with nothing left in EITHER bucket is
-                    # correctly pruned rather than kept alive by a now-empty
-                    # _endpoints/ directory still sitting inside it.
-                    if not os.listdir(rec_dir.path):
-                        try: os.rmdir(rec_dir.path)
-                        except Exception: pass
+            dropped = await buf_expire_sweep()
         except Exception as e:
             log.warning("BUF        expire sweep error: %s", e)
         if dropped:
@@ -1642,6 +2190,8 @@ async def buf_expire():
             buf_recipient_limiters.pop(k, None)
         if idle_keys:
             log.info("BUF        pruned %d idle write-rate limiter(s)", len(idle_keys))
+        # same housekeeping for the push cooldown table
+        _prune_push_last(now_mono)
 
 # ══════════════════════════════════════════
 #   STATS
@@ -1650,6 +2200,17 @@ async def buf_expire():
 async def log_stats():
     while True:
         await asyncio.sleep(STATS_INTERVAL)
+        log.info("STATS      sockets=%d  push_queue=%d  push_last=%d  buf_recipients=%d  push_identities=%d",
+                 socket_count(), len(push_tasks), len(push_last),
+                 buf_recipient_count.count(), push_identity_count.count())
+        log.info("REJECTED   conn_refused=%d  conn_evicted=%d  unauth_deadline=%d  rate=%d  bytes=%d  type=%d  "
+                 "frame=%d  binary=%d  malformed=%d  strike_closed=%d  session_cap=%d  send_timeout=%d  "
+                 "push_cooldown=%d  push_dropped=%d",
+                 stats["conn_refused"], stats["conn_evicted"], stats["unauth_deadline"],
+                 stats["rate_rejected"], stats["byte_rejected"], stats["type_rejected"],
+                 stats["frame_rejected"], stats["binary_rejected"], stats["malformed"],
+                 stats["strike_closed"], stats["session_cap_evicted"], stats["send_timeout"],
+                 stats["push_cooldown"], stats["push_dropped"])
         log.info("STATS      keys=%d  sessions=%d  in=%s(%d msgs)  out=%s(%d msgs)  "
                  "buf_in=%d  buf_out=%d  buf_cap_rejected=%d  buf_endpoint_cap_rejected=%d  buf_rate_rejected=%d  auth_admission_rejected=%d  "
                  "push_sent=%d  push_failed=%d  push_pruned=%d",
@@ -1684,12 +2245,115 @@ async def sweep_pending_auth():
                 continue
             ws = entry.get("ws")
             if ws is not None:
-                try:
-                    await ws.close(1013, "auth timeout")
-                except Exception:
-                    pass
+                request_close(ws, CLOSE_CODE_BUSY, "auth timeout")   # background: a peer that won't answer the close can't stall the sweep
         if stale:
             log.info("AUTH       swept %d stale half-authed connection(s)", len(stale))
+
+# ── per-kind rules ──
+# kind → (budget class, frame size cap in bytes). The class picks the
+# per-type token bucket (TYPE_LIMITS); the cap is enforced on the raw frame
+# (see handler). A kind that isn't listed is dropped as unknown anyway, so it
+# is held to the smallest cap.
+KIND_RULES: dict = {}
+
+def _rules(kinds, cls, cap):
+    for k in kinds:
+        KIND_RULES[k] = (cls, cap)
+
+_rules(("sig:auth_init", "sig:auth_proof"),                      "auth",     FRAME_CAP_PREAUTH)
+_rules(("session:propose", "session:ack"),                       "session",  FRAME_CAP_TINY)
+_rules(("app:burn",),                                            "migrate",  FRAME_CAP_TINY)
+_rules(("app:migrate",),                                         "migrate",  FRAME_CAP_HANDSHAKE)
+_rules(("app:message",),                                         "message",  FRAME_CAP_MESSAGE)
+_rules(("sig:push_subscribe", "sig:push_unsubscribe"),           "push",     FRAME_CAP_HANDSHAKE)
+_rules(("sig:announce",),                                        "announce", FRAME_CAP_TINY)
+_rules(("sig:ping", "sig:relay_req"),                            "misc",     FRAME_CAP_TINY)
+_rules(("sync:backup_offer", "sync:backup_accept", "sync:restore_req", "sync:restore_ack",
+        "sync:token_req", "sync:token_resp"),                    "sync",     FRAME_CAP_HANDSHAKE)
+_rules(("app:sync", "sync:backup_push", "sync:restore_push"),    "sync",     FRAME_CAP_BULK)
+_rules(("call:invite", "call:claim", "call:cancel", "call:end", "call:offer", "call:answer", "call:ice",
+        "data:invite", "data:claim", "data:cancel", "data:end", "data:offer", "data:answer", "data:ice"),
+                                                                 "signal",   FRAME_CAP_SIGNAL)
+
+DEFAULT_RULE = ("other", FRAME_CAP_TINY)
+
+# Frames up to this size are simply parsed and then held to their own type's
+# cap. Anything bigger is only worth parsing if it CLAIMS to be a type that is
+# allowed to be that big — judged by peeking at the frame's "type" key
+# without parsing it (see peek_type).
+SMALL_FRAME_MAX = max(FRAME_CAP_PREAUTH, FRAME_CAP_TINY, FRAME_CAP_HANDSHAKE, FRAME_CAP_SIGNAL)
+
+_TYPE_PEEK = re.compile(r'"type"\s*:\s*"([^"\\]{1,48})"')
+
+def peek_type(raw):
+    """The value of the first "type" key in a frame, found by text search —
+    no parse. Packets carry no key named "type" other than the top-level one
+    (blobs are {v, iv, data}), so the first occurrence is the real one in any
+    well-formed frame; a sender can only fake it to get its frame PARSED,
+    after which the exact type's cap and budgets apply."""
+    i = raw.find('"type"')
+    if i < 0:
+        return None
+    m = _TYPE_PEEK.match(raw, i)
+    return m.group(1) if m else None
+
+def frame_size(raw):
+    """Size of a text frame in BYTES (len() counts characters). str.isascii()
+    is O(1), so the common all-ASCII frame costs nothing extra."""
+    return len(raw) if raw.isascii() else len(raw.encode("utf-8", "replace"))
+
+def set_max_frame(ws, size):
+    """Change the library's own per-message cap on THIS connection (lowered
+    before auth, raised once authenticated), so an oversized pre-auth frame is
+    refused by the library without ever being buffered. Best-effort: touches a
+    protocol attribute, so a websockets version without it just keeps
+    WS_MAX_SIZE and handler()'s own checks do the work."""
+    try:
+        proto = getattr(ws, "protocol", None)
+        if proto is not None and hasattr(proto, "max_message_size"):
+            proto.max_message_size = size
+            return True
+        if hasattr(ws, "max_size"):          # legacy implementation
+            ws.max_size = size
+            return True
+    except Exception:
+        pass
+    return False
+
+def pick_eviction_victim(now=None):
+    """Which open socket to close to make room: an unauthenticated one first
+    (oldest first — the newest is the likeliest to be a real client mid
+    handshake), otherwise the authed socket silent for longest, but only if
+    it has been silent past WS_IDLE_EVICT_S. None when everything is a live,
+    recently-active session — then the newcomer is refused."""
+    now = time.monotonic() if now is None else now
+    unauthed = [s for s in sock_state.values() if not s.authed and not s.closing]
+    if unauthed:
+        return min(unauthed, key=lambda s: s.t_connect)
+    idle = [s for s in sock_state.values() if s.authed and not s.closing and now - s.t_last > WS_IDLE_EVICT_S]
+    if idle:
+        return max(idle, key=lambda s: now - s.t_last)
+    return None
+
+def _unauth_deadline_expired(st):
+    st.deadline = None
+    if st.authed or st.closing:
+        return
+    stats["unauth_deadline"] += 1
+    warn_throttled("unauth_deadline", "UNAUTH     no completed auth within %.0fs — closing  peer=%s",
+                   UNAUTH_DEADLINE_S, st.addr)
+    request_close(st.ws, CLOSE_CODE_POLICY, "authentication deadline")
+
+def strike(st, weight, code, why):
+    """Record a violation on this socket; if it has piled up too many, start
+    closing it (in the background — see handler(): the receive loop keeps
+    reading and discarding until the close completes, because a handler that
+    stops reading stalls the close handshake behind the peer's unread data)."""
+    if st.closing or not st.add_strike(weight):
+        return
+    stats["strike_closed"] += 1
+    warn_throttled("strike_closed", "STRIKES    closing — too many violations (last: %s)  peer=%s", why, st.addr)
+    request_close(st.ws, code, "too many violations")
 
 # ══════════════════════════════════════════
 #   WEBSOCKET HANDLER
@@ -1697,39 +2361,65 @@ async def sweep_pending_auth():
 
 async def handler(ws):
     client_ids = []   # public_ids authed this socket
-    limiter    = RateLimiter()
     addr       = peer_info(ws)
+    ipk        = ip_key(addr)   # what per-address limits are counted under — see ip_key()
 
     # ── connection limits ──
-    if session_count() >= MAX_CONNECTIONS:
-        log.warning("LIMIT      max_connections=%d reached  peer=%s", MAX_CONNECTIONS, addr)
-        await ws.close(1013, "server full")
+    # All of these count sockets of ANY auth state. A socket that has only
+    # connected and said nothing is a slot held like any other.
+    async def refuse(key, what):
+        stats["conn_refused"] += 1
+        warn_throttled("limit_" + key, "LIMIT      %s  peer=%s", what, addr)
+        await _close_quiet(ws, CLOSE_CODE_BUSY, what)
+
+    if socket_count() >= MAX_CONNECTIONS * CONN_HARD_CAP_FACTOR:
+        await refuse("hard", "server full")
         return
-
-    ip_conns[addr] = ip_conns.get(addr, 0) + 1
-    if ip_conns[addr] > MAX_CONNECTIONS_PER_IP:
-        log.warning("LIMIT      per_ip=%d reached  peer=%s", MAX_CONNECTIONS_PER_IP, addr)
-        ip_conns[addr] -= 1
-        await ws.close(1013, "too many connections from your address")
+    if ip_conns.get(ipk, 0) >= MAX_CONNECTIONS_PER_IP:
+        await refuse("ip", "too many connections from your address")
         return
+    if sum(1 for s in sock_state.values() if s.ipk == ipk and not s.authed and not s.closing) >= MAX_UNAUTH_PER_IP:
+        await refuse("unauth_ip", "too many unauthenticated connections from your address")
+        return
+    if socket_count(include_closing=False) >= MAX_CONNECTIONS:
+        # Full. Make room by dropping the least valuable socket instead of
+        # turning the newcomer away — otherwise whoever connects first and
+        # idles wins every slot, and real clients are the ones locked out.
+        victim = pick_eviction_victim()
+        if victim is None:
+            await refuse("full", "server full")
+            return
+        stats["conn_evicted"] += 1
+        warn_throttled("evict", "EVICT      relay full (%d) — dropping %s socket  peer=%s",
+                       MAX_CONNECTIONS, "an authed idle" if victim.authed else "an unauthenticated", victim.addr)
+        request_close(victim.ws, CLOSE_CODE_BUSY, "evicted: server full")
+        _prune_dead(victim.ws)
 
-    # Shared across every socket this IP currently has open — without this,
-    # MAX_CONNECTIONS_PER_IP sockets each got their own independent budget,
-    # so an IP's effective throughput scaled with how many connections it
-    # opened rather than staying capped. Deliberately its own, wider tier
-    # (IP_RATE_LIMIT_RATE/BURST) rather than reusing the per-socket
-    # RateLimiter() defaults — see that pair's own comment near their
-    # definition for why sharing one constant between "one connection" and
-    # "everything behind this NAT" was the wrong call. get-or-create rather
-    # than always-new so it persists (and its token bucket state carries
-    # over) across this IP's concurrent sockets.
-    if addr not in ip_limiters:
-        ip_limiters[addr] = RateLimiter(rate=IP_RATE_LIMIT_RATE, burst=IP_RATE_LIMIT_BURST)
-    ip_limiter = ip_limiters[addr]
+    st = SockState(ws, addr, ipk)
+    sock_state[ws] = st
+    ip_conns[ipk] = ip_conns.get(ipk, 0) + 1
 
-    log.info("CONNECT    peer=%s  sessions=%d/%d  from_ip=%d/%d",
-             addr, session_count(), MAX_CONNECTIONS,
-             ip_conns[addr], MAX_CONNECTIONS_PER_IP)
+    # Shared across every socket this address currently has open — without
+    # this, MAX_CONNECTIONS_PER_IP sockets each got their own independent
+    # budget, so an IP's effective throughput scaled with how many
+    # connections it opened rather than staying capped. Deliberately its own,
+    # wider tier (IP_RATE_LIMIT_RATE/BURST) rather than reusing the
+    # per-socket RateLimiter() defaults — see that pair's own comment near
+    # their definition for why sharing one constant between "one connection"
+    # and "everything behind this NAT" was the wrong call. get-or-create
+    # rather than always-new so it persists (and its token bucket state
+    # carries over) across this address's concurrent sockets. Same for the
+    # byte budget.
+    if ipk not in ip_limiters:
+        ip_limiters[ipk] = RateLimiter(rate=IP_RATE_LIMIT_RATE, burst=IP_RATE_LIMIT_BURST)
+    ip_limiter = ip_limiters[ipk]
+    if ipk not in ip_byte_limiters:
+        ip_byte_limiters[ipk] = RateLimiter(rate=BYTE_RATE_IP, burst=BYTE_BURST_IP)
+    ip_bytes = ip_byte_limiters[ipk]
+
+    log.info("CONNECT    peer=%s  sockets=%d/%d  sessions=%d  from_ip=%d/%d",
+             addr, socket_count(), MAX_CONNECTIONS, session_count(),
+             ip_conns[ipk], MAX_CONNECTIONS_PER_IP)
 
     def is_authed():
         return len(client_ids) > 0
@@ -1738,38 +2428,106 @@ async def handler(ws):
         return client_ids[-1] if client_ids else None
 
     try:
-        async for raw in ws:
+        # Until it authenticates a socket gets a short leash: the library
+        # itself refuses frames over FRAME_CAP_PREAUTH, and the connection is
+        # closed unless auth COMPLETES within UNAUTH_DEADLINE_S.
+        set_max_frame(ws, FRAME_CAP_PREAUTH)
+        st.deadline = asyncio.get_running_loop().call_later(UNAUTH_DEADLINE_S, _unauth_deadline_expired, st)
 
-            if not limiter.allow():
-                log.warning("RATELIMIT  peer=%s  ids=%s", addr, client_ids)
-                await send_to(ws, {"type": "error", "reason": "rate_limited"})
+        async for raw in ws:
+            st.t_last = time.monotonic()
+
+            # A socket that is being closed (strikes, eviction, deadline, slow
+            # consumer, session cap) keeps its receive loop running but
+            # discards everything: if nothing reads, the peer's unread data
+            # holds the close handshake up until the transport is aborted.
+            if st.closing:
+                continue
+
+            # The protocol is text frames only. A binary frame is never a
+            # mistake a client makes by accident.
+            if not isinstance(raw, str):
+                stats["binary_rejected"] += 1
+                warn_throttled("binary", "BINARY     frame rejected  peer=%s", addr)
+                request_close(ws, CLOSE_CODE_BINARY, "text frames only")
+                continue
+
+            # ── packet-count limiters ──
+            # First violation gets one error reply, later ones none (see
+            # reply_once); every one is a strike, and a socket that keeps
+            # going is closed rather than answered forever.
+            if not st.limiter.allow():
+                stats["rate_rejected"] += 1
+                warn_throttled("ratelimit", "RATELIMIT  peer=%s  ids=%s", addr, client_ids)
+                await reply_once(ws, "rate_limited", {"type": "error", "reason": "rate_limited"})
+                strike(st, 1.0, CLOSE_CODE_BUSY, "rate")
                 continue
 
             if not ip_limiter.allow():
-                log.warning("RATELIMIT(ip)  peer=%s  ids=%s  sockets_from_ip=%d",
-                            addr, client_ids, ip_conns.get(addr, 0))
-                await send_to(ws, {"type": "error", "reason": "rate_limited"})
+                stats["rate_rejected"] += 1
+                warn_throttled("ratelimit_ip", "RATELIMIT(ip)  peer=%s  ids=%s  sockets_from_ip=%d",
+                               addr, client_ids, ip_conns.get(ipk, 0))
+                await reply_once(ws, "rate_limited", {"type": "error", "reason": "rate_limited"})
+                strike(st, STRIKE_WEIGHT_IP, CLOSE_CODE_BUSY, "rate(ip)")
                 continue
 
+            # ── size, BEFORE any parsing ──
+            size = frame_size(raw)
+            if not st.authed:
+                over = size > FRAME_CAP_PREAUTH
+            elif size > SMALL_FRAME_MAX:
+                peeked = peek_type(raw)
+                over = size > KIND_RULES.get(peeked, DEFAULT_RULE)[1]
+            else:
+                over = False   # parsed below, then held to its own type's cap
+            if over:
+                stats["frame_rejected"] += 1
+                warn_throttled("oversize", "OVERSIZE   peer=%s  size=%d  authed=%s  dropped", addr, size, st.authed)
+                strike(st, 1.0, CLOSE_CODE_POLICY, "oversize")
+                continue
+
+            # ── byte budgets ──
+            if not st.bytes.allow(size):
+                stats["byte_rejected"] += 1
+                warn_throttled("bytes", "BYTELIMIT  peer=%s  ids=%s  size=%d", addr, client_ids, size)
+                await reply_once(ws, "rate_limited", {"type": "error", "reason": "rate_limited"})
+                strike(st, 1.0, CLOSE_CODE_BUSY, "bytes")
+                continue
+            if not ip_bytes.allow(size):
+                stats["byte_rejected"] += 1
+                warn_throttled("bytes_ip", "BYTELIMIT(ip)  peer=%s  ids=%s  size=%d", addr, client_ids, size)
+                await reply_once(ws, "rate_limited", {"type": "error", "reason": "rate_limited"})
+                strike(st, STRIKE_WEIGHT_IP, CLOSE_CODE_BUSY, "bytes(ip)")
+                continue
+
+            # ── parse: must be a JSON object with a string "type" ──
             try:
                 msg = json.loads(raw)
-            except json.JSONDecodeError:
-                log.warning("BAD JSON   peer=%s  raw=%r", addr, raw[:120])
+            except (ValueError, RecursionError):
+                msg = None
+            if not isinstance(msg, dict) or not isinstance(msg.get("type"), str):
+                stats["malformed"] += 1
+                warn_throttled("malformed", "MALFORMED  peer=%s  size=%d  head=%r", addr, size, raw[:60])
+                strike(st, 1.0, CLOSE_CODE_POLICY, "malformed")
                 continue
 
-            if len(raw) > WS_MAX_SIZE:
-                log.warning("OVERSIZE   peer=%s  size=%d  dropped", addr, len(raw))
-                continue
-
-            stats["bytes_in"] += len(raw)
+            stats["bytes_in"] += size
             stats["msgs_in"]  += 1
 
-            kind = msg.get("type", "?")
-            #log.info("IN  %-20s peer=%s  size=%-8s total_in=%s  total_out=%s",
-            #         kind, addr,
-            #         fmt_bytes(len(raw)),
-            #         fmt_bytes(stats["bytes_in"]),
-            #         fmt_bytes(stats["bytes_out"]))
+            kind = msg["type"]
+            cls, cap = KIND_RULES.get(kind, DEFAULT_RULE)
+            if st.authed and size > cap:
+                # exact per-type cap — the pre-parse check above only had a
+                # peeked guess for frames over SMALL_FRAME_MAX
+                stats["frame_rejected"] += 1
+                warn_throttled("oversize", "OVERSIZE   peer=%s  type=%.48s  size=%d  cap=%d  dropped", addr, kind, size, cap)
+                strike(st, 1.0, CLOSE_CODE_POLICY, "oversize")
+                continue
+            if not st.type_allow(cls):
+                stats["type_rejected"] += 1
+                warn_throttled("type_" + cls, "TYPELIMIT  peer=%s  ids=%s  class=%s  type=%.48s", addr, client_ids, cls, kind)
+                strike(st, 1.0, CLOSE_CODE_BUSY, "type " + cls)
+                continue
 
             # ── auth_init: client presents both public keys, server sends challenge ──
             if kind == "sig:auth_init":
@@ -1835,35 +2593,36 @@ async def handler(ws):
             # ── everything below requires at least one authed identity ──
             elif not is_authed():
                 frm = msg.get("from", "?")
-                log.warning("UNAUTHED   type=%r  from=%s  peer=%s  dropped", kind, short(frm), addr)
-                await send_to(ws, {"type": "sig:auth_fail", "reason": "not_authenticated"})
+                warn_throttled("unauthed", "UNAUTHED   type=%.48r  from=%s  peer=%s  dropped", kind, short(frm), addr)
+                await reply_once(ws, "not_authenticated", {"type": "sig:auth_fail", "reason": "not_authenticated"})
+                strike(st, 1.0, CLOSE_CODE_POLICY, "unauthenticated")
 
             # ── message / migrate: from must match an authed identity on this socket ──
             elif kind in ("app:message", "app:migrate", "app:burn", "session:propose", "session:ack"):
                 frm = msg.get("from", "?")
                 to_id, to_endpoint = parse_address(msg.get("to"))
                 if to_id is None:
-                    log.warning("  %s with invalid 'to', dropped", kind)
+                    warn_throttled("bad_to", "  %s with invalid 'to', dropped  peer=%s", kind, addr)
                     continue
                 # migrate/burn are never device-targeted by design — a
                 # compound address here is either a bug or something
                 # probing the boundary, dropped outright rather than
                 # silently treated as the bare identity.
                 if to_endpoint and kind in ("app:migrate", "app:burn"):
-                    log.warning("  %s with device-targeted 'to' — not allowed for this type, dropped", kind)
+                    warn_throttled("bad_to_dev", "  %s with device-targeted 'to' — not allowed for this type, dropped  peer=%s", kind, addr)
                     continue
                 # session:propose/session:ack are the inverse case — a
                 # session is always device-to-device (X4DH.md §13.3), so
                 # a BARE 'to' has no defined meaning here, unlike
                 # app:message's broadcast-to-every-session fallback.
                 if not to_endpoint and kind in ("session:propose", "session:ack"):
-                    log.warning("  %s without device-targeted 'to' — required for this type, dropped", kind)
+                    warn_throttled("bad_to_bare", "  %s without device-targeted 'to' — required for this type, dropped  peer=%s", kind, addr)
                     continue
                 if frm not in client_ids:
-                    log.warning("%-10s from=%s  not authed  peer=%s  dropped", kind.upper(), short(frm), addr)
-                    await send_to(ws, {"type": "error", "reason": "not_authenticated"})
+                    warn_throttled("from_not_authed", "%-10s from=%s  not authed  peer=%s  dropped", kind.upper(), short(frm), addr)
+                    await reply_once(ws, "not_authenticated", {"type": "error", "reason": "not_authenticated"})
                     continue
-                await route_or_buffer(kind, frm, to_id, to_endpoint, msg, ws)
+                await route_or_buffer(kind, frm, to_id, to_endpoint, msg, ws, raw=raw)
 
             # ── push subscribe/unsubscribe: from must match an authed
             #    identity on this socket, same rule as app:message et al.
@@ -1877,7 +2636,7 @@ async def handler(ws):
                 sub         = msg.get("subscription")
                 if frm not in client_ids:
                     log.warning("PUSH_SUB   from=%s  not authed  peer=%s  dropped", short(frm), addr)
-                    await send_to(ws, {"type": "error", "reason": "not_authenticated"})
+                    await reply_once(ws, "not_authenticated", {"type": "error", "reason": "not_authenticated"})
                     continue
                 if not valid_id(endpoint_id):
                     log.warning("PUSH_SUB   from=%s  bad/missing endpointId, dropped", short(frm))
@@ -1905,7 +2664,7 @@ async def handler(ws):
                 if len(p256dh) > PUSH_MAX_KEY_LEN or len(auth_key) > PUSH_MAX_KEY_LEN:
                     log.warning("PUSH_SUB   from=%s  oversized keys.p256dh/auth, dropped", short(frm))
                     continue
-                await asyncio.to_thread(_push_sub_write_sync, frm, endpoint_id, {
+                await _push_thread(_push_sub_write_sync, frm, endpoint_id, {
                     "endpoint": endpoint,
                     "p256dh":   p256dh,
                     "auth":     auth_key,
@@ -1916,26 +2675,28 @@ async def handler(ws):
                 endpoint_id = msg.get("endpointId")
                 if frm not in client_ids:
                     log.warning("PUSH_UNSUB from=%s  not authed  peer=%s  dropped", short(frm), addr)
-                    await send_to(ws, {"type": "error", "reason": "not_authenticated"})
+                    await reply_once(ws, "not_authenticated", {"type": "error", "reason": "not_authenticated"})
                     continue
                 if not valid_id(endpoint_id):
                     log.warning("PUSH_UNSUB from=%s  bad/missing endpointId, dropped", short(frm))
                     continue
-                await asyncio.to_thread(_push_sub_delete_sync, frm, endpoint_id)
+                await _push_thread(_push_sub_delete_sync, frm, endpoint_id)
 
             elif kind == "sig:announce":
                 ids = msg.get("ids", [])
                 if not isinstance(ids, list):
-                    log.warning("  announce bad payload, dropped")
+                    warn_throttled("announce_bad", "  announce bad payload, dropped  peer=%s", addr)
                     continue
-                ids     = [i for i in ids[:10] if valid_id(i)]
+                # de-duplicated: the same id listed ten times must not mean
+                # ten deliveries to it
+                ids     = list(dict.fromkeys(i for i in ids[:10] if valid_id(i)))
                 matched = [i for i in ids if i in connected]
                 if matched:
-                    seen_msg = {"type": "sig:seen", "id": last_id()}
+                    seen_raw = wire({"type": "sig:seen", "id": last_id()})   # serialised once for every recipient
                     # Fan out in parallel — sequential awaits would serialize
                     # delivery across all matched recipients.
                     await asyncio.gather(
-                        *(deliver(mid, seen_msg, exclude=ws) for mid in matched),
+                        *(deliver(mid, seen_raw, exclude=ws) for mid in matched),
                         return_exceptions=True,
                     )
 
@@ -1963,7 +2724,7 @@ async def handler(ws):
                 # targeted backup pushes and their acks.
                 to_id, to_endpoint = parse_address(msg.get("to"))
                 if to_id is None:
-                    log.warning("  %s with invalid 'to', dropped", kind)
+                    warn_throttled("bad_to", "  %s with invalid 'to', dropped  peer=%s", kind, addr)
                     continue
                 # sync:backup_offer/accept/push and sync:restore_ack/push
                 # (contact-path variants) are the deliberate exception
@@ -1987,18 +2748,18 @@ async def handler(ws):
                             "sync:restore_ack", "sync:restore_push"):
                     frm_id, _frm_endpoint = parse_address(frm)
                     if frm_id is None:
-                        log.warning("  %s with invalid 'from', dropped", kind)
+                        warn_throttled("bad_from", "  %s with invalid 'from', dropped  peer=%s", kind, addr)
                         continue
                 else:
                     frm_id = frm
                 if frm_id not in client_ids:
-                    log.warning("%-10s from=%s  not authed  peer=%s  dropped", kind.upper(), short_addr(frm), addr)
-                    await send_to(ws, {"type": "error", "reason": "not_authenticated"})
+                    warn_throttled("from_not_authed", "%-10s from=%s  not authed  peer=%s  dropped", kind.upper(), short_addr(frm), addr)
+                    await reply_once(ws, "not_authenticated", {"type": "error", "reason": "not_authenticated"})
                     continue
                 if to_endpoint:
-                    reached = await deliver_to_endpoint(to_id, to_endpoint, msg, exclude=ws)
+                    reached = await deliver_to_endpoint(to_id, to_endpoint, raw, exclude=ws)
                 else:
-                    reached = await deliver(to_id, msg, exclude=ws)
+                    reached = await deliver(to_id, raw, exclude=ws)
                 log.info("%-16s from=%s  to=%s  reached=%d",
                          kind.upper()[:16], short_addr(frm), short_addr(msg.get("to")), reached)
                 # sync:backup_push is deliberately NOT buffered — live delivery
@@ -2035,23 +2796,39 @@ async def handler(ws):
                 await send_to(ws, {"type": "sig:pong"})
 
             else:
-                log.warning("UNKNOWN    type=%r  peer=%s  dropped", kind, addr)
+                warn_throttled("unknown", "UNKNOWN    type=%.48r  peer=%s  dropped", kind, addr)
 
     except websockets.exceptions.ConnectionClosedOK:
         log.info("CLOSE OK   peer=%s  ids=%s", addr, client_ids)
     except websockets.exceptions.ConnectionClosedError as e:
-        log.warning("CLOSE ERR  peer=%s  ids=%s  reason=%s", addr, client_ids, e)
+        # A frame over the library's own cap (lowered before auth, see
+        # set_max_frame) closes the connection with 1009 before handler()
+        # ever sees it — count it with the other oversize rejections.
+        sent = getattr(e, "sent", None)
+        if sent is not None and getattr(sent, "code", None) == CLOSE_CODE_TOO_BIG:
+            stats["frame_rejected"] += 1
+        warn_throttled("close_err", "CLOSE ERR  peer=%s  ids=%s  reason=%s", addr, client_ids, e)
     except Exception as e:
-        log.error("HANDLER EX peer=%s  ids=%s  error=%s", addr, client_ids, e)
+        emit, suppressed = _log_throttle.ok("handler_ex")
+        if emit:
+            log.error("HANDLER EX peer=%s  ids=%s  error=%s%s", addr, client_ids, e,
+                      "  (+%d similar suppressed)" % suppressed if suppressed else "")
     finally:
-        # release per-IP slot — and the shared limiter along with it, once
-        # this IP has no sockets left (otherwise ip_limiters grows forever
-        # under normal IP churn, one entry per address ever seen).
-        if addr in ip_conns:
-            ip_conns[addr] -= 1
-            if ip_conns[addr] <= 0:
-                del ip_conns[addr]
-                ip_limiters.pop(addr, None)
+        # no more unauthenticated deadline, and out of the all-sockets table
+        if st.deadline is not None:
+            st.deadline.cancel()
+            st.deadline = None
+        st.closing = True
+        sock_state.pop(ws, None)
+        # release per-IP slot — and the shared limiters along with it, once
+        # this address has no sockets left (otherwise ip_limiters grows
+        # forever under normal IP churn, one entry per address ever seen).
+        if ipk in ip_conns:
+            ip_conns[ipk] -= 1
+            if ip_conns[ipk] <= 0:
+                del ip_conns[ipk]
+                ip_limiters.pop(ipk, None)
+                ip_byte_limiters.pop(ipk, None)
         # clean up any pending challenge if socket dropped mid-auth
         pending_auth.pop(id(ws), None)
         # unregister every identity this socket is REGISTERED under. The
@@ -2106,6 +2883,18 @@ async def run_signal_server():
     log.info("Global auth admission: %.1f/s  burst=%.0f", GLOBAL_AUTH_RATE, GLOBAL_AUTH_BURST)
     log.info("Rate limits: per-socket=%d/s burst=%d  per-ip=%d/s burst=%d",
               RATE_LIMIT_RATE, RATE_LIMIT_BURST, IP_RATE_LIMIT_RATE, IP_RATE_LIMIT_BURST)
+    log.info("Sockets: max=%d (all open sockets)  per_ip=%d (key: IPv4 / IPv6 /%d)  unauth_per_ip=%d  unauth_deadline=%.0fs  idle_evict=%.0fs  max_sessions_per_identity=%d  send_timeout=%.0fs",
+             MAX_CONNECTIONS, MAX_CONNECTIONS_PER_IP, IPV6_KEY_PREFIX, MAX_UNAUTH_PER_IP, UNAUTH_DEADLINE_S,
+             WS_IDLE_EVICT_S, MAX_SESSIONS_PER_IDENTITY, SEND_TIMEOUT_S)
+    log.info("Frame caps (bytes): pre-auth=%d  tiny=%d  handshake=%d  signal=%d  bulk=%d  message=%d  (library max=%d)",
+             FRAME_CAP_PREAUTH, FRAME_CAP_TINY, FRAME_CAP_HANDSHAKE, FRAME_CAP_SIGNAL, FRAME_CAP_BULK, FRAME_CAP_MESSAGE, WS_MAX_SIZE)
+    log.info("Byte budgets: per-socket=%.0f B/s burst=%.0f  per-ip=%.0f B/s burst=%.0f",
+             BYTE_RATE_SOCKET, BYTE_BURST_SOCKET, BYTE_RATE_IP, BYTE_BURST_IP)
+    log.info("Type budgets (rate/s, burst): %s",
+             "  ".join(f"{c}={r:g}/{b:g}" for c, (r, b) in TYPE_LIMITS.items()))
+    log.info("Strikes: close after >%.0f (one forgiven per %.0fs)  log_throttle=%.0fs", STRIKE_LIMIT, STRIKE_DECAY_S, LOG_THROTTLE_S)
+    log.info("Push: cooldown=%.0fs  max_concurrent=%d  max_queue=%d  max_identities=%d",
+             PUSH_COOLDOWN_S, PUSH_MAX_CONCURRENT, PUSH_MAX_QUEUE, MAX_PUSH_IDENTITIES)
     log.info("Trusted proxies: %s", ", ".join(str(n) for n in TRUSTED_PROXIES) or "(none)")
     if AUTH_HOSTS:
         log.info("Auth: v%d  bound to host(s): %s", AUTH_VERSION, ", ".join(sorted(AUTH_HOSTS)))
@@ -2118,6 +2907,9 @@ async def run_signal_server():
              ", ".join(sorted(PUSH_ALLOWED_EXACT) + list(PUSH_ALLOWED_SUFFIXES)) or "(none — every push endpoint is rejected)",
              PUSH_MAX_SUBS_PER_IDENTITY)
     log.info("=" * 50)
+    # prime the in-memory directory counts off the loop (one scandir each)
+    await asyncio.to_thread(buf_recipient_count.resync)
+    await asyncio.to_thread(push_identity_count.resync)
     async with websockets.serve(handler, WS_HOST, WS_PORT, max_size=WS_MAX_SIZE):
         asyncio.create_task(log_stats())
         asyncio.create_task(buf_expire())
@@ -2172,5 +2964,6 @@ if __name__ == "__main__":
                  fmt_bytes(stats["bytes_out"]), stats["msgs_out"],
                  stats["buf_in"], stats["buf_out"])
     finally:
+        PUSH_EXECUTOR.shutdown(wait=False, cancel_futures=True)
         http_proc.terminate()
         http_proc.join()
