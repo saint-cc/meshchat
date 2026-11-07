@@ -10,12 +10,15 @@ import multiprocessing
 import os
 import re
 import secrets
+import shutil
 import socket
+import sqlite3
 import ssl
 import threading
 import time
 import urllib.parse
 import uuid
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 
 from cryptography.hazmat.primitives import hashes
@@ -397,6 +400,20 @@ BUF_MAX_AGE  = int(os.environ.get("BUF_MAX_AGE",  86400))   # seconds before exp
 BUF_MAX_MB   = float(os.environ.get("BUF_MAX_MB",  10))     # max MB per recipient
 BUF_EXPIRE_INTERVAL = 300                                    # seconds between expiry sweeps
 
+# Fair share and reserved slots inside ONE recipient's buffer (or one device
+# bucket). The per-recipient cap (BUF_MAX_MSGS / BUF_MAX_MB) used to be
+# "drop the oldest", across everybody — so one sender writing 100 packets
+# pushed out the genuine packets other senders had left, migrate/burn notices
+# included. Now:
+#   - REGULAR packets (app:message, session:*, …) may use at most
+#     BUF_MAX_MSGS - BUF_RESERVED_SLOTS slots. The reserved slots are for
+#     app:migrate / app:burn only, and a regular packet never evicts one.
+#   - when something has to go, it comes from the sender holding the MOST
+#     (slots, or bytes for the size limit) — that sender's own oldest packet.
+#     A single sender therefore still gets the whole buffer when nobody else
+#     is writing, but can never push out another sender's packets by flooding.
+BUF_RESERVED_SLOTS = _env_int("BUF_RESERVED_SLOTS", 10)
+
 # app:migrate packets get their own (much longer) TTL — they're address
 # corrections, not conversation, and are useless if lost. 1 week for now
 # while testing; production target is closer to a year.
@@ -424,6 +441,73 @@ BURN_SUFFIX       = "_burn.json"   # filename tag — same role as MIGRATE_SUFFI
 X4DH_PROPOSE_SUFFIX = "_x4dh_propose.json"
 
 # ══════════════════════════════════════════
+#   KNOWN-IDENTITY REGISTRY + PROBATION
+#   `to` only has to satisfy valid_id(): a sender can aim packets at an
+#   identity that has never connected here, and every one of those used to get
+#   a full recipient directory (up to MAX_BUF_RECIPIENTS of them, 100 packets /
+#   10 MB each). The relay now remembers which identities have actually
+#   authenticated to RECEIVE here (and which of their devices), and treats a
+#   recipient it has never seen differently:
+#     - known identity                → the normal buffer, as before
+#     - never-seen identity           → PROBATION: ONE packet, keep-first, in a
+#                                       small separate pool (BUF_DIR/.probation)
+#                                       that can never touch real capacity
+#     - known identity, unknown device→ ONE packet per bucket, and only a couple
+#                                       of such buckets, so the real
+#                                       MAX_ENDPOINTS_PER_RECIPIENT slots can't
+#                                       be squatted
+#   The first packet a legitimate stranger needs to send (a content-free
+#   session:propose / HELLO) fits in one slot; anything more waits until the
+#   recipient has connected once, which promotes them to known and flushes
+#   whatever sat in probation. Live delivery is never affected.
+#
+#   The registry is a SQLite file under STATE_DIR. It is only a cache of
+#   "who has authed here" — losing it is never fatal: a missing / corrupt /
+#   newer-format file is replaced by a fresh one, seeded from the existing
+#   BUF_DIR and PUSH_SUBS_DIR directories, and for REGISTRY_GRACE_S afterwards
+#   every recipient is treated as known (so nobody's offline messages are
+#   refused just because the relay forgot who they were). If STATE_DIR can't
+#   be written at all the registry simply lives in memory.
+# ══════════════════════════════════════════
+# One place for the relay's own small state. It defaults to the directory that
+# holds BUF_DIR — exactly where VAPID_KEY_FILE and PUSH_SUBS_DIR have always
+# defaulted — so an existing setup changes nothing. Mount it as a volume to
+# keep the registry (and, optionally, the VAPID key and push subscriptions)
+# across container updates; mounting it is optional.
+STATE_DIR   = os.environ.get("STATE_DIR", os.path.dirname(os.path.abspath(BUF_DIR)))
+REGISTRY_DB = os.environ.get("REGISTRY_DB", os.path.join(STATE_DIR, "known_ids.sqlite3"))
+REGISTRY_FORMAT = 1                  # PRAGMA user_version this code reads and writes
+REGISTRY_GRACE_S        = _env_float("REGISTRY_GRACE_S", BUF_MAX_AGE)   # after a NEW registry: treat every recipient as known this long
+REGISTRY_TTL_S          = _env_float("REGISTRY_TTL_S", 30 * 86400)      # forget an identity not seen for this long
+REGISTRY_MAX_IDENTITIES = _env_int("REGISTRY_MAX_IDENTITIES", 50000)    # least-recently-seen evicted past this
+REGISTRY_MAX_ENDPOINTS  = _env_int("REGISTRY_MAX_ENDPOINTS", 32)        # remembered devices per identity (LRU)
+REGISTRY_FLUSH_S        = 5          # seconds between write-behind flushes to disk
+REGISTRY_TOUCH_GRANULARITY_S = 600   # a re-auth only rewrites an already-known identity's row this often
+
+PROBATION_DIRNAME = ".probation"     # under BUF_DIR; the leading dot can never be a valid_id(), so it can't collide with a recipient
+MAX_PROBATION_RECIPIENTS = _env_int("MAX_PROBATION_RECIPIENTS", 500)    # never-seen recipients holding a packet at once; the OLDEST is evicted for a new one
+PROBATION_MAX_BYTES      = _env_int("PROBATION_MAX_BYTES", FRAME_CAP_HANDSHAKE)   # largest packet accepted into probation (a handshake fits; media doesn't)
+PROBATION_ENDPOINTS_PER_RECIPIENT = _env_int("PROBATION_ENDPOINTS_PER_RECIPIENT", 2)   # unknown-device buckets a KNOWN identity may hold at once
+# Creating a probation slot costs the relay a directory; per ADDRESS, so one
+# machine can't churn the pool. Counted only for writes that would start a new slot.
+PROBATION_IP_RATE  = _env_float("PROBATION_IP_RATE", 0.2)    # new probation slots/sec per address
+PROBATION_IP_BURST = _env_float("PROBATION_IP_BURST", 10)
+
+# ── auth admission, per address and for known identities ──
+# GLOBAL_AUTH_RATE (above) caps how fast ANY auth can complete. Two additions:
+#   - AUTH_RATE_IP: a per-address ceiling checked BEFORE the signature is
+#     verified, so one machine can't make the relay spend CPU on proofs (or
+#     burn the shared budget) faster than this. Sized for a NAT full of
+#     clients reconnecting at once.
+#   - AUTH_KNOWN_*: when the global budget is exhausted, an identity this relay
+#     already knows still gets in through its own lane, so a flood of brand-new
+#     identities can't lock real users out.
+AUTH_RATE_IP     = _env_float("AUTH_RATE_IP",     2)
+AUTH_BURST_IP    = _env_float("AUTH_BURST_IP",    20)
+AUTH_KNOWN_RATE  = _env_float("AUTH_KNOWN_RATE",  GLOBAL_AUTH_RATE)
+AUTH_KNOWN_BURST = _env_float("AUTH_KNOWN_BURST", GLOBAL_AUTH_BURST)
+
+# ══════════════════════════════════════════
 #   VAPID / WEB PUSH — configuration
 #   Push is opt-in per-device (client-side checkbox) and deliberately
 #   payload-less — a push here only ever means "wake up and check", never
@@ -434,16 +518,15 @@ X4DH_PROPOSE_SUFFIX = "_x4dh_propose.json"
 #   below. Only fired for genuinely-offline app:message deliveries;
 #   app:migrate/app:burn are not user-facing and never trigger one.
 #
-#   VAPID_KEY_FILE/PUSH_SUBS_DIR default to sitting next to BUF_DIR rather
-#   than under it — same "fresh relay boots with sane defaults" spirit as
-#   BUF_DIR's own default, just its own sibling directory rather than a
-#   subdirectory, since a push subscription isn't a buffered packet.
+#   VAPID_KEY_FILE/PUSH_SUBS_DIR default to sitting in STATE_DIR (which itself
+#   defaults to the directory next to BUF_DIR) rather than under BUF_DIR —
+#   same "fresh relay boots with sane defaults" spirit as BUF_DIR's own
+#   default, just their own entries rather than a subdirectory, since a push
+#   subscription isn't a buffered packet.
 # ══════════════════════════════════════════
 VAPID_SUBJECT    = os.environ.get("VAPID_SUBJECT", "mailto:admin@example.com")
-VAPID_KEY_FILE   = os.environ.get("VAPID_KEY_FILE",
-                                   os.path.join(os.path.dirname(os.path.abspath(BUF_DIR)), "vapid_key.pem"))
-PUSH_SUBS_DIR    = os.environ.get("PUSH_SUBS_DIR",
-                                   os.path.join(os.path.dirname(os.path.abspath(BUF_DIR)), "push_subs"))
+VAPID_KEY_FILE   = os.environ.get("VAPID_KEY_FILE", os.path.join(STATE_DIR, "vapid_key.pem"))
+PUSH_SUBS_DIR    = os.environ.get("PUSH_SUBS_DIR",  os.path.join(STATE_DIR, "push_subs"))
 PUSH_TTL_SECONDS = int(os.environ.get("PUSH_TTL_SECONDS", 60))   # how long the push service should hold this if the device is unreachable
 
 # ── push endpoint policy (SSRF) ──
@@ -558,6 +641,8 @@ ws_to_ids: dict = {}             # ws → set of publicIds (reverse of connected
 ws_to_endpoint: dict = {}         # ws → list of (publicId, endpointId) (reverse of connected_by_endpoint; O(1) cleanup)
 buf_locks: dict = {}             # to_id → asyncio.Lock (serializes per-recipient buffer writes)
 buf_recipient_limiters: dict = {}   # to_id → RateLimiter, governs rate of NEW buffer writes for that recipient
+ip_auth_limiters: dict = {}         # ip key → RateLimiter on auth proofs (checked before signature verification); pruned when idle
+probation_ip_limiters: dict = {}    # ip key → RateLimiter on starting NEW probation slots; pruned when idle
 sock_state: dict = {}            # ws → SockState — EVERY open socket, authed or not (connected/ws_to_ids only know registered ones)
 ip_byte_limiters: dict = {}      # ip key → byte RateLimiter shared across all that address's sockets (lifetime tied to ip_conns, like ip_limiters)
 push_last: dict = {}             # to_id → monotonic time of the last push scheduled for that recipient (cooldown)
@@ -570,6 +655,9 @@ stats = {
     "buf_in":    0, "buf_out":   0,
     "buf_cap_rejected":  0,   # writes dropped for hitting MAX_BUF_RECIPIENTS
     "buf_endpoint_cap_rejected": 0,   # writes dropped for hitting MAX_ENDPOINTS_PER_RECIPIENT
+    "buf_fair_evicted":  0,   # packets evicted from the heaviest sender to make room (count or size limit)
+    "buf_reserved_full": 0,   # migrate/burn refused: no regular packet left to evict and the buffer is full
+    "buf_size_rejected": 0,   # writes dropped because they could never fit BUF_MAX_MB / the size limit held only migrate/burn
     "buf_rate_rejected": 0,   # writes dropped for hitting a recipient's write-rate limit
     "auth_admission_rejected": 0,   # auth completions dropped by the global admission limiter
     "push_sent":    0,   # pushes that got a non-error response from the push service
@@ -590,6 +678,16 @@ stats = {
     "send_timeout":        0,   # sockets closed because a send stalled for SEND_TIMEOUT_S
     "push_cooldown":       0,   # pushes skipped by the per-recipient cooldown
     "push_dropped":        0,   # pushes dropped because the push queue was full
+    # ── known-identity registry / probation ──
+    "probation_stored":    0,   # packets accepted into probation (never-seen recipient / unknown device)
+    "probation_kept_first":0,   # packets refused because that probation slot already held one
+    "probation_oversize":  0,   # packets refused for exceeding PROBATION_MAX_BYTES
+    "probation_ip_limited":0,   # new probation slots refused by the per-address creation limiter
+    "probation_endpoint_cap": 0,  # unknown-device buckets refused by PROBATION_ENDPOINTS_PER_RECIPIENT
+    "probation_evicted":   0,   # oldest probation entries evicted to make room
+    "probation_promoted":  0,   # probation packets handed to a recipient when it first authenticated
+    "auth_ip_rejected":    0,   # auth proofs refused by the per-address auth limiter (before verification)
+    "auth_known_lane":     0,   # auths admitted through the known-identity lane after the global budget ran out
 }
 
 # ══════════════════════════════════════════
@@ -785,7 +883,8 @@ class DirCounter:
             return 0
         try:
             with os.scandir(path) as it:
-                return sum(1 for e in it if e.is_dir())
+                # dot-names (BUF_DIR/.probation) are relay bookkeeping, never recipients
+                return sum(1 for e in it if e.is_dir() and not e.name.startswith("."))
         except OSError:
             return 0
 
@@ -809,10 +908,396 @@ class DirCounter:
 buf_recipient_count  = DirCounter(lambda: BUF_DIR)
 push_identity_count  = DirCounter(lambda: PUSH_SUBS_DIR)
 
+# ══════════════════════════════════════════
+#   KNOWN-IDENTITY REGISTRY  (see the config block near BUF_DIR)
+#   Memory is the source of truth for lookups — they happen on the event loop
+#   and in buffer worker threads and must never wait on disk. SQLite is a
+#   write-behind mirror that exists only so a restart doesn't forget everyone.
+# ══════════════════════════════════════════
+
+class _RegistryUnusable(Exception):
+    """The database file exists but this code can't use it (wrong format
+    version, failed integrity check, not a database)."""
+
+class KnownRegistry:
+    def __init__(self, path=None):
+        self._path = path or REGISTRY_DB
+        self._lock = threading.Lock()      # guards _ids and the pending-change sets
+        self._db_lock = threading.Lock()   # serialises everything that touches the sqlite connection
+        # id → [last_seen, {endpoint_id: last_seen}, persisted_at]; ordered least → most recently seen
+        self._ids = OrderedDict()
+        self._dirty = set()                # ids whose rows need (re)writing
+        self._gone = set()                 # ids whose rows need deleting
+        self._meta_dirty = False
+        self._db = None
+        self.mode = "memory"               # "sqlite" once a database is open
+        self.grace_until = 0.0             # wall-clock; recipients count as known until then
+        self.note = ""                     # one line for the startup log: how the registry came up
+
+    # ── lookups (hot path: cheap, memory only) ──
+    def is_known(self, pid):
+        with self._lock:
+            return pid in self._ids
+
+    def endpoint_known(self, pid, endpoint_id):
+        with self._lock:
+            e = self._ids.get(pid)
+            return e is not None and endpoint_id in e[1]
+
+    def endpoints(self, pid):
+        with self._lock:
+            e = self._ids.get(pid)
+            return set(e[1]) if e else set()
+
+    def in_grace(self, now=None):
+        return (time.time() if now is None else now) < self.grace_until
+
+    def accepts(self, pid):
+        """True when `pid` should get the normal buffer: it is known, or the
+        registry is still inside its post-creation grace window."""
+        return self.in_grace() or self.is_known(pid)
+
+    def size(self):
+        with self._lock:
+            return len(self._ids)
+
+    # ── updates ──
+    def touch(self, pid, endpoint_id=None, now=None):
+        """Record that `pid` (and its device `endpoint_id`) just authenticated
+        to receive here. Returns True if the identity was already known."""
+        now = time.time() if now is None else now
+        with self._lock:
+            e = self._ids.get(pid)
+            was_known = e is not None
+            if e is None:
+                while len(self._ids) >= REGISTRY_MAX_IDENTITIES:      # least recently seen goes first
+                    old, _ = self._ids.popitem(last=False)
+                    self._dirty.discard(old)
+                    self._gone.add(old)
+                e = [now, {}, 0.0]
+                self._ids[pid] = e
+                dirty = True
+            else:
+                dirty = (now - e[2]) >= REGISTRY_TOUCH_GRANULARITY_S
+                e[0] = now
+                self._ids.move_to_end(pid)
+            eps = e[1]
+            for ep in [k for k, ts in eps.items() if now - ts > REGISTRY_TTL_S]:
+                del eps[ep]
+                dirty = True
+            if endpoint_id:
+                if endpoint_id not in eps:
+                    dirty = True
+                    while len(eps) >= REGISTRY_MAX_ENDPOINTS:
+                        del eps[min(eps, key=eps.get)]
+                eps[endpoint_id] = now
+            if dirty:
+                self._dirty.add(pid)
+                self._gone.discard(pid)
+            return was_known
+
+    def expire(self, now=None):
+        """Forget identities not seen for REGISTRY_TTL_S. Returns how many."""
+        now = time.time() if now is None else now
+        cutoff = now - REGISTRY_TTL_S
+        n = 0
+        with self._lock:
+            while self._ids:
+                pid, e = next(iter(self._ids.items()))
+                if e[0] >= cutoff:
+                    break
+                del self._ids[pid]
+                self._dirty.discard(pid)
+                self._gone.add(pid)
+                n += 1
+        return n
+
+    # ── bring-up ──
+    def open(self, now=None):
+        """Open (create, or rebuild) the database. Always leaves the registry
+        usable — the worst outcome is memory-only mode — and never raises."""
+        now = time.time() if now is None else now
+        for attempt in (1, 2):
+            try:
+                os.makedirs(os.path.dirname(self._path) or ".", exist_ok=True)
+                db = sqlite3.connect(self._path, timeout=5, check_same_thread=False, isolation_level=None)
+            except (OSError, sqlite3.Error) as e:
+                return self._memory_mode("cannot open %s (%s)" % (self._path, e), now)
+            try:
+                db.execute("PRAGMA synchronous=NORMAL")
+                ver    = db.execute("PRAGMA user_version").fetchone()[0]
+                tables = db.execute("SELECT count(*) FROM sqlite_master WHERE type='table'").fetchone()[0]
+                if ver == 0 and tables == 0:
+                    self._create(db)
+                    self._db, self.mode = db, "sqlite"
+                    return self._fresh("no registry found — created %s" % self._path, now)
+                if ver != REGISTRY_FORMAT:
+                    raise _RegistryUnusable("format version %s (this relay uses %d)" % (ver, REGISTRY_FORMAT))
+                check = db.execute("PRAGMA quick_check").fetchone()[0]
+                if check != "ok":
+                    raise _RegistryUnusable("integrity check failed (%s)" % str(check)[:80])
+                self._load(db, now)
+                self._db, self.mode = db, "sqlite"
+                return
+            except sqlite3.OperationalError as e:
+                # locked / read-only / I/O trouble — not a verdict on the file itself
+                try: db.close()
+                except Exception: pass
+                return self._memory_mode("%s unusable (%s)" % (self._path, e), now)
+            except (_RegistryUnusable, sqlite3.DatabaseError) as e:
+                try: db.close()
+                except Exception: pass
+                if attempt == 2:
+                    return self._memory_mode("%s unusable even after starting over (%s)" % (self._path, e), now)
+                aside = "%s.unusable-%d" % (self._path, int(now))
+                try:
+                    os.replace(self._path, aside)
+                    for ext in ("-wal", "-shm", "-journal"):
+                        try: os.remove(self._path + ext)
+                        except OSError: pass
+                except OSError as e2:
+                    return self._memory_mode("%s unusable (%s) and can't be moved aside (%s)" % (self._path, e, e2), now)
+                log.warning("REGISTRY  %s is unusable (%s) — kept as %s, starting a new one", self._path, e, aside)
+
+    @staticmethod
+    def _create(db):
+        db.executescript("""
+            CREATE TABLE identities(id TEXT PRIMARY KEY, last_seen REAL NOT NULL) WITHOUT ROWID;
+            CREATE TABLE endpoints(id TEXT NOT NULL, endpoint TEXT NOT NULL, last_seen REAL NOT NULL,
+                                   PRIMARY KEY(id, endpoint)) WITHOUT ROWID;
+            CREATE TABLE meta(k TEXT PRIMARY KEY, v TEXT NOT NULL) WITHOUT ROWID;
+        """)
+        db.execute("PRAGMA user_version=%d" % REGISTRY_FORMAT)
+
+    def _load(self, db, now):
+        rows = db.execute("SELECT id, last_seen FROM identities ORDER BY last_seen").fetchall()
+        eps = {}
+        for pid, ep, ts in db.execute("SELECT id, endpoint, last_seen FROM endpoints"):
+            eps.setdefault(pid, {})[ep] = ts
+        cutoff = now - REGISTRY_TTL_S
+        with self._lock:
+            for pid, ts in rows:
+                if ts < cutoff:
+                    self._gone.add(pid)
+                    continue
+                self._ids[pid] = [ts, eps.get(pid, {}), ts]      # persisted_at = last_seen: no rewrite until it's touched again
+            while len(self._ids) > REGISTRY_MAX_IDENTITIES:
+                old, _ = self._ids.popitem(last=False)
+                self._gone.add(old)
+        row = db.execute("SELECT v FROM meta WHERE k='grace_until'").fetchone()
+        try:    self.grace_until = float(row[0]) if row else 0.0
+        except ValueError: self.grace_until = 0.0
+        self.note = "loaded %d identities from %s%s" % (
+            len(self._ids), self._path,
+            ("  (grace window open for another %ds)" % (self.grace_until - now)) if self.grace_until > now else "")
+
+    def _fresh(self, why, now):
+        """A registry with no memory of its own: seed it from what is on disk
+        and open the grace window."""
+        n = self._seed(now)
+        self.grace_until = now + REGISTRY_GRACE_S
+        self._meta_dirty = True
+        self.note = "%s; seeded %d identities from existing data; grace window %ds" % (why, n, REGISTRY_GRACE_S)
+        self.flush()
+
+    def _memory_mode(self, why, now):
+        self._db, self.mode = None, "memory"
+        n = self._seed(now)
+        self.grace_until = now + REGISTRY_GRACE_S
+        self.note = "MEMORY ONLY — %s; seeded %d identities; grace window %ds (restarts will forget who was seen)" % (why, n, REGISTRY_GRACE_S)
+        log.warning("REGISTRY  %s", self.note)
+
+    def _seed(self, now):
+        """Rebuild what we can from the data directories: every recipient that
+        has a buffer directory or a push subscription. Their timestamps are the
+        files' own, so identities that were never heard from again still age out."""
+        found = {}
+        def _add(pid, ep, ts):
+            ts = min(ts, now)
+            if now - ts > REGISTRY_TTL_S:
+                return
+            cur = found.setdefault(pid, [ts, {}])
+            cur[0] = max(cur[0], ts)
+            if ep:
+                cur[1][ep] = max(cur[1].get(ep, 0.0), ts)
+        def _subdirs(path):
+            try:
+                with os.scandir(path) as it:
+                    return [e for e in it if e.is_dir()]
+            except OSError:
+                return []
+        for d in _subdirs(BUF_DIR):
+            if not valid_id(d.name):
+                continue
+            try: _add(d.name, None, d.stat().st_mtime)
+            except OSError: continue
+            for ep in _subdirs(os.path.join(d.path, "_endpoints")):
+                if valid_id(ep.name):
+                    try: _add(d.name, ep.name, ep.stat().st_mtime)
+                    except OSError: pass
+        for d in _subdirs(PUSH_SUBS_DIR):
+            if not valid_id(d.name):
+                continue
+            try:
+                with os.scandir(d.path) as it:
+                    for f in it:
+                        if f.is_file() and f.name.endswith(".json") and valid_id(f.name[:-5]):
+                            try: _add(d.name, f.name[:-5], f.stat().st_mtime)
+                            except OSError: pass
+            except OSError:
+                continue
+        newest = sorted(found.items(), key=lambda kv: kv[1][0])[-REGISTRY_MAX_IDENTITIES:]
+        with self._lock:
+            for pid, (ts, eps) in newest:
+                self._ids[pid] = [ts, dict(list(sorted(eps.items(), key=lambda kv: kv[1]))[-REGISTRY_MAX_ENDPOINTS:]), 0.0]
+                self._dirty.add(pid)
+        return len(newest)
+
+    # ── persistence ──
+    def flush(self):
+        """Write pending changes to disk (worker thread, or shutdown). Never
+        raises; a failed write is retried on the next flush."""
+        with self._lock:
+            dirty = {pid: (e[0], dict(e[1])) for pid in self._dirty if (e := self._ids.get(pid)) is not None}
+            gone  = list(self._gone)
+            meta  = self._meta_dirty
+            self._dirty.clear(); self._gone.clear(); self._meta_dirty = False
+        db = self._db
+        if db is None:
+            return                                    # memory mode: nothing to write, nothing to retry
+        if not (dirty or gone or meta):
+            return
+        now = time.time()
+        with self._db_lock:
+            try:
+                db.execute("BEGIN")
+                if gone:
+                    db.executemany("DELETE FROM identities WHERE id=?", [(g,) for g in gone])
+                    db.executemany("DELETE FROM endpoints WHERE id=?",  [(g,) for g in gone])
+                for pid, (ts, eps) in dirty.items():
+                    db.execute("INSERT OR REPLACE INTO identities(id, last_seen) VALUES(?,?)", (pid, ts))
+                    db.execute("DELETE FROM endpoints WHERE id=?", (pid,))
+                    if eps:
+                        db.executemany("INSERT INTO endpoints(id, endpoint, last_seen) VALUES(?,?,?)",
+                                       [(pid, ep, t) for ep, t in eps.items()])
+                if meta:
+                    db.execute("INSERT OR REPLACE INTO meta(k, v) VALUES('grace_until', ?)", (repr(self.grace_until),))
+                db.execute("COMMIT")
+            except sqlite3.Error as e:
+                try: db.execute("ROLLBACK")
+                except sqlite3.Error: pass
+                with self._lock:                      # put the work back for the next attempt
+                    for pid in dirty:
+                        if pid in self._ids: self._dirty.add(pid)
+                    self._gone.update(g for g in gone if g not in self._ids)
+                    self._meta_dirty = self._meta_dirty or meta
+                warn_throttled("registry_flush", "REGISTRY  write failed (%s) — will retry", e)
+                return
+        with self._lock:
+            for pid in dirty:
+                e = self._ids.get(pid)
+                if e is not None:
+                    e[2] = now
+
+    def close(self):
+        self.flush()
+        with self._db_lock:
+            if self._db is not None:
+                try: self._db.close()
+                except sqlite3.Error: pass
+                self._db = None
+
+known_registry = KnownRegistry()
+
+class ProbationPool:
+    """Never-seen recipients that hold ONE keep-first packet each, kept apart
+    from the real buffer: BUF_DIR/.probation/<id>/…, same inner layout as a
+    real recipient directory (identity-level files, _endpoints/<ep>/…) so that
+    promoting a recipient is a single rename. The index lives in memory in
+    arrival order, so evicting the oldest and expiring are O(1) per entry."""
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._order = OrderedDict()      # id → created (wall clock); oldest first
+
+    @staticmethod
+    def root():
+        return os.path.join(BUF_DIR, PROBATION_DIRNAME)
+
+    def path(self, pid):
+        return os.path.join(self.root(), pid)     # pid is valid_id()-checked by every caller: no separators, no dots
+
+    def load(self):
+        """Rebuild the index from disk (startup)."""
+        try:
+            with os.scandir(self.root()) as it:
+                found = sorted(((e.stat().st_mtime, e.name) for e in it if e.is_dir() and valid_id(e.name)))
+        except OSError:
+            found = []
+        with self._lock:
+            self._order = OrderedDict((name, ts) for ts, name in found)
+            extra = []
+            while len(self._order) > MAX_PROBATION_RECIPIENTS:
+                extra.append(self._order.popitem(last=False)[0])
+        for name in extra:
+            shutil.rmtree(self.path(name), ignore_errors=True)
+        return len(self._order)
+
+    def __len__(self):
+        with self._lock:
+            return len(self._order)
+
+    def has(self, pid):
+        with self._lock:
+            return pid in self._order
+
+    def claim(self, pid):
+        """Reserve the slot for `pid`. None if it already holds a packet
+        (keep-first); otherwise the slot's directory, with the OLDEST entry
+        evicted first when the pool is full. Returns (path, evicted_count)."""
+        victims = []
+        with self._lock:
+            if pid in self._order:
+                return None
+            while len(self._order) >= max(1, MAX_PROBATION_RECIPIENTS):
+                victims.append(self._order.popitem(last=False)[0])
+            self._order[pid] = time.time()
+        for v in victims:
+            shutil.rmtree(self.path(v), ignore_errors=True)
+        return self.path(pid), len(victims)
+
+    def release(self, pid):
+        """Give a slot back (the write that claimed it failed)."""
+        with self._lock:
+            self._order.pop(pid, None)
+        shutil.rmtree(self.path(pid), ignore_errors=True)
+
+    def pop(self, pid):
+        """Take `pid` out of the index (it is being promoted); True if it was there."""
+        with self._lock:
+            return self._order.pop(pid, None) is not None
+
+    def sweep(self, now=None):
+        """Drop entries older than BUF_MAX_AGE. Returns how many."""
+        cutoff = (time.time() if now is None else now) - BUF_MAX_AGE
+        victims = []
+        with self._lock:
+            while self._order:
+                pid, ts = next(iter(self._order.items()))
+                if ts >= cutoff:
+                    break
+                del self._order[pid]
+                victims.append(pid)
+        for v in victims:
+            shutil.rmtree(self.path(v), ignore_errors=True)
+        return len(victims)
+
+probation_pool = ProbationPool()
+
 # Single shared instance — deliberately NOT one-per-IP or one-per-socket.
 # See GLOBAL_AUTH_RATE comment near its definition for why this needs to
 # be global to be effective at all.
 global_auth_limiter = RateLimiter(rate=GLOBAL_AUTH_RATE, burst=GLOBAL_AUTH_BURST)
+known_auth_limiter  = RateLimiter(rate=AUTH_KNOWN_RATE, burst=AUTH_KNOWN_BURST)   # lane for identities already in known_registry
 
 # ══════════════════════════════════════════
 #   VAPID / WEB PUSH
@@ -1454,7 +1939,8 @@ async def route_or_buffer(kind, frm, to_id, to_endpoint, msg, ws, raw=None):
         log.info("%-10s from=%s  to=%s  reached=%d", kind.upper(), short(frm), short_addr(addr_disp), reached)
     DURABLE_KINDS = ("app:migrate", "app:burn", "session:propose", "session:ack")
     if not reached or kind in DURABLE_KINDS:
-        await buf_write(to_id, msg, to_endpoint)
+        _st = sock_state.get(ws)
+        await buf_write(to_id, msg, to_endpoint, src=_st.ipk if _st is not None else None)
         if reached:
             durable_tag = {
                 "app:migrate": "migrate", "app:burn": "burn",
@@ -1651,6 +2137,20 @@ async def auth_verify(ws, sig_bytes: list, addr: str, authed_as: str | None = No
         log.warning("AUTH       challenge expired  peer=%s", addr)
         await send_to(ws, {"type": "sig:auth_fail", "reason": "timeout"})
         return None
+    # Per-address ceiling on proofs, BEFORE any signature work — see
+    # AUTH_RATE_IP. Charged for valid and invalid proofs alike: both cost the
+    # relay a verification. Same reply as the global gate, so clients back off
+    # the way they already do for server_busy.
+    _st = sock_state.get(ws)
+    _ipk = _st.ipk if _st is not None else addr
+    _alim = ip_auth_limiters.get(_ipk)
+    if _alim is None:
+        _alim = ip_auth_limiters[_ipk] = RateLimiter(rate=AUTH_RATE_IP, burst=AUTH_BURST_IP)
+    if not _alim.allow():
+        stats["auth_ip_rejected"] += 1
+        warn_throttled("auth_ip", "AUTH       per-address auth rate limit reached  peer=%s", addr)
+        await send_to(ws, {"type": "sig:auth_fail", "reason": "server_busy"})
+        return None
     # The signature must verify against OUR host name(s), rebuilt from what
     # we issued (nonce) and what the client presented in auth_init. A proof
     # a client made for some other relay's host — e.g. one forwarded by a
@@ -1696,11 +2196,18 @@ async def auth_verify(ws, sig_bytes: list, addr: str, authed_as: str | None = No
     # Deliberately independent of source IP (see GLOBAL_AUTH_RATE comment)
     # — this is the one lever that still works when the flood is genuinely
     # distributed across many real, distinct addresses rather than one.
+    #
+    # Known identities have a lane of their own behind it: when the shared
+    # budget is spent (a flood of brand-new identities), one this relay has
+    # already seen authenticate still gets through, within AUTH_KNOWN_RATE.
     if not global_auth_limiter.allow():
-        log.warning("AUTH       global admission limit reached  peer=%s", addr)
-        stats["auth_admission_rejected"] += 1
-        await send_to(ws, {"type": "sig:auth_fail", "reason": "server_busy"})
-        return None
+        if known_registry.is_known(public_id) and known_auth_limiter.allow():
+            stats["auth_known_lane"] += 1
+        else:
+            warn_throttled("auth_global", "AUTH       global admission limit reached  peer=%s", addr)
+            stats["auth_admission_rejected"] += 1
+            await send_to(ws, {"type": "sig:auth_fail", "reason": "server_busy"})
+            return None
 
     no_receive = entry.get("no_receive", False)
     endpoint_id = entry.get("endpoint_id")
@@ -1729,18 +2236,26 @@ async def auth_verify(ws, sig_bytes: list, addr: str, authed_as: str | None = No
         if endpoint_id:
             connected_by_endpoint.setdefault(public_id, {}).setdefault(endpoint_id, set()).add(ws)
             ws_to_endpoint.setdefault(ws, []).append((public_id, endpoint_id))
+        # Only a socket that registers to RECEIVE makes the identity (and its
+        # device) known — a send-only (no_receive) connection never gets a
+        # buffer here. Done together with the registration above so a durable
+        # packet that arrives from now on takes the normal path, not probation.
+        known_registry.touch(public_id, endpoint_id)
     log.info("AUTH OK    id=%s  bits=%d  host=%s  peer=%s  keys=%d  sessions=%d%s%s",
              short(public_id), entry["bits"], verified_host, addr, unique_keys(), session_count(),
              "  [no_receive — not registered]" if no_receive else "",
              f"  endpoint={short(endpoint_id)}" if (endpoint_id and not no_receive) else "")
     await send_to(ws, {"type": "sig:auth_ok", "public_id": public_id})
     if not no_receive:
+        # A first-time identity's probation packet is handed over before the
+        # flush below, so it is delivered with everything else.
+        await promote_probation(public_id)
         await buf_deliver(public_id, ws, endpoint_id)
     return public_id
 
 # ══════════════════════════════════════════
 #   OFFLINE BUFFER
-#   Layout: BUF_DIR/<publicId>/<ts>_<uuid>.json
+#   Layout: BUF_DIR/<publicId>/<ts>_<uuid>[_s<sendertag>].json
 #   Limits: BUF_MAX_MSGS, BUF_MAX_AGE, BUF_MAX_MB per recipient.
 #   On connect: flush all buffered packets oldest-first, delete on success.
 #   Expiry sweep: background task removes files older than their TTL bucket.
@@ -1792,6 +2307,183 @@ def buf_endpoint_files(to_id, endpoint_id):
     if not os.path.isdir(d): return []
     return sorted(glob.glob(os.path.join(d, "*.json"), recursive=False))
 
+_BUF_SENDER_RE = re.compile(r"^\d+_[0-9a-f]{8}_s([0-9a-f]{8})")
+
+def _sender_tag(frm):
+    """Short stable tag for a sender identity, carried in the buffer filename
+    so fair-share decisions never have to open a file. Not a secret; only
+    used to tell senders apart (a collision just means two senders share a
+    share)."""
+    if not isinstance(frm, str) or not frm:
+        return None
+    return hashlib.sha256(frm.encode("utf-8", "replace")).hexdigest()[:8]
+
+def _buf_filename(msg, suffix):
+    """<ms>_<uuid8>[_s<sendertag>]<suffix>. Sorts by time exactly as before;
+    files written by older versions (no tag) count as sender "?"."""
+    tag = _sender_tag(msg.get("from"))
+    return f"{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}{'_s' + tag if tag else ''}{suffix}"
+
+def _buf_sender_of(path):
+    m = _BUF_SENDER_RE.match(os.path.basename(path))
+    return m.group(1) if m else "?"
+
+def _buf_is_protected(path):
+    """migrate/burn notices: long-lived, must eventually be seen."""
+    return path.endswith(MIGRATE_SUFFIX) or path.endswith(BURN_SUFFIX)
+
+def _pick_victim(candidates, sizes=None):
+    """Fair-share eviction. `candidates` is oldest-first. Returns the oldest
+    file of the sender holding the most files — or the most bytes when
+    `sizes` ({path: bytes}) is given. Ties go to the sender whose file is
+    oldest overall."""
+    groups = {}
+    for p in candidates:
+        g = groups.setdefault(_buf_sender_of(p), [0, p])      # [weight, oldest file]
+        g[0] += sizes.get(p, 0) if sizes is not None else 1
+    return max(groups.values(), key=lambda g: g[0])[1]        # max() keeps the first maximum → oldest sender wins ties
+
+def _buf_suffix_for(kind):
+    """Filename tag for a packet kind (same mapping _buf_write_sync applies)."""
+    return (MIGRATE_SUFFIX if kind == "app:migrate" else
+            BURN_SUFFIX if kind == "app:burn" else
+            X4DH_PROPOSE_SUFFIX if kind == "session:propose" else ".json")
+
+def _probation_write_sync(to_id, msg, endpoint_id=None):
+    """Buffer ONE packet for a recipient this relay has never seen. Keep-first:
+    if the recipient's probation slot already holds a packet this one is
+    dropped (nothing is overwritten, so a squatter can't push out the packet
+    that is already waiting). Lives in BUF_DIR/.probation, a pool of at most
+    MAX_PROBATION_RECIPIENTS recipients whose oldest entry makes room for a new
+    one — it can never use real buffer capacity. Runs in a worker thread."""
+    try:
+        raw = json.dumps(msg)
+    except (TypeError, ValueError):
+        return
+    if len(raw) > PROBATION_MAX_BYTES:
+        stats["probation_oversize"] += 1
+        warn_throttled("prob_size", "PROBATION  packet too large for an unseen recipient (%d > %d)  to=%s",
+                       len(raw), PROBATION_MAX_BYTES, short(to_id))
+        return
+    slot = probation_pool.claim(to_id)
+    if slot is None:
+        stats["probation_kept_first"] += 1
+        warn_throttled("prob_first", "PROBATION  slot already holds a packet — keeping the first  to=%s", short(to_id))
+        return
+    base, evicted = slot
+    if evicted:
+        stats["probation_evicted"] += evicted
+        warn_throttled("prob_evict", "PROBATION  pool full (%d) — evicted %d oldest", MAX_PROBATION_RECIPIENTS, evicted)
+    try:
+        d = os.path.join(base, "_endpoints", endpoint_id) if endpoint_id else base
+        os.makedirs(d, exist_ok=True)
+        fname = os.path.join(d, _buf_filename(msg, _buf_suffix_for(msg.get('type'))))
+        with open(fname, "w") as f:
+            f.write(raw)
+    except Exception as e:
+        log.warning("PROBATION  write failed  to=%s  err=%s", short(to_id), e)
+        probation_pool.release(to_id)
+        return
+    stats["probation_stored"] += 1
+    stats["buf_in"] += 1
+    log.info("PROBATION  write  to=%s  type=%s%s", short(to_id), msg.get("type"),
+             f"  endpoint={short(endpoint_id)}" if endpoint_id else "")
+
+def _unknown_endpoint_ok(to_id, endpoint_id, d, top_dir, msg):
+    """A packet for a device of a KNOWN identity that has never authenticated
+    here. True if it may be written to that device's bucket. The bucket holds
+    ONE packet (keep-first) and an identity may hold only
+    PROBATION_ENDPOINTS_PER_RECIPIENT such buckets at once — so a stranger
+    can't fill the identity's real MAX_ENDPOINTS_PER_RECIPIENT slots with
+    devices that don't exist. Once the device authenticates, the registry
+    learns it and the bucket becomes an ordinary one."""
+    try:
+        size = len(json.dumps(msg))
+    except (TypeError, ValueError):
+        return False
+    if size > PROBATION_MAX_BYTES:
+        stats["probation_oversize"] += 1
+        warn_throttled("prob_size", "PROBATION  packet too large for an unseen device (%d > %d)  to=%s",
+                       size, PROBATION_MAX_BYTES, short(to_id))
+        return False
+    if os.path.isdir(d):
+        try:
+            with os.scandir(d) as it:
+                if any(e.name.endswith(".json") for e in it):
+                    stats["probation_kept_first"] += 1
+                    warn_throttled("prob_first", "PROBATION  device bucket already holds a packet — keeping the first  to=%s  endpoint=%s",
+                                   short(to_id), short(endpoint_id))
+                    return False
+        except OSError:
+            pass
+        return True   # an empty bucket that was already admitted
+    known = known_registry.endpoints(to_id)
+    try:
+        with os.scandir(os.path.join(top_dir, "_endpoints")) as it:
+            unknown_n = sum(1 for e in it if e.is_dir() and e.name not in known)
+    except OSError:
+        unknown_n = 0
+    if unknown_n >= PROBATION_ENDPOINTS_PER_RECIPIENT:
+        stats["probation_endpoint_cap"] += 1
+        warn_throttled("prob_ep_cap", "PROBATION  unseen-device allowance reached (%d)  to=%s  endpoint=%s",
+                       PROBATION_ENDPOINTS_PER_RECIPIENT, short(to_id), short(endpoint_id))
+        return False
+    stats["probation_stored"] += 1
+    return True
+
+def _probation_adopt_sync(to_id):
+    """Hand a recipient's probation packet to its real buffer — it has just
+    authenticated, so it is known now. A rename when it has no directory yet
+    (the usual case), otherwise a file-by-file merge. Worker thread."""
+    if not probation_pool.pop(to_id):
+        return 0
+    src = probation_pool.path(to_id)
+    if not os.path.isdir(src):
+        return 0
+    try:
+        dst = buf_dir(to_id)
+    except ValueError:
+        shutil.rmtree(src, ignore_errors=True)
+        return 0
+    moved = 0
+    try:
+        if not os.path.exists(dst):
+            if buf_recipient_count.count() >= MAX_BUF_RECIPIENTS:
+                stats["buf_cap_rejected"] += 1
+                shutil.rmtree(src, ignore_errors=True)
+                return 0
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.rename(src, dst)
+            buf_recipient_count.add(1)
+            moved = 1
+        else:
+            for root, _dirs, names in os.walk(src):
+                rel = os.path.relpath(root, src)
+                target = dst if rel == "." else os.path.join(dst, rel)
+                for n in names:
+                    os.makedirs(target, exist_ok=True)
+                    os.replace(os.path.join(root, n), os.path.join(target, n))
+                    moved += 1
+            shutil.rmtree(src, ignore_errors=True)
+    except OSError as e:
+        log.warning("PROBATION  promote failed  to=%s  err=%s", short(to_id), e)
+        shutil.rmtree(src, ignore_errors=True)
+        return 0
+    return moved
+
+async def promote_probation(to_id):
+    """Called when `to_id` authenticates, BEFORE its buffer is flushed."""
+    if not probation_pool.has(to_id):
+        return
+    lock = await _acquire_buf_lock(to_id)
+    try:
+        n = await asyncio.to_thread(_probation_adopt_sync, to_id)
+    finally:
+        await _release_buf_lock(to_id, lock)
+    if n:
+        stats["probation_promoted"] += 1
+        log.info("PROBATION  promoted  id=%s", short(to_id))
+
 def _buf_write_sync(to_id, msg, endpoint_id=None):
     """Sync body of buf_write — runs in a worker thread, no awaits.
 
@@ -1821,6 +2513,18 @@ def _buf_write_sync(to_id, msg, endpoint_id=None):
     except ValueError as e:
         log.warning("BUF        rejected  to=%s  reason=%s", short(to_id), e)
         return
+
+    # Known-identity gate — see the KNOWN-IDENTITY REGISTRY + PROBATION config
+    # block. A recipient this relay has never seen authenticate (and that is
+    # not inside the registry's grace window) gets one keep-first packet in the
+    # probation pool instead of a real directory; an unknown DEVICE of a known
+    # identity gets one packet per bucket, a couple of buckets at most.
+    if not known_registry.accepts(to_id):
+        _probation_write_sync(to_id, msg, endpoint_id)
+        return
+    if endpoint_id and not known_registry.in_grace() and not known_registry.endpoint_known(to_id, endpoint_id):
+        if not _unknown_endpoint_ok(to_id, endpoint_id, d, top_dir, msg):
+            return
 
     # Recipient cap — only matters for a NEW recipient directory (the
     # top-level <to_id> dir itself, whether this particular write is
@@ -1894,23 +2598,69 @@ def _buf_write_sync(to_id, msg, endpoint_id=None):
                 kept.append(fpath)
         files = kept
 
-    # enforce message count limit — drop oldest
-    while len(files) >= BUF_MAX_MSGS:
-        try:
-            os.remove(files.pop(0))
-            log.info("BUF        drop oldest (count limit)  to=%s", short(to_id))
-        except Exception:
-            pass
-
-    # enforce size limit
-    total = sum(os.path.getsize(f) for f in files if os.path.exists(f))
+    # Make room — fair share + reserved slots (see BUF_RESERVED_SLOTS).
     raw   = json.dumps(msg).encode()
-    if total + len(raw) > BUF_MAX_MB * 1024 * 1024:
+    sizes = {}
+    for fpath in list(files):
+        try:
+            sizes[fpath] = os.path.getsize(fpath)
+        except OSError:
+            files.remove(fpath)                 # vanished under us (delivery / expiry)
+
+    def evict(candidates, by_bytes, why):
+        victim = _pick_victim(candidates, sizes if by_bytes else None)
+        try:
+            os.remove(victim)
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            log.warning("BUF        evict failed  to=%s  err=%s", short(to_id), e)
+        for lst in (files, candidates):
+            if victim in lst:
+                lst.remove(victim)
+        sizes.pop(victim, None)
+        stats["buf_fair_evicted"] += 1
+        log.info("BUF        evict (%s)  to=%s  sender-tag=%s  incoming-from=%s", why, short(to_id),
+                 _buf_sender_of(victim), short(frm))
+
+    protected_in = is_migrate or is_burn
+    regular      = [f for f in files if not _buf_is_protected(f)]
+    regular_cap  = max(1, BUF_MAX_MSGS - max(0, BUF_RESERVED_SLOTS))
+    if protected_in:
+        # migrate/burn may use every slot, including the reserved ones; when
+        # full they displace regular packets, heaviest sender first.
+        while len(files) >= BUF_MAX_MSGS:
+            if not regular:
+                stats["buf_reserved_full"] += 1
+                warn_throttled("buf_resv_full", "BUF        full of migrate/burn notices — dropping  to=%s  from=%s", short(to_id), short(frm))
+                return
+            evict(regular, False, "count, for migrate/burn")
+    else:
+        while len(regular) >= regular_cap:
+            evict(regular, False, "count")
+        while len(files) >= BUF_MAX_MSGS:                        # protected notices took more than the reserved share
+            if not regular:
+                stats["buf_reserved_full"] += 1
+                warn_throttled("buf_resv_full", "BUF        full of migrate/burn notices — dropping  to=%s  from=%s", short(to_id), short(frm))
+                return
+            evict(regular, False, "count")
+
+    # size limit — same rule, by bytes. A packet bigger than the whole limit
+    # can never fit, so it is refused without evicting anyone for nothing.
+    limit = BUF_MAX_MB * 1024 * 1024
+    if len(raw) > limit:
+        stats["buf_size_rejected"] += 1
         log.warning("BUF        size limit reached  to=%s  dropping", short(to_id))
         return
+    while sum(sizes.values()) + len(raw) > limit:
+        if not regular:
+            stats["buf_size_rejected"] += 1
+            log.warning("BUF        size limit reached  to=%s  dropping", short(to_id))
+            return
+        evict(regular, True, "size")
 
     suffix = MIGRATE_SUFFIX if is_migrate else (BURN_SUFFIX if is_burn else (X4DH_PROPOSE_SUFFIX if is_propose else ".json"))
-    fname  = os.path.join(d, f"{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}{suffix}")
+    fname  = os.path.join(d, _buf_filename(msg, suffix))
     try:
         try:
             f = open(fname, "w")
@@ -1964,7 +2714,7 @@ async def _release_buf_lock(to_id, lock):
         else:
             buf_lock_refs[to_id] = remaining
 
-async def buf_write(to_id, msg, endpoint_id=None):
+async def buf_write(to_id, msg, endpoint_id=None, src=None):
     """Async wrapper: serializes per-recipient (or per-recipient-device)
     writes via a lock, offloads sync file I/O to a worker thread so the
     event loop stays unblocked. The lock prevents count/size-check races
@@ -1990,6 +2740,23 @@ async def buf_write(to_id, msg, endpoint_id=None):
     specific real recipient's BUF_MAX_MSGS cap fast enough to evict their
     genuine buffered messages; the lock/thread machinery below only cares
     about serializing writes that get past this gate."""
+    # A write that would START a new probation slot (never-seen recipient, or an
+    # unseen device of a known one) costs the relay a directory: limited per
+    # sending ADDRESS (`src`, the sender socket's address key) so one machine
+    # can't churn the pool. Writes to recipients the relay knows, or into a
+    # slot that already exists (those are refused as keep-first anyway), skip it.
+    if src is not None and not known_registry.in_grace():
+        starts_slot = (not known_registry.is_known(to_id) and not probation_pool.has(to_id)) or \
+                      (endpoint_id and known_registry.is_known(to_id) and not known_registry.endpoint_known(to_id, endpoint_id))
+        if starts_slot:
+            plim = probation_ip_limiters.get(src)
+            if plim is None:
+                plim = probation_ip_limiters[src] = RateLimiter(rate=PROBATION_IP_RATE, burst=PROBATION_IP_BURST)
+            if not plim.allow():
+                stats["probation_ip_limited"] += 1
+                warn_throttled("prob_ip", "PROBATION  per-address limit on new slots reached  src=%s  to=%s", src, short(to_id))
+                return
+
     limiter_key = f"{to_id}::{endpoint_id}" if endpoint_id else to_id
     limiter = buf_recipient_limiters.get(limiter_key)
     if limiter is None:
@@ -2140,7 +2907,7 @@ def _buf_expire_chunk_sync(names, now):
 def _buf_recipient_names_sync():
     try:
         with os.scandir(BUF_DIR) as it:
-            return [e.name for e in it if e.is_dir()]
+            return [e.name for e in it if e.is_dir() and not e.name.startswith(".")]
     except OSError:
         return []
 
@@ -2192,6 +2959,30 @@ async def buf_expire():
             log.info("BUF        pruned %d idle write-rate limiter(s)", len(idle_keys))
         # same housekeeping for the push cooldown table
         _prune_push_last(now_mono)
+        # registry / probation housekeeping, same cadence
+        try:
+            forgotten = known_registry.expire()
+            swept = await asyncio.to_thread(probation_pool.sweep)
+            if forgotten:
+                log.info("REGISTRY  forgot %d identit%s not seen for %.0f days", forgotten,
+                         "y" if forgotten == 1 else "ies", REGISTRY_TTL_S / 86400)
+            if swept:
+                log.info("PROBATION  expired %d unclaimed entr%s", swept, "y" if swept == 1 else "ies")
+        except Exception as e:
+            log.warning("REGISTRY  housekeeping error: %s", e)
+        for table in (ip_auth_limiters, probation_ip_limiters):
+            for k in [k for k, lim in table.items() if now_mono - lim.last_time > BUF_RATE_LIMITER_IDLE_S]:
+                table.pop(k, None)
+
+async def registry_flush_loop():
+    """Write-behind: push registry changes to SQLite every REGISTRY_FLUSH_S,
+    in a worker thread so a slow disk can't stall the loop."""
+    while True:
+        await asyncio.sleep(REGISTRY_FLUSH_S)
+        try:
+            await asyncio.to_thread(known_registry.flush)
+        except Exception as e:
+            warn_throttled("registry_flush_loop", "REGISTRY  flush error: %s", e)
 
 # ══════════════════════════════════════════
 #   STATS
@@ -2203,6 +2994,16 @@ async def log_stats():
         log.info("STATS      sockets=%d  push_queue=%d  push_last=%d  buf_recipients=%d  push_identities=%d",
                  socket_count(), len(push_tasks), len(push_last),
                  buf_recipient_count.count(), push_identity_count.count())
+        log.info("BUFFER     fair_evicted=%d  reserved_full=%d  size_rejected=%d",
+                 stats["buf_fair_evicted"], stats["buf_reserved_full"], stats["buf_size_rejected"])
+        log.info("REGISTRY   mode=%s  known=%d  grace=%s  probation=%d/%d  stored=%d  kept_first=%d  oversize=%d  ip_limited=%d  "
+                 "endpoint_cap=%d  evicted=%d  promoted=%d  auth_ip_rejected=%d  auth_known_lane=%d",
+                 known_registry.mode, known_registry.size(),
+                 ("open %ds" % (known_registry.grace_until - time.time())) if known_registry.in_grace() else "closed",
+                 len(probation_pool), MAX_PROBATION_RECIPIENTS,
+                 stats["probation_stored"], stats["probation_kept_first"], stats["probation_oversize"],
+                 stats["probation_ip_limited"], stats["probation_endpoint_cap"], stats["probation_evicted"],
+                 stats["probation_promoted"], stats["auth_ip_rejected"], stats["auth_known_lane"])
         log.info("REJECTED   conn_refused=%d  conn_evicted=%d  unauth_deadline=%d  rate=%d  bytes=%d  type=%d  "
                  "frame=%d  binary=%d  malformed=%d  strike_closed=%d  session_cap=%d  send_timeout=%d  "
                  "push_cooldown=%d  push_dropped=%d",
@@ -2880,7 +3681,10 @@ async def run_signal_server():
              BUF_DIR, BUF_MAX_MSGS, BUF_MAX_AGE, BUF_MAX_AGE_MIGRATE, BUF_MAX_AGE_BURN, BUF_MAX_MB, MAX_BUF_RECIPIENTS, MAX_ENDPOINTS_PER_RECIPIENT)
     log.info("Buffer write-rate: %.1f/s per recipient  burst=%.0f  idle_prune=%ds",
              BUF_WRITE_RATE_LIMIT, BUF_WRITE_RATE_BURST, BUF_RATE_LIMITER_IDLE_S)
-    log.info("Global auth admission: %.1f/s  burst=%.0f", GLOBAL_AUTH_RATE, GLOBAL_AUTH_BURST)
+    log.info("Buffer fair share: regular packets use at most %d of %d slots (%d reserved for migrate/burn); overflow evicts the heaviest sender's oldest",
+             max(1, BUF_MAX_MSGS - max(0, BUF_RESERVED_SLOTS)), BUF_MAX_MSGS, max(0, BUF_RESERVED_SLOTS))
+    log.info("Global auth admission: %.1f/s  burst=%.0f  known-identity lane: %.1f/s burst=%.0f  per-address: %.1f/s burst=%.0f",
+             GLOBAL_AUTH_RATE, GLOBAL_AUTH_BURST, AUTH_KNOWN_RATE, AUTH_KNOWN_BURST, AUTH_RATE_IP, AUTH_BURST_IP)
     log.info("Rate limits: per-socket=%d/s burst=%d  per-ip=%d/s burst=%d",
               RATE_LIMIT_RATE, RATE_LIMIT_BURST, IP_RATE_LIMIT_RATE, IP_RATE_LIMIT_BURST)
     log.info("Sockets: max=%d (all open sockets)  per_ip=%d (key: IPv4 / IPv6 /%d)  unauth_per_ip=%d  unauth_deadline=%.0fs  idle_evict=%.0fs  max_sessions_per_identity=%d  send_timeout=%.0fs",
@@ -2910,10 +3714,21 @@ async def run_signal_server():
     # prime the in-memory directory counts off the loop (one scandir each)
     await asyncio.to_thread(buf_recipient_count.resync)
     await asyncio.to_thread(push_identity_count.resync)
+    # known-identity registry: open / create / rebuild, off the loop (it can
+    # scan the data directories). Never fails — worst case it runs in memory.
+    await asyncio.to_thread(known_registry.open)
+    n_prob = await asyncio.to_thread(probation_pool.load)
+    log.info("State dir: %s  registry=%s  (%s)", STATE_DIR, known_registry.mode, known_registry.note)
+    log.info("Registry: ttl=%.0fd  max_identities=%d  max_endpoints=%d  grace=%ds   Probation: pool=%d (now %d)  max_bytes=%d  "
+             "unseen_devices_per_recipient=%d  new_slots=%.1f/s burst=%.0f per address",
+             REGISTRY_TTL_S / 86400, REGISTRY_MAX_IDENTITIES, REGISTRY_MAX_ENDPOINTS, REGISTRY_GRACE_S,
+             MAX_PROBATION_RECIPIENTS, n_prob, PROBATION_MAX_BYTES, PROBATION_ENDPOINTS_PER_RECIPIENT,
+             PROBATION_IP_RATE, PROBATION_IP_BURST)
     async with websockets.serve(handler, WS_HOST, WS_PORT, max_size=WS_MAX_SIZE):
         asyncio.create_task(log_stats())
         asyncio.create_task(buf_expire())
         asyncio.create_task(sweep_pending_auth())
+        asyncio.create_task(registry_flush_loop())
         await asyncio.Future()
 
 # ══════════════════════════════════════════
@@ -2964,6 +3779,7 @@ if __name__ == "__main__":
                  fmt_bytes(stats["bytes_out"]), stats["msgs_out"],
                  stats["buf_in"], stats["buf_out"])
     finally:
+        known_registry.close()   # last write-behind flush
         PUSH_EXECUTOR.shutdown(wait=False, cancel_futures=True)
         http_proc.terminate()
         http_proc.join()
