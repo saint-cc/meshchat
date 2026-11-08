@@ -30,7 +30,6 @@ Message content is encrypted with AES-256-GCM under a per-device-pair session ke
 - Per-device session establishment (X4DH) with partial forward secrecy. Message content is session-only: there is no fallback to the static identity key, and a message to a device without a ready session is held on your device and sent automatically once one exists. See `known-limitations.md` for exactly what this does and doesn't cover
 - Held outbox: messages wait locally (up to 24 hours) for a secure session instead of being sent under a weaker key
 - Peer-to-peer voice calling over WebRTC (STUN only, no TURN, by design — see `known-limitations.md`)
-- Agent contacts: a bounded command whitelist over ordinary encrypted messages, plus interactive shell access over a WebRTC data channel for contacts on a separate, stricter allowlist
 - No accounts, email addresses or phone numbers
 - Roaming identities — move freely between relay servers
 - No central directory or identity provider
@@ -52,7 +51,7 @@ Message content is encrypted with AES-256-GCM under a per-device-pair session ke
 
 MeshChat identities are derived from a name and passphrase — no registration, API key, or phone number required. That statelessness is what makes the protocol a natural fit for AI agents, not just people.
 
-Agent contacts already work today: a contact can be given a bounded command whitelist over ordinary encrypted messages, or — on a separate, stricter allowlist — an interactive shell over a WebRTC data channel. Looking further ahead, an agent doesn't need any of that client machinery to talk to MeshChat at all — just the ability to run the same handshake a human client does (derive keys, authenticate, encrypt, send). A lightweight skill/tool (e.g. a `SKILL.md`) that lets an agent join as a MeshChat contact this way — talking to a human, or in principle to another agent, since the protocol itself draws no distinction between the two — is planned but not yet built; see `Roadmap.md`.
+An agent needs no special client machinery to talk to MeshChat — just the ability to run the same handshake a human client does (derive keys, authenticate, encrypt, send). The protocol draws no distinction between a human and an agent. A lightweight skill/tool (e.g. a `SKILL.md`) that lets an agent join as a MeshChat contact this way, talking to a human or in principle to another agent, is planned but not yet built; see `Roadmap.md`.
 
 ---
 
@@ -85,7 +84,11 @@ export BUF_MAX_MB=10
 python3 server.py
 ```
 
+Optionally, `STATE_DIR` (default: the directory that holds `BUF_DIR`) is where the relay keeps its own small state: a SQLite registry of the identities that have connected to receive (`known_ids.sqlite3`), and by default the VAPID key and push subscriptions. If you run the relay in a container, mount it as a volume to keep that across updates. Losing it is never fatal: the relay rebuilds the registry from what is on disk and, for a day, treats every recipient as known so nobody's offline messages are refused.
+
 `RELAY_WSS_URL` is required. It is the relay address clients distribute when sharing their identity, and its host is what clients' authentication proofs are bound to. Without a valid value the relay refuses every client with `relay_not_configured`.
+
+The relay is open to anyone and an identity costs nothing to create, so it bounds what a single connection, address or identity can make it spend: sockets held, bytes parsed, disk written, outbound push requests made. The defaults suit a small relay and need no tuning to start. A recipient the relay has never seen can have only **one** packet waiting until it has connected once. The limits and every variable that tunes them are in `protocol.md` (Resource limits, Offline Delivery, Server Configuration).
 
 Push notifications are only sent to push services on an allowlist, `PUSH_ALLOWED_HOSTS`. The defaults cover the services used by Chrome, Edge, Brave, Opera, Firefox and Safari. Setting the variable replaces the defaults; see `protocol.md` for the full configuration table.
 

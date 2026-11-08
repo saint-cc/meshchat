@@ -26,7 +26,7 @@ Implementation version: `0.6.2`, reported informationally in the `version` field
 
 ## Wire Conventions
 
-- **Transport:** WebSocket text frames, one JSON object per frame. Frames larger than the relay's `WS_MAX_SIZE` (default 2 MiB) are dropped.
+- **Transport:** WebSocket text frames, one JSON object per frame. A relay drops frames over its per-type size cap, which is at most `WS_MAX_SIZE` (default 2 MiB); see [Resource limits](#resource-limits).
 - **Binary fields** (`iv`, `data`, `sig`, `ek`, `ekPub`, `nonce`, public keys) are JSON arrays of integers 0–255.
 - **Ids.** `publicId`, `deviceId` and `endpointId` are `base64url(SHA-256(...)[0:12])`, unpadded (16 characters). All ids are base64url, `[A-Za-z0-9_-]{8,64}`, which never contains `:`. `callId`, `sessionId`, `syncId` and `sessionEpoch` are random UUIDs.
 - **base64url** in this document is the URL-safe alphabet without padding. The one exception is the relay segment of a shareable address, which is standard base64 (`btoa`).
@@ -268,7 +268,13 @@ To deliver to a contact on a foreign relay, the client opens a connection to tha
 
 ### Admission limits
 
-A connection that sends `sig:auth_init` but never a proof is closed after `AUTH_TIMEOUT` (15 s, enforced by a periodic sweep). Completed auths are additionally rate-limited server-wide (`GLOBAL_AUTH_RATE`/`GLOBAL_AUTH_BURST`), checked only after the proof is valid; a rejected completion gets `server_busy`.
+Admission is bounded at several points. None of it changes the handshake; a normal client never reaches any of these limits.
+
+- **Before auth.** A socket that has not authenticated may send frames of at most `FRAME_CAP_PREAUTH` (1 KiB); the relay lowers that connection's own maximum frame size for the duration and raises it when auth completes. One address (IPv6 clients are keyed by their /64) may hold at most `MAX_UNAUTH_PER_IP` (4) unauthenticated sockets at once, and every socket must have **completed** auth within `UNAUTH_DEADLINE_S` (10 s) of connecting, or it is closed.
+- **Half-finished handshakes.** A connection that sends `sig:auth_init` but never a proof is closed after `AUTH_TIMEOUT` (15 s, enforced by a periodic sweep).
+- **Per address, before verification.** Auth proofs from one address pass a token bucket (`AUTH_RATE_IP`/`AUTH_BURST_IP`, default 2/s, burst 20) *before* the signature is checked, so one machine cannot make the relay spend CPU on proofs faster than that. Valid and invalid proofs are charged alike. It is sized for a NAT full of clients reconnecting together.
+- **Server-wide, after a valid proof.** Completed auths are rate-limited as a whole (`GLOBAL_AUTH_RATE`/`GLOBAL_AUTH_BURST`). When that budget is spent, an identity the relay already knows (see [Known identities and probation](#known-identities-and-probation)) is still admitted through a lane of its own (`AUTH_KNOWN_RATE`/`AUTH_KNOWN_BURST`), so a flood of brand-new identities cannot lock existing users out. Either rejection gets `server_busy`.
+- **Per identity.** One identity may be connected at most `MAX_SESSIONS_PER_IDENTITY` (8) times at once: devices, tabs, and the outbound connections its contacts' clients open to deliver to it. A further session is admitted and the **oldest** session of that identity is closed.
 
 ### Auth failure
 
@@ -654,13 +660,17 @@ If the recipient is not connected when a buffered packet type arrives, the relay
 ```
 relay_buf/
   <recipientPublicId>/
-    <timestamp>_<uuid>.json          — identity-level bucket, reached by any live session under this identity
+    <ms>_<id>[_s<sender>][_<kind>].json    — identity-level bucket, reached by any live session under this identity
     _endpoints/
       <endpointId>/
-        <timestamp>_<uuid>.json      — device-targeted bucket, reached only by a connection presenting this exact endpoint_id at auth
+        <ms>_<id>[_s<sender>][_<kind>].json — device-targeted bucket, reached only by a connection presenting this exact endpoint_id at auth
+  .probation/
+    <recipientPublicId>/                    — same layout, for an identity this relay has never seen (see below)
 ```
 
 A packet whose `to` is bare goes into the identity-level bucket; one with a `::endpointId` suffix goes into that device's own bucket.
+
+A filename is `<ms>_<id>` (millisecond timestamp and 8 hex characters, so files sort by arrival), then optionally `_s<sender>` — the first 8 hex characters of SHA-256 of the authenticated sender's id, used only to tell senders apart for fair share and not secret — then a kind tag, then `.json`. The kind tag is `_migrate`, `_burn` or `_x4dh_propose` for `app:migrate`, `app:burn` and `session:propose`, and absent otherwise; it lets the relay pick a TTL and apply overwrite-per-sender without opening files. A file without a sender tag (written by an older relay) counts as one sender.
 
 **What is buffered.** Only `app:message`, `app:migrate`, `app:burn`, `session:propose` and `session:ack`. Everything else — `app:sync`, every `sync:*`, every `call:*`, every `data:*` — is live-only. (`sync:backup_push` is never buffered: contact-path pushes answer a live handshake and may be wrapped under an ephemeral held about 60 s in memory, so a buffered copy flushed later could never be unwrapped.)
 
@@ -669,15 +679,39 @@ A packet whose `to` is bare goes into the identity-level bucket; one with a `::e
 On auth, the relay flushes buffered packets oldest-first and deletes each on successful delivery. A connection that presents `endpoint_id` gets **both** the identity-level bucket and its own endpoint bucket; a connection that doesn't gets only the identity-level one. Unauthenticated connections never receive buffered packets.
 
 **Limits** (environment-configurable; applied independently to the identity-level bucket and to each endpoint bucket):
-- `BUF_MAX_MSGS` — maximum buffered packets (default 100, drops oldest).
-- `BUF_MAX_MB` — maximum total size (default 10, drops new).
-- `BUF_MAX_AGE` — expiry (default 24 h, swept periodically).
+- `BUF_MAX_MSGS` — maximum buffered packets (default 100). Which packet makes room is decided by [fair share](#fair-share-and-reserved-slots).
+- `BUF_RESERVED_SLOTS` — of those, the slots only `app:migrate` and `app:burn` may use (default 10). Regular packets are capped at `BUF_MAX_MSGS − BUF_RESERVED_SLOTS`.
+- `BUF_MAX_MB` — maximum total size (default 10). Also decided by fair share.
+- `BUF_MAX_AGE` — expiry (default 24 h, swept periodically; the sweep works in chunks of `BUF_EXPIRE_CHUNK` recipient directories per worker-thread call, so it never blocks the event loop).
 - `BUF_WRITE_RATE_LIMIT`/`BUF_WRITE_RATE_BURST` — rate of *new* buffered writes per bucket, independent of sender. Only the offline path is gated.
 - `MAX_BUF_RECIPIENTS` — distinct recipient directories.
 - `MAX_ENDPOINTS_PER_RECIPIENT` — distinct endpoint buckets one identity can accumulate (default 20).
 - `app:migrate`/`app:burn` use overwrite-per-sender, a long TTL, and are always identity-level.
 
-**Push.** A push is fired only for an `app:message` (including a hello) that missed live delivery and is not self-addressed (`from ≠ to`).
+**Push.** A push is fired only for an `app:message` (including a hello) that missed live delivery and is not self-addressed (`from ≠ to`). It is further limited by a per-recipient cooldown and a bounded queue; see [Firing a push](#firing-a-push).
+
+#### Fair share and reserved slots
+
+When a bucket is full, the packet that goes is the **oldest packet of the sender currently holding the most**: most slots for the count limit, most bytes for the size limit. A tie goes to the sender whose packet is oldest. A sender alone in a bucket can use all of it, but a sender cannot push out someone else's packets by writing more: once it holds the most, its own oldest packet is the one that makes room.
+
+`app:migrate` and `app:burn` may use every slot, including the reserved ones, and when the bucket is full they displace a regular packet (heaviest sender first). A regular packet never evicts a migrate or burn notice. A bucket full of notices refuses any further packet. A packet larger than `BUF_MAX_MB` is refused outright, without evicting anything.
+
+### Known identities and probation
+
+`to` only has to be a well-formed id, so a sender can aim packets at an identity that has never connected to this relay, and each such recipient would otherwise get a full buffer. The relay therefore remembers which identities have authenticated here **to receive** (an auth with `no_receive` does not count) and which of their devices, and buffers differently for a recipient it has not seen:
+
+| Recipient | What is buffered |
+|---|---|
+| Known identity (bare `to`, or a known device) | The normal buffer, with every limit above |
+| Identity never seen here | **One packet**, keep-first, in the probation pool |
+| Known identity, `::endpointId` of a device never seen here | **One packet** per such bucket, and at most `PROBATION_ENDPOINTS_PER_RECIPIENT` (2) such buckets at once |
+
+Live delivery is never affected. Anything beyond the one packet is dropped by the relay until the recipient has connected once.
+
+- **Probation pool.** `BUF_DIR/.probation/<recipientPublicId>/`, with the same layout as a real buffer. Keep-first: if the slot is occupied a further packet is dropped, and nothing already waiting is overwritten. The pool holds at most `MAX_PROBATION_RECIPIENTS` (500) recipients; when it is full the *oldest* entry is evicted for a new one, so probation can never use real buffer capacity. A packet over `PROBATION_MAX_BYTES` (default `FRAME_CAP_HANDSHAKE`, 16 KiB) is refused: a content-free `session:propose` or hello fits, media does not. Starting a new probation slot is rate-limited per source address (`PROBATION_IP_RATE`/`PROBATION_IP_BURST`, default 0.2/s, burst 10). Probation packets expire after `BUF_MAX_AGE`.
+- **Promotion.** The first auth by that identity that **receives** makes it known: its probation directory is moved into the real buffer (merged file by file if a real directory already exists) and flushed with the rest. A device of a known identity becomes known the same way, when it first authenticates with that endpoint id.
+- **The registry.** The set of known identities is a SQLite file, `known_ids.sqlite3`, under `STATE_DIR` (default: the directory that holds `BUF_DIR`). The in-memory copy is authoritative and the file is a write-behind mirror, flushed every 5 s. An identity is forgotten after `REGISTRY_TTL_S` (30 d) without a receiving auth; the registry holds at most `REGISTRY_MAX_IDENTITIES` (50 000, least-recently-seen evicted) and remembers at most `REGISTRY_MAX_ENDPOINTS` (32) devices per identity. A re-auth rewrites an already-known identity's row at most every 10 min.
+- **Loss is not fatal.** The registry is a cache of who has authenticated here. If the file is missing, corrupt, or of a newer format, it is moved aside as `<path>.unusable-<timestamp>`, replaced with a fresh one, and reseeded from the existing directories under `BUF_DIR` and `PUSH_SUBS_DIR`. For `REGISTRY_GRACE_S` afterwards (default `BUF_MAX_AGE`) every recipient is treated as known, so nobody's offline messages are refused because the relay forgot them. If the file cannot be opened at all, the registry lives in memory and the grace window restarts at each boot. Mounting `STATE_DIR` as a volume keeps the registry (and the VAPID key and push subscriptions) across container updates; it is optional.
 
 ---
 
@@ -882,7 +916,7 @@ Stored at `PUSH_SUBS_DIR/<publicId>/<endpointId>.json` as `{ endpoint, p256dh, a
 
 Neither type requires a signature (they redirect no routing and drive no irreversible action) but both require an authenticated socket with `from` matching it. A subscription must pass the [endpoint policy](#push-endpoint-policy) and carry non-empty string `keys.p256dh` and `keys.auth` of at most 256 characters each; anything else is dropped without a reply (the log records the rejection reason and the endpoint's *host* only — the path is the device's push token).
 
-Each identity may hold at most `PUSH_MAX_SUBS_PER_IDENTITY` subscription files (default 10; an identity costs nothing to create). The cap is counted after the stale-duplicate sweep, excluding the subscribing device's own file (a re-subscribe replaces it), and is not exact under concurrent subscribes — a brake on unbounded growth, not a quota. A new subscription beyond it is rejected.
+Each identity may hold at most `PUSH_MAX_SUBS_PER_IDENTITY` subscription files (default 10; an identity costs nothing to create). The cap is counted after the stale-duplicate sweep, excluding the subscribing device's own file (a re-subscribe replaces it), and is not exact under concurrent subscribes — a brake on unbounded growth, not a quota. A new subscription beyond it is rejected. The relay also keeps at most `MAX_PUSH_IDENTITIES` (default 10 000) identity directories under `PUSH_SUBS_DIR`; a first subscription from a further identity is rejected.
 
 ### Push endpoint policy
 
@@ -908,7 +942,7 @@ At **send time**, in addition:
 
 Triggered from the offline-buffering path for an `app:message` that missed live delivery and is not self-addressed. `app:migrate`, `app:burn`, `session:*` and everything live-only never push. A hello and the call notice are ordinary `app:message`s and do push.
 
-Each subscription on file gets its own bodyless HTTPS POST to `endpoint` with `TTL: PUSH_TTL_SECONDS` and `Authorization: vapid t=<jwt>, k=<vapidPublicKey>`. The JWT (`ES256`, claims `{ aud, exp, sub }`, `exp` 12 h out) is signed fresh per push; `aud` is the scheme and host of that endpoint; the signature is raw `r||s`. The POST is made under the defences in the [endpoint policy](#push-endpoint-policy). Pushes are best-effort: a transient failure — network error, 5xx, a redirect, a non-public resolution — is not retried and leaves the file. A `404`/`410`, or an endpoint that no longer passes the policy, deletes the subscription file (the client re-subscribes at its next login).
+Each subscription on file gets its own bodyless HTTPS POST to `endpoint` with `TTL: PUSH_TTL_SECONDS` and `Authorization: vapid t=<jwt>, k=<vapidPublicKey>`. The JWT (`ES256`, claims `{ aud, exp, sub }`, `exp` 12 h out) is signed fresh per push; `aud` is the scheme and host of that endpoint; the signature is raw `r||s`. The POST is made under the defences in the [endpoint policy](#push-endpoint-policy). Pushes are sent in the background, never inline with delivery. At most one push is scheduled per recipient per `PUSH_COOLDOWN_S` (45 s): a push only means "check", so a message arriving inside that window does not fire another. At most `PUSH_MAX_CONCURRENT` (4) are in flight, and at most `PUSH_MAX_QUEUE` (200) are waiting or in flight; beyond that a push is dropped (the packet itself is still buffered). Pushes are best-effort: a transient failure — network error, 5xx, a redirect, a non-public resolution — is not retried and leaves the file. A `404`/`410`, or an endpoint that no longer passes the policy, deletes the subscription file (the client re-subscribes at its next login).
 
 ### Client-side opt-in
 
@@ -920,6 +954,7 @@ The service worker handles `push` (always shows a generic "MeshChat — tap to c
 
 - A push cannot distinguish a call notice from a text, or a hello from either.
 - `call:invite`/`data:invite` are live-only, so a missed call produces no push.
+- A message that arrives within `PUSH_COOLDOWN_S` of the previous push to the same recipient does not push.
 - A message landing on the old relay from a contact who hasn't learned of a migration won't trigger a push (it is still recovered).
 
 ---
@@ -975,8 +1010,47 @@ The service worker handles `push` (always shows a generic "MeshChat — tap to c
 - **Compound `to`** is honoured on the shared delivery branch for `app:sync`, every `sync:*`, `call:*` and `data:*`, as well as for `app:message` and `session:*`. Of the shared-branch types only some `sync:*` self-sync packets send one today.
 - **Compound `from`** is accepted only on `sync:backup_offer`, `sync:backup_accept`, `sync:backup_push`, `sync:restore_ack` and `sync:restore_push`. A receiving client trusts and displays the endpoint half only once the accompanying signature has verified against a contact already on file.
 - **Signature rules differ by type.** Mandatory (drop on missing/invalid): `app:migrate`, `app:burn`, `session:*`, `app:sync`, `sync:restore_req`, `sync:token_resp` (checked client-side), `call:*`, `data:*`. Conditional (must verify whenever we hold a signing key for the claimed sender; an unknown sender is still let through, because bootstrap has to work): contact-path `sync:backup_offer`/`accept`/`push`, `sync:restore_ack`, `sync:restore_push`. A `restore_ack` from ourselves (a sibling device) is always checked, because our own key is always on file. None: the self-sync backup packets. `app:message`: flagged, not dropped.
-- **Rate and size limits.** Each socket has its own token-bucket limiter (`RATE_LIMIT_RATE`/`RATE_LIMIT_BURST`) and shares a wider one with every other socket from the same IP (`IP_RATE_LIMIT_*`); either returns `error { rate_limited }`. Connections are capped in total (`MAX_CONNECTIONS`) and per IP (`MAX_CONNECTIONS_PER_IP`). A frame over `WS_MAX_SIZE` is dropped. `X-Real-IP`/`X-Forwarded-For` are honoured only when the TCP peer is inside `TRUSTED_PROXIES`.
+- **Limits.** Frame size, packet and byte rates, per-type budgets, connection caps and strikes are described under [Resource limits](#resource-limits). `X-Real-IP`/`X-Forwarded-For` are honoured only when the TCP peer is inside `TRUSTED_PROXIES`.
 - Unknown packet types are dropped. Sync and backup types are routed without inspecting their contents.
+
+### Resource limits
+
+The relay is open to anyone and an identity costs nothing to create, so everything a connection can make the relay spend is bounded per socket, per source address, or per identity. None of this changes the wire protocol. Wherever "address" appears below, IPv6 clients are counted by their /64.
+
+**Connections.** `MAX_CONNECTIONS` (100) and `MAX_CONNECTIONS_PER_IP` (15) count every open socket, authenticated or not. Unauthenticated sockets also have their own per-address cap and a deadline, and one identity has a session cap (see [Admission limits](#admission-limits)). When the relay is full a new connection **evicts** instead of being refused: an unauthenticated socket first (oldest first), otherwise an authenticated socket that has been silent for more than `WS_IDLE_EVICT_S` (180 s; a live client announces about every 30 s). If every socket is live and recently active, the newcomer is refused. A closing socket holds its slot until the close finishes, so past 2 × `MAX_CONNECTIONS` new connections are refused outright.
+
+**Frame size.** Checked on the raw text before it is parsed, by class of message:
+
+| Class | Cap (default) | Types |
+|---|---|---|
+| pre-auth | `FRAME_CAP_PREAUTH` — 1 KiB | `sig:auth_init`, `sig:auth_proof`, and every frame from a socket that has not authenticated |
+| tiny | `FRAME_CAP_TINY` — 4 KiB | `session:propose`, `session:ack`, `app:burn`, `sig:announce`, `sig:ping`, `sig:relay_req` |
+| handshake | `FRAME_CAP_HANDSHAKE` — 16 KiB | `app:migrate`, `sync:backup_offer`, `sync:backup_accept`, `sync:restore_req`, `sync:restore_ack`, `sync:token_req`, `sync:token_resp`, `sig:push_subscribe`, `sig:push_unsubscribe` |
+| signal | `FRAME_CAP_SIGNAL` — 128 KiB | `call:*`, `data:*` |
+| bulk | `FRAME_CAP_BULK` — `WS_MAX_SIZE` | `app:sync`, `sync:backup_push`, `sync:restore_push` |
+| message | `FRAME_CAP_MESSAGE` — `WS_MAX_SIZE` | `app:message` |
+
+Every cap is clamped to `WS_MAX_SIZE` (2 MiB), the transport library's own limit, which the relay also lowers on a connection to the pre-auth cap until it authenticates (the library closes a socket that exceeds its limit with code 1009). A type not listed is held to the tiny cap and dropped as unknown. A frame over its cap is dropped and counts as a strike.
+
+**Rates.** Each socket has a token bucket for packets (`RATE_LIMIT_RATE`/`RATE_LIMIT_BURST`) and shares a wider one with every other socket of the same address (`IP_RATE_LIMIT_*`). The same two levels are also counted in **bytes**, since a packet count cannot tell a 100-byte frame from a 2 MiB one: per socket `BYTE_RATE_SOCKET` (1 MiB/s, burst 6 MiB), per address `BYTE_RATE_IP` (2 MiB/s, burst 12 MiB). Each burst is raised as needed to hold at least one maximum-size frame. On top of these, each class below has its own bucket per socket, so a socket cannot spend its whole allowance on the most expensive kind of packet:
+
+| Class | Types | Refill / s | Burst |
+|---|---|---|---|
+| `announce` | `sig:announce` | 0.1 | 3 |
+| `push` | `sig:push_subscribe`, `sig:push_unsubscribe` | 0.2 | 5 |
+| `session` | `session:propose`, `session:ack` | 5 | 40 |
+| `migrate` | `app:migrate`, `app:burn` | 2 | 60 |
+| `sync` | `app:sync`, every `sync:*` | 5 | 30 |
+| `signal` | `call:*`, `data:*` | 10 | 40 |
+| `misc` | `sig:ping`, `sig:relay_req` | 2 | 10 |
+
+`app:message` has no class bucket and is governed by the general packet and byte limiters. The class values are `LIMIT_<CLASS>_RATE` and `LIMIT_<CLASS>_BURST`.
+
+**Strikes.** Answering every over-limit packet would turn a flood into twice the traffic, so a violation (a rate or byte limit, an oversized or malformed frame, traffic before auth) is a **strike** instead, and only the first rate-limit or not-authenticated reply on a socket is actually sent. Strikes leak away, one per `STRIKE_DECAY_S` (10 s) of quiet; a socket whose count exceeds `STRIKE_LIMIT` (10) is closed. The close code says why: `1008` for malformed, oversized or unauthenticated traffic, `1013` for rate limits and capacity, `1003` for a binary frame (the protocol is text-only). Hitting the per-address limiter counts half a strike (`STRIKE_WEIGHT_IP`), because a neighbour behind the same NAT can hit it too.
+
+**Slow peers.** A send that does not complete within `SEND_TIMEOUT_S` (8 s) closes that socket, so a peer that stops reading cannot hold up every handler delivering to it.
+
+**Logging.** A repeating warning is logged at most once per kind per `LOG_THROTTLE_S` (10 s), and the next line reports how many were suppressed, so a flood cannot also become a log flood.
 
 ---
 
@@ -1283,19 +1357,43 @@ Held in memory only, never persisted: pending X4DH proposal ephemerals, retired 
 | `RELAY_WSS_URL`       | —             | Public WSS URL of this relay. **Required for auth**: its host is what clients' auth proofs are bound to; with no valid value the relay refuses every `sig:auth_init` (`relay_not_configured`) |
 | `RELAY_AUTH_HOSTS`    | —             | Extra hostnames (bare, or full URLs; comma-separated) this relay also accepts an auth proof for. Only meaningful on top of a valid `RELAY_WSS_URL` |
 | `PROTOCOL_VERSION`    | `0.6.2`       | Reported on `sig:relay_info`; informational |
-| `WS_MAX_SIZE`         | `2097152`     | Maximum frame size in bytes; larger frames are dropped |
-| `MAX_CONNECTIONS`     | `100`         | Total concurrent WebSocket sessions |
-| `MAX_CONNECTIONS_PER_IP` | `15`       | Concurrent sessions per source IP |
+| `WS_MAX_SIZE`         | `2097152`     | Outer bound on any frame, in bytes. The per-type caps below it are clamped to this |
+| `FRAME_CAP_PREAUTH`   | `1024`        | Largest frame accepted before auth |
+| `FRAME_CAP_TINY`      | `4096`        | `session:*`, `app:burn`, `sig:announce`, `sig:ping`, `sig:relay_req` |
+| `FRAME_CAP_HANDSHAKE` | `16384`       | `app:migrate`, `sync:backup_offer`/`accept`, `sync:restore_req`/`ack`, `sync:token_*`, `sig:push_*` |
+| `FRAME_CAP_SIGNAL`    | `131072`      | `call:*`, `data:*` |
+| `FRAME_CAP_BULK`      | `WS_MAX_SIZE` | `app:sync`, `sync:backup_push`, `sync:restore_push` |
+| `FRAME_CAP_MESSAGE`   | `WS_MAX_SIZE` | `app:message` |
+| `MAX_CONNECTIONS`     | `100`         | Total concurrent sockets, authenticated or not. When full, a new connection evicts an unauthenticated or idle one instead of being refused |
+| `MAX_CONNECTIONS_PER_IP` | `15`       | Concurrent sockets per source address (IPv6: per /64) |
+| `MAX_UNAUTH_PER_IP`   | `4`           | Unauthenticated sockets one address may hold at once |
+| `UNAUTH_DEADLINE_S`   | `10`          | Seconds from connect to a completed auth, else the socket is closed |
+| `WS_IDLE_EVICT_S`     | `180`         | An authenticated socket silent this long may be evicted when the relay is full |
+| `MAX_SESSIONS_PER_IDENTITY` | `8`     | Concurrent sessions of one identity; past it the oldest is closed |
+| `SEND_TIMEOUT_S`      | `8`           | A send that takes longer closes the socket |
 | `TRUSTED_PROXIES`     | `127.0.0.1,::1` | Comma-separated IPs/CIDR ranges whose `X-Real-IP`/`X-Forwarded-For` are honoured |
 | `RATE_LIMIT_RATE`     | `20`          | Per-socket token refill, packets/second |
 | `RATE_LIMIT_BURST`    | `60`          | Per-socket burst |
 | `IP_RATE_LIMIT_RATE`  | `3 × RATE_LIMIT_RATE`  | Budget shared by all sockets from one IP |
 | `IP_RATE_LIMIT_BURST` | `3 × RATE_LIMIT_BURST` | Burst for that shared budget |
+| `BYTE_RATE_SOCKET`    | `1048576`     | Bytes/second refilled per socket |
+| `BYTE_BURST_SOCKET`   | `max(6 MiB, 3 × WS_MAX_SIZE)`  | Byte burst per socket |
+| `BYTE_RATE_IP`        | `2097152`     | Bytes/second refilled per source address |
+| `BYTE_BURST_IP`       | `max(12 MiB, 6 × WS_MAX_SIZE)` | Byte burst per source address |
+| `LIMIT_<CLASS>_RATE`, `LIMIT_<CLASS>_BURST` | see [Resource limits](#resource-limits) | Per-socket bucket for a class of message. `<CLASS>` is `ANNOUNCE`, `PUSH`, `SESSION`, `MIGRATE`, `SYNC`, `SIGNAL` or `MISC` |
+| `STRIKE_LIMIT`        | `10`          | A socket whose strike count exceeds this is closed |
+| `STRIKE_DECAY_S`      | `10`          | One strike is forgiven per this many quiet seconds |
+| `LOG_THROTTLE_S`      | `10`          | At most one log line per kind per this many seconds |
 | `GLOBAL_AUTH_RATE`    | `50`          | Server-wide cap on completed auths/second |
 | `GLOBAL_AUTH_BURST`   | `100`         | Burst for that cap |
+| `AUTH_RATE_IP`        | `2`           | Auth proofs/second per source address, checked before the signature is verified |
+| `AUTH_BURST_IP`       | `20`          | Burst for that limit |
+| `AUTH_KNOWN_RATE`     | `GLOBAL_AUTH_RATE`  | Completed auths/second for identities in the registry, used when the global budget is spent |
+| `AUTH_KNOWN_BURST`    | `GLOBAL_AUTH_BURST` | Burst for that lane |
 | `BUF_DIR`             | `./relay_buf` | Offline message buffer directory |
 | `BUF_MAX_MSGS`        | `100`         | Max buffered packets per bucket |
-| `BUF_MAX_AGE`         | `86400`       | Buffer expiry in seconds — ordinary packets, including `session:*` |
+| `BUF_RESERVED_SLOTS`  | `10`          | Of those, slots only `app:migrate`/`app:burn` may use |
+| `BUF_MAX_AGE`         | `86400`       | Buffer expiry in seconds — ordinary packets, including `session:*`, and probation packets |
 | `BUF_MAX_AGE_MIGRATE` | `604800`      | Expiry in seconds (7 d) — `app:migrate` only |
 | `BUF_MAX_AGE_BURN`    | `604800`      | Expiry in seconds (7 d) — `app:burn` only |
 | `BUF_MAX_MB`          | `10`          | Max buffer size per bucket in MB |
@@ -1303,14 +1401,30 @@ Held in memory only, never persisted: pending X4DH proposal ephemerals, retired 
 | `BUF_WRITE_RATE_BURST`| `20`          | Burst for that limit |
 | `MAX_BUF_RECIPIENTS`  | `10000`       | Max distinct recipient directories under `BUF_DIR` |
 | `MAX_ENDPOINTS_PER_RECIPIENT` | `20`  | Max endpoint buckets one identity can accumulate |
+| `BUF_EXPIRE_CHUNK`    | `200`         | Recipient directories swept per worker-thread call during expiry |
+| `STATE_DIR`           | directory containing `BUF_DIR` | Where the relay keeps its own small state: the registry, and by default the VAPID key and push subscriptions |
+| `REGISTRY_DB`         | `STATE_DIR/known_ids.sqlite3` | The known-identity registry file |
+| `REGISTRY_GRACE_S`    | `BUF_MAX_AGE` | After a **new** registry is created, every recipient counts as known for this long |
+| `REGISTRY_TTL_S`      | `2592000`     | An identity not seen to receive for this long (30 d) is forgotten |
+| `REGISTRY_MAX_IDENTITIES` | `50000`   | Registry size; the least-recently-seen identity is evicted past it |
+| `REGISTRY_MAX_ENDPOINTS`  | `32`      | Devices remembered per identity (least-recently-seen evicted) |
+| `MAX_PROBATION_RECIPIENTS` | `500`    | Never-seen recipients holding a probation packet at once; the oldest is evicted for a new one |
+| `PROBATION_MAX_BYTES` | `FRAME_CAP_HANDSHAKE` | Largest packet accepted for a recipient or device not yet known |
+| `PROBATION_ENDPOINTS_PER_RECIPIENT` | `2` | Unknown-device buckets a known identity may hold at once |
+| `PROBATION_IP_RATE`   | `0.2`         | New probation slots/second per source address |
+| `PROBATION_IP_BURST`  | `10`          | Burst for that limit |
 | `VAPID_SUBJECT`       | `mailto:admin@example.com` | Operator contact, sent in every push JWT's `sub` claim |
-| `VAPID_KEY_FILE`      | next to `BUF_DIR` | Persisted VAPID EC P-256 private key (PEM); generated on first boot if missing |
-| `PUSH_SUBS_DIR`       | next to `BUF_DIR` | Push subscription storage |
+| `VAPID_KEY_FILE`      | `STATE_DIR/vapid_key.pem` | Persisted VAPID EC P-256 private key (PEM); generated on first boot if missing |
+| `PUSH_SUBS_DIR`       | `STATE_DIR/push_subs` | Push subscription storage |
 | `PUSH_TTL_SECONDS`    | `60`          | `TTL` header sent with each push |
 | `PUSH_ALLOWED_HOSTS`  | the defaults listed under [Push endpoint policy](#push-endpoint-policy) | Comma-separated allowlist of push-service hosts (an entry is an exact hostname, or a leading-dot suffix that needs at least one more label). **Replaces** the defaults rather than adding to them. A rejected endpoint's host is logged, so adding a service is a config change. Empty turns push off |
 | `PUSH_MAX_SUBS_PER_IDENTITY` | `10`   | Push subscriptions kept per identity (one file per endpoint id). A further new endpoint is rejected |
+| `MAX_PUSH_IDENTITIES` | `10000`       | Identity directories under `PUSH_SUBS_DIR`; a first subscription from a further identity is rejected |
+| `PUSH_COOLDOWN_S`     | `45`          | At most one push per recipient per this long |
+| `PUSH_MAX_CONCURRENT` | `4`           | Pushes in flight |
+| `PUSH_MAX_QUEUE`      | `200`         | Pushes waiting or in flight; beyond it a push is dropped |
 
-`AUTH_TIMEOUT` (15 s), `AUTH_VERSION` (`2`) and the push request limits (endpoint at most 2048 characters, each key at most 256, 10 s timeout per connect and read, at most 3 resolved addresses tried per send) are constants, not environment variables.
+`AUTH_TIMEOUT` (15 s), `AUTH_VERSION` (`2`), `CONN_HARD_CAP_FACTOR` (2), `IPV6_KEY_PREFIX` (64), `STRIKE_WEIGHT_IP` (0.5), the close codes (`1008`, `1013`, `1003`, `1009`), `REGISTRY_FLUSH_S` (5 s), `REGISTRY_TOUCH_GRANULARITY_S` (600 s), `PROBATION_DIRNAME` (`.probation`) and the push request limits (endpoint at most 2048 characters, each key at most 256, 10 s timeout per connect and read, at most 3 resolved addresses tried per send) are constants, not environment variables.
 
 ---
 
