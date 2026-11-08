@@ -2,7 +2,7 @@
 
 A decentralised, encrypted messaging protocol built on WebSocket relay servers. No accounts, no central authority, no plaintext.
 
-Implementation version: `0.6.2`, reported informationally in the `version` field of `sig:relay_info` (not enforced). This document specifies the protocol as implemented, in enough detail to build an interoperable client. Packet shapes, key rules and signed field sets are exact; a peer that deviates will have its packets dropped. `X4DH.md` is the authoritative source for session establishment, session keys and send-readiness. `known-limitations.md` lists the permanent trade-offs.
+Implementation version: `0.6.3`, reported informationally in the `version` field of `sig:relay_info` (not enforced). This document specifies the protocol as implemented, in enough detail to build an interoperable client. Packet shapes, key rules and signed field sets are exact; a peer that deviates will have its packets dropped. `X4DH.md` is the authoritative source for session establishment, session keys and send-readiness. `known-limitations.md` lists the permanent trade-offs.
 
 ---
 
@@ -1356,7 +1356,7 @@ Held in memory only, never persisted: pending X4DH proposal ephemerals, retired 
 | `WS_PORT`             | `8888`        | WebSocket signal server port |
 | `RELAY_WSS_URL`       | —             | Public WSS URL of this relay. **Required for auth**: its host is what clients' auth proofs are bound to; with no valid value the relay refuses every `sig:auth_init` (`relay_not_configured`) |
 | `RELAY_AUTH_HOSTS`    | —             | Extra hostnames (bare, or full URLs; comma-separated) this relay also accepts an auth proof for. Only meaningful on top of a valid `RELAY_WSS_URL` |
-| `PROTOCOL_VERSION`    | `0.6.2`       | Reported on `sig:relay_info`; informational |
+| `PROTOCOL_VERSION`    | `0.6.3`       | Reported on `sig:relay_info`; informational |
 | `WS_MAX_SIZE`         | `2097152`     | Outer bound on any frame, in bytes. The per-type caps below it are clamped to this |
 | `FRAME_CAP_PREAUTH`   | `1024`        | Largest frame accepted before auth |
 | `FRAME_CAP_TINY`      | `4096`        | `session:*`, `app:burn`, `sig:announce`, `sig:ping`, `sig:relay_req` |
@@ -1470,5 +1470,5 @@ Held in memory only, never persisted: pending X4DH proposal ephemerals, retired 
 
 ---
 
-*MeshChat Protocol v1 — implementation 0.6.2 — experimental, subject to change*
+*MeshChat Protocol v1 — implementation 0.6.3 — experimental, subject to change*
 *Last updated: October 2026*
