@@ -13,7 +13,7 @@
 
    Load order: meshchat-lib.js → meshchat-gui.js → meshchat.js → statemachine.js
 ═══════════════════════════════════════════════════════════════ */
-const CLIENT_VERSION = "0.6.3";
+const CLIENT_VERSION = "0.6.4";
 
 const POLL_INTERVAL_MS        	= 30_000;			// base interval between presence polls
 const POLL_JITTER_MS          	= 10_000;			// ± random jitter added to poll interval
@@ -210,8 +210,9 @@ function isDuplicateInbound(key, windowMs = DEDUP_WINDOW_MS) {
 // this to the key keeps real duplicate suppression while letting
 // different replies from one endpoint through independently.
 function ekDedupTag(ek) {
-  if (!Array.isArray(ek) || !ek.length) return "";
-  return ":" + ek.slice(0, 6).map(b => (b & 0xff).toString(16).padStart(2, "0")).join("");
+  const b = tryBytes(ek);   // int array (<= 0.6.3) or base64url string
+  if (!b || !b.length) return "";
+  return ":" + bytesToHex(b.subarray(0, 6));
 }
 
 /* ══════════════════════════════════════════
@@ -310,15 +311,15 @@ async function decryptMessage(blob, key, aad) {
   if (blob.v !== undefined && blob.v > 2) throw new Error(`unsupported message version v${blob.v}`);
   if (aad) { if (blob.v !== 2) throw new Error(`message blob v${blob.v} lacks envelope binding`); }
   else if (blob.v === 2)       throw new Error("message blob v2 needs its envelope binding to decrypt");
-  const params = { name: "AES-GCM", iv: new Uint8Array(blob.iv) };
+  const params = { name: "AES-GCM", iv: toBytes(blob.iv, 12) };
   if (aad) params.additionalData = aad;
-  const plain = await crypto.subtle.decrypt(params, key, new Uint8Array(blob.data));
+  const plain = await crypto.subtle.decrypt(params, key, toBytes(blob.data));
   return JSON.parse(new TextDecoder().decode(plain));
 }
 function signBlob(blob){
   const bytes=new TextEncoder().encode(JSON.stringify(blob));
   const sig=ed25519.sign(bytes,state.keys.signingKeySeed);
-  return Array.from(sig);
+  return b64e(sig);   // base64url string on the wire since 0.6.4 (verifyBlob still reads either form)
 }
 
 /* ══════════════════════════════════════════
@@ -381,7 +382,7 @@ function msgSigBody(m, toId) {
 function signMessage(m, toId) {
   try {
     const body = msgSigBody(m, toId);
-    return body ? rawToBase64(Uint8Array.from(signBlob(body))) : undefined;
+    return body ? signBlob(body) : undefined;
   } catch(e) { return undefined; }
 }
 
@@ -1724,7 +1725,7 @@ async function sendX4DHPropose(contactId, theirDeviceId) {
 
   const obj = {
     type: "session:propose", from: state.publicId, to: buildAddress(contactId, theirEndpoint),
-    sessionEpoch, ekPub: Array.from(ekPub), deviceId: state.deviceId, ts: proposeTs,
+    sessionEpoch, ekPub: b64e(ekPub), deviceId: state.deviceId, ts: proposeTs,
   };
   obj.sig = signX4DHPacket(obj);
   const viaRelay = sendToRelay(contactId, obj, true);
@@ -1778,7 +1779,11 @@ async function handleX4DHPropose(msg) {
     return;
   }
 
-  const ekAPub = new Uint8Array(msg.ekPub);
+  const ekAPub = tryBytes(msg.ekPub, 32);
+  if (!ekAPub) {
+    mlog.warn(`\u2190 X4DH_PROPOSE from ${pid(msg.from, { deviceId: theirDeviceId })} \u2014 ekPub malformed, dropped`);
+    return;
+  }
   const dh1 = x25519.getSharedSecret(state.x25519Seed, contact.x25519PublicKey);
   const dh2 = x25519.getSharedSecret(state.x25519Seed, ekAPub);
   const rk0 = await deriveX4DHRootStage1(dh1, dh2);
@@ -1851,7 +1856,7 @@ async function completeX4DHAck(contactId, theirDeviceId, theirEndpoint, sessionE
 
   const ackObj = {
     type: "session:ack", from: state.publicId, to: buildAddress(contactId, theirEndpoint),
-    sessionEpoch, ekPub: Array.from(ekBPub), deviceId: state.deviceId, ts: Date.now(),
+    sessionEpoch, ekPub: b64e(ekBPub), deviceId: state.deviceId, ts: Date.now(),
   };
   ackObj.sig = signX4DHPacket(ackObj);
   const viaRelay = sendToRelay(contactId, ackObj, true);
@@ -1931,7 +1936,11 @@ async function handleX4DHAck(msg) {
     return;
   }
 
-  const ekBPub = new Uint8Array(msg.ekPub);
+  const ekBPub = tryBytes(msg.ekPub, 32);
+  if (!ekBPub) {
+    mlog.warn(`\u2190 X4DH_ACK     from ${pid(msg.from, { deviceId: theirDeviceId })} \u2014 ekPub malformed, dropped`);
+    return;
+  }
   const dh3    = x25519.getSharedSecret(state.x25519Seed, ekBPub);
   const dh4    = x25519.getSharedSecret(pending.ekPriv, ekBPub);
   const rk0    = base64ToRaw(session.rootKey);
@@ -2044,15 +2053,29 @@ function contactNeedsHello(contactId) {
     (now - (info.lastSeen || 0)) <= FANOUT_STALE_MS && !getX4DHSession(contactId, deviceId));
 }
 
+/* Largest app:message frame the relay accepts: FRAME_CAP_MESSAGE, which
+   server.py clamps to WS_MAX_SIZE (default 2 MiB). A relay can be configured
+   lower or higher; this is the default every stock relay ships with. A frame
+   over the cap is not answered with an error — the relay closes the whole
+   connection (1009 / policy) — and the sender would still have shown "sent".
+   So the check lives here, before anything is written to a socket. */
+const RELAY_FRAME_CAP_MESSAGE = 2 * 1024 * 1024;
+
 async function sendFannedX4DH(contactId, payload) {
   const resolved = resolveDeviceTargets(contactId);
-  let sent = false, x4dhCount = 0, awaitingSession = 0;
+  let sent = false, x4dhCount = 0, awaitingSession = 0, tooBig = 0;
   const envelopes = [];
 
   for (const { deviceId, endpointId } of resolved.targeted) {
     const wireKey = isSessionSendReady(contactId, deviceId) ? await getOrDeriveWireKey(contactId, deviceId) : null;
     if (!wireKey) { awaitingSession++; continue; }
     const obj = await sealEnvelope("app:message", state.publicId, buildAddress(contactId, endpointId), wireKey, payload);
+    const frameLen = JSON.stringify(obj).length;   // ASCII only: base64url + ids, so chars == bytes
+    if (frameLen > RELAY_FRAME_CAP_MESSAGE) {
+      tooBig++;
+      mlog.warn(`\u2192 MSG too large  to ${pid(contactId, { deviceId })}  ${(frameLen / 1024).toFixed(0)} KiB on the wire, relay limit ${RELAY_FRAME_CAP_MESSAGE / 1024} KiB \u2014 not sent`);
+      continue;
+    }
     const viaRelay = sendToRelay(contactId, obj, true);
     if (!viaRelay) sendSignal(obj);
     sent = sent || viaRelay || state.ws?.readyState === WebSocket.OPEN;
@@ -2065,13 +2088,13 @@ async function sendFannedX4DH(contactId, payload) {
   const helloWanted = contactId !== state.publicId && contactNeedsHello(contactId);
   if (helloWanted) sendHello(contactId, "fanout");
 
-  return { sent, targetedCount: resolved.targeted.length, x4dhCount, awaitingSession, helloWanted, envelopes };
+  return { sent, targetedCount: resolved.targeted.length, x4dhCount, awaitingSession, tooBig, helloWanted, envelopes };
 }
 
 // One log fragment for every send path: "2 targeted (1 x4dh, 1 awaiting session) + hello".
 function fanSummary(f) {
   const nowhere = (!f.sent && f.x4dhCount > 0) ? " — nowhere, no open socket" : "";
-  return `${f.targetedCount} targeted (${f.x4dhCount} x4dh${f.awaitingSession ? `, ${f.awaitingSession} awaiting session` : ""})${f.helloWanted ? " + hello" : ""}${nowhere}`;
+  return `${f.targetedCount} targeted (${f.x4dhCount} x4dh${f.awaitingSession ? `, ${f.awaitingSession} awaiting session` : ""}${f.tooBig ? `, ${f.tooBig} TOO LARGE — not sent` : ""})${f.helloWanted ? " + hello" : ""}${nowhere}`;
 }
 
 /* ══════════════════════════════════════════
@@ -2266,7 +2289,7 @@ async function sendQrIntro(contactId, tokenB64) {
     const type = "app:message", to = contactId;
     const blob = await encryptMessage(wrapKey, payload, envelopeAad(type, state.publicId, to));
     blob.intro = 1;
-    blob.ek    = Array.from(eph.pub);            // inside the signature: the sig covers the whole blob
+    blob.ek    = b64e(eph.pub);                  // inside the signature: the sig covers the whole blob
     const obj = { type, from: state.publicId, to, blob, sig: signEnvelope(type, state.publicId, to, blob) };
     const viaRelay = sendToRelay(contactId, obj, true);
     if (!viaRelay) sendSignal(obj);
@@ -2287,16 +2310,15 @@ async function handleQrIntro(msg) {
     mlog.debug(`← QR_INTRO     from ${pid(msg.from)} — no live QR, dropped`);
     return;
   }
-  const ek = msg.blob.ek;
-  if (msg.type !== "app:message" || msg.blob.v !== 2 || !msg.sig || typeof msg.from !== "string" ||
-      !Array.isArray(ek) || ek.length !== 32 || !ek.every(b => Number.isInteger(b) && b >= 0 && b <= 255)) {
+  const ek = tryBytes(msg.blob.ek, 32);
+  if (msg.type !== "app:message" || msg.blob.v !== 2 || !msg.sig || typeof msg.from !== "string" || !ek) {
     mlog.debug(`← QR_INTRO     from ${pid(msg.from)} — malformed, dropped`);
     return;
   }
   const tokenBytes = qrLive.tokenBytes.slice();   // private copy: a disarm mid-await zeroes the original
   let plain;
   try {
-    const shared = x25519.getSharedSecret(state.x25519Seed, Uint8Array.from(ek));
+    const shared = x25519.getSharedSecret(state.x25519Seed, ek);
     plain = await decryptMessage(msg.blob, await deriveIntroWrapKey(shared, tokenBytes), envelopeAad(msg.type, msg.from, msg.to));
   } catch(e) {
     mlog.debug(`← QR_INTRO     from ${pid(msg.from)} — not decryptable under the live token, ignored`);
@@ -2377,7 +2399,7 @@ async function sendContent(contactId, payload, { hold = true, label = "MSG" } = 
     // Self chat: there is nobody to wait for. No sibling with a session just
     // means nothing to deliver — the note stays local until one exists.
     const fanned = await sendFannedX4DH(contactId, payload);
-    return { outcome: (fanned.x4dhCount === 0 || fanned.sent) ? "sent" : "failed", fanned };
+    return { outcome: ((fanned.x4dhCount === 0 && !fanned.tooBig) || fanned.sent) ? "sent" : "failed", fanned };
   }
   const ready  = readyTargetCount(contactId);
   const queued = hold && hasHeld(contactId);
@@ -2594,7 +2616,10 @@ function handshakeSigProblem(msg, key, verified) {
 // only exists so a stored-blob overwrite can't also be used to fill storage.
 const MAX_PEER_BACKUP_BYTES = 1024 * 1024;
 function peerBackupBlobOk(blob) {
-  return !!blob && typeof blob === "object" && Array.isArray(blob.data) && blob.data.length <= MAX_PEER_BACKUP_BYTES;
+  if (!blob || typeof blob !== "object") return false;
+  const d = blob.data;   // int array (<= 0.6.3) or base64url string
+  const n = typeof d === "string" ? Math.floor(d.length * 3 / 4) : Array.isArray(d) ? d.length : -1;
+  return n >= 0 && n <= MAX_PEER_BACKUP_BYTES;
 }
 
 // Tracks which peers we have a pending offer waiting for accept. Bare
@@ -2938,12 +2963,12 @@ async function handleBackupAccept(msg) {
   let outBlob = pending.blob, ek = null;
   if (verified && msg.ek) {
     try {
-      const theirEk = new Uint8Array(msg.ek);
+      const theirEk = toBytes(msg.ek, 32);
       const { priv, pub } = generateX25519Ephemeral();
       const shared  = x25519.getSharedSecret(priv, theirEk);
       const wrapKey = await deriveEphemeralWrapKey(shared);
       outBlob = await encryptObject(wrapKey, pending.blob);
-      ek = Array.from(pub);
+      ek = b64e(pub);
     } catch(e) {
       mlog.warn(`BACKUP_PUSH    wrap failed for ${pid(fromId)}, sending unwrapped: ${e.message}`);
       outBlob = pending.blob; ek = null;
@@ -3155,7 +3180,11 @@ async function handleBackupPush(msg) {
       mlog.warn(`← BACKUP_PUSH  from ${pid(fromId, verified ? { endpointId: fromEndpoint } : {})} — wrap present but no pending ephemeral for ${pid(fromId)}, dropped`);
       return;
     }
-    const theirEk = new Uint8Array(msg.ek);
+    const theirEk = tryBytes(msg.ek, 32);
+    if (!theirEk) {
+      mlog.warn(`\u2190 BACKUP_PUSH  from ${pid(fromId)} \u2014 wrap key malformed, dropped`);
+      return;
+    }
     let matched = false;
     for (const candidate of candidates) {
       try {
@@ -3447,7 +3476,7 @@ function appendPendingEk(map, key, targetId, endpointId, timeoutMs, label) {
 function attachRestoreEk(obj, targetId, endpointId) {
   const key = pendingEkSlotKey(targetId, endpointId);
   const pub = appendPendingEk(pendingRestoreEk, key, targetId, endpointId, RESTORE_EK_TIMEOUT_MS, "RESTORE_EK");
-  obj.ek = Array.from(pub);
+  obj.ek = b64e(pub);
 }
 // Same one-shot-ephemeral shape as attachRestoreEk/pendingRestoreEk just
 // above, for the contact BACKUP handshake instead of restore. Kept as a
@@ -3462,7 +3491,7 @@ const pendingBackupEk = new Map();     // slotKey (see pendingEkSlotKey) -> Arra
 function attachBackupEk(obj, targetId, endpointId) {
   const key = pendingEkSlotKey(targetId, endpointId);
   const pub = appendPendingEk(pendingBackupEk, key, targetId, endpointId, BACKUP_EK_TIMEOUT_MS, "BACKUP_EK");
-  obj.ek = Array.from(pub);
+  obj.ek = b64e(pub);
 }
 /* ══════════════════════════════════════════
    RESTORE_REQ — mandatory signature, unlike the handshake pair above
@@ -3864,12 +3893,12 @@ async function handleRestoreAck(msg) {
     let outBlob = freshBlob, ek = null;
     if (verified && msg.ek) {
       try {
-        const theirEk = new Uint8Array(msg.ek);
+        const theirEk = toBytes(msg.ek, 32);
         const { priv, pub } = generateX25519Ephemeral();
         const shared  = x25519.getSharedSecret(priv, theirEk);
         const wrapKey = await deriveEphemeralWrapKey(shared);
         outBlob = await encryptObject(wrapKey, freshBlob);
-        ek = Array.from(pub);
+        ek = b64e(pub);
       } catch(e) {
         mlog.warn(`RESTORE_PUSH   wrap failed for self ${fromDisp}, sending unwrapped: ${e.message}`);
         outBlob = freshBlob; ek = null;
@@ -3897,12 +3926,12 @@ async function handleRestoreAck(msg) {
   let outBlob = backup, ek = null;
   if (verified && msg.ek) {
     try {
-      const theirEk = new Uint8Array(msg.ek);
+      const theirEk = toBytes(msg.ek, 32);
       const { priv, pub } = generateX25519Ephemeral();
       const shared  = x25519.getSharedSecret(priv, theirEk);
       const wrapKey = await deriveEphemeralWrapKey(shared);
       outBlob = await encryptObject(wrapKey, backup);
-      ek = Array.from(pub);
+      ek = b64e(pub);
     } catch(e) {
       mlog.warn(`RESTORE_PUSH   wrap failed for ${fromDisp}, sending unwrapped: ${e.message}`);
       outBlob = backup; ek = null;
@@ -4025,7 +4054,11 @@ async function handleRestorePush(msg) {
         mlog.warn(`← RESTORE_PUSH from ${fromDisp} — wrap present but no pending ephemeral for ${pid(fromId)}, dropped`);
         return;
       }
-      const theirEk = new Uint8Array(msg.ek);
+      const theirEk = tryBytes(msg.ek, 32);
+      if (!theirEk) {
+        mlog.warn(`\u2190 RESTORE_PUSH from ${fromDisp} \u2014 wrap key malformed, dropped`);
+        return;
+      }
       let matched = false;
       for (const candidate of candidates) {
         try {
@@ -4148,7 +4181,7 @@ const SYNC_PENDING_TTL_MS  = 60_000;   // how long a reply to our own request st
 const SYNC_MAX_ID_LEN      = 64;       // syncId is a uuid; anything longer is junk
 const pendingSyncs = new Map();        // syncId -> { contactId, createdAt, ekPriv } — ekPriv is memory-only, same tier as pendingX4DHProposals
 
-const validSyncEk = (ek) => Array.isArray(ek) && ek.length === 32 && ek.every(b => Number.isInteger(b) && b >= 0 && b <= 255);
+const validSyncEk = (ek) => tryBytes(ek, 32) !== null;   // int array (<= 0.6.3) or base64url string
 
 // The exact object that is signed/verified — built in ONE place, with a
 // fixed key order, so sender and receiver can't drift apart (JSON.stringify
@@ -4286,7 +4319,7 @@ async function initiateExchange(contactId) {
   // private key sitting in memory long after its window closed.
   setTimeout(() => pendingSyncs.delete(syncId), SYNC_PENDING_TTL_MS);
   try {
-    sendSignal(buildSyncPacket(contact, { syncId, reply: false, ek: Array.from(ekPub) }));
+    sendSignal(buildSyncPacket(contact, { syncId, reply: false, ek: b64e(ekPub) }));
     mlog.info(`\u2192 SYNC         to   ${pid(contactId)}  id=${pid(syncId)}`);
     setSyncStatus("syncing\u2026");
   } catch(e) {
@@ -4334,9 +4367,9 @@ async function handleMsgExchange(msg) {
     mlog.info(`← SYNC_REQ     from ${pid(msg.from)}  id=${pid(msg.syncId)} — replying (wrapped)`);
     try {
       const { priv, pub } = generateX25519Ephemeral();
-      const wrapKey = await deriveEphemeralWrapKey(x25519.getSharedSecret(priv, new Uint8Array(msg.ek)));
+      const wrapKey = await deriveEphemeralWrapKey(x25519.getSharedSecret(priv, toBytes(msg.ek, 32)));
       const wrapped = await encryptObject(wrapKey, getLast(msg.from));
-      sendSignal(buildSyncPacket(contact, { syncId: msg.syncId, reply: true, ek: Array.from(pub), wrapped }));
+      sendSignal(buildSyncPacket(contact, { syncId: msg.syncId, reply: true, ek: b64e(pub), wrapped }));
     } catch(e) {
       mlog.warn(`\u2192 SYNC_REPLY   to   ${pid(msg.from)} \u2014 send failed: ${e.message}`);
     }
@@ -4358,7 +4391,7 @@ async function handleMsgExchange(msg) {
   // is why the pending entry is not consumed here.
   let msgs;
   try {
-    const wrapKey = await deriveEphemeralWrapKey(x25519.getSharedSecret(pending.ekPriv, new Uint8Array(msg.ek)));
+    const wrapKey = await deriveEphemeralWrapKey(x25519.getSharedSecret(pending.ekPriv, toBytes(msg.ek, 32)));
     msgs = await decryptObject(wrapKey, msg.wrapped);
   } catch(e) {
     mlog.warn(`\u2190 SYNC_REPLY   from ${pid(msg.from)} \u2014 unwrap failed, dropped`);

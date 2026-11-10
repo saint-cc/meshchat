@@ -341,8 +341,59 @@ async function deriveReactionId(myPublicId, targetMsgId) {
   return btoa(String.fromCharCode(...new Uint8Array(hash).slice(0, 12))).replace(/\+/g,'-').replace(/\//g,'_').replace(/=/g,'');
 }
 
-function rawToBase64(raw) { return btoa(String.fromCharCode(...raw)).replace(/\+/g,'-').replace(/\//g,'_').replace(/=/g,''); }
+// Chunked: `String.fromCharCode(...raw)` throws a RangeError once raw is past
+// the engine's argument limit (~100k on some mobile engines), which a media
+// blob easily is. Output is identical to the old one-shot form.
+function rawToBase64(raw) {
+  let s = "";
+  for (let i = 0; i < raw.length; i += 0x2000) s += String.fromCharCode.apply(null, raw.subarray ? raw.subarray(i, i + 0x2000) : raw.slice(i, i + 0x2000));
+  return btoa(s).replace(/\+/g,'-').replace(/\//g,'_').replace(/=/g,'');
+}
 function base64ToRaw(b64) { return Uint8Array.from(atob(b64.replace(/-/g,'+').replace(/_/g,'/')), c => c.charCodeAt(0)); }
+
+/* ── WIRE BYTE FIELDS (0.6.4) ──
+   Binary fields on the wire (blob iv/data, sig, ek, ekPub, wrapped's iv/data)
+   used to be JSON int arrays: ~3.6 chars per byte. They are now base64url
+   strings: ~1.33 chars per byte. That is what lets a hybrid session propose
+   fit the 4 KiB handshake frame cap and lets a 2 MiB frame carry roughly
+   2.5x the media.
+   b64e  bytes -> base64url, no padding.
+   b64d  strict decode: alphabet [A-Za-z0-9_-] only, no padding, no stray
+         whitespace, canonical (re-encodes to the same string). Throws.
+   toBytes(x, len?)  THE reader for a wire byte field. Accepts EITHER form for
+         now — a base64url string (what 0.6.4 sends) or an int array (what
+         <= 0.6.3 sent) — and returns a Uint8Array, or throws. An int array
+         must be a real Array of integers 0..255. `len`, if given, is the exact
+         byte length required.
+   Signatures are NOT affected by which form is on the wire: they cover
+   JSON.stringify of the packet AS RECEIVED, so a verifier re-serialises the
+   very form it got. Only the sender's choice of form changes the signed bytes.
+   Auth packets (sig:auth_proof, the shareable address, the QR token) stay as
+   they were. */
+function b64e(bytes) { return rawToBase64(bytes instanceof Uint8Array ? bytes : Uint8Array.from(bytes)); }
+function b64d(s) {
+  if (typeof s !== "string" || !/^[A-Za-z0-9_-]*$/.test(s) || s.length % 4 === 1) throw new Error("bad base64url");
+  const out = base64ToRaw(s);
+  if (rawToBase64(out) !== s) throw new Error("non-canonical base64url");
+  return out;
+}
+function toBytes(x, len) {
+  let out;
+  if (typeof x === "string") out = b64d(x);
+  else if (x instanceof Uint8Array) out = x;
+  else if (Array.isArray(x)) {
+    out = new Uint8Array(x.length);
+    for (let i = 0; i < x.length; i++) {
+      const v = x[i];
+      if (!Number.isInteger(v) || v < 0 || v > 255) throw new Error("bad byte array");
+      out[i] = v;
+    }
+  } else throw new Error("not a byte field");
+  if (len !== undefined && out.length !== len) throw new Error(`byte field is ${out.length} bytes, expected ${len}`);
+  return out;
+}
+// Non-throwing form for validators: Uint8Array or null.
+function tryBytes(x, len) { try { return toBytes(x, len); } catch (e) { return null; } }
 
 // Plain byte-array -> hex string. Display-only helper (currently used by
 // the packet inspector to render `sig` as a compact string instead of one
@@ -401,7 +452,7 @@ async function encryptObject(key, obj, aad) {
   const params = { name: "AES-GCM", iv };
   if (aad) params.additionalData = aad;
   const cipher = await crypto.subtle.encrypt(params, key, plain);
-  return { v: aad ? 3 : 2, iv: Array.from(iv), data: Array.from(new Uint8Array(cipher)) };
+  return { v: aad ? 3 : 2, iv: b64e(iv), data: b64e(new Uint8Array(cipher)) };
 }
 async function decryptObject(key, payload, aad) {
   // v missing = v0 (legacy unversioned), v1 = AES-GCM plain JSON, v2 = AES-GCM + gzip,
@@ -409,9 +460,9 @@ async function decryptObject(key, payload, aad) {
   if (payload.v !== undefined && payload.v > 3) throw new Error(`unsupported object version v${payload.v}`);
   if (aad) { if (payload.v !== 3) throw new Error(`object v${payload.v} lacks envelope binding`); }
   else if (payload.v === 3)        throw new Error("object v3 needs its envelope binding to decrypt");
-  const params = { name: "AES-GCM", iv: new Uint8Array(payload.iv) };
+  const params = { name: "AES-GCM", iv: toBytes(payload.iv, 12) };
   if (aad) params.additionalData = aad;
-  const raw  = await crypto.subtle.decrypt(params, key, new Uint8Array(payload.data));
+  const raw  = await crypto.subtle.decrypt(params, key, toBytes(payload.data));
   const text = (payload.v === 2 || payload.v === 3)
     ? await decompress(new Uint8Array(raw))
     : new TextDecoder().decode(raw);
@@ -423,7 +474,7 @@ async function encryptMessage(recipientEncKey, payload, aad) {
   const params = { name: "AES-GCM", iv };
   if (aad) params.additionalData = aad;   // envelope-bound — see ENV_LABEL / envelopeAad
   const cipher = await crypto.subtle.encrypt(params, recipientEncKey, new TextEncoder().encode(JSON.stringify(payload)));
-  return { v: aad ? 2 : 1, iv: Array.from(iv), data: Array.from(new Uint8Array(cipher)) };
+  return { v: aad ? 2 : 1, iv: b64e(iv), data: b64e(new Uint8Array(cipher)) };
 }
 
 // THE fix — replaces "AES key handed out in the QR code" with a real
@@ -460,7 +511,7 @@ async function deriveSharedAesKey(myX25519Seed, theirX25519PublicKey) {
 function verifyBlob(blob,sig,contactSignPublicKey){
   try{
     const bytes=new TextEncoder().encode(JSON.stringify(blob));
-    return ed25519.verify(new Uint8Array(sig),bytes,contactSignPublicKey);
+    return ed25519.verify(toBytes(sig, 64),bytes,contactSignPublicKey);
   }catch(e){
     return false;
   }

@@ -1265,9 +1265,8 @@ function formatPacketInfo(msgId) {
     const display = { ...envelope };
     delete display.blob;
 
-    if (Array.isArray(display.sig)) {
-      display.sig = bytesToHex(display.sig);
-    }
+    const sigBytes = tryBytes(display.sig);   // base64url string (0.6.4+) or int array (<= 0.6.3)
+    if (sigBytes) display.sig = bytesToHex(sigBytes);
 
     const payloadDisplay = { ...payload };
 
