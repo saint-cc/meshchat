@@ -13,7 +13,7 @@
 
    Load order: meshchat-lib.js → meshchat-gui.js → meshchat.js → statemachine.js
 ═══════════════════════════════════════════════════════════════ */
-const CLIENT_VERSION = "0.6.4";
+const CLIENT_VERSION = "0.6.6";
 
 const POLL_INTERVAL_MS        	= 30_000;			// base interval between presence polls
 const POLL_JITTER_MS          	= 10_000;			// ± random jitter added to poll interval
@@ -916,7 +916,7 @@ function recordKnownDevice(identityId, deviceId, n, endpointId) {
   // because this device's endpoint wasn't known yet (the first-contact race)
   // can be completed the moment this call learned it. No-op unless a
   // pendingAck is parked on the session.
-  maybeCompleteDeferredAck(identityId, deviceId);
+  maybeCompleteDeferredAck(identityId, deviceId).catch(e => mlog.warn(`X4DH       deferred ack failed: ${e.message}`));
 }
 
 function loadSendCounters() {
@@ -1190,22 +1190,64 @@ async function loadX4DHSessions() {
 // Here every call queues behind the previous one, and the snapshot is taken
 // INSIDE the queued step, so each write carries the latest in-memory state at
 // the moment it runs — the last write in the queue is always the freshest.
-// Resolves once THIS call's write has landed (or been skipped), as before.
+// Resolves once THIS call's write has finished, to true (it landed) or false
+// (it failed or was skipped: no key, or persistence halted by selfDestruct).
+//
+// PERSISTENCE CONTRACT (0.6.5) — session state is key material, and the peer
+// acts on what we send. Two rules, in this order of importance:
+//   1. SENDER: persist before you send. A packet that depends on a state
+//      change (a propose carrying a fresh RK0, an ack built from RK1, a
+//      message under a root we just switched to) goes out only after the write
+//      that records that change has landed. Otherwise a reload (or a crash)
+//      between the send and the write brings back older state while the peer
+//      already acts on the newer one — e.g. we forget the RK1 we acked, the
+//      initiator sends under it, and nothing we hold can read it.
+//   2. RECEIVER: commit only after the packet is authenticated. State changes
+//      driven by an inbound packet (confirmX4DHPeerKey, an RK1 upgrade, storing
+//      a propose's RK0) happen after the AEAD tag and/or signature check passed,
+//      never during trial decryption and never on an unverified packet.
+// A failed write used to be logged and forgotten, so every caller carried on as
+// if it had landed. Now the result is returned, callers that send act on it,
+// and a failed write leaves a mark (x4dhLastSaveOk) that getOrDeriveWireKey —
+// the one place every session-key encrypt goes through — checks via
+// x4dhSessionsDurable(): while memory is ahead of storage we do not encrypt
+// under session keys (callers see "no session" and hold/fall back exactly as
+// they already do). Receiving is never gated. In memory the session state is
+// NOT rolled back on a failed write — receiving keeps working from it, and the
+// next successful write persists everything at once.
 let _saveX4DHChain = Promise.resolve();
+let x4dhLastSaveOk = true;    // did the most recent write land?
+let x4dhLastFailAt = 0;
+const X4DH_SAVE_RETRY_MS = 5000;   // after a failed write, how long before a send retries storage (not once per device per message)
 
 function saveX4DHSessions() {
   const run = _saveX4DHChain.then(async () => {
-    if (!state.cryptoKey || persistenceHalted) return;
+    if (!state.cryptoKey || persistenceHalted) { x4dhLastSaveOk = false; x4dhLastFailAt = Date.now(); return false; }
     try {
       const encrypted = await encryptObject(state.cryptoKey, state.x4dhSessions);
-      if (persistenceHalted) return;   // wiped while we were encrypting — see PERSISTENCE HALT
+      if (persistenceHalted) { x4dhLastSaveOk = false; x4dhLastFailAt = Date.now(); return false; }   // wiped while we were encrypting — see PERSISTENCE HALT
       localStorage.setItem(X4DH_SESSION_KEY + "_" + state.publicId, JSON.stringify(encrypted));
+      x4dhLastSaveOk = true;
+      return true;
     } catch(e) {
-      mlog.err(`STORAGE    X4DH session save failed: ${e.message}`);
+      x4dhLastSaveOk = false; x4dhLastFailAt = Date.now();
+      mlog.err(`STORAGE    X4DH session save failed: ${e.message} — session state is ahead of storage; not encrypting under session keys until a write lands`);
+      return false;
     }
   });
   _saveX4DHChain = run.catch(() => {});   // one failed save must not wedge every later one
   return run;
+}
+
+// True when what is on disk is what is in memory (as far as we know). Waits for
+// queued writes first, so a change whose write is still in flight is judged by
+// that write's outcome. If the last write failed, tries once more — but not
+// more often than X4DH_SAVE_RETRY_MS.
+async function x4dhSessionsDurable() {
+  await _saveX4DHChain;
+  if (x4dhLastSaveOk) return true;
+  if (Date.now() - x4dhLastFailAt < X4DH_SAVE_RETRY_MS) return false;
+  return await saveX4DHSessions();
 }
 
 function getX4DHSession(contactId, theirDeviceId) {
@@ -1221,6 +1263,32 @@ function getX4DHSession(contactId, theirDeviceId) {
 // re-establishes RK0 must NOT silently zero its own attempt count. A
 // brand-new device pair simply has nothing to carry forward (existing
 // is undefined), so it starts clean.
+/* proposeTs is a high-water mark: handleX4DHPropose refuses any propose that
+   is not strictly newer than the one the session was built from. The mark is
+   the SENDER's own signed `ts`, so a sender whose clock runs far ahead (or a
+   validly signed propose carrying a far-future ts) would push the mark into
+   the future and every honest propose afterwards, with a real ts, would look
+   stale — that device could not (re)establish a session until real time caught
+   up. So the mark is clamped to OUR clock + X4DH_PROPOSE_TS_SKEW_MS, the same
+   idea as clampMsgTs / clampRelayTs: a sender can be a little ahead (ordinary
+   skew), never far. Worst case a lockout lasts one skew window.
+   Missing / non-numeric / non-positive ts becomes "now". The guard also
+   bounds what it READS (sessionProposeMark), so a mark stored before this
+   clamp existed heals too. That bound is anchored to establishedAt — OUR clock
+   when the session was stored, a fixed point — and NOT to the current time:
+   "now + skew" slides forward with the clock, so a stale far-future mark
+   would stay ahead of every honest propose forever. */
+const X4DH_PROPOSE_TS_SKEW_MS = 5 * 60 * 1000;
+function clampProposeTs(ts, now = Date.now()) {
+  return (Number.isFinite(ts) && ts > 0) ? Math.min(ts, now + X4DH_PROPOSE_TS_SKEW_MS) : now;
+}
+// The high-water mark the stale-propose guard compares against; null = no mark.
+function sessionProposeMark(session) {
+  if (!session || session.proposeTs == null) return null;
+  const anchor = Number.isFinite(session.establishedAt) && session.establishedAt > 0 ? session.establishedAt : Date.now();
+  return clampProposeTs(session.proposeTs, anchor);
+}
+
 async function storeX4DHSessionRK0(contactId, theirDeviceId, sessionEpoch, rk0Bytes, initiator, proposeTs) {
   if (!state.x4dhSessions[contactId]) state.x4dhSessions[contactId] = {};
   const existing = state.x4dhSessions[contactId][theirDeviceId];
@@ -1245,7 +1313,7 @@ async function storeX4DHSessionRK0(contactId, theirDeviceId, sessionEpoch, rk0By
     // (handleX4DHPropose) always passes the real msg.ts explicitly.
     sessionEpoch, stage: "rk0", rootKey: rawToBase64(rk0Bytes),
     initiator, establishedAt: Date.now(), upgradedAt: null,
-    proposeTs: proposeTs ?? Date.now(),
+    proposeTs: clampProposeTs(proposeTs),   // clamped to our clock + skew, see clampProposeTs
     // Retry-budget fields (Roadmap.md's automatic-retry design pass) —
     // per-(contact,device), not per-epoch. Carried forward across every
     // overwrite of this object, including a retry's own fresh RK0.
@@ -1254,10 +1322,11 @@ async function storeX4DHSessionRK0(contactId, theirDeviceId, sessionEpoch, rk0By
     lastRetryAt:      existing?.lastRetryAt      || null,
   };
   // (wire keys are cached per ROOT now — nothing to evict here, see x4dhWireKeyByRoot)
-  await saveX4DHSessions();
-  mlog.info(`X4DH       RK0 established  ${pid(contactId, { deviceId: theirDeviceId })}  epoch=${pid(sessionEpoch)}`);
+  const saved = await saveX4DHSessions();   // returned: callers that SEND on the strength of this session must not if it did not land
+  mlog.info(`X4DH       RK0 established  ${pid(contactId, { deviceId: theirDeviceId })}  epoch=${pid(sessionEpoch)}${saved ? "" : "  (NOT SAVED)"}`);
   // Responder side is send-ready at once (see isSessionSendReady); the initiator's RK0 is not — it waits for the ack.
   if (!initiator) flushHeldMessages(contactId, "session established (responder)");
+  return saved;
 }
 
 // Guards against upgrading the wrong session — if a session has already
@@ -1288,7 +1357,14 @@ async function upgradeX4DHSessionToRK1(contactId, theirDeviceId, sessionEpoch, r
   // starts with a clean budget rather than inheriting an old exhaustion.
   existing.retryAttempts    = 0;
   existing.retryExhaustedAt = null;
-  await saveX4DHSessions();
+  // Returns false when the write failed too (not just when the upgrade was
+  // stale): the session IS upgraded in memory — receiving works from it — but a
+  // caller about to send something that depends on the upgrade (the responder's
+  // session:ack) must not, see the PERSISTENCE CONTRACT at saveX4DHSessions.
+  if (!(await saveX4DHSessions())) {
+    mlog.err(`X4DH       RK1 reached in memory but NOT SAVED  ${pid(contactId, { deviceId: theirDeviceId })}  epoch=${pid(sessionEpoch)} — nothing is sent on the strength of it until a write lands`);
+    return false;
+  }
   mlog.info(`X4DH       RK1 upgrade complete  ${pid(contactId, { deviceId: theirDeviceId })}  epoch=${pid(sessionEpoch)}`);
   flushHeldMessages(contactId, "session upgraded");   // a session just became send-ready — release anything held for this contact
   return true;
@@ -1363,9 +1439,21 @@ function x4dhSendRoot(s) {
 // getOrDeriveWireKey(contactId, theirDeviceId) — the key to ENCRYPT under
 // for that device pair (null if no session). Decrypting uses
 // getDecryptWireKeys below, never this.
+// Also null while session state is not durable (see the PERSISTENCE CONTRACT at
+// saveX4DHSessions): every encrypt-under-a-session path goes through here, so
+// this is the one gate rule 1 needs. Callers already handle null as "no usable
+// session" (held message / fallback), which is the right behaviour here too.
+let x4dhNotDurableLoggedAt = 0;
 async function getOrDeriveWireKey(contactId, theirDeviceId) {
   const session = getX4DHSession(contactId, theirDeviceId);
   if (!session) return null;
+  if (!(await x4dhSessionsDurable())) {
+    if (Date.now() - x4dhNotDurableLoggedAt > 30_000) {
+      x4dhNotDurableLoggedAt = Date.now();
+      mlog.warn(`X4DH       session state could not be saved — not sending under session keys until storage works (held messages retry on the next tick)`);
+    }
+    return null;
+  }
   return wireKeyForRoot(x4dhSendRoot(session));
 }
 
@@ -1390,15 +1478,23 @@ async function getDecryptWireKeys(contactId, theirDeviceId) {
 // A verified message from this device just decrypted under our CURRENT RK1:
 // it provably holds RK1. Switch to sending under RK1 (responder) and retire
 // the retained RK0 (both sides) into the decrypt-only grace.
-function confirmX4DHPeerKey(contactId, theirDeviceId) {
+// Callers must be past the authentication of the packet that proves it (AEAD
+// under the CURRENT root, plus the signature where the packet has one) — rule 2
+// of the PERSISTENCE CONTRACT. The switch is applied in memory at once (so the
+// very next send already uses RK1) and the write is AWAITED: until it lands,
+// getOrDeriveWireKey will not encrypt under session keys (rule 1), because a
+// reload would otherwise bring back "sending under RK0" while the peer has
+// already retired RK0.
+async function confirmX4DHPeerKey(contactId, theirDeviceId) {
   const s = getX4DHSession(contactId, theirDeviceId);
-  if (!s || s.stage !== "rk1") return;
+  if (!s || s.stage !== "rk1") return false;
   const switching = s.sendStage === "rk0";
-  if (!switching && !s.rk0Root) return;
+  if (!switching && !s.rk0Root) return false;
   if (s.rk0Root) { retireX4DHRoot(contactId, theirDeviceId, s.rk0Root); delete s.rk0Root; }
   s.sendStage = "rk1";
-  saveX4DHSessions();
-  mlog.info(`X4DH       peer confirmed RK1 — ${switching ? "now sending under RK1, " : ""}RK0 retired (decrypt-only grace ${X4DH_RETIRED_GRACE_MS / 1000}s)  ${pid(contactId, { deviceId: theirDeviceId })}`);
+  const saved = await saveX4DHSessions();
+  mlog.info(`X4DH       peer confirmed RK1 — ${switching ? "now sending under RK1, " : ""}RK0 retired (decrypt-only grace ${X4DH_RETIRED_GRACE_MS / 1000}s)  ${pid(contactId, { deviceId: theirDeviceId })}${saved ? "" : "  (NOT SAVED)"}`);
+  return saved;
 }
 
 /* ── packet signing ──
@@ -1721,7 +1817,15 @@ async function sendX4DHPropose(contactId, theirDeviceId) {
   pendingX4DHProposals.set(pendingKey, {
     ekPriv, createdAt: Date.now(), timeoutHandle: schedulePendingX4DHExpiry(pendingKey),
   });
-  await storeX4DHSessionRK0(contactId, theirDeviceId, sessionEpoch, rk0, true, proposeTs);
+  // Rule 1: the propose goes out only once the RK0 it creates is on disk. If the
+  // write fails nothing is sent and the pending ephemeral is dropped; the session
+  // is in memory at rk0/initiator and the stuck-retry re-proposes later.
+  if (!(await storeX4DHSessionRK0(contactId, theirDeviceId, sessionEpoch, rk0, true, proposeTs))) {
+    clearTimeout(pendingX4DHProposals.get(pendingKey)?.timeoutHandle);
+    pendingX4DHProposals.delete(pendingKey);
+    mlog.err(`X4DH       propose NOT sent — session state could not be saved  ${pid(contactId, { deviceId: theirDeviceId })}  epoch=${pid(sessionEpoch)}`);
+    return false;
+  }
 
   const obj = {
     type: "session:propose", from: state.publicId, to: buildAddress(contactId, theirEndpoint),
@@ -1773,10 +1877,21 @@ async function handleX4DHPropose(msg) {
 
   // X4DH.md §13.2 — refuse a propose that isn't STRICTLY newer than
   // whatever we already adopted for this device.
-  const existingSession = getX4DHSession(msg.from, theirDeviceId);
-  if (existingSession && existingSession.proposeTs != null && msg.ts <= existingSession.proposeTs) {
-    mlog.warn(`← X4DH_PROPOSE from ${pid(msg.from, { deviceId: theirDeviceId })} — stale (ts=${msg.ts} <= existing proposeTs=${existingSession.proposeTs}), refusing to regress session (stage=${existingSession.stage}), dropped`);
+  // ts is inside the signed body; a propose without a usable one cannot be
+  // ordered against anything (and `undefined <= n` is false, which would
+  // wave it straight past the guard below), so it is refused.
+  if (!Number.isFinite(msg.ts) || msg.ts <= 0) {
+    mlog.warn(`← X4DH_PROPOSE from ${pid(msg.from, { deviceId: theirDeviceId })} — missing/invalid ts, dropped`);
     return;
+  }
+  const existingSession = getX4DHSession(msg.from, theirDeviceId);
+  const existingMark    = existingSession ? sessionProposeMark(existingSession) : null;
+  if (existingMark != null && msg.ts <= existingMark) {
+    mlog.warn(`← X4DH_PROPOSE from ${pid(msg.from, { deviceId: theirDeviceId })} — stale (ts=${msg.ts} <= existing proposeTs=${existingMark}), refusing to regress session (stage=${existingSession.stage}), dropped`);
+    return;
+  }
+  if (msg.ts > Date.now() + X4DH_PROPOSE_TS_SKEW_MS) {
+    mlog.warn(`← X4DH_PROPOSE from ${pid(msg.from, { deviceId: theirDeviceId })} — ts is ${Math.round((msg.ts - Date.now()) / 60000)} min ahead of our clock, accepted; recorded as now+${X4DH_PROPOSE_TS_SKEW_MS / 60000}min`);
   }
 
   const ekAPub = tryBytes(msg.ekPub, 32);
@@ -1787,7 +1902,10 @@ async function handleX4DHPropose(msg) {
   const dh1 = x25519.getSharedSecret(state.x25519Seed, contact.x25519PublicKey);
   const dh2 = x25519.getSharedSecret(state.x25519Seed, ekAPub);
   const rk0 = await deriveX4DHRootStage1(dh1, dh2);
-  await storeX4DHSessionRK0(msg.from, theirDeviceId, msg.sessionEpoch, rk0, false, msg.ts);
+  if (!(await storeX4DHSessionRK0(msg.from, theirDeviceId, msg.sessionEpoch, rk0, false, msg.ts))) {
+    mlog.err(`← X4DH_PROPOSE from ${pid(msg.from, { deviceId: theirDeviceId })} — RK0 could not be saved, not acking (the initiator's stuck-retry will propose again)`);
+    return;
+  }
 
   const theirEndpoint = state.knownDevices[msg.from]?.[theirDeviceId]?.endpointId;
   if (!theirEndpoint) {
@@ -1868,7 +1986,7 @@ async function completeX4DHAck(contactId, theirDeviceId, theirEndpoint, sessionE
 // Called from recordKnownDevice on EVERY observation of a device — so a
 // no-op the overwhelming majority of the time (no pendingAck). Fires when
 // the endpoint that was missing at propose time has now been learned.
-function maybeCompleteDeferredAck(contactId, theirDeviceId) {
+async function maybeCompleteDeferredAck(contactId, theirDeviceId) {
   if (!theirDeviceId) return;
   const session = getX4DHSession(contactId, theirDeviceId);
   const pending = session?.pendingAck;
@@ -1881,7 +1999,7 @@ function maybeCompleteDeferredAck(contactId, theirDeviceId) {
   const ageMs = Date.now() - pending.receivedAt;
   if (session.stage !== "rk0" || session.initiator || ageMs > X4DH_DEFERRED_ACK_WINDOW_MS) {
     delete session.pendingAck;
-    saveX4DHSessions();
+    await saveX4DHSessions();
     mlog.info(ageMs > X4DH_DEFERRED_ACK_WINDOW_MS
       ? `X4DH       deferred ack window expired (${Math.round(ageMs / 1000)}s > ${X4DH_DEFERRED_ACK_WINDOW_MS / 1000}s) — staying at RK0 until the initiator retries  ${pid(contactId, { deviceId: theirDeviceId })}`
       : `X4DH       deferred ack dropped — session no longer a pending responder RK0  ${pid(contactId, { deviceId: theirDeviceId })}`);
@@ -1902,7 +2020,7 @@ function maybeCompleteDeferredAck(contactId, theirDeviceId) {
       x4dhAckInFlight.delete(key);
       // a newer propose may have parked ITS pendingAck while we were busy
       const s = getX4DHSession(contactId, theirDeviceId);
-      if (s?.pendingAck && s.sessionEpoch !== epoch) maybeCompleteDeferredAck(contactId, theirDeviceId);
+      if (s?.pendingAck && s.sessionEpoch !== epoch) maybeCompleteDeferredAck(contactId, theirDeviceId).catch(e => mlog.warn(`X4DH       deferred ack failed: ${e.message}`));
     }
   })();
 }
@@ -1945,13 +2063,17 @@ async function handleX4DHAck(msg) {
   const dh4    = x25519.getSharedSecret(pending.ekPriv, ekBPub);
   const rk0    = base64ToRaw(session.rootKey);
   const rk1    = await deriveX4DHRootStage2(rk0, dh3, dh4);
-  await upgradeX4DHSessionToRK1(msg.from, theirDeviceId, msg.sessionEpoch, rk1);
+  const upgraded = await upgradeX4DHSessionToRK1(msg.from, theirDeviceId, msg.sessionEpoch, rk1);
 
   // Ephemeral private key's job is done — discard it now rather than
-  // waiting for its scheduled expiry.
+  // waiting for its scheduled expiry. (Also when the upgrade could not be
+  // SAVED: the session is at RK1 in memory, a retry is a new propose with a new
+  // ephemeral, and this one must not be replayable.)
   clearTimeout(pending.timeoutHandle);
   pendingX4DHProposals.delete(key);
-  mlog.info(`← X4DH_ACK     from ${pid(msg.from, { deviceId: theirDeviceId })}  epoch=${pid(msg.sessionEpoch)} — session upgraded to RK1`);
+  mlog.info(upgraded
+    ? `← X4DH_ACK     from ${pid(msg.from, { deviceId: theirDeviceId })}  epoch=${pid(msg.sessionEpoch)} — session upgraded to RK1`
+    : `← X4DH_ACK     from ${pid(msg.from, { deviceId: theirDeviceId })}  epoch=${pid(msg.sessionEpoch)} — NOT upgraded (stale, or the upgrade could not be saved — see above)`);
 }
 
 // retryX4DHPropose(contactId, theirDeviceId) — Roadmap.md's "session
@@ -2100,7 +2222,7 @@ function fanSummary(f) {
 /* ══════════════════════════════════════════
    HELLO (6.0.0)
    A content-free app:message — { id, type:"hello", ts, deviceId, endpointId,
-   relay? } — sealed under the legacy static-static key, bare-addressed
+   relay?, sessions? } — sealed under the legacy static-static key, bare-addressed
    (every device of the contact), signed like any app:message. It is the ONLY
    thing that key still carries, and it holds nothing worth protecting beyond
    what the relay already sees: it exists to tell the other side "this device,
@@ -2134,6 +2256,78 @@ const HELLO_MIN_INTERVAL_MS = 20_000;        // per contact, for event-driven he
 const HELLO_RETRY_MS        = 15 * 60_000;   // per contact, the held outbox's periodic nudge — and only to a contact currently believed online (see flushHeldOnce)
 const lastHelloSent = new Map();             // contactId -> ts. Memory only: a reload may legitimately re-send one
 
+/* ── HELLO session list (0.6.6) — desync recovery ──
+   HELLO carries one more optional field inside its signed payload:
+     sessions: [deviceId, ...]   — the contact's devices WE hold an x4dhSessions
+                                    record with, at any stage.
+   Why: the fixed initiator (lower publicId) holds an rk1 session, the responder
+   lost its side (storage cleared, an old backup restored). The responder sends
+   a HELLO — it has no session, so contactNeedsHello is true — but before this
+   the initiator had nothing to compare it with: it knows the device, holds a
+   session, and does nothing. Now the HELLO says which of the initiator's
+   devices the sender still holds, and an initiator that is missing re-proposes
+   (new sessionEpoch, the ordinary propose path).
+   - absent  = an old client: no conclusion. [] = "I hold none of yours".
+   - If we hold more sessions with the contact than HELLO_SESSIONS_MAX the field
+     is OMITTED, never truncated — a truncated list would read as "missing".
+   - No staleness filter: a device we have not heard from for a month that we
+     still hold a session with must stay in the list, or it would be re-proposed
+     to the moment it came back.
+   - Receive side acts only as the fixed initiator, only for its own deviceId,
+     only on an rk1 session older than the propose window (a HELLO built just
+     before our propose landed must not trigger another), at most once per
+     X4DH_REPAIR_MIN_INTERVAL_MS and X4DH_REPAIR_MAX_ATTEMPTS times per pair
+     (memory only; reset when the peer lists us again). A responder never acts. */
+const HELLO_SESSIONS_MAX = 64;
+function helloSessionList(contactId) {
+  const ids = Object.keys(state.x4dhSessions?.[contactId] || {}).filter(isIdLike);
+  return ids.length <= HELLO_SESSIONS_MAX ? ids : null;
+}
+// null = field absent or malformed (ignored); otherwise a Set of device IDs.
+function parseHelloSessions(x) {
+  if (!Array.isArray(x) || x.length > HELLO_SESSIONS_MAX) return null;
+  for (const e of x) if (!isIdLike(e)) return null;
+  return new Set(x);
+}
+const X4DH_REPAIR_MIN_INTERVAL_MS = 2 * 60 * 1000;
+const X4DH_REPAIR_MAX_ATTEMPTS    = 10;
+const x4dhRepairState = new Map();   // "contactId:theirDeviceId" -> { attempts, lastAt }. Memory only
+
+async function maybeRepairFromHello(contactId, theirDeviceId, listed, helloTs) {
+  const key = `${contactId}:${theirDeviceId}`;
+  if (listed.has(state.deviceId)) { x4dhRepairState.delete(key); return false; }   // peer agrees the session exists
+  if (!isFixedInitiator(contactId, theirDeviceId)) return false;                    // the responder never proposes
+  // The relay buffers a HELLO for 24 h and the signature does not expire: a stale
+  // one, delivered after the session was rebuilt, would say "missing" about a session
+  // that now exists. Only a HELLO stamped within the skew window counts. A peer whose
+  // clock is further off than that gets no automatic repair (a manual reset still works).
+  if (!Number.isFinite(helloTs) || Math.abs(Date.now() - helloTs) > X4DH_PROPOSE_TS_SKEW_MS) {
+    mlog.debug(`X4DH       repair skipped — HELLO ts outside the ${X4DH_PROPOSE_TS_SKEW_MS / 60000}-min window  ${pid(contactId, { deviceId: theirDeviceId })}`);
+    return false;
+  }
+  const s = getX4DHSession(contactId, theirDeviceId);
+  if (!s) return false;                                                             // no session: the ordinary propose trigger owns this
+  if (s.stage !== "rk1") return false;                                              // rk0 stalls belong to the stuck-retry
+  const now = Date.now();
+  const sinceMs = now - Math.max(s.establishedAt || 0, s.upgradedAt || 0);
+  if (sinceMs < X4DH_STUCK_RK0_THRESHOLD_MS) {
+    mlog.debug(`X4DH       repair skipped — session only ${Math.round(sinceMs / 1000)}s old  ${pid(contactId, { deviceId: theirDeviceId })}`);
+    return false;
+  }
+  const rec = x4dhRepairState.get(key) || { attempts: 0, lastAt: 0 };
+  if (now - rec.lastAt < X4DH_REPAIR_MIN_INTERVAL_MS) return false;
+  if (rec.attempts >= X4DH_REPAIR_MAX_ATTEMPTS) {
+    mlog.debug(`X4DH       repair skipped — attempt budget spent  ${pid(contactId, { deviceId: theirDeviceId })}`);
+    return false;
+  }
+  if (x4dhProposeInFlight.has(key)) return false;
+  rec.attempts++; rec.lastAt = now; x4dhRepairState.set(key, rec);   // before any await: two HELLOs in one tick must not both pass
+  mlog.warn(`X4DH       peer HELLO does not list us — it lost its side of this session; re-proposing (attempt ${rec.attempts}/${X4DH_REPAIR_MAX_ATTEMPTS})  ${pid(contactId, { deviceId: theirDeviceId })}  epoch=${pid(s.sessionEpoch)}`);
+  x4dhProposeInFlight.add(key);
+  try { return await sendX4DHPropose(contactId, theirDeviceId); }
+  finally { x4dhProposeInFlight.delete(key); }
+}
+
 async function sendHello(contactId, reason, minIntervalMs = HELLO_MIN_INTERVAL_MS) {
   if (!state.publicId || !contactId || contactId === state.publicId) return false;
   const contact = state.contacts[contactId];
@@ -2143,9 +2337,11 @@ async function sendHello(contactId, reason, minIntervalMs = HELLO_MIN_INTERVAL_M
   lastHelloSent.set(contactId, now);   // before any await: two callers in the same tick must not both pass
   try {
     const me = state.contacts[state.publicId];
+    const sessions = helloSessionList(contactId);   // null (too many) = field omitted
     const payload = { id: crypto.randomUUID(), type: "hello", ts: now,
                       deviceId: state.deviceId, endpointId: state.endpointId,
-                      ...(me?.lastRelay ? { relay: { wss: me.lastRelay } } : {}) };
+                      ...(me?.lastRelay ? { relay: { wss: me.lastRelay } } : {}),
+                      ...(sessions ? { sessions } : {}) };
     const obj = await sealEnvelope("app:message", state.publicId, contactId, contact.encKey, payload);
     const viaRelay = sendToRelay(contactId, obj, true);
     if (!viaRelay) sendSignal(obj);
@@ -2174,6 +2370,13 @@ async function handleHello(msg, plain, valid, viaX4DH) {
   // Reply rule — see HELLO above. A session record (even a half-built one)
   // means the bootstrap is already under way and the peer has what it needs.
   if (!getX4DHSession(msg.from, plain.deviceId)) sendHello(msg.from, "reply");
+  // Desync recovery (HELLO session list): sender's view of which of our devices it
+  // holds. Signature already verified above; a malformed list is simply ignored.
+  const listed = parseHelloSessions(plain.sessions);
+  if (listed) {
+    try { await maybeRepairFromHello(msg.from, plain.deviceId, listed, plain.ts); }
+    catch (e) { mlog.warn(`X4DH       repair from HELLO failed: ${e.message}`); }
+  }
 }
 
 /* ══════════════════════════════════════════
@@ -2662,7 +2865,7 @@ async function decryptSelfBackupBlob(blob, aad) {
         const plain = await decryptObject(key, blob, aad);
         // self blobs carry no signature, but AES-GCM success under RK1 is the
         // same proof of possession — see confirmX4DHPeerKey
-        if (label === "current") confirmX4DHPeerKey(state.publicId, theirDeviceId);
+        if (label === "current") await confirmX4DHPeerKey(state.publicId, theirDeviceId);
         return { plain, wireDeviceId: theirDeviceId };
       } catch(e) { /* wrong key — try the next generation / sibling */ }
     }
@@ -5563,7 +5766,7 @@ async function receiveMessage(msg) {
     // A VERIFIED message under our current RK1 proves the peer holds RK1 —
     // see "wire-message keys". Only after verification: nothing here may
     // switch our send key on the strength of an unverified packet.
-    if (viaX4DH && valid && keyLabel === "current") confirmX4DHPeerKey(msg.from, matchedDeviceId);
+    if (viaX4DH && valid && keyLabel === "current") await confirmX4DHPeerKey(msg.from, matchedDeviceId);
 
     // 0.6.2 — shape of what is about to become part of the conversation (see
     // MESSAGE IDS AND TIMESTAMPS). Content messages only: a hello's id is never
