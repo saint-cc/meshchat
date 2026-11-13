@@ -5,9 +5,17 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <!-- CONTENT SECURITY POLICY. A <meta> CSP only covers what comes after it, so it must stay
      the first thing in <head> after the charset/viewport. Everything the page runs is now
-     same-origin: the three libraries are vendored under ./vendor/ (see vendor/README.md),
+     same-origin: the libraries are vendored under ./vendor/ (see vendor/README.md),
      there are no inline <script> blocks and no inline event-handler attributes (wiring lives
-     in meshchat-boot.js), and nothing needs eval — script-src is plain 'self'.
+     in meshchat-boot.js), and nothing needs eval — script-src is 'self' plus 'wasm-unsafe-eval'.
+       'wasm-unsafe-eval' allows WebAssembly.compile/instantiate and NOTHING else (no eval(),
+         no new Function()). It is there for the Argon2id identity KDF (hash-wasm), which runs in
+         ./kdf-worker.js. A dedicated worker loaded from a URL takes its CSP from ITS OWN response
+         headers, not from this <meta>, so what actually decides whether WASM may run there is
+         whatever headers the server/nginx puts on kdf-worker.js: no CSP header (what Flask sends)
+         = unrestricted; a CSP header without 'wasm-unsafe-eval' = the worker quietly falls back to
+         the pure-JS Argon2 (same result, several times slower). worker-src 'self' is what lets
+         the page start it.
        style-src keeps 'unsafe-inline' because of the many style="" attributes and the two
          <style> blocks below; that is tolerable ONLY because img/font/connect/etc. are locked
          down, so injected CSS has nowhere to send anything.
@@ -17,7 +25,7 @@
          html5-qrcode's built-in icons.
        frame-ancestors, report-uri and sandbox are ignored in a <meta> policy — set those as
          a real header (nginx/Flask) if you want them. -->
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; font-src 'self'; connect-src 'self' ws: wss:; worker-src 'self'; manifest-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; font-src 'self'; connect-src 'self' ws: wss:; worker-src 'self'; manifest-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'">
 <title>MeshChat</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' fill='%23000'/%3E%3Cpath d='M3 8h10' stroke='%2300ffcc' stroke-width='2'/%3E%3Ccircle cx='8' cy='8' r='2' fill='%2300ffcc'/%3E%3C/svg%3E">
 <!-- vendored, pinned copies (was: cdnjs, unpkg and esm.sh at runtime) — vendor/README.md has
@@ -53,6 +61,34 @@
   font-size: 14px;
   text-align: center;
   white-space: pre-line;
+}
+
+/* ── identity KDF progress (login) ──
+   Shown only while the Argon2id derivation runs (meshchat-gui.js, kdfProgress). The WASM
+   backend reports no progress, so the bar starts INDETERMINATE (a block sliding back and
+   forth); the pure-JS fallback reports real percentages and the bar switches to determinate. */
+#kdfProgress { margin-top: 14px; }
+.kdfBar {
+  width: 260px;
+  height: 8px;
+  background: #333;
+  border: 1px solid #444;
+  overflow: hidden;
+}
+.kdfFill {
+  height: 100%;
+  width: 0%;
+  background: #8a8a8a;
+  transition: width 0.2s ease;
+}
+.kdfBar.indeterminate .kdfFill {
+  width: 35%;
+  transition: none;
+  animation: kdfSlide 1.1s ease-in-out infinite alternate;
+}
+@keyframes kdfSlide { from { margin-left: 0; } to { margin-left: 65%; } }
+@media (prefers-reduced-motion: reduce) {
+  .kdfBar.indeterminate .kdfFill { animation: none; margin-left: 32%; }
 }
 
 /* ── login checkboxes: "show password" and "auto login" ──
@@ -125,7 +161,7 @@
         Show password
       </label>
       <!-- auto login = "remember me on this device": the checkbox state lives in localStorage
-           (meshchat_autologin), the secret (PBKDF2 master secret, wrapped under a non-extractable
+           (meshchat_autologin), the secret (Argon2id master secret, wrapped under a non-extractable
            key) in IndexedDB, the logic in meshchat-identity.js — see AUTO LOGIN there. -->
       <label class="loginOpt">
         <input type="checkbox" id="autoLoginChk">
@@ -137,6 +173,10 @@
 
       <button id="loginButton" type="button">ENTER</button>
       <div id="loginStatus"></div>
+      <div id="kdfProgress" hidden>
+        <div id="kdfBar" class="kdfBar indeterminate"><div id="kdfFill" class="kdfFill"></div></div>
+        <div id="kdfLabel" class="labelEntr"></div>
+      </div>
       <div class="bar-container">
         <div id="barEntr" class="barEntr"></div>
       </div>

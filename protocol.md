@@ -27,11 +27,11 @@ Implementation version: `0.6.3`, reported informationally in the `version` field
 ## Wire Conventions
 
 - **Transport:** WebSocket text frames, one JSON object per frame. A relay drops frames over its per-type size cap, which is at most `WS_MAX_SIZE` (default 2 MiB); see [Resource limits](#resource-limits).
-- **Binary fields** (`iv`, `data`, `sig`, `ek`, `ekPub`, `nonce`, public keys) are JSON arrays of integers 0–255.
+- **Binary fields** (`iv`, `data`, `sig`, `ek`, `ekPub`) are base64url strings, unpadded: a 12-byte `iv` is 16 characters, a 32-byte key 43, a 64-byte signature 86. A receiver also accepts the older form, a JSON array of integers 0–255, for one release, and drops anything malformed (characters outside the alphabet, padding, a wrong length); a sender always sends strings. Signatures cover `JSON.stringify` of the packet as it is received, so the form the sender used is the form that was signed: a receiver verifies the packet as it arrived and never re-encodes it first. The relay-authentication packets (`sig:auth_init`, `sig:auth_challenge`, `sig:auth_proof`, with `nonce`, `x25519_pub`, `ed25519_pub` and `sig`) are unchanged and stay integer arrays (`auth_v` 2). Inline media (`data` of an audio or image payload) is base64 as before.
 - **Ids.** `publicId`, `deviceId` and `endpointId` are `base64url(SHA-256(...)[0:12])`, unpadded (16 characters). All ids are base64url, `[A-Za-z0-9_-]{8,64}`, which never contains `:`. `callId`, `sessionId`, `syncId` and `sessionEpoch` are random UUIDs.
 - **base64url** in this document is the URL-safe alphabet without padding. The one exception is the relay segment of a shareable address, which is standard base64 (`btoa`).
 - **Timestamps** are integer milliseconds since the epoch, taken from the sender's clock.
-- **Signatures** are Ed25519 over the UTF-8 bytes of `JSON.stringify(body)`: compact (no whitespace), keys in exactly the order listed, optional fields that the list marks "or null" present as `null`. Signature is serialised as an array of 64 integers.
+- **Signatures** are Ed25519 over the UTF-8 bytes of `JSON.stringify(body)`: compact (no whitespace), keys in exactly the order listed, optional fields that the list marks "or null" present as `null`. Signature is serialised as a base64url string (64 raw bytes, 86 characters).
 - **Verification is by the sender's signing key**, known from their shareable address. For packets from your own identity (self-targeted), verify against your own signing key.
 
 ### Signed bodies
@@ -47,7 +47,7 @@ Implementation version: `0.6.3`, reported informationally in the `version` field
 | `sync:backup_offer`, `sync:backup_accept`, `sync:backup_push`, `sync:restore_ack`, `sync:restore_push` | `{ type, from, to, size, ts, blob }` (`size`, `blob` or `null`), then `ek` appended as a final key **only if the packet carries one** |
 | `sync:restore_req` | `{ type, from, to, ts, blob }` |
 | `sync:token_resp` | `{ type, from, to, ts, token }` (`token` or `null`) |
-| per-message signature (a field inside an `app:message` payload, not a packet) | `{ l, id, from, to, ts, type, …content }` — see [Per-message signatures](#per-message-signatures). Serialised as a base64url string, not an integer array |
+| per-message signature (a field inside an `app:message` payload, not a packet) | `{ l, id, from, to, ts, type, …content }` — see [Per-message signatures](#per-message-signatures). Serialised as a base64url string |
 
 Fields outside these sets are not signed and must not be trusted: notably the `token` attached to `sync:restore_req` and `sync:restore_push`.
 
@@ -207,7 +207,7 @@ The token is never transmitted; it is only a KDF salt, so the AES-GCM tag check 
 **Shower, on a packet from a non-contact with `blob.intro === 1`** (anything else from a non-contact is dropped):
 
 1. Drop unless a token is armed, not expired (judged on the shower's own clock when the packet is processed, so a packet a relay buffered and flushes late is rejected), and not mid-claim.
-2. Require `type === "app:message"`, `blob.v === 2`, a `sig`, string `from`, and `blob.ek` an array of 32 integers 0–255.
+2. Require `type === "app:message"`, `blob.v === 2`, a `sig`, string `from`, and `blob.ek` a 32-byte value (a base64url string; an integer array is still accepted).
 3. Derive `wrapKey` from `X25519(showerScalar, ek)` and the token; decrypt with `envelopeAad(type, from, to)`. A failure (wrong token, junk) is ignored silently and **does not** disarm the QR.
 4. Take the claim lock (two valid introductions arriving together must not both win), then require: `plain.type === "intro"`, `plain.addr` parses as an address, the address's two keys hash to `msg.from`, the envelope signature verifies under the signing key in that address, the sender is neither us nor an existing contact, the token has not expired mid-claim.
 5. Add the contact (placeholder local name, e.g. `QR contact <short id>`), record `deviceId`/`endpointId` if both are well-formed ids, mark online, **disarm the token (single use)**, and send a [HELLO](#hello) with no rate-limit delay. A failed check releases the claim lock but never burns the token.
@@ -300,7 +300,7 @@ Four independent key families:
 
 ### Primitive: blobs
 
-AES-256-GCM, random 12-byte IV, 128-bit tag. A blob is `{ v, iv: [...12], data: [...ciphertext+tag] }`. Two formats exist; which applies is fixed per packet type, and a receiver rejects any other version:
+AES-256-GCM, random 12-byte IV, 128-bit tag. A blob is `{ v, iv, data }`, with `iv` (12 bytes) and `data` (ciphertext and tag) as base64url strings. Two formats exist; which applies is fixed per packet type, and a receiver rejects any other version:
 
 | Format | Plaintext | Unbound | Envelope-bound |
 |---|---|---|---|
@@ -396,10 +396,10 @@ Device pairs establish an X4DH session — an asynchronous root-key agreement th
   "from":         "<publicId>",
   "to":           "<publicId>::<endpointId>",
   "sessionEpoch": "<uuid>",
-  "ekPub":        [ /* 32 bytes: fresh X25519 ephemeral public key */ ],
+  "ekPub":        "<base64url: 32 bytes, fresh X25519 ephemeral public key>",
   "deviceId":     "<deviceId>",
   "ts":           1234567890123,
-  "sig":          [...]
+  "sig":          "<base64url: 64 bytes>"
 }
 ```
 
@@ -541,8 +541,8 @@ The ack never fires for self-targeted traffic, for a message that failed verific
   "type": "app:message",
   "from": "<publicId>",
   "to":   "<publicId>" | "<publicId>::<endpointId>",
-  "blob": { "v": 2, "iv": [...], "data": [...] },
-  "sig":  [...]
+  "blob": { "v": 2, "iv": "<base64url>", "data": "<base64url>" },
+  "sig":  "<base64url>"
 }
 ```
 
@@ -724,8 +724,8 @@ A deliberate relay change is announced via a dedicated packet so contacts (and t
   "type": "app:migrate",
   "from": "<publicId>",
   "to":   "<publicId>",
-  "blob": { "v": 2, "iv": [...], "data": [...] },
-  "sig":  [...]
+  "blob": { "v": 2, "iv": "<base64url>", "data": "<base64url>" },
+  "sig":  "<base64url>"
 }
 ```
 
@@ -753,7 +753,7 @@ A client offers migration only to a relay that passed a **TEST** (full auth hand
 A deliberate, irreversible local action — "stop trusting this identity" — announced via its own packet. It is **sign-only**: no blob, no encryption, nothing secret.
 
 ```json
-{ "type": "app:burn", "from": "<publicId>", "to": "<publicId>", "ts": 1234567890123, "sig": [...] }
+{ "type": "app:burn", "from": "<publicId>", "to": "<publicId>", "ts": 1234567890123, "sig": "<base64url>" }
 ```
 
 `to` is always bare. The signature (mandatory) covers `{ type, from, to, ts }`, which authenticates the sender and prevents the relay from retyping, redirecting or reflecting it. A packet without `sig` or a finite `ts` is dropped.
@@ -823,7 +823,7 @@ Audio calls are negotiated peer-to-peer over WebRTC. The relay carries only smal
 ### Signaling — invite / claim / cancel / end
 
 ```json
-{ "type": "call:invite", "from": "<publicId>", "to": "<publicId>", "callId": "<uuid>", "ts": 1234567890123, "deviceId": "<deviceId>", "sig": [...] }
+{ "type": "call:invite", "from": "<publicId>", "to": "<publicId>", "callId": "<uuid>", "ts": 1234567890123, "deviceId": "<deviceId>", "sig": "<base64url>" }
 ```
 
 Four types: `call:invite`, `call:claim`, `call:cancel`, `call:end`. All share this shape, carry no `blob`, are not encrypted, and are **mandatory-signed** (`blob: null` in the signed body). `callId` ties every packet to one attempt, generated once by the caller. All `call:*` are live-only: an offline callee never rings. A second invite while a call with that contact is past `idle` is ignored.
@@ -876,7 +876,7 @@ A connection test: it answers "can these two devices reach each other directly?"
 Seven packet types mirror `call:*` under their own prefix: `data:invite`/`data:claim`/`data:cancel`/`data:end` (signed only, no `blob`) and `data:offer`/`data:answer`/`data:ice` (signed, encrypted `blob` — SDP or one ICE candidate — under the static pairwise key, inside the signature). `sessionId` plays `callId`'s role. All are mandatory-signed and live-only. Same shared state machine, same multi-device claim dedup, same STUN-only ICE.
 
 ```json
-{ "type": "data:invite", "from": "<publicId>", "to": "<publicId>", "sessionId": "<uuid>", "ts": 1234567890123, "deviceId": "<deviceId>", "sig": [...] }
+{ "type": "data:invite", "from": "<publicId>", "to": "<publicId>", "sessionId": "<uuid>", "ts": 1234567890123, "deviceId": "<deviceId>", "sig": "<base64url>" }
 ```
 
 **Acceptance is explicit.** An incoming `data:invite` puts the contact in `ringing` and raises an accept/decline banner stating that accepting shares the network address; nothing auto-claims. A second invite while a session is active is ignored. A `data:offer` is only answered while `negotiating` with role `callee`.
@@ -1177,8 +1177,8 @@ The inner blob is unchanged — the recipient still decrypts it with its own pas
 The SYNC button asks one contact for its recent messages. It requires the contact to be online (per presence) and is addressed to the contact's identity (bare `to`), so every live session of the contact may answer. The packet is **sign-only**: no pairwise-key blob and no AAD. The only secret, the message batch, is wrapped under an ephemeral-to-ephemeral key; everything else (`syncId`, `ek`, `reply`) is a nonce, a one-shot public key, or a bit the relay could already infer.
 
 ```json
-{ "type": "app:sync", "from": "<publicId>", "to": "<publicId>", "syncId": "<uuid>", "reply": false, "ek": [...32], "sig": [...] }
-{ "type": "app:sync", "from": "<publicId>", "to": "<publicId>", "syncId": "<uuid>", "reply": true,  "ek": [...32], "wrapped": { "v": 2, ... }, "sig": [...] }
+{ "type": "app:sync", "from": "<publicId>", "to": "<publicId>", "syncId": "<uuid>", "reply": false, "ek": "<base64url: 32 bytes>", "sig": "<base64url>" }
+{ "type": "app:sync", "from": "<publicId>", "to": "<publicId>", "syncId": "<uuid>", "reply": true,  "ek": "<base64url: 32 bytes>", "wrapped": { "v": 2, ... }, "sig": "<base64url>" }
 ```
 
 The signature covers `{ type, from, to, syncId, reply, ek, wrapped }` (`wrapped` is `null` in the signed body of a request, and absent on the wire). Verification is mandatory.
@@ -1187,7 +1187,7 @@ The signature covers `{ type, from, to, syncId, reply, ek, wrapped }` (`wrapped`
 2. **Reply** (`reply: true`) — the recipient generates its own ephemeral, derives `wrapKey` (the [Ephemeral Wrap](#ephemeral-wrap) derivation) from `X25519(replierEphemeralPriv, requesterEk)`, and returns its own `ek` plus `wrapped` = `objectBlob_v2(wrapKey, its 10 most recent messages for the initiator)`.
 3. **Accept** — the initiator accepts a reply only while a request of its own to that same contact with that `syncId` is pending (60 s), unwraps with the held ephemeral, and merges. A matching reply is deliberately not consumed — several of the contact's devices can each legitimately answer the one broadcast request, and merging the same batch twice is a no-op.
 
-**Receive checks:** `to` addresses us; sender is a known, non-blocked contact and not ourselves; signature valid; `syncId` a non-empty string of at most 64 characters; `reply` a boolean. A request needs a valid `ek` (32 integers 0–255) and is deduped for 3 s on `(from, syncId)`. A reply needs a valid `ek` and a `wrapped` object.
+**Receive checks:** `to` addresses us; sender is a known, non-blocked contact and not ourselves; signature valid; `syncId` a non-empty string of at most 64 characters; `reply` a boolean. A request needs a valid `ek` (32 bytes) and is deduped for 3 s on `(from, syncId)`. A reply needs a valid `ek` and a `wrapped` object.
 
 **One-directional:** only the side that pressed SYNC receives; press it on both sides for a two-way exchange.
 

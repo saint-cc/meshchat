@@ -13,7 +13,7 @@
 
    Load order: meshchat-lib.js → meshchat-gui.js → meshchat.js → statemachine.js
 ═══════════════════════════════════════════════════════════════ */
-const CLIENT_VERSION = "0.6.6";
+const CLIENT_VERSION = "0.7.0";
 
 const POLL_INTERVAL_MS        	= 30_000;			// base interval between presence polls
 const POLL_JITTER_MS          	= 10_000;			// ± random jitter added to poll interval
@@ -7958,7 +7958,8 @@ async function exportBackup(passphrase) {
   const exportKey = await importEncKey(keys.backupKey);
   const blob      = await encryptObject(exportKey, serialiseContacts());
   const a         = Object.assign(document.createElement("a"), {
-    href:     "data:application/json," + encodeURIComponent(JSON.stringify({ v: 2, user: state.user, blob })),
+    // v = file format; kdf = identity-KDF generation the backup key came from (KDF_VERSION, meshchat-lib.js) — importBackup refuses any other
+    href:     "data:application/json," + encodeURIComponent(JSON.stringify({ v: 2, kdf: KDF_VERSION, user: state.user, blob })),
     download: "meshchat-backup-" + Date.now() + ".json"
   });
   a.click();
@@ -7968,6 +7969,14 @@ async function exportBackup(passphrase) {
 async function importBackup(file, passphrase) {
   const parsed    = JSON.parse(await file.text());
   if (!parsed.blob) throw new Error("invalid backup file");
+  // Checked BEFORE the KDF: no point spending 512 MiB and seconds to fail a decrypt. A pre-Argon2id
+  // backup has no `kdf` field; its backup key came from the PBKDF2 master secret, which this
+  // version can no longer derive.
+  if (parsed.kdf !== KDF_VERSION) {
+    const err = new Error("this backup was made before the Argon2id key change — it belongs to the old identity and can't be restored here");
+    err.code = "kdf_version";
+    throw err;
+  }
   const master    = await deriveMasterSecret(parsed.user || state.user, passphrase);
   const keys      = await hkdfExpand(master);
   const importKey = await importEncKey(keys.backupKey);

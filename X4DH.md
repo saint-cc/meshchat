@@ -128,7 +128,7 @@ Preconditions as in §3.3 (and the function itself re-checks that we are the fix
 
 ```json
 { "type": "session:propose", "from": "<publicId>", "to": "<publicId>::<endpointId>",
-  "sessionEpoch": "<uuid>", "ekPub": [...32], "deviceId": "<our deviceId>", "ts": <proposeTs>, "sig": [...] }
+  "sessionEpoch": "<uuid>", "ekPub": "<base64url: 32 bytes>", "deviceId": "<our deviceId>", "ts": <proposeTs>, "sig": "<base64url: 64 bytes>" }
 ```
 
 signed over `{ type, from, to, sessionEpoch, ekPub, deviceId, ts }` (see `protocol.md`), routed to the contact's relay with fallback to the main socket. The relay buffers it (overwrite per sender, 24 h TTL) as well as delivering live.

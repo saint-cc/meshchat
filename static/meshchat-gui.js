@@ -1991,6 +1991,44 @@ function showBurnWarning() {
 /* ══════════════════════════════════════════
    LOGIN
 ══════════════════════════════════════════ */
+/* KDF progress (the Argon2id derivation in kdf-worker.js). The UI appears only when the
+   worker actually starts (onBackend) — a remembered login never runs the KDF and never shows it.
+   WASM has no progress, so the bar is indeterminate until/unless the pure-JS fallback reports
+   percentages. Reasoned from the APIs, not yet observed on devices: the indeterminate -> pct
+   switch, and how long the JS fallback takes on a phone. */
+function kdfProgress() {
+  const box = document.getElementById("kdfProgress"), bar = document.getElementById("kdfBar");
+  const fill = document.getElementById("kdfFill"), label = document.getElementById("kdfLabel");
+  const status = document.getElementById("loginStatus");
+  const mib = Math.round(ARGON2_PARAMS.memoryKiB / 1024);
+  return {
+    opts: {
+      onBackend(backend) {
+        box.hidden = false;
+        bar.classList.add("indeterminate");
+        fill.style.width = "";
+        if (backend === "wasm") {
+          label.textContent = `WASM: calculating… (${mib} MiB, a few seconds)`;
+        } else {
+          label.textContent = `JS: calculating… (${mib} MiB — WebAssembly isn't available here, so this is the slower fallback; about 20 s on a phone)`;
+        }
+        mlog.info(`KDF        Argon2id ${mib} MiB t=${ARGON2_PARAMS.iterations} p=${ARGON2_PARAMS.parallelism}  backend=${backend}`);
+      },
+      onProgress(pct) {
+        bar.classList.remove("indeterminate");
+        fill.style.width = pct + "%";
+        status.textContent = `deriving keys… ${pct}%`;
+      },
+    },
+    hide() { box.hidden = true; },
+  };
+}
+
+// What the person sees when the device can't give the KDF its memory. Also used by the backup export/import.
+function kdfOomMessage() {
+  return `not enough memory to derive your keys — this needs ${Math.round(ARGON2_PARAMS.memoryKiB / 1024)} MiB free. close other tabs and apps and try again, or use a device with more memory`;
+}
+
 document.getElementById("loginButton").onclick = async (e) => {
   e.preventDefault();
   const name   = document.getElementById("inputName").value.trim();
@@ -2000,8 +2038,10 @@ document.getElementById("loginButton").onclick = async (e) => {
   const btn = document.getElementById("loginButton");
   btn.disabled = true;
   status.textContent = "deriving keys…";
+  const kdf = kdfProgress();
   try {
-    const master = await deriveMasterSecretOrRemembered(name, pass);   // meshchat-identity.js: stored master secret when auto-logging in, else the real KDF
+    const master = await deriveMasterSecretOrRemembered(name, pass, kdf.opts);   // meshchat-identity.js: stored master secret when auto-logging in, else the real KDF
+    kdf.hide();
     const keys   = await hkdfExpand(master);
 	state.user=name;
 	state.keys=keys;
@@ -2061,7 +2101,7 @@ document.getElementById("loginButton").onclick = async (e) => {
     mlog.info(`LOGIN      ${name}  ${pid(state.publicId)}`);
     renderContactList();
     connectSignal();
-  } catch(e) { releaseIdentity(); status.textContent = e.message || "error during login"; btn.disabled = false; }
+  } catch(e) { kdf.hide(); releaseIdentity(); status.textContent = e.code === "oom" ? kdfOomMessage() : (e.message || "error during login"); btn.disabled = false; }
 };
 
 /* ══════════════════════════════════════════
@@ -2194,8 +2234,8 @@ document.getElementById("exportConfirm").onclick = async () => {
   const pass   = document.getElementById("exportPassphrase").value;
   const status = document.getElementById("exportStatus");
   if (!pass) { status.textContent = "passphrase required"; return; }
-  try { status.textContent = "encrypting…"; await exportBackup(pass); status.textContent = "exported!"; setTimeout(closeExportModal, MODAL_CLOSE_DELAY_MS); }
-  catch(e) { status.textContent = "export failed: " + e.message; }
+  try { status.textContent = "deriving key… (a few seconds)"; await exportBackup(pass); status.textContent = "exported!"; setTimeout(closeExportModal, MODAL_CLOSE_DELAY_MS); }
+  catch(e) { status.textContent = "export failed: " + (e.code === "oom" ? kdfOomMessage() : e.message); }
 };
 
 document.getElementById("importConfirm").onclick = () => {
@@ -2206,8 +2246,9 @@ document.getElementById("importConfirm").onclick = () => {
     const status = document.getElementById("exportStatus");
     if (!file) return;
     if (!pass) { status.textContent = "enter passphrase first"; return; }
-    try { status.textContent = "decrypting…"; await importBackup(file, pass); status.textContent = "restored!"; setTimeout(closeExportModal, MODAL_CLOSE_DELAY_MS); }
-    catch(e) { status.textContent = "restore failed — wrong passphrase or file?"; }
+    try { status.textContent = "deriving key… (a few seconds)"; await importBackup(file, pass); status.textContent = "restored!"; setTimeout(closeExportModal, MODAL_CLOSE_DELAY_MS); }
+    // oom and kdf_version have messages worth showing; everything else stays the old catch-all (a wrong passphrase is a decrypt failure, indistinguishable from a bad file)
+    catch(e) { status.textContent = e.code === "oom" ? "restore failed — " + kdfOomMessage() : e.code === "kdf_version" ? "restore failed — " + e.message : "restore failed — wrong passphrase or file?"; }
   };
   input.click();
 };

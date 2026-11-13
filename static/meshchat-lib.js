@@ -9,6 +9,35 @@
    Load order: meshchat-lib.js → meshchat-gui.js → meshchat.js → statemachine.js
 ═══════════════════════════════════════════════════════════════ */
 
+/* ── identity KDF: Argon2id (kdf-worker.js does the work) ──
+   name + passphrase -> 32-byte master secret -> hkdfExpand -> the keys.
+   The parameters are FIXED for every device, forever: they are part of the
+   identity (change one and the same name+passphrase derives a different
+   identity), so there is no per-device tuning and no "weaker on phones" mode.
+   512 MiB is the price of making each guess cost an attacker 512 MiB of
+   memory bandwidth instead of a few kB of ALU — see KDF_ATTACK_RATE. A device
+   that cannot allocate it cannot log in (deriveMasterSecret -> code "oom").
+
+   KDF_VERSION is the identity-derivation generation. v1 was PBKDF2-SHA256
+   (1,000,000 iterations), v2 is Argon2id. It rides in the Argon2 salt input
+   and in the x25519/backup/signing HKDF labels (KDF_LABEL_PREFIX), so a v2
+   name+passphrase can never land on a v1 identity. Backup files carry it too
+   (meshchat.js exportBackup/importBackup). The OTHER "meshchat-v1:" labels in
+   this file (pairwise, device-endpoint, qr-intro, ephemeral-wrap, ...) name
+   protocol domains, not the identity KDF, and deliberately stay as they are. */
+const KDF_VERSION      = 2;
+const KDF_LABEL_PREFIX = "meshchat-v" + KDF_VERSION + ":";
+const ARGON2_PARAMS    = Object.freeze({ memoryKiB: 524288, iterations: 3, parallelism: 2, hashLength: 32 });   // 512 MiB, t=3, p=2
+const KDF_WORKER_URL   = "./kdf-worker.js";
+
+// What the strength meter assumes an attacker can do, in password guesses per
+// second against ONE target (estimateCrackTimeBits). A deliberately generous,
+// hand-estimated number, not a measurement: Argon2id at 512 MiB / t=3 moves
+// ~3 GiB per guess, which is memory-bandwidth bound — a GPU with ~1 TB/s
+// manages a few hundred guesses/s, so ~1e6/s is a cluster of a few thousand
+// GPUs. (The old 1e11 was a PBKDF2-era figure.) It only labels the meter.
+const KDF_ATTACK_RATE  = 1e6;
+
 /* ── passphrase entropy model (login screen strength meter) ── */
 function calcEntropy(pass) {
   let charset = 0;
@@ -38,7 +67,7 @@ function usernameEntropy(user) {
   return Math.log2(5000); // rough generic namespace estimate
 }
 
-function estimateCrackTimeBits(bits, rate = 1e11) {
+function estimateCrackTimeBits(bits, rate = KDF_ATTACK_RATE) {
   const totalGuesses = Math.pow(2, bits);
   const seconds = totalGuesses / rate;
 
@@ -244,18 +273,55 @@ function buildAuthMessage(relayHost, nonce, x25519Pub, ed25519Pub, endpointId, n
 /* ══════════════════════════════════════════
    CRYPTO
 ══════════════════════════════════════════ */
-async function deriveMasterSecret(name, passphrase) {
+// Error whose .code says what went wrong: "oom" (the device could not allocate
+// ARGON2_PARAMS.memoryKiB), "selftest" (the Argon2 build computes a wrong
+// answer), "other". The GUI shows a dedicated message for "oom".
+function kdfError(code, message) {
+  const e = new Error(message);
+  e.code = code;
+  return e;
+}
+
+// One Argon2id derivation in a throwaway Worker (kdf-worker.js has the protocol
+// and the backend/self-test story). The worker is terminated the moment it
+// answers, so the 512 MiB is released at once. No main-thread fallback if the
+// Worker can't start: 512 MiB of Argon2 on the page thread would freeze it.
+// onProgress(pct 0..100) fires only for the pure-JS backend (WASM has no
+// progress); onBackend("wasm" | "js") fires once, before the work starts.
+function runKdfWorker(password, salt, params, { onProgress, onBackend } = {}) {
+  return new Promise((resolve, reject) => {
+    let w;
+    try { w = new Worker(KDF_WORKER_URL); }
+    catch (e) { reject(kdfError("other", "could not start the key-derivation worker: " + e.message)); return; }
+    const end = (settle, value) => { w.onmessage = w.onerror = w.onmessageerror = null; w.terminate(); settle(value); };
+    w.onmessage = (ev) => {
+      const m = ev.data || {};
+      if      (m.type === "backend")  { try { onBackend && onBackend(m.backend); } catch (_) {} }
+      else if (m.type === "progress") { try { onProgress && onProgress(m.pct); } catch (_) {} }
+      else if (m.type === "done")     end(resolve, m.key);
+      else if (m.type === "error")    end(reject, kdfError(m.kind || "other", m.message || "key derivation failed"));
+    };
+    // script failed to load (a missing kdf-worker.js comes back as index.html from the static server -> a syntax error here)
+    w.onerror        = (ev) => { if (ev.preventDefault) ev.preventDefault(); end(reject, kdfError("other", "key-derivation worker failed: " + (ev.message || "could not load kdf-worker.js"))); };
+    w.onmessageerror = () => end(reject, kdfError("other", "key-derivation worker sent an unreadable reply"));
+    // buffers are transferred: the page keeps no copy of the passphrase bytes
+    w.postMessage({ type: "derive", password, salt, params }, [password.buffer, salt.buffer]);
+  });
+}
+
+// opts: { onProgress, onBackend } — see runKdfWorker. Rejects with .code "oom" | "selftest" | "other".
+async function deriveMasterSecret(name, passphrase, opts = {}) {
   if (!crypto?.subtle) throw new Error("crypto.subtle unavailable — needs HTTPS or localhost");
-  const enc      = new TextEncoder();
-  const saltData = await crypto.subtle.digest("SHA-256", enc.encode("meshchat-v1:" + name.toLowerCase().trim()));
-  const baseKey  = await crypto.subtle.importKey("raw", enc.encode(passphrase), { name: "PBKDF2" }, false, ["deriveBits"]);
-  const bits     = await crypto.subtle.deriveBits({ name: "PBKDF2", salt: saltData, iterations: 1000000, hash: "SHA-256" }, baseKey, 256);
-  return new Uint8Array(bits);
+  if (!passphrase) throw new Error("passphrase required");   // Argon2 (hash-wasm) refuses an empty password; every caller already checks
+  const enc  = new TextEncoder();
+  // salt = SHA-256(label + lowercased trimmed name): 32 bytes, per-name, public — same construction as v1, new label.
+  const salt = new Uint8Array(await crypto.subtle.digest("SHA-256", enc.encode(KDF_LABEL_PREFIX + name.toLowerCase().trim())));
+  return runKdfWorker(enc.encode(passphrase), salt, ARGON2_PARAMS, opts);
 }
 
 async function hkdfExpand(master){
   const key=await crypto.subtle.importKey("raw",master,{name:"HKDF"},false,["deriveBits"]);
-  const derive=async(label)=>new Uint8Array(await crypto.subtle.deriveBits({name:"HKDF",hash:"SHA-256",salt:new Uint8Array(32),info:new TextEncoder().encode("meshchat-v1:"+label)},key,256));
+  const derive=async(label)=>new Uint8Array(await crypto.subtle.deriveBits({name:"HKDF",hash:"SHA-256",salt:new Uint8Array(32),info:new TextEncoder().encode(KDF_LABEL_PREFIX+label)},key,256));
   // x25519Seed replaces the old raw AES "encryptionKey" — this is now a DH
   // private scalar, never handed to anyone. What goes in the shareable
   // address is x25519.getPublicKey(x25519Seed), a genuine public key, not

@@ -169,7 +169,7 @@ directory next to `server.py`:
 
 * `index.html`, `style.css`, `style_local.css` (themes), `manifest.json`, `sw.js`
 * `meshchat-lib.js`, `meshchat-gui.js`, `meshchat.js`, `meshchat-identity.js`, `statemachine.js`, `meshchat-boot.js`
-* `vendor/` with the three bundled libraries (`qrcode.min.js`, `html5-qrcode.min.js`, `noble-ed25519.js`)
+* `vendor/` with the bundled libraries (`qrcode.min.js`, `html5-qrcode.min.js`, `noble-ed25519.js`, `noble-mlkem.js`, `noble-argon2.js`, `hash-wasm-argon2.min.js`), their licenses and `README.md` (versions, hashes, how to rebuild)
 
 The page runs entirely from its own origin: the libraries are bundled rather than loaded from a CDN, and the Content-Security-Policy in `index.html` allows scripts from `'self'` only, with no inline scripts or event-handler attributes.
 

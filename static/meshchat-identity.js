@@ -145,14 +145,14 @@ try {
    autofilled password hidden from scripts until a user gesture, phones want
    a tap on the suggestion, and Safari has no silent credential API at all.
 
-   WHAT IS STORED. Not the passphrase: the 32-byte PBKDF2 master secret
+   WHAT IS STORED. Not the passphrase: the 32-byte Argon2id master secret
    (deriveMasterSecret's output) and the username, in IndexedDB
    ("meshchat-remember"), AES-GCM-encrypted under a NON-EXTRACTABLE WebCrypto
    key that sits beside it as a CryptoKey. Consequences, stated plainly:
      - the master secret IS the identity: whoever holds it can log in as you,
        forever (identities cannot be revoked — see known-limitations.md);
      - it is not your passphrase, so a leak does not expose a passphrase you
-       reuse elsewhere, and login skips the 1,000,000-iteration derivation;
+       reuse elsewhere, and login skips the 512 MiB Argon2id derivation;
      - the non-extractable key stops a script (XSS) or a storage dump from
        copying the key bytes. It does NOT stop a script from asking the page
        to decrypt, and it is no protection against someone with real access
@@ -188,6 +188,17 @@ try {
    The localStorage flag AUTOLOGIN_KEY is the checkbox state (the user's
    intent); the IndexedDB record is the secret. Unticking deletes the record.
 
+   RECORD VERSION = KDF GENERATION. A record holds a master secret, and a
+   master secret only means something under the KDF that produced it. A v:1
+   record is a PBKDF2 (pre-Argon2id) master secret: fed to hkdfExpand it would
+   still "work" and log straight in — to the OLD identity's keys under the new
+   labels, i.e. a different, empty identity, with no error. So rememberLoad
+   accepts only v === REMEMBER_VERSION (the KDF generation) and DELETES a
+   record of any other version; the user lands on the login screen and types
+   the passphrase once. REMEMBER_AAD carries the generation as well, so an old
+   record can't be decrypted under the new one even if the version field were
+   edited.
+
    Reasoned from the APIs, not yet observed on devices: storing a CryptoKey
    in IndexedDB on iOS Safari, and Safari clearing site storage after ~7 days
    without a visit unless the app is on the Home Screen (the remembered login
@@ -198,7 +209,8 @@ const NO_AUTOLOGIN_FLAG = "meshchat_no_autologin";    // sessionStorage: this ta
 const REMEMBER_DB       = "meshchat-remember";
 const REMEMBER_STORE    = "kv";
 const REMEMBER_KEY      = "remembered";
-const REMEMBER_AAD      = "meshchat-remember-v1";
+const REMEMBER_VERSION  = KDF_VERSION;                  // record format == KDF generation (meshchat-lib.js) — see RECORD VERSION above
+const REMEMBER_AAD      = "meshchat-remember-v" + REMEMBER_VERSION;
 const REMEMBERED_PASS   = "\u0000remembered\u0000";
 
 let pendingRemembered = null;   // { name, master } loaded for the login startAutoLogin is about to fire
@@ -251,14 +263,20 @@ async function rememberStore(name, master) {
   const key = await crypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);   // extractable: false — the point
   const iv  = crypto.getRandomValues(new Uint8Array(12));
   const ct  = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv, additionalData: rememberAad(name) }, key, master));
-  await idbDo("readwrite", s => s.put({ v: 1, name, iv, ct, key, createdAt: Date.now() }, REMEMBER_KEY));
+  await idbDo("readwrite", s => s.put({ v: REMEMBER_VERSION, name, iv, ct, key, createdAt: Date.now() }, REMEMBER_KEY));
 }
 
 // -> { name, master: Uint8Array(32) } or null. Never throws: anything wrong with the record is "no record".
+// A record from another KDF generation (v:1 = PBKDF2) is not just ignored but deleted — see RECORD VERSION.
 async function rememberLoad() {
   try {
     const rec = await idbDo("readonly", s => s.get(REMEMBER_KEY));
-    if (!rec || rec.v !== 1 || typeof rec.name !== "string" || !rec.name || !rec.key) return null;
+    if (rec && rec.v !== REMEMBER_VERSION) {
+      mlog.info("REMEMBER  dropping a remembered login from an older key derivation — log in with your passphrase");
+      await forgetRemembered();
+      return null;
+    }
+    if (!rec || typeof rec.name !== "string" || !rec.name || !rec.key) return null;
     const pt = await crypto.subtle.decrypt({ name: "AES-GCM", iv: rec.iv, additionalData: rememberAad(rec.name) }, rec.key, rec.ct);
     if (pt.byteLength !== 32) return null;
     return { name: rec.name, master: new Uint8Array(pt) };
@@ -280,7 +298,8 @@ async function persistRememberCandidate() {
 }
 
 // The one function meshchat-gui.js's login handler calls instead of deriveMasterSecret.
-async function deriveMasterSecretOrRemembered(name, pass) {
+// opts is passed straight to deriveMasterSecret ({ onProgress, onBackend }) — only the real KDF reports progress.
+async function deriveMasterSecretOrRemembered(name, pass, opts) {
   if (pass === REMEMBERED_PASS) {
     const rec = pendingRemembered;
     pendingRemembered = null;
@@ -288,7 +307,7 @@ async function deriveMasterSecretOrRemembered(name, pass) {
     if (!rec || rec.name !== name) throw new Error("remembered login unavailable — log in with your passphrase");
     return rec.master;
   }
-  const master = await deriveMasterSecret(name, pass);
+  const master = await deriveMasterSecret(name, pass, opts);
   rememberCandidate = { name, master };
   return master;
 }
