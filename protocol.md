@@ -2,7 +2,7 @@
 
 A decentralised, encrypted messaging protocol built on WebSocket relay servers. No accounts, no central authority, no plaintext.
 
-Implementation version: `0.6.3`, reported informationally in the `version` field of `sig:relay_info` (not enforced). This document specifies the protocol as implemented, in enough detail to build an interoperable client. Packet shapes, key rules and signed field sets are exact; a peer that deviates will have its packets dropped. `X4DH.md` is the authoritative source for session establishment, session keys and send-readiness. `known-limitations.md` lists the permanent trade-offs.
+Implementation version: `0.7.0`, reported informationally in the `version` field of `sig:relay_info` (not enforced). This document specifies the protocol as implemented, in enough detail to build an interoperable client. Packet shapes, key rules and signed field sets are exact; a peer that deviates will have its packets dropped. `X4DH.md` is the authoritative source for session establishment, session keys and send-readiness. `known-limitations.md` lists the permanent trade-offs.
 
 ---
 
@@ -58,26 +58,34 @@ Fields outside these sets are not signed and must not be trusted: notably the `t
 All keys are derived deterministically from `(username, passphrase)`:
 
 ```
-masterSecret = PBKDF2(
-  password   = passphrase (UTF-8),
-  salt       = SHA-256("meshchat-v1:" + username.toLowerCase().trim()),
-  iterations = 1000000,
-  hash       = SHA-256,
-  bits       = 256
+masterSecret = Argon2id(
+  password    = passphrase (UTF-8),
+  salt        = SHA-256("meshchat-v2:" + username.toLowerCase().trim()),   // 32 bytes
+  memory      = 524288 KiB (512 MiB),
+  iterations  = 3,
+  parallelism = 2,
+  version     = 0x13,
+  output      = 32 bytes
 )
 ```
 
-Every derivation parameter — iteration count, salt format, HKDF labels — is an input to the identity: changing any of them changes every derived key and therefore the `publicId`.
+Every derivation parameter — memory, iterations, parallelism, salt format, HKDF labels — is an input to the identity: changing any of them changes every derived key and therefore the `publicId`. The parameters are fixed for every device; there is no per-device tuning. A device that cannot allocate 512 MiB cannot log in.
+
+The client runs the derivation in a Web Worker (`kdf-worker.js`) and terminates the worker when it finishes. It uses a vendored WebAssembly build (hash-wasm) when available and a vendored pure-JS build (`@noble/hashes`) otherwise. Both produce the same output, and a backend is used only after it reproduces a known-answer vector at small parameters. Out of memory is reported as such and does not trigger the fallback.
 
 Three 32-byte values are expanded with HKDF-SHA-256 (`ikm = masterSecret`, `salt` = 32 zero bytes, `info` = the label below as UTF-8):
 
 | Label | Use |
 |---|---|
-| `meshchat-v1:x25519`  | X25519 private scalar — key agreement |
-| `meshchat-v1:backup`  | AES-256-GCM backup key — backup blobs, restore token, local storage |
-| `meshchat-v1:signing` | Ed25519 signing seed |
+| `meshchat-v2:x25519`  | X25519 private scalar — key agreement |
+| `meshchat-v2:backup`  | AES-256-GCM backup key — backup blobs, restore token, local storage |
+| `meshchat-v2:signing` | Ed25519 signing seed |
 
 The X25519 private scalar never leaves the device. `X25519.getPublicKey(scalar)` and `Ed25519.getPublicKey(seed)` are the two public keys that appear in the shareable address.
+
+The `meshchat-v2:` prefix is the identity-derivation generation (`KDF_VERSION` = 2). The other HKDF labels in this document (`pairwise`, `device-endpoint`, `qr-intro`, `ephemeral-wrap`, `restore-wrap`) name protocol domains and keep the `meshchat-v1:` prefix.
+
+**Backup file.** Export writes `{ "v": 2, "kdf": 2, "user": <name>, "blob": <object blob under the backup key> }`. Import refuses a file whose `kdf` is not 2 before running the derivation.
 
 ### PublicId
 
@@ -1276,10 +1284,10 @@ Both live in `meshchat-identity.js` and never touch the wire. They exist because
 
 An opt-in checkbox on the login screen (stored as `meshchat_autologin`) remembers the login on this device, so a page load logs straight in. It does not use the browser's password autofill, which cannot work here: Chrome withholds an autofilled password from scripts until a user gesture, phones want a tap, and Safari has no silent credential API.
 
-**What is stored.** Not the passphrase. The 32-byte PBKDF2 master secret and the username go into IndexedDB (database `meshchat-remember`, store `kv`, record `remembered`), AES-GCM-encrypted under a **non-extractable** WebCrypto key kept beside it as a `CryptoKey`. The username rides as additional authenticated data, so a record whose name was swapped fails to decrypt instead of logging in under another name. Consequences:
+**What is stored.** Not the passphrase. The 32-byte Argon2id master secret and the username go into IndexedDB (database `meshchat-remember`, store `kv`, record `remembered`), AES-GCM-encrypted under a **non-extractable** WebCrypto key kept beside it as a `CryptoKey`. The username rides as additional authenticated data, so a record whose name was swapped fails to decrypt instead of logging in under another name. Consequences:
 
 - The master secret *is* the identity. Whoever holds it can log in as you, indefinitely, and identities cannot be revoked.
-- It is not the passphrase, so a leak does not expose a passphrase reused elsewhere, and login skips the 1,000,000-iteration derivation.
+- It is not the passphrase, so a leak does not expose a passphrase reused elsewhere, and login skips the 512 MiB Argon2id derivation.
 - The non-extractable key stops a script or a storage dump from copying the key bytes. It does not stop a script from asking the page to decrypt, and it is no protection against someone with real access to the browser profile, because key and ciphertext both live in it.
 - A normal login protects contacts and sessions at rest with a key derived from the passphrase. A remembered login drops that layer on this device.
 
@@ -1293,6 +1301,8 @@ An opt-in checkbox on the login screen (stored as `meshchat_autologin`) remember
 **An auto login never takes over.** It does not show the "take over?" confirm. Nobody is looking at the screen, and two auto-login tabs would otherwise steal the identity from each other forever. If the identity lock is held elsewhere it retries once after 1 s (a reload can race the old page's lock release), then gives up with "identity already open in another tab". A manual ENTER asks as usual.
 
 **Suppression.** Two events stop the next page load of *this tab* from logging straight back in, by setting `meshchat_no_autologin` in `sessionStorage` (per tab, survives the reload, gone with the tab): being displaced by another tab, and logout. A login a human chose lifts the mark.
+
+**Version.** The record carries the identity-derivation generation (`v: 2`, and `meshchat-remember-v2` as AES-GCM additional data). A record of any other generation is deleted on load and the login screen shows.
 
 **Deletion.** The record is deleted by: unticking the checkbox, logout, and self-destruct (fire-and-forget there, since the page reloads after 300 ms). On load, if the checkbox is off but a record is left over (unticked in another tab), it is deleted.
 
@@ -1356,7 +1366,7 @@ Held in memory only, never persisted: pending X4DH proposal ephemerals, retired 
 | `WS_PORT`             | `8888`        | WebSocket signal server port |
 | `RELAY_WSS_URL`       | —             | Public WSS URL of this relay. **Required for auth**: its host is what clients' auth proofs are bound to; with no valid value the relay refuses every `sig:auth_init` (`relay_not_configured`) |
 | `RELAY_AUTH_HOSTS`    | —             | Extra hostnames (bare, or full URLs; comma-separated) this relay also accepts an auth proof for. Only meaningful on top of a valid `RELAY_WSS_URL` |
-| `PROTOCOL_VERSION`    | `0.6.3`       | Reported on `sig:relay_info`; informational |
+| `PROTOCOL_VERSION`    | `0.7.0`       | Reported on `sig:relay_info`; informational |
 | `WS_MAX_SIZE`         | `2097152`     | Outer bound on any frame, in bytes. The per-type caps below it are clamped to this |
 | `FRAME_CAP_PREAUTH`   | `1024`        | Largest frame accepted before auth |
 | `FRAME_CAP_TINY`      | `4096`        | `session:*`, `app:burn`, `sig:announce`, `sig:ping`, `sig:relay_req` |
@@ -1470,5 +1480,5 @@ Held in memory only, never persisted: pending X4DH proposal ephemerals, retired 
 
 ---
 
-*MeshChat Protocol v1 — implementation 0.6.3 — experimental, subject to change*
+*MeshChat Protocol v1 — implementation 0.7.0 — experimental, subject to change*
 *Last updated: October 2026*

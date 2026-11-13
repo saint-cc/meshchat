@@ -6,7 +6,7 @@
 
 X4DH establishes a cryptographic session between **two specific devices** and yields the root key from which the AES-256-GCM key for all `app:message` content between them is derived. It establishes a usable session immediately when the responder is offline, and opportunistically upgrades that session when both devices are online.
 
-This document specifies the cryptography and the state machine. `protocol.md` specifies the surrounding wire protocol (envelopes, routing, the held outbox, HELLO). Implementation version `0.6.2`.
+This document specifies the cryptography and the state machine. `protocol.md` specifies the surrounding wire protocol (envelopes, routing, the held outbox, HELLO). Implementation version `0.7.0`.
 
 **Session-only content.** Every message that carries content is encrypted under a session wire key (§5.3) and under nothing else. There is no fallback to any identity-level key: if no send-ready session exists with a device (§7.2), content is not sent to it. The one thing the identity-level static key still carries is the content-free HELLO (`protocol.md`), which exists to give the two sides what this handshake needs (§3.3).
 
@@ -48,7 +48,7 @@ The root key is stored on the device and is the actual encryption root for real 
 
 | Symbol | Meaning |
 |---|---|
-| `IK_X` | identity X25519 key pair of party X (`IK_X_priv` is the scalar from `meshchat-v1:x25519`; `IK_X_pub` is in the shareable address) |
+| `IK_X` | identity X25519 key pair of party X (`IK_X_priv` is the scalar from `meshchat-v2:x25519`; `IK_X_pub` is in the shareable address) |
 | `EK_A`, `EK_B` | fresh one-time X25519 ephemeral key pairs of initiator A and responder B |
 | `DHn` | 32-byte X25519 shared secret |
 | `zero32` | 32 zero bytes |
@@ -359,4 +359,4 @@ HKDF labels: `MeshChat-X4DH-v1/root`, `MeshChat-X4DH-v1/root-v2`, `MeshChat-X4DH
 
 ---
 
-*MeshChat X4DH — implementation 0.6.2 — experimental*
+*MeshChat X4DH — implementation 0.7.0 — experimental*

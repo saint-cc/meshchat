@@ -11,8 +11,8 @@ temporarily buffer ciphertext, but never possess your private keys or message co
 
 ## How it works
 
-Your identity is derived locally from your username and passphrase using PBKDF2 + HKDF. The same 
-credentials always produce the same cryptographic identity.
+Your identity is derived locally from your username and passphrase using Argon2id (512 MiB, run in a Web Worker) + HKDF. The same 
+credentials always produce the same cryptographic identity. Logging in takes a few seconds and needs 512 MiB of free memory.
 
 There are no accounts to create and no passwords stored on any server. Your passphrase **is** your identity.
 
@@ -167,11 +167,11 @@ server {
 The client files are inside a `static/` 
 directory next to `server.py`:
 
-* `index.html`, `style.css`, `style_local.css` (themes), `manifest.json`, `sw.js`
+* `index.html`, `style.css`, `style_local.css` (themes), `manifest.json`, `sw.js`, `kdf-worker.js` (the identity key derivation)
 * `meshchat-lib.js`, `meshchat-gui.js`, `meshchat.js`, `meshchat-identity.js`, `statemachine.js`, `meshchat-boot.js`
 * `vendor/` with the bundled libraries (`qrcode.min.js`, `html5-qrcode.min.js`, `noble-ed25519.js`, `noble-mlkem.js`, `noble-argon2.js`, `hash-wasm-argon2.min.js`), their licenses and `README.md` (versions, hashes, how to rebuild)
 
-The page runs entirely from its own origin: the libraries are bundled rather than loaded from a CDN, and the Content-Security-Policy in `index.html` allows scripts from `'self'` only, with no inline scripts or event-handler attributes.
+The page runs entirely from its own origin: the libraries are bundled rather than loaded from a CDN, and the Content-Security-Policy in `index.html` allows scripts from `'self'` only (plus `'wasm-unsafe-eval'` for the Argon2id WebAssembly build), with no inline scripts or event-handler attributes.
 
 ---
 
