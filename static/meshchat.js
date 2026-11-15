@@ -13,7 +13,7 @@
 
    Load order: meshchat-lib.js → meshchat-gui.js → meshchat.js → statemachine.js
 ═══════════════════════════════════════════════════════════════ */
-const CLIENT_VERSION = "0.7.0";
+const CLIENT_VERSION = "0.7.1";
 
 const POLL_INTERVAL_MS        	= 30_000;			// base interval between presence polls
 const POLL_JITTER_MS          	= 10_000;			// ± random jitter added to poll interval
@@ -1117,7 +1117,7 @@ function isFixedInitiator(contactId, theirDeviceId) {
 // upgrade unless a fresh propose is sent while both sides are actually
 // online together. 60s mirrors BACKUP_OFFER_TTL's existing "how long is
 // a live handshake still fresh" precedent in this file.
-const pendingX4DHProposals = new Map();   // "contactId:theirDeviceId:sessionEpoch" -> { ekPriv, createdAt, timeoutHandle }
+const pendingX4DHProposals = new Map();   // "contactId:theirDeviceId:sessionEpoch" -> { ekPriv, kemSk, kemPub, createdAt, timeoutHandle }
 
 function pendingX4DHKey(contactId, theirDeviceId, sessionEpoch) {
   return `${contactId}:${theirDeviceId}:${sessionEpoch}`;
@@ -1135,6 +1135,8 @@ function pendingX4DHKey(contactId, theirDeviceId, sessionEpoch) {
 // shared schedule it happens to fall.
 function schedulePendingX4DHExpiry(key) {
   return setTimeout(() => {
+    const ent = pendingX4DHProposals.get(key);
+    if (ent && ent.kemSk) ent.kemSk.fill(0);
     if (pendingX4DHProposals.delete(key)) {
       mlog.debug(`X4DH       proposal expired, ephemeral discarded  key=${key}`);
     }
@@ -1339,7 +1341,7 @@ async function storeX4DHSessionRK0(contactId, theirDeviceId, sessionEpoch, rk0By
 // responder provably has it), "rk0" for the responder (it has no proof yet
 // that the initiator received the ack — it keeps sending under RK0, which
 // the initiator certainly holds, until a message arrives under RK1).
-async function upgradeX4DHSessionToRK1(contactId, theirDeviceId, sessionEpoch, rk1Bytes, sendStage = "rk1") {
+async function upgradeX4DHSessionToRK1(contactId, theirDeviceId, sessionEpoch, rk1Bytes, sendStage = "rk1", pq = false) {
   const existing = getX4DHSession(contactId, theirDeviceId);
   if (!existing || existing.sessionEpoch !== sessionEpoch) {
     mlog.warn(`X4DH       stale upgrade attempt — no matching rk0 session, dropped  ${pid(contactId, { deviceId: theirDeviceId })}  epoch=${pid(sessionEpoch)}`);
@@ -1349,6 +1351,7 @@ async function upgradeX4DHSessionToRK1(contactId, theirDeviceId, sessionEpoch, r
   existing.stage      = "rk1";
   existing.rootKey    = rawToBase64(rk1Bytes);
   existing.sendStage  = sendStage;
+  existing.pq         = !!pq;   // true iff RK1 was derived with the ML-KEM-768 secret (root-v3)
   existing.upgradedAt = Date.now();
   delete existing.pendingAck;   // nothing left to defer — see maybeCompleteDeferredAck
   // A session that reaches RK1 isn't stuck anymore — clear whatever
@@ -1505,14 +1508,22 @@ async function confirmX4DHPeerKey(contactId, theirDeviceId) {
    drives crypto session state, not just display, so an unsigned or
    invalid packet is dropped outright rather than flagged and shown.
 ── */
+// kemPub (propose) / kemCt (ack), 0.8.0: part of the signed body ONLY when present,
+// as the final keys, so a relay can neither strip nor swap them (stripping changes
+// the signed bytes) and kem-less packets keep their old signed form.
+function x4dhSignedBody(obj) {
+  const { type, from, to, sessionEpoch, ekPub, deviceId, ts, kemPub, kemCt } = obj;
+  const body = { type, from, to, sessionEpoch, ekPub, deviceId: deviceId || null, ts };
+  if (kemPub) body.kemPub = kemPub;
+  if (kemCt)  body.kemCt  = kemCt;
+  return body;
+}
 function signX4DHPacket(obj) {
-  const { type, from, to, sessionEpoch, ekPub, deviceId, ts } = obj;
-  return signBlob({ type, from, to, sessionEpoch, ekPub, deviceId: deviceId || null, ts });
+  return signBlob(x4dhSignedBody(obj));
 }
 function verifyX4DHPacket(obj, contactSignPublicKey) {
   if (!obj.sig || !contactSignPublicKey) return false;
-  const { type, from, to, sessionEpoch, ekPub, deviceId, ts } = obj;
-  return verifyBlob({ type, from, to, sessionEpoch, ekPub, deviceId: deviceId || null, ts }, obj.sig, contactSignPublicKey);
+  return verifyBlob(x4dhSignedBody(obj), obj.sig, contactSignPublicKey);
 }
 
 /* ── automatic trigger (X4DH.md §13.3) ──
@@ -1725,7 +1736,7 @@ window.x4dhDebug = {
           retryAttempts: s.retryAttempts || 0,
           exhausted: !!s.retryExhaustedAt,
           deferredAck: !!s.pendingAck,
-          sendStage: s.sendStage || s.stage, rk0Kept: !!s.rk0Root,
+          sendStage: s.sendStage || s.stage, pq: !!s.pq, rk0Kept: !!s.rk0Root,
           epoch: pid(s.sessionEpoch),
         });
       }
@@ -1807,6 +1818,11 @@ async function sendX4DHPropose(contactId, theirDeviceId) {
   }
 
   const { priv: ekPriv, pub: ekPub } = generateX25519Ephemeral();
+  // ML-KEM-768 keypair for this proposal (0.8.0). The secret key lives only in the
+  // pending entry (memory, 60 s), never in the session record or storage.
+  let kem;
+  try { kem = kemKeygen(); }
+  catch (e) { mlog.err(`X4DH       propose NOT sent — ML-KEM keygen failed: ${e.message}`); return false; }
   const dh1 = x25519.getSharedSecret(state.x25519Seed, contact.x25519PublicKey);
   const dh2 = x25519.getSharedSecret(ekPriv, contact.x25519PublicKey);
   const rk0 = await deriveX4DHRootStage1(dh1, dh2);
@@ -1815,13 +1831,14 @@ async function sendX4DHPropose(contactId, theirDeviceId) {
   const proposeTs    = Date.now();   // one value, used for both storage and the outgoing packet's signed `ts` — see storeX4DHSessionRK0's own comment
   const pendingKey   = pendingX4DHKey(contactId, theirDeviceId, sessionEpoch);
   pendingX4DHProposals.set(pendingKey, {
-    ekPriv, createdAt: Date.now(), timeoutHandle: schedulePendingX4DHExpiry(pendingKey),
+    ekPriv, kemSk: kem.sk, kemPub: kem.pub, createdAt: Date.now(), timeoutHandle: schedulePendingX4DHExpiry(pendingKey),
   });
   // Rule 1: the propose goes out only once the RK0 it creates is on disk. If the
   // write fails nothing is sent and the pending ephemeral is dropped; the session
   // is in memory at rk0/initiator and the stuck-retry re-proposes later.
   if (!(await storeX4DHSessionRK0(contactId, theirDeviceId, sessionEpoch, rk0, true, proposeTs))) {
     clearTimeout(pendingX4DHProposals.get(pendingKey)?.timeoutHandle);
+    kem.sk.fill(0);
     pendingX4DHProposals.delete(pendingKey);
     mlog.err(`X4DH       propose NOT sent — session state could not be saved  ${pid(contactId, { deviceId: theirDeviceId })}  epoch=${pid(sessionEpoch)}`);
     return false;
@@ -1829,7 +1846,7 @@ async function sendX4DHPropose(contactId, theirDeviceId) {
 
   const obj = {
     type: "session:propose", from: state.publicId, to: buildAddress(contactId, theirEndpoint),
-    sessionEpoch, ekPub: b64e(ekPub), deviceId: state.deviceId, ts: proposeTs,
+    sessionEpoch, ekPub: b64e(ekPub), kemPub: b64e(kem.pub), deviceId: state.deviceId, ts: proposeTs,
   };
   obj.sig = signX4DHPacket(obj);
   const viaRelay = sendToRelay(contactId, obj, true);
@@ -1899,6 +1916,18 @@ async function handleX4DHPropose(msg) {
     mlog.warn(`\u2190 X4DH_PROPOSE from ${pid(msg.from, { deviceId: theirDeviceId })} \u2014 ekPub malformed, dropped`);
     return;
   }
+  // kemPub (0.8.0): absent → transitional classical path (RK1 with pq:false).
+  // Present → must be a valid ML-KEM-768 public key; checked by a trial
+  // encapsulation (noble verifies the modulus) BEFORE anything is stored.
+  let kemAPub = null;
+  if (msg.kemPub != null) {
+    kemAPub = tryBytes(msg.kemPub, KEM_PK_LEN);
+    try { if (!kemAPub) throw new Error("bad length"); kemEncap(kemAPub); }
+    catch (e) {
+      mlog.warn(`\u2190 X4DH_PROPOSE from ${pid(msg.from, { deviceId: theirDeviceId })} \u2014 kemPub invalid (${e.message}), dropped`);
+      return;
+    }
+  }
   const dh1 = x25519.getSharedSecret(state.x25519Seed, contact.x25519PublicKey);
   const dh2 = x25519.getSharedSecret(state.x25519Seed, ekAPub);
   const rk0 = await deriveX4DHRootStage1(dh1, dh2);
@@ -1929,13 +1958,13 @@ async function handleX4DHPropose(msg) {
     // pendingAck already set.
     const session = getX4DHSession(msg.from, theirDeviceId);
     if (session && session.sessionEpoch === msg.sessionEpoch) {
-      session.pendingAck = { ekPub: rawToBase64(ekAPub), receivedAt: Date.now() };
+      session.pendingAck = { ekPub: rawToBase64(ekAPub), kemPub: kemAPub ? rawToBase64(kemAPub) : null, receivedAt: Date.now() };
       await saveX4DHSessions();
       mlog.info(`← X4DH_PROPOSE from ${pid(msg.from, { deviceId: theirDeviceId })} — endpoint not known yet, ack deferred (up to ${X4DH_DEFERRED_ACK_WINDOW_MS / 1000}s) — session stays at RK0 meanwhile`);
     }
     return;
   }
-  await completeX4DHAck(msg.from, theirDeviceId, theirEndpoint, msg.sessionEpoch, ekAPub, rk0);
+  await completeX4DHAck(msg.from, theirDeviceId, theirEndpoint, msg.sessionEpoch, ekAPub, rk0, kemAPub);
 }
 
 /* ── deferred ack (the first-contact race) ──
@@ -1962,24 +1991,31 @@ async function handleX4DHPropose(msg) {
 const X4DH_DEFERRED_ACK_WINDOW_MS = 30_000;
 const x4dhAckInFlight = new Set();   // "contactId:theirDeviceId" — one completion at a time per device
 
-async function completeX4DHAck(contactId, theirDeviceId, theirEndpoint, sessionEpoch, ekAPub, rk0) {
+async function completeX4DHAck(contactId, theirDeviceId, theirEndpoint, sessionEpoch, ekAPub, rk0, kemAPub = null) {
   const contact = state.contacts[contactId];
   if (!contact || contact.blocked || !contact.x25519PublicKey) return false;
 
   const { priv: ekBPriv, pub: ekBPub } = generateX25519Ephemeral();
   const dh3 = x25519.getSharedSecret(ekBPriv, contact.x25519PublicKey);
   const dh4 = x25519.getSharedSecret(ekBPriv, ekAPub);
-  const rk1 = await deriveX4DHRootStage2(rk0, dh3, dh4);
-  if (!(await upgradeX4DHSessionToRK1(contactId, theirDeviceId, sessionEpoch, rk1, "rk0"))) return false;
+  let kemEnc = null;   // { ss, ct } when the propose carried a kemPub
+  if (kemAPub) {
+    try { kemEnc = kemEncap(kemAPub); }
+    catch (e) { mlog.warn(`X4DH       ML-KEM encapsulation failed (${e.message}) — not acking  ${pid(contactId, { deviceId: theirDeviceId })}`); return false; }
+  }
+  const rk1 = await deriveX4DHRootStage2(rk0, dh3, dh4, kemEnc ? { ss: kemEnc.ss, pub: kemAPub, ct: kemEnc.ct } : undefined);
+  const pq  = !!kemEnc;
+  if (kemEnc) kemEnc.ss.fill(0);
+  if (!(await upgradeX4DHSessionToRK1(contactId, theirDeviceId, sessionEpoch, rk1, "rk0", pq))) return false;
 
   const ackObj = {
     type: "session:ack", from: state.publicId, to: buildAddress(contactId, theirEndpoint),
-    sessionEpoch, ekPub: b64e(ekBPub), deviceId: state.deviceId, ts: Date.now(),
+    sessionEpoch, ekPub: b64e(ekBPub), ...(kemEnc ? { kemCt: b64e(kemEnc.ct) } : {}), deviceId: state.deviceId, ts: Date.now(),
   };
   ackObj.sig = signX4DHPacket(ackObj);
   const viaRelay = sendToRelay(contactId, ackObj, true);
   if (!viaRelay) sendSignal(ackObj);
-  mlog.info(`→ X4DH_ACK     to   ${pid(contactId, { deviceId: theirDeviceId, endpointId: theirEndpoint })}  epoch=${pid(sessionEpoch)}  via=${viaRelay ? "relay" : "signal(fallback)"}`);
+  mlog.info(`→ X4DH_ACK     to   ${pid(contactId, { deviceId: theirDeviceId, endpointId: theirEndpoint })}  epoch=${pid(sessionEpoch)}  pq=${pq}  via=${viaRelay ? "relay" : "signal(fallback)"}`);
   return true;
 }
 
@@ -2010,10 +2046,11 @@ async function maybeCompleteDeferredAck(contactId, theirDeviceId) {
   const epoch = session.sessionEpoch;
   (async () => {
     try {
-      const ekAPub = base64ToRaw(pending.ekPub);
+      const ekAPub  = base64ToRaw(pending.ekPub);
+      const kemAPub = pending.kemPub ? base64ToRaw(pending.kemPub) : null;
       const rk0    = base64ToRaw(session.rootKey);   // stage is rk0 (checked above), so this IS RK0
       mlog.info(`X4DH       endpoint learned — completing deferred ack  ${pid(contactId, { deviceId: theirDeviceId, endpointId: theirEndpoint })}  epoch=${pid(epoch)}  after=${Math.round(ageMs)}ms`);
-      await completeX4DHAck(contactId, theirDeviceId, theirEndpoint, epoch, ekAPub, rk0);
+      await completeX4DHAck(contactId, theirDeviceId, theirEndpoint, epoch, ekAPub, rk0, kemAPub);
     } catch(e) {
       mlog.warn(`X4DH       deferred ack failed: ${e.message}  ${pid(contactId, { deviceId: theirDeviceId })}`);
     } finally {
@@ -2050,6 +2087,7 @@ async function handleX4DHAck(msg) {
   if (!session || session.sessionEpoch !== msg.sessionEpoch) {
     mlog.warn(`← X4DH_ACK     from ${pid(msg.from, { deviceId: theirDeviceId })} — no matching rk0 session on file, dropped`);
     clearTimeout(pending.timeoutHandle);
+    if (pending.kemSk) pending.kemSk.fill(0);
     pendingX4DHProposals.delete(key);
     return;
   }
@@ -2059,16 +2097,39 @@ async function handleX4DHAck(msg) {
     mlog.warn(`\u2190 X4DH_ACK     from ${pid(msg.from, { deviceId: theirDeviceId })} \u2014 ekPub malformed, dropped`);
     return;
   }
+  // kemCt (0.8.0). The ack's signature is already verified above — that must stay
+  // true before decapsulating: decapsulation implicit-rejects, so a forged ct would
+  // not throw, it would silently derive a different key. Absent kemCt = a
+  // responder that did the classical derivation (pq:false), which is also what
+  // it will have derived. A malformed kemCt is refused outright.
+  let kemSS = null, kemCt = null;
+  if (msg.kemCt != null) {
+    kemCt = tryBytes(msg.kemCt, KEM_CT_LEN);
+    if (!kemCt || !pending.kemSk) {
+      mlog.warn(`\u2190 X4DH_ACK     from ${pid(msg.from, { deviceId: theirDeviceId })} \u2014 kemCt malformed or no kem state, dropped`);
+      return;
+    }
+    try { kemSS = kemDecap(kemCt, pending.kemSk); }
+    catch (e) {
+      mlog.warn(`\u2190 X4DH_ACK     from ${pid(msg.from, { deviceId: theirDeviceId })} \u2014 ML-KEM decapsulation failed (${e.message}), dropped`);
+      return;
+    }
+  } else {
+    mlog.warn(`\u2190 X4DH_ACK     from ${pid(msg.from, { deviceId: theirDeviceId })} \u2014 no kemCt, session will be classical (pq:false)`);
+  }
   const dh3    = x25519.getSharedSecret(state.x25519Seed, ekBPub);
   const dh4    = x25519.getSharedSecret(pending.ekPriv, ekBPub);
   const rk0    = base64ToRaw(session.rootKey);
-  const rk1    = await deriveX4DHRootStage2(rk0, dh3, dh4);
-  const upgraded = await upgradeX4DHSessionToRK1(msg.from, theirDeviceId, msg.sessionEpoch, rk1);
+  const kemPubSent = pending.kemPub;   // our own public key, kept for the transcript hash
+  const rk1    = await deriveX4DHRootStage2(rk0, dh3, dh4, kemSS ? { ss: kemSS, pub: kemPubSent, ct: kemCt } : undefined);
+  const upgraded = await upgradeX4DHSessionToRK1(msg.from, theirDeviceId, msg.sessionEpoch, rk1, "rk1", !!kemSS);
 
-  // Ephemeral private key's job is done — discard it now rather than
-  // waiting for its scheduled expiry. (Also when the upgrade could not be
+  // Ephemeral private keys' job is done — discard them now rather than
+  // waiting for their scheduled expiry. (Also when the upgrade could not be
   // SAVED: the session is at RK1 in memory, a retry is a new propose with a new
   // ephemeral, and this one must not be replayable.)
+  if (kemSS) kemSS.fill(0);
+  if (pending.kemSk) pending.kemSk.fill(0);
   clearTimeout(pending.timeoutHandle);
   pendingX4DHProposals.delete(key);
   mlog.info(upgraded

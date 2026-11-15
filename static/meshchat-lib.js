@@ -609,6 +609,7 @@ async function hkdfBits(saltBytes, ikmBytes, infoStr, lengthBits = 256) {
 
 const X4DH_INFO_ROOT    = "MeshChat-X4DH-v1/root";
 const X4DH_INFO_ROOT_V2 = "MeshChat-X4DH-v1/root-v2";
+const X4DH_INFO_ROOT_V3 = "MeshChat-X4DH-v1/root-v3"; // hybrid (ML-KEM-768), 0.7.1
 // New — wire-message key domain separation. Distinct label from both root
 // stages above, same "fixed, ASCII-only literal" rule X4DH.md §6.1 already
 // states for every HKDF info string in this codebase (a label that has to
@@ -632,11 +633,51 @@ async function deriveX4DHRootStage1(dh1, dh2) {
 // rather than a special bootstrap-only formula (see §6.1's own comment
 // for why that distinction matters, and §7.1 for why this means BOTH
 // sides compute RK0 as a genuine intermediate, not just Alice).
-async function deriveX4DHRootStage2(rk0, dh3, dh4) {
-  const ikm = new Uint8Array(dh3.length + dh4.length);
-  ikm.set(dh3, 0);
-  ikm.set(dh4, dh3.length);
-  return hkdfBits(rk0, ikm, X4DH_INFO_ROOT_V2);
+async function deriveX4DHRootStage2(rk0, dh3, dh4, kem /* optional { ss, pub, ct } */) {
+  if (!kem) {
+    // Classical stage 2 — byte-for-byte the pre-0.7.1 derivation (root-v2).
+    const ikm = new Uint8Array(dh3.length + dh4.length);
+    ikm.set(dh3, 0);
+    ikm.set(dh4, dh3.length);
+    return hkdfBits(rk0, ikm, X4DH_INFO_ROOT_V2);
+  }
+  // Hybrid stage 2 (0.7.1) — ML-KEM-768 shared secret joins the IKM, plus a
+  // transcript hash binding the exact kemPub and kemCt used. The hash lives
+  // in the IKM, not in `info`, because info strings stay fixed ASCII literals.
+  const th = new Uint8Array(await crypto.subtle.digest("SHA-256", concatBytesKEM(kem.pub, kem.ct)));
+  const ikm = concatBytesKEM(dh3, dh4, kem.ss, th);
+  return hkdfBits(rk0, ikm, X4DH_INFO_ROOT_V3);
+}
+
+function concatBytesKEM(...parts) {
+  let n = 0; for (const p of parts) n += p.length;
+  const out = new Uint8Array(n);
+  let o = 0; for (const p of parts) { out.set(p, o); o += p.length; }
+  return out;
+}
+
+// ML-KEM-768 wrappers (vendored noble-mlkem.js → window.mlkem). Strict length
+// checks everywhere: decapsulation uses implicit rejection and never throws on
+// a bad ciphertext, so length/shape errors are the only thing we can catch here.
+const KEM_PK_LEN = 1184, KEM_SK_LEN = 2400, KEM_CT_LEN = 1088, KEM_SS_LEN = 32;
+function kemKeygen() {
+  const { publicKey, secretKey } = mlkem.ml_kem768.keygen();
+  if (publicKey.length !== KEM_PK_LEN || secretKey.length !== KEM_SK_LEN) throw new Error("kem keygen: bad length");
+  return { pub: publicKey, sk: secretKey };
+}
+// Throws on a malformed public key (noble checks the modulus on encapsulate).
+function kemEncap(pub) {
+  if (!(pub instanceof Uint8Array) || pub.length !== KEM_PK_LEN) throw new Error("kem encap: bad pub length");
+  const { cipherText, sharedSecret } = mlkem.ml_kem768.encapsulate(pub);
+  if (cipherText.length !== KEM_CT_LEN || sharedSecret.length !== KEM_SS_LEN) throw new Error("kem encap: bad output length");
+  return { ct: cipherText, ss: sharedSecret };
+}
+function kemDecap(ct, sk) {
+  if (!(ct instanceof Uint8Array) || ct.length !== KEM_CT_LEN) throw new Error("kem decap: bad ct length");
+  if (!(sk instanceof Uint8Array) || sk.length !== KEM_SK_LEN) throw new Error("kem decap: bad sk length");
+  const ss = mlkem.ml_kem768.decapsulate(ct, sk);
+  if (ss.length !== KEM_SS_LEN) throw new Error("kem decap: bad output length");
+  return ss;
 }
 
 // X4DH wire-message key — derives the AES-256-GCM key that actually
