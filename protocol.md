@@ -2,7 +2,7 @@
 
 A decentralised, encrypted messaging protocol built on WebSocket relay servers. No accounts, no central authority, no plaintext.
 
-Implementation version: `0.7.0`, reported informationally in the `version` field of `sig:relay_info` (not enforced). This document specifies the protocol as implemented, in enough detail to build an interoperable client. Packet shapes, key rules and signed field sets are exact; a peer that deviates will have its packets dropped. `X4DH.md` is the authoritative source for session establishment, session keys and send-readiness. `known-limitations.md` lists the permanent trade-offs.
+Implementation version: `0.7.1`, reported informationally in the `version` field of `sig:relay_info` (not enforced). This document specifies the protocol as implemented, in enough detail to build an interoperable client. Packet shapes, key rules and signed field sets are exact; a peer that deviates will have its packets dropped. `X4DH.md` is the authoritative source for session establishment, session keys and send-readiness. `known-limitations.md` lists the permanent trade-offs.
 
 ---
 
@@ -27,7 +27,7 @@ Implementation version: `0.7.0`, reported informationally in the `version` field
 ## Wire Conventions
 
 - **Transport:** WebSocket text frames, one JSON object per frame. A relay drops frames over its per-type size cap, which is at most `WS_MAX_SIZE` (default 2 MiB); see [Resource limits](#resource-limits).
-- **Binary fields** (`iv`, `data`, `sig`, `ek`, `ekPub`) are base64url strings, unpadded: a 12-byte `iv` is 16 characters, a 32-byte key 43, a 64-byte signature 86. A receiver also accepts the older form, a JSON array of integers 0–255, for one release, and drops anything malformed (characters outside the alphabet, padding, a wrong length); a sender always sends strings. Signatures cover `JSON.stringify` of the packet as it is received, so the form the sender used is the form that was signed: a receiver verifies the packet as it arrived and never re-encodes it first. The relay-authentication packets (`sig:auth_init`, `sig:auth_challenge`, `sig:auth_proof`, with `nonce`, `x25519_pub`, `ed25519_pub` and `sig`) are unchanged and stay integer arrays (`auth_v` 2). Inline media (`data` of an audio or image payload) is base64 as before.
+- **Binary fields** (`iv`, `data`, `sig`, `ek`, `ekPub`, `kemPub`, `kemCt`) are base64url strings, unpadded: a 12-byte `iv` is 16 characters, a 32-byte key 43, a 64-byte signature 86. A receiver also accepts the older form, a JSON array of integers 0–255, for one release, and drops anything malformed (characters outside the alphabet, padding, a wrong length); a sender always sends strings. Signatures cover `JSON.stringify` of the packet as it is received, so the form the sender used is the form that was signed: a receiver verifies the packet as it arrived and never re-encodes it first. The relay-authentication packets (`sig:auth_init`, `sig:auth_challenge`, `sig:auth_proof`, with `nonce`, `x25519_pub`, `ed25519_pub` and `sig`) are unchanged and stay integer arrays (`auth_v` 2). Inline media (`data` of an audio or image payload) is base64 as before.
 - **Ids.** `publicId`, `deviceId` and `endpointId` are `base64url(SHA-256(...)[0:12])`, unpadded (16 characters). All ids are base64url, `[A-Za-z0-9_-]{8,64}`, which never contains `:`. `callId`, `sessionId`, `syncId` and `sessionEpoch` are random UUIDs.
 - **base64url** in this document is the URL-safe alphabet without padding. The one exception is the relay segment of a shareable address, which is standard base64 (`btoa`).
 - **Timestamps** are integer milliseconds since the epoch, taken from the sender's clock.
@@ -41,7 +41,7 @@ Implementation version: `0.7.0`, reported informationally in the `version` field
 | `app:message`, `app:migrate` | `{ type, from, to, blob }` |
 | `app:burn` | `{ type, from, to, ts }` |
 | `app:sync` | `{ type, from, to, syncId, reply, ek, wrapped }` (`wrapped` is `null` on a request) |
-| `session:propose`, `session:ack` | `{ type, from, to, sessionEpoch, ekPub, deviceId, ts }` (`deviceId` or `null`) |
+| `session:propose`, `session:ack` | `{ type, from, to, sessionEpoch, ekPub, deviceId, ts }` (`deviceId` or `null`), then `kemPub` (propose) or `kemCt` (ack) appended as a final key **only if the packet carries one** |
 | `call:*` | `{ type, from, to, callId, deviceId, ts, blob }` (`deviceId`, `blob` or `null`) |
 | `data:*` | `{ type, from, to, sessionId, deviceId, ts, blob }` (`deviceId`, `blob` or `null`) |
 | `sync:backup_offer`, `sync:backup_accept`, `sync:backup_push`, `sync:restore_ack`, `sync:restore_push` | `{ type, from, to, size, ts, blob }` (`size`, `blob` or `null`), then `ek` appended as a final key **only if the packet carries one** |
@@ -405,13 +405,14 @@ Device pairs establish an X4DH session — an asynchronous root-key agreement th
   "to":           "<publicId>::<endpointId>",
   "sessionEpoch": "<uuid>",
   "ekPub":        "<base64url: 32 bytes, fresh X25519 ephemeral public key>",
+  "kemPub":       "<base64url: 1184 bytes, ML-KEM-768 public key>",
   "deviceId":     "<deviceId>",
   "ts":           1234567890123,
   "sig":          "<base64url: 64 bytes>"
 }
 ```
 
-`session:ack` is structurally identical, sent in reply (`ekPub` is the responder's ephemeral). Both types:
+`session:ack` is structurally identical, sent in reply: `ekPub` is the responder's ephemeral and `kemCt` (base64url, 1088 bytes, the ML-KEM-768 ciphertext) takes the place of `kemPub`. Both KEM fields are optional on the wire and covered by the signature only when present, so they cannot be stripped in transit; a propose without `kemPub` yields a classical `RK1` (`X4DH.md` §4.2, §11.3). With them, both packets are about 2 KB, inside `FRAME_CAP_TINY`, so the relay needs no change. A 0.7.0 client cannot verify a propose that carries `kemPub` and drops it, so 0.7.0 and 0.7.1 clients do not establish sessions with each other when the 0.7.1 side is the initiator. Both types:
 
 - are **mandatory-signed** (see [Signed bodies](#signed-bodies)) and dropped on a missing or invalid signature. `deviceId` is an identity-authenticated claim, not proven with a separate device key;
 - **require a compound `to`** — a session is always device-to-device; the relay drops a bare `to`;
@@ -1366,7 +1367,7 @@ Held in memory only, never persisted: pending X4DH proposal ephemerals, retired 
 | `WS_PORT`             | `8888`        | WebSocket signal server port |
 | `RELAY_WSS_URL`       | —             | Public WSS URL of this relay. **Required for auth**: its host is what clients' auth proofs are bound to; with no valid value the relay refuses every `sig:auth_init` (`relay_not_configured`) |
 | `RELAY_AUTH_HOSTS`    | —             | Extra hostnames (bare, or full URLs; comma-separated) this relay also accepts an auth proof for. Only meaningful on top of a valid `RELAY_WSS_URL` |
-| `PROTOCOL_VERSION`    | `0.7.0`       | Reported on `sig:relay_info`; informational |
+| `PROTOCOL_VERSION`    | `0.7.1`       | Reported on `sig:relay_info`; informational |
 | `WS_MAX_SIZE`         | `2097152`     | Outer bound on any frame, in bytes. The per-type caps below it are clamped to this |
 | `FRAME_CAP_PREAUTH`   | `1024`        | Largest frame accepted before auth |
 | `FRAME_CAP_TINY`      | `4096`        | `session:*`, `app:burn`, `sig:announce`, `sig:ping`, `sig:relay_req` |
@@ -1480,5 +1481,5 @@ Held in memory only, never persisted: pending X4DH proposal ephemerals, retired 
 
 ---
 
-*MeshChat Protocol v1 — implementation 0.7.0 — experimental, subject to change*
+*MeshChat Protocol v1 — implementation 0.7.1 — experimental, subject to change*
 *Last updated: October 2026*
