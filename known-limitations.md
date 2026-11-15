@@ -28,9 +28,11 @@ Existing contacts cannot automatically determine that the new identity belongs t
 
 ## Key-derivation changes are hard cutovers
 
-The key-derivation parameters — PBKDF2 iteration count, HKDF labels, salt format — are inputs to your identity exactly as the username and passphrase are. Raising the iteration count from 100,000 to 1,000,000 in `0.5.2` therefore had the same effect as changing everyone's passphrase at once: logging in with the same credentials derived a completely different identity, with no local data under it and no path back to the old one.
+The key-derivation parameters — the algorithm, Argon2id's memory, iteration and parallelism settings, HKDF labels, salt format — are inputs to your identity exactly as the username and passphrase are. Changing any of them has the same effect as changing everyone's passphrase at once: logging in with the same credentials derives a completely different identity, with no local data under it and no path back to the old one. This has already happened twice: raising the PBKDF2 iteration count in `0.5.2`, and the later move from PBKDF2 to Argon2id.
 
 No dual-version detection or migration was attempted, and any future change to these parameters will behave the same way.
+
+The parameters are also fixed for every device. Argon2id runs with 512 MiB of memory, so a device that cannot allocate that cannot log in.
 
 ---
 
@@ -38,7 +40,7 @@ No dual-version detection or migration was attempted, and any future change to t
 
 Your `publicId` is public by design. Anyone who knows your username and your public ID can therefore test passphrase guesses entirely offline — derive the keys from a guess, hash the two public keys, compare against the known ID — with no captured traffic and no network access.
 
-The 1,000,000 PBKDF2 iterations make each guess more expensive; they do not change the shape of the problem. The passphrase is the security floor for everything built on top of it, including every forward-secrecy property that depends on identity keys not leaking. The login screen's entropy meter is a rough guide, not a guarantee.
+Argon2id with 512 MiB of memory and 3 iterations makes each guess expensive, particularly on GPUs and ASICs; it does not change the shape of the problem. The passphrase is the security floor for everything built on top of it, including every forward-secrecy property that depends on identity keys not leaking. The login screen's entropy meter is a rough guide, not a guarantee.
 
 ---
 
@@ -166,23 +168,33 @@ Spreading users across many relays means one operator sees only a fraction of th
 
 ## Forward secrecy is partial, not absent, and does not cover everything
 
-Identity keys are static, and the identity-level pairwise key derived from them provides none of the protection described here — see `protocol.md`'s Encryption section. As of `0.5.0`, a device pair that has completed X4DH session establishment (`X4DH.md`) uses that session's root key to encrypt real message traffic instead, which changes this picture, but only partially:
+Identity keys are static, and the identity-level pairwise key derived from them provides none of the protection described here — see `protocol.md`'s Encryption section. Message content therefore never rides that key: it is encrypted under the root key of an X4DH session (`X4DH.md`) between a specific device pair. That gives forward secrecy, but only partially:
 
-- A session still sitting at `RK0` (the asynchronous bootstrap stage, before a live round trip has completed) protects only the *initiator's* identity key against a future compromise — not the responder's. See `X4DH.md` §10 for why the asymmetry runs that direction.
+- A session still sitting at `RK0` (the asynchronous bootstrap stage, before a live round trip has completed) protects only the *initiator's* identity key against a future compromise — not the responder's. See `X4DH.md` §11.1 for why the asymmetry runs that direction.
 - A session that has completed the live upgrade to `RK1` closes that gap for both sides, for that specific device pair, going forward from the point the upgrade happened. Precisely, this is *session-level forward secrecy against later identity-key compromise*, with these qualifiers:
   - It covers only traffic sent after the upgrade; anything sent under `RK0` beforehand stays exposed as described above.
   - It relies on both ephemeral private keys being erased. In JavaScript that is best-effort (dropped and garbage-collected, not zeroised).
   - The wire key is static per session, so there is no per-message forward secrecy and no post-compromise recovery until the session resets.
   - The session root key is stored on the device, encrypted with a key derived from the passphrase. An attacker with both the device's storage and the passphrase obtains it directly, without needing any identity-key attack.
   - Since `0.5.9`, key material lingers slightly longer than a strict "delete on upgrade" would suggest: `RK0` stays in the session record (encrypted at rest) until the peer is confirmed to be on `RK1`, and replaced roots are kept in memory, decrypt-only, for 120 seconds so in-flight packets aren't lost. Both are deliberate trade-offs for reliability, and both widen the window in which old keys exist on the device.
-- None of this is a full ratchet yet — a device pair's session key is reused for every message under it until the session itself resets (X4DH.md §16.5/§16.6). Per-message forward secrecy (a real Double Ratchet) is separate, later work.
-- Any device pair that hasn't (yet, or ever) completed X4DH bootstrap still falls back to the identity-level static key, with none of the above.
-- **The legacy key is also still accepted on receive for device pairs that do have a session.** A message from such a device that decrypts under the identity-level key is processed (its signature is still checked and a failure is flagged), rather than rejected. Until that fallback is closed, a session is not a one-way door: protection against a compromised static key applies to what you send, not to what is accepted.
+- None of this is a full ratchet yet — a device pair's session key is reused for every message under it until the session itself resets. Per-message forward secrecy (a real Double Ratchet) is separate, later work.
+- A device pair without a send-ready session gets no content at all: the message is held locally until a session exists (`protocol.md`, Held Outbox). There is no fallback to the identity-level key. The cost is that a first message can wait, not that it goes out weakly protected.
+- The identity-level key is still accepted on receive for exactly one type, the content-free HELLO. A static-key packet of any other type is dropped.
 - Calls, data-channel tests, relay migration notices, and burn notices are permanently out of scope for this — they aren't device-targeted infrastructure, so there's no session for them to ride on.
-- Copies of your own messages mirrored between your devices ride the same per-device keys as ordinary messages where a self-session exists, and the legacy self key otherwise — so the same qualifiers apply.
+- Copies of your own messages mirrored between your devices ride the same per-device session keys as ordinary messages, session-only like them — so the same qualifiers apply. A sibling without a session is skipped, not sent a weaker copy.
 - Manual SYNC's envelope uses the identity-level key, but the message batch inside a reply is wrapped under a one-shot ephemeral key (since `0.5.5`), so a recorded batch is not exposed by a later identity-key compromise. The envelope itself carries only an ephemeral public key and a request ID.
 
-In short: if an attacker records encrypted traffic today and later compromises your identity, previously recorded traffic on any device pair without a completed X4DH session — and any non-message traffic regardless — may become decryptable. A device pair with a completed `RK1` session is protected against exactly that scenario for the messages sent after the upgrade; a device pair still at `RK0` is protected only against a future compromise of the initiator's key.
+In short: if an attacker records encrypted traffic today and later compromises your identity, previously recorded non-message traffic (HELLO, calls, data-channel tests, relay migration and burn notices) may become decryptable. A device pair with a completed `RK1` session is protected against exactly that scenario for the messages sent after the upgrade; a device pair still at `RK0` is protected only against a future compromise of the initiator's key.
+
+## Post-quantum protection is partial
+
+Since `0.7.1` the live upgrade to `RK1` also mixes in an ML-KEM-768 shared secret (`X4DH.md` §5.2, §11.3). An attacker has to break both X25519 and ML-KEM to read a session derived that way, so traffic recorded today under such a session stays confidential if X25519 is broken later. That is the whole claim, and it has limits:
+
+- **`RK0` is classical.** Messages sent under `RK0` — an offline responder, or the window before the ack — are exposed to a future break of X25519 exactly as before. Making `RK0` post-quantum would need a long-lived KEM key per device in the HELLO, which is not done.
+- **Authentication is classical.** Identity keys and all signatures are Ed25519/X25519. A quantum adversary present *at handshake time* could impersonate; this protects recorded traffic, not live sessions.
+- **A session can still be classical.** A propose without a KEM key, or an ack without a ciphertext, produces a classical `RK1` (`pq: false`, shown in the device status). The fields are signed, so a relay cannot cause this by stripping them, but the peer itself can. This is a transitional path and is expected to be removed or made optional.
+- **Everything outside X4DH sessions is classical**: HELLO, the ephemeral wrap on backup pushes, call and data signaling, the restore handshake.
+- **The primitives are new and unaudited**, and ML-KEM runs in the browser from a vendored JavaScript build, with best-effort erasure of the secret key.
 
 ## Restore and backup traffic have their own, narrower wire protection
 
@@ -274,6 +286,7 @@ Several changes to how packets are authenticated and protected have deliberately
 - **Relay authentication (`0.5.9`, `auth_v` 2):** a client and relay that disagree on the auth version cannot connect at all.
 - **Envelope binding (`0.5.9`):** packets are now signed over, and encrypted against, their type and addresses. Clients on either side of that line drop each other's `app:message`, `app:migrate`, `app:burn` and `app:sync` packets, and any packets already sitting in a relay's buffer from before the change will not decrypt.
 - **Manual SYNC (`0.5.5`):** a SYNC between a current and a legacy client does nothing.
+- **Hybrid session handshake (`0.7.1`):** a `session:propose` now carries a KEM public key inside the signed body. A `0.7.0` client cannot verify it and drops it, so a `0.7.1` initiator and a `0.7.0` responder never establish a session, and no content flows between them. The other direction works: a `0.7.1` responder accepts a `0.7.0` propose and gets a classical `RK1`.
 
 Anyone running a mixed set of versions should expect silent drops (visible in the log, not in the UI) until everything is updated. Future changes of this kind should be assumed to behave the same way until the project says otherwise.
 
