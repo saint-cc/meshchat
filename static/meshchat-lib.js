@@ -330,7 +330,32 @@ async function hkdfExpand(master){
   const x25519Seed=await derive("x25519");
   const backupKey=await derive("backup");
   const signingKeySeed=await derive("signing");  // raw bytes now, not imported as HMAC
-  return{signingKeySeed,x25519Seed,backupKey};
+  // Local storage only (see STORE at the top of the storage section in
+  // meshchat.js). backupKey also leaves the device — it encrypts the backup
+  // blobs handed to contacts and the export file — so what merely sits in this
+  // browser gets its own key: a leak of one never opens the other. The locator
+  // seed names the localStorage entries; derived from the master secret, so the
+  // key names are opaque and not linkable to the (public) publicId. Additive
+  // labels: identity, publicId and every wire key are unchanged.
+  const storageKeySeed=await derive("storage");
+  const storageLocatorSeed=await derive("storage-locator");
+  return{signingKeySeed,x25519Seed,backupKey,storageKeySeed,storageLocatorSeed};
+}
+
+// The four localStorage entry names, opaque: "mc." + base64url(SHA-256(seed ‖ name)[0:15]).
+// 15 bytes -> 20 chars, no padding. Only the holder of the master secret can
+// recompute them; the names say nothing about what is inside.
+const STORE_NAMES = ["contacts", "sessions", "settings", "held"];
+async function deriveStorageLocators(locatorSeed) {
+  const out = {};
+  for (const name of STORE_NAMES) {
+    const nameBytes = new TextEncoder().encode(name);
+    const buf = new Uint8Array(locatorSeed.length + nameBytes.length);
+    buf.set(locatorSeed, 0); buf.set(nameBytes, locatorSeed.length);
+    const h = new Uint8Array(await crypto.subtle.digest("SHA-256", buf));
+    out[name] = "mc." + rawToBase64(h.slice(0, 15));
+  }
+  return out;
 }
 
 // Single-key hash — used for DEVICE identity only (getOrCreateDeviceId），
@@ -502,8 +527,10 @@ async function decompress(bytes) {
    an aad, a bound blob is refused too (it couldn't decrypt anyway).
    The array form is canonical and unambiguous (JSON string escaping), and
    the leading label keeps it disjoint from any other use of these bytes.
-   Everything here that is NOT a wire packet — contacts/sessions at rest,
-   backup files, ephemeral wraps — stays unbound v1/v2 exactly as before. */
+   Everything here that is NOT a wire packet — backup files, ephemeral wraps —
+   stays unbound v1/v2 exactly as before. The local storage entries are bound
+   too, but to their PURPOSE, not an envelope: aad = ["meshchat-store-v1", name]
+   (storeAad in meshchat.js), so an entry cannot be swapped into another's slot. */
 const ENV_LABEL = "meshchat-env-v1";
 function envelopeAad(type, from, to) {
   for (const [name, v] of [["type", type], ["from", from], ["to", to]]) {

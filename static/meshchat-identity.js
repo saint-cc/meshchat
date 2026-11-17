@@ -185,8 +185,14 @@ try {
    A manual login lifts the mark. An auto login never shows the take-over
    confirm() (see claimIdentityOrAsk).
 
-   The localStorage flag AUTOLOGIN_KEY is the checkbox state (the user's
-   intent); the IndexedDB record is the secret. Unticking deletes the record.
+   The intent (the checkbox) and the secret both live in the IndexedDB store —
+   no localStorage key is involved any more: REMEMBER_INTENT_KEY = 1 means the
+   box is ticked, the REMEMBER_KEY record is the secret. They are separate
+   because the box can be ticked before any login has produced a secret to
+   store. Unticking deletes both. logout and BURN delete the secret only; the
+   box stays ticked, so the next typed login is remembered again. An old
+   meshchat_autologin localStorage flag is moved into the store once, at load
+   (migrateLegacyAutoLoginFlag), and removed.
 
    RECORD VERSION = KDF GENERATION. A record holds a master secret, and a
    master secret only means something under the KDF that produced it. A v:1
@@ -204,11 +210,12 @@ try {
    without a visit unless the app is on the Home Screen (the remembered login
    then simply disappears and the login screen shows).
 ═════════════════════════════════════════════════════════════ */
-const AUTOLOGIN_KEY     = "meshchat_autologin";       // localStorage: "1" = checkbox ticked
+const LEGACY_AUTOLOGIN_KEY = "meshchat_autologin";    // old localStorage flag, "1" = ticked — migrated into the store, then removed
 const NO_AUTOLOGIN_FLAG = "meshchat_no_autologin";    // sessionStorage: this tab must not auto-login ("logout" | "displaced")
 const REMEMBER_DB       = "meshchat-remember";
 const REMEMBER_STORE    = "kv";
-const REMEMBER_KEY      = "remembered";
+const REMEMBER_KEY      = "remembered";               // the record: the secret
+const REMEMBER_INTENT_KEY = "intent";                   // 1 = the "Auto login" box is ticked
 const REMEMBER_VERSION  = KDF_VERSION;                  // record format == KDF generation (meshchat-lib.js) — see RECORD VERSION above
 const REMEMBER_AAD      = "meshchat-remember-v" + REMEMBER_VERSION;
 const REMEMBERED_PASS   = "\u0000remembered\u0000";
@@ -217,11 +224,22 @@ let pendingRemembered = null;   // { name, master } loaded for the login startAu
 let rememberCandidate = null;   // { name, master } from a typed login, persisted once the lock is won
 let autoFireFlag      = false;  // set just before startAutoLogin clicks ENTER; consumed by the click listener below
 
-function autoLoginEnabled() {
-  try { return localStorage.getItem(AUTOLOGIN_KEY) === "1"; } catch(e) { return false; }
+// Async: the intent lives in IndexedDB (see idbDo below). Never throws; any
+// failure reads as "not ticked".
+async function autoLoginEnabled() {
+  try { return (await idbDo("readonly", s => s.get(REMEMBER_INTENT_KEY))) === 1; } catch(e) { return false; }
 }
-function setAutoLoginEnabled(on) {
-  try { if (on) localStorage.setItem(AUTOLOGIN_KEY, "1"); else localStorage.removeItem(AUTOLOGIN_KEY); } catch(e) {}
+async function setAutoLoginEnabled(on) {
+  try { await idbDo("readwrite", s => on ? s.put(1, REMEMBER_INTENT_KEY) : s.delete(REMEMBER_INTENT_KEY)); } catch(e) {}
+}
+// One-time move of the old plaintext flag. The flag is removed either way: when
+// the store is unusable auto login is unavailable and the flag has no purpose.
+async function migrateLegacyAutoLoginFlag() {
+  let flag = null;
+  try { flag = localStorage.getItem(LEGACY_AUTOLOGIN_KEY); } catch(e) { return; }
+  if (flag === null) return;
+  if (flag === "1") await setAutoLoginEnabled(true);
+  try { localStorage.removeItem(LEGACY_AUTOLOGIN_KEY); } catch(e) {}
 }
 function suppressAutoLogin(why) {
   try { sessionStorage.setItem(NO_AUTOLOGIN_FLAG, why || "1"); } catch(e) {}
@@ -292,7 +310,7 @@ async function forgetRemembered() {
 async function persistRememberCandidate() {
   const c = rememberCandidate;
   rememberCandidate = null;
-  if (!c || !autoLoginEnabled()) return;
+  if (!c || !(await autoLoginEnabled())) return;
   try { await rememberStore(c.name, c.master); mlog.info("REMEMBER  login remembered on this device"); }
   catch(e) { mlog.warn(`REMEMBER  couldn't store the login: ${e.message}`); }   // login itself carries on
 }
@@ -346,7 +364,7 @@ async function startAutoLogin() {
   const status = document.getElementById("loginStatus");
   if (!nameEl || !passEl || !btn) return;
 
-  if (!autoLoginEnabled()) { await forgetRemembered(); return; }   // unticked elsewhere (another tab): drop any leftover secret
+  if (!(await autoLoginEnabled())) { await forgetRemembered(); return; }   // unticked elsewhere (another tab): drop any leftover secret
   if (autoLoginSuppressed()) return;
 
   const rec = await rememberLoad();
@@ -374,10 +392,10 @@ async function wireAutoLoginCheckbox(usable, whyNot) {
     if (hint) hint.textContent = "not available: " + whyNot;
     return;
   }
-  chk.checked = autoLoginEnabled();
-  chk.addEventListener("change", () => {
-    setAutoLoginEnabled(chk.checked);
-    if (!chk.checked) forgetRemembered();
+  chk.checked = await autoLoginEnabled();
+  chk.addEventListener("change", async () => {
+    await setAutoLoginEnabled(chk.checked);
+    if (!chk.checked) await forgetRemembered();
   });
 }
 
@@ -389,6 +407,7 @@ async function initAutoLogin() {
     try { await idbDo("readonly", s => s.get(REMEMBER_KEY)); }   // private modes can have IndexedDB present but unusable
     catch(e) { whyNot = "this browser won't let MeshChat store it (private mode?)"; }
   }
+  await migrateLegacyAutoLoginFlag();
   await wireAutoLoginCheckbox(!whyNot, whyNot);
   if (!whyNot) await startAutoLogin();
 }
@@ -424,7 +443,8 @@ else initAutoLogin();
      1. end or decline anything in flight — otherwise the peer rings until
         its own timeout;
      2. flush storage. saveContacts is already serialised; saveX4DHSessions
-        is not awaited by every caller, so wait for it here;
+        is not awaited by every caller, so wait for it here; settings and held
+        are debounced (see LOCAL STORAGE in meshchat.js), so flush those too;
      3. a short pause so what step 1 queued can leave the socket (same
         reasoning as commitBurn's);
      4. drop the socket WITHOUT onclose — it would schedule a reconnect;
@@ -461,6 +481,7 @@ async function logout() {
   try { endActiveSessions(); } catch(e) {}
   try { await saveContacts(); }        catch(e) { mlog.warn(`LOGOUT     saveContacts failed: ${e.message}`); }
   try { await saveX4DHSessions(); }    catch(e) { mlog.warn(`LOGOUT     saveX4DHSessions failed: ${e.message}`); }
+  try { await flushStores(); }         catch(e) { mlog.warn(`LOGOUT     flushStores failed: ${e.message}`); }
   await new Promise(r => setTimeout(r, LOGOUT_FLUSH_MS));
 
   try { if (state.ws) { state.ws.onclose = null; state.ws.close(1000, "logout"); } } catch(e) {}

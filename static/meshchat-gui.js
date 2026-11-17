@@ -43,28 +43,35 @@ const SYSTEM_ICON = { call: "📞" };
 const MAX_DOT_AGE   			= 300_000; 			// = PRUNE_INTERVAL_MS
 
 /* ══════════════════════════════════════════
-   THEME — per identity, per device (localStorage); never synced.
+   THEME — per identity, per device; never synced.
    Colour sets live in style_local.css as :root[data-theme="…"]; "default"
    is simply no data-theme attribute. Picked in EDIT CONTACT on your own
    contact (see contactAction("edit")); applied live on change.
 
-   Two keys:
-     meshchat-theme-<publicId>  this identity's choice on this device
-     meshchat-theme             last theme shown — what the login screen uses
-                                (no identity known yet), and the fallback for an
-                                identity that never picked one
+   Two places:
+     settings blob .theme       this identity's choice on this device — inside the
+                                encrypted settings entry (state.settings, see LOCAL
+                                STORAGE in meshchat.js), so only available after login
+     meshchat-theme             last theme shown — a plain localStorage key, the ONE
+                                readable thing left: the login screen needs it before
+                                anyone is known, and it is the fallback for an identity
+                                that never picked one
    Login applies the identity's theme (applyTheme at login in the login
-   handler) without pinning it: an identity only gets its own key once its
+   handler) without pinning it: an identity only gets its own entry once its
    owner picks something.
 ══════════════════════════════════════════ */
-const THEME_KEY = "meshchat-theme";
+const THEME_KEY = "meshchat-theme";   // last shown — plaintext on purpose, see above
 const THEMES    = { default: "default (violet)", amber: "amber", matrix: "matrix", solarized: "solarized", dracula: "dracula", monokai: "monokai" };
-
-function themeKeyFor(publicId) { return THEME_KEY + "-" + publicId; }
 
 // `state` is declared in meshchat.js, which loads AFTER this file — at boot it
 // doesn't exist yet (typeof is safe on an undeclared name, plain access throws).
 function themeIdentity() { return typeof state !== "undefined" ? state.publicId : null; }
+// This identity's own pick (settings blob), or null: no identity yet / never picked / not loaded.
+function identityTheme() {
+  if (!themeIdentity()) return null;
+  const t = state.settings && state.settings.theme;
+  return Object.hasOwn(THEMES, t) ? t : null;
+}
 
 function readTheme(key) {
   try { const t = localStorage.getItem(key); return Object.hasOwn(THEMES, t) ? t : null; }
@@ -74,20 +81,17 @@ function readTheme(key) {
 // This identity's theme if it has picked one, else the last one shown, else default.
 function loadTheme() {
   const id = themeIdentity();
-  return (id && readTheme(themeKeyFor(id))) || readTheme(THEME_KEY) || "default";
+  return (id && identityTheme()) || readTheme(THEME_KEY) || "default";
 }
 
-// remember: write the "last shown" key (login screen).  pin: also write this
-// identity's own key (an explicit pick).  Boot passes neither.
+// remember: write the "last shown" key (login screen).  pin: also record it as
+// this identity's own pick in the settings blob (an explicit pick).  Boot passes neither.
 function applyTheme(theme, { remember = true, pin = true } = {}) {
   if (!Object.hasOwn(THEMES, theme)) theme = "default";
   if (theme === "default") document.documentElement.removeAttribute("data-theme");
   else document.documentElement.dataset.theme = theme;
-  try {
-    if (remember) localStorage.setItem(THEME_KEY, theme);
-    const id = themeIdentity();
-    if (pin && id) localStorage.setItem(themeKeyFor(id), theme);
-  } catch(e) {}
+  try { if (remember) localStorage.setItem(THEME_KEY, theme); } catch(e) {}
+  if (pin && themeIdentity()) setSetting("theme", theme);   // meshchat.js — debounced write of the settings entry
 }
 
 applyTheme(loadTheme(), { remember: false, pin: false });   // boot: apply only, no identity yet
@@ -1378,7 +1382,7 @@ function renderInfoRoute(id) {
   return ciSection("ROUTE", rows.join(""));
 }
 
-function ciDeviceBlock(d) {
+function ciDeviceBlock(d, contactId) {
   const s       = d.session;
   const missing = d.missing.length
     ? "#" + d.missing.slice(0, 8).join(", #") + (d.missing.length > 8 ? " +" + (d.missing.length - 8) : "")
@@ -1401,6 +1405,10 @@ function ciDeviceBlock(d) {
       '<span class="ci-device-id">' + packetEscapeHTML(pid(d.deviceId)) + '</span>' +
       (d.isThisDevice ? '<span class="ci-tag">THIS DEVICE</span>' : '') +
       '<span class="ci-device-seen">seen ' + packetEscapeHTML(fmtAgo(d.lastSeen)) + (d.lastN ? ' · n:' + d.lastN : '') + '</span>' +
+      // cold drop of this device's X4DH session — no confirmation, see the click handler below
+      (s ? '<button type="button" data-drop-contact="' + packetEscapeHTML(contactId) + '" data-drop-device="' + packetEscapeHTML(d.deviceId) + '"' +
+           ' title="drop this X4DH session (no confirmation)"' +
+           ' style="background:none;border:1px solid #263b3d;color:#8babb0;font:inherit;line-height:1;padding:0 5px;cursor:pointer">\u00d7</button>' : '') +
     '</div>' +
     ciLine("endpoint", d.endpointId ? pid(d.endpointId) : "—") +
     ciLine("missing", missing) +
@@ -1411,7 +1419,7 @@ function ciDeviceBlock(d) {
 function renderInfoDevices(id) {
   const rows = getDeviceRows(id);
   const body = rows.length
-    ? rows.map(ciDeviceBlock).join("")
+    ? rows.map(d => ciDeviceBlock(d, id)).join("")
     : '<span class="mc-packet-null">no devices seen yet</span>';
   return ciSection("DEVICES (" + rows.length + ")", body);
 }
@@ -1491,6 +1499,23 @@ function setChatInfoVisible(on) {
 }
 
 document.getElementById("chatInfoToggle")?.addEventListener("click", () => setChatInfoOpen(!chatInfoOpen));
+
+// × on a device in DEVICES: drop that X4DH session, nothing else. No confirmation — a test tool.
+// What follows is the ordinary recovery: the fixed initiator proposes again on the next packet from
+// that device; if we are the responder, our next send goes out as a HELLO that does not list the
+// session and the initiator re-proposes (see "HELLO session list" in meshchat.js).
+document.getElementById("chatInfoPanel")?.addEventListener("click", async (e) => {
+  const btn = e.target.closest?.("[data-drop-device]");
+  if (!btn) return;
+  const contactId = btn.dataset.dropContact, theirDeviceId = btn.dataset.dropDevice;
+  if (!state.x4dhSessions[contactId]) return;
+  delete state.x4dhSessions[contactId][theirDeviceId];
+  await saveX4DHSessions();
+  mlog.info(`X4DH       session dropped by hand  ${pid(contactId, { deviceId: theirDeviceId })}`);
+  _chatInfoLastHtml = null;
+  refreshChatInfo(contactId);
+  renderContactList();
+});
 setInterval(() => { if (!document.hidden) refreshChatInfo(); }, CHAT_INFO_REFRESH_MS);
 
 function openModal() {
@@ -2061,9 +2086,15 @@ document.getElementById("loginButton").onclick = async (e) => {
 	// one identity, one tab per browser profile — see meshchat-identity.js.
 	// Before anything touches storage or the network.
 	if (!(await claimIdentityOrAsk())) { status.textContent = "identity already open in another tab"; btn.disabled = false; return; }
-	applyTheme(loadTheme(), { pin: false });   // this identity's theme (or the last shown one) — see THEME above
 	state.shareableKey=rawToBase64(x25519PublicKey)+"."+rawToBase64(signPublicKey);
-	state.cryptoKey=await importEncKey(keys.backupKey);
+	state.cryptoKey=await importEncKey(keys.backupKey);   // backupKey: also what leaves the device (peer backups, export) — not used for local storage any more
+	// Local storage: its own derived key and four opaque entry names — see LOCAL STORAGE in
+	// meshchat.js. Settings come first: the device seed (below) and this identity's theme live in them.
+	state.storeKey=await importEncKey(keys.storageKeySeed);
+	state.loc=await deriveStorageLocators(keys.storageLocatorSeed);
+	await migrateLegacyStorage();   // old one-key-per-thing layout -> the four entries; no-op once done
+	await loadSettings();
+	applyTheme(loadTheme(), { pin: false });   // this identity's theme (or the last shown one) — see THEME above
 	// "our own" AES key, for self-targeted traffic (multi-device sync,
 	// mini-backups, etc.) — ECDH against our own public key. Deterministic,
 	// same result on every device that logs into this identity.
@@ -2090,10 +2121,8 @@ document.getElementById("loginButton").onclick = async (e) => {
 	  state.contacts[state.publicId].x25519PublicKey=x25519PublicKey;
 	  state.contacts[state.publicId].encKey=state.encKey;
 	}
-    loadPeerBackups();
-    loadPeerTokens();
+    await loadHeld();
 	loadDeviceRegistry();
-	loadSendCounters();
 	await loadX4DHSessions();
 	recordKnownDevice(state.publicId, state.deviceId);
 

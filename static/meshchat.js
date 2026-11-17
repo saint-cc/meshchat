@@ -63,6 +63,12 @@ const DEVICE_PRUNE_INTERVAL_MS   = 10 * 60 * 1000;   // periodic sweep, piggybac
 const state = {
   user: null, publicId: null, shareableKey: null,
   keys: null, cryptoKey: null, encKey: null,
+  // storeKey / loc / settings — the local storage layer, see LOCAL STORAGE below.
+  // storeKey encrypts what sits in this browser (cryptoKey = backupKey stays for
+  // what leaves the device); loc = the four opaque localStorage entry names;
+  // settings = the small scalars of the settings blob (knownDevices and
+  // sendCounters live in their own state fields, the blob just carries them).
+  storeKey: null, loc: null, settings: { deviceSeed: null, push: false, theme: null },
   contacts: {}, peerBackups: {}, peerTokens: {}, knownDevices: {}, sendCounters: {},
   currentChat: null, ws: null, online: new Set(),
   unread: {}, knownDeviceFingerprints: {},
@@ -83,20 +89,24 @@ const state = {
   // x4dhSessions — X4DH.md session-establishment state, keyed by
   // contactId -> theirDeviceId -> { sessionEpoch, stage, rootKey, ... }.
   // Loaded/saved by loadX4DHSessions()/saveX4DHSessions() below, local-
-  // only, never in serialiseContacts()/backups (see that section for why
-  // this is also encrypted at rest, unlike knownDevices/sendCounters).
+  // only, never in serialiseContacts()/backups (see that section for why it
+  // keeps its own storage entry rather than sharing the settings one).
   x4dhSessions: {}
 };
 
 const SIGNAL_URL		=`wss://${window.location.hostname}/ws/`;
+// LEGACY localStorage names (<name>_<publicId>). Nothing writes these any more:
+// they are read once by migrateLegacyStorage() and removed by it (and by
+// selfDestruct, in case a migration never ran). Current layout: LOCAL STORAGE below.
 const STORAGE_KEY		= "meshchat_contacts";
 const PEER_BACKUP_KEY	= "meshchat_peer_backups_v1";
 const PEER_TOKEN_KEY	= "meshchat_peer_tokens_v1";
 const DEVICE_REGISTRY_KEY = "meshchat_known_devices_v1";
 const DEVICE_KEY_STORAGE = "meshchat_device_seed_v1";
 const SEND_COUNTER_KEY = "meshchat_send_counters_v1";
-const PUSH_PREF_KEY = "meshchat_push_pref_v1";   // per-device opt-in preference, local-only
-const X4DH_SESSION_KEY = "meshchat_x4dh_sessions_v1";   // X4DH.md session-establishment state — encrypted at rest, see its own section below
+const PUSH_PREF_KEY = "meshchat_push_pref_v1";
+const X4DH_SESSION_KEY = "meshchat_x4dh_sessions_v1";
+const LEGACY_THEME_PREFIX = "meshchat-theme-";   // + publicId (meshchat-gui.js THEME_KEY + "-")
 const EXCHANGE_COUNT	= 10;
 
 /* ══════════════════════════════════════════
@@ -266,12 +276,17 @@ setInterval(pruneOnline, PRUNE_INTERVAL_MS);
 // secrecy can be derived from this same seed later via the standard
 // birational Ed25519↔X25519 conversion — no re-keying, no redistribution,
 // no "deviceId v1 vs v2" when that work actually happens.
+// The seed lives in the settings blob (loadSettings must have run). A NEW seed
+// is written through before it is handed out — the one settings write that is
+// not debounced: the deviceId derived from it is about to be announced, and a
+// seed that never landed would announce one that a reload then cannot reproduce.
 async function getOrCreateDeviceSeed() {
-  const storageKey = DEVICE_KEY_STORAGE + "_" + state.publicId;
-  const existing = localStorage.getItem(storageKey);
+  const existing = state.settings.deviceSeed;
   if (existing) return base64ToRaw(existing);
   const seed = crypto.getRandomValues(new Uint8Array(32));
-  localStorage.setItem(storageKey, rawToBase64(seed));
+  state.settings.deviceSeed = rawToBase64(seed);
+  scheduleSettingsSave();
+  if (!(await flushSettings())) { state.settings.deviceSeed = null; throw new Error("could not store the device identity — is browser storage full or blocked?"); }
   mlog.info("DEVICE     new device identity generated");
   return seed;
 }
@@ -701,13 +716,194 @@ function quarantineUnreadable(storageKey, raw) {
   catch(e) { mlog.err(`STORAGE    could not quarantine unreadable blob: ${e.message}`); }
 }
 
+/* ══════════════════════════════════════════
+   LOCAL STORAGE — four encrypted entries, nothing readable
+   Everything this browser keeps for an identity is one of four localStorage
+   entries. Their NAMES are opaque (state.loc, derived from the master secret —
+   deriveStorageLocators in lib.js, not the public publicId), their contents are
+   AES-GCM under state.storeKey (derived, separate from backupKey, which is the
+   one that leaves the device) and bound to their purpose (storeAad), so one
+   entry cannot be swapped for another.
+     contacts   contacts + messages (serialiseContacts({local:true}))
+     sessions   X4DH session state — its own entry on purpose: the persistence
+                contract below (saveX4DHSessions returns whether it landed)
+     settings   device seed · knownDevices · sendCounters · push pref · theme
+     held       peerBackups + peerTokens — what we keep FOR others, up to 1 MiB
+                each; changes rarely, so it must not drag the small hot data
+                into a megabyte rewrite
+   Format versioning lives inside the payload ({v:1,…}), not in the key names.
+   contacts / sessions have their own serialised writers (below); settings and
+   held share a coalescing one: callers just mark them dirty (saveDeviceRegistry,
+   saveSendCounters, setSetting, savePeerBackups…) and at most one write per
+   STORE_DEBOUNCE_MS happens, always carrying the newest state. The only plaintext
+   left in localStorage is meshchat-theme (last theme shown — the login screen
+   needs it before anyone is logged in).
+══════════════════════════════════════════ */
+const STORE_DEBOUNCE_MS = 1000;
+function storeAad(name) { return new TextEncoder().encode(JSON.stringify(["meshchat-store-v1", name])); }
+
+function makeCoalescingWriter(name, snapshot) {
+  let dirty = false, timer = null, chain = Promise.resolve();
+  // Resolves true when everything marked dirty so far is on disk, false if the write failed or was refused.
+  function flush() {
+    if (timer) { clearTimeout(timer); timer = null; }
+    const run = chain.then(async () => {
+      if (!dirty) return true;
+      if (!state.storeKey || !state.loc || persistenceHalted) return false;
+      dirty = false;   // anything marked from here on is newer than the snapshot taken below
+      try {
+        const encrypted = await encryptObject(state.storeKey, snapshot(), storeAad(name));
+        if (persistenceHalted) return false;   // wiped while we were encrypting — see PERSISTENCE HALT
+        localStorage.setItem(state.loc[name], JSON.stringify(encrypted));
+        return true;
+      } catch(e) {
+        dirty = true;   // still owed; the next change (or flush) tries again
+        mlog.err(`STORAGE    ${name} save failed: ${e.message}`);
+        return false;
+      }
+    });
+    chain = run.catch(() => {});
+    return run;
+  }
+  function schedule() {
+    if (persistenceHalted) return;
+    dirty = true;
+    if (!timer) timer = setTimeout(flush, STORE_DEBOUNCE_MS);
+  }
+  return { schedule, flush };
+}
+
+const _settingsWriter = makeCoalescingWriter("settings", () => ({
+  v: 1,
+  deviceSeed:   state.settings.deviceSeed,
+  push:         state.settings.push === true,
+  theme:        state.settings.theme,
+  knownDevices: state.knownDevices,
+  sendCounters: state.sendCounters
+}));
+const _heldWriter = makeCoalescingWriter("held", () => ({
+  v: 1, peerBackups: state.peerBackups, peerTokens: state.peerTokens
+}));
+function scheduleSettingsSave() { _settingsWriter.schedule(); }
+function flushSettings()        { return _settingsWriter.flush(); }
+function scheduleHeldSave()     { _heldWriter.schedule(); }
+function flushHeld()            { return _heldWriter.flush(); }
+// For logout: everything pending, on disk, before the page goes.
+function flushStores()          { return Promise.all([flushSettings(), flushHeld()]); }
+
+function setSetting(key, value) { state.settings[key] = value; scheduleSettingsSave(); }
+
+const isPlainObject = (o) => o !== null && typeof o === "object" && !Array.isArray(o);
+
+async function loadSettings() {
+  state.settings = { deviceSeed: null, push: false, theme: null };
+  state.knownDevices = {}; state.sendCounters = {};
+  const raw = localStorage.getItem(state.loc.settings);
+  if (!raw) return;
+  try {
+    const o = await decryptObject(state.storeKey, JSON.parse(raw), storeAad("settings"));
+    if (!isPlainObject(o) || o.v !== 1) throw new Error("unsupported settings format");
+    state.settings = {
+      deviceSeed: typeof o.deviceSeed === "string" && o.deviceSeed ? o.deviceSeed : null,
+      push:       o.push === true,
+      theme:      typeof o.theme === "string" ? o.theme : null
+    };
+    state.knownDevices = isPlainObject(o.knownDevices) ? o.knownDevices : {};
+    state.sendCounters = isPlainObject(o.sendCounters) ? o.sendCounters : {};
+    mlog.debug(`STORAGE    settings loaded  devices=${Object.keys(state.knownDevices).length}  counters=${Object.keys(state.sendCounters).length}`);
+  } catch(e) {
+    // same stance as contacts: keep the raw blob aside before the next save replaces it
+    quarantineUnreadable(state.loc.settings, raw);
+    mlog.err("STORAGE    settings load failed: " + e.message);
+  }
+}
+
+async function loadHeld() {
+  state.peerBackups = {}; state.peerTokens = {};
+  const raw = localStorage.getItem(state.loc.held);
+  if (!raw) return;
+  try {
+    const o = await decryptObject(state.storeKey, JSON.parse(raw), storeAad("held"));
+    if (!isPlainObject(o) || o.v !== 1) throw new Error("unsupported held-data format");
+    state.peerBackups = isPlainObject(o.peerBackups) ? o.peerBackups : {};
+    state.peerTokens  = isPlainObject(o.peerTokens)  ? o.peerTokens  : {};
+    mlog.debug(`STORAGE    held for others loaded  backups=${Object.keys(state.peerBackups).length}  tokens=${Object.keys(state.peerTokens).length}`);
+  } catch(e) {
+    quarantineUnreadable(state.loc.held, raw);
+    mlog.err("STORAGE    held-data load failed: " + e.message);
+  }
+}
+
+/* ── ONE-TIME MIGRATION from the old layout (one readable key per thing, "<name>_<publicId>") ──
+   Runs at login, after the identity lock and before anything loads. Per entry:
+   read the old keys, write the new encrypted entry, read it back and compare,
+   and only then remove the old keys. Anything that fails stays exactly where it
+   was and is retried next login. An old contacts/sessions blob that cannot be
+   decrypted is copied to "<new name>_unreadable" first (same stance as
+   quarantineUnreadable). Safe to re-run: an entry that already exists is not
+   overwritten, only checked before its old keys are dropped. */
+async function migrateLegacyStorage() {
+  const sfx = "_" + state.publicId;
+  const get = (k) => { try { return localStorage.getItem(k); } catch(e) { return null; } };
+  const parse = (k) => { try { const r = get(k); const v = r ? JSON.parse(r) : null; return isPlainObject(v) ? v : {}; } catch(e) { return {}; } };
+  const oldKeys = {
+    contacts: [STORAGE_KEY + sfx],
+    sessions: [X4DH_SESSION_KEY + sfx],
+    settings: [DEVICE_KEY_STORAGE + sfx, DEVICE_REGISTRY_KEY + sfx, SEND_COUNTER_KEY + sfx, PUSH_PREF_KEY + sfx, LEGACY_THEME_PREFIX + state.publicId],
+    held:     [PEER_BACKUP_KEY + sfx, PEER_TOKEN_KEY + sfx]
+  };
+  const pending = STORE_NAMES.filter(name => oldKeys[name].some(k => get(k) !== null));
+  if (!pending.length) return;
+  mlog.info(`STORAGE    migrating old storage layout: ${pending.join(", ")}`);
+  for (const name of pending) {
+    try {
+      const newKey = state.loc[name];
+      if (get(newKey) === null) {
+        let value;
+        if (name === "contacts" || name === "sessions") {
+          const raw = get(oldKeys[name][0]);   // the old blobs were encrypted under backupKey (state.cryptoKey)
+          try { value = await decryptObject(state.cryptoKey, JSON.parse(raw)); }
+          catch(e) {
+            localStorage.setItem(newKey + UNREADABLE_SUFFIX, raw);
+            mlog.warn(`STORAGE    old ${name} blob unreadable (${e.message}) — kept as ${newKey}${UNREADABLE_SUFFIX}`);
+          }
+        } else if (name === "settings") {
+          value = { v: 1,
+            deviceSeed:   get(DEVICE_KEY_STORAGE + sfx) || null,
+            push:         get(PUSH_PREF_KEY + sfx) === "1",
+            theme:        get(LEGACY_THEME_PREFIX + state.publicId) || null,
+            knownDevices: parse(DEVICE_REGISTRY_KEY + sfx),
+            sendCounters: parse(SEND_COUNTER_KEY + sfx) };
+        } else {
+          value = { v: 1, peerBackups: parse(PEER_BACKUP_KEY + sfx), peerTokens: parse(PEER_TOKEN_KEY + sfx) };
+        }
+        if (value !== undefined) {
+          const encrypted = await encryptObject(state.storeKey, value, storeAad(name));
+          localStorage.setItem(newKey, JSON.stringify(encrypted));
+          const back = await decryptObject(state.storeKey, JSON.parse(localStorage.getItem(newKey)), storeAad(name));
+          if (JSON.stringify(back) !== JSON.stringify(value)) {
+            localStorage.removeItem(newKey);
+            throw new Error("read-back did not match");
+          }
+        }
+      } else {
+        // a previous run got this far but not to the clean-up: the new entry must be readable before the old keys go
+        await decryptObject(state.storeKey, JSON.parse(get(newKey)), storeAad(name));
+      }
+      oldKeys[name].forEach(k => localStorage.removeItem(k));
+    } catch(e) {
+      mlog.err(`STORAGE    migration of "${name}" failed: ${e.message} — old entries kept, will retry at next login`);
+    }
+  }
+}
+
 function saveContacts() {
   const run = _saveContactsChain.then(async () => {
-    if (!state.cryptoKey || persistenceHalted) return;
+    if (!state.storeKey || persistenceHalted) return;
     try {
-      const encrypted = await encryptObject(state.cryptoKey, serialiseContacts({ local: true }));
+      const encrypted = await encryptObject(state.storeKey, serialiseContacts({ local: true }), storeAad("contacts"));
       if (persistenceHalted) return undefined;   // wiped while we were encrypting — see PERSISTENCE HALT
-      localStorage.setItem(STORAGE_KEY + "_" + state.publicId, JSON.stringify(encrypted));
+      localStorage.setItem(state.loc.contacts, JSON.stringify(encrypted));
       return encrypted;
     } catch(e) {
       // previously an unhandled rejection here failed completely silently —
@@ -750,16 +946,16 @@ setInterval(() => {
 
 async function loadContacts() {
   try {
-    if (!state.cryptoKey) { state.contacts = {}; return; }
-    const raw = localStorage.getItem(STORAGE_KEY + "_" + state.publicId);
+    if (!state.storeKey) { state.contacts = {}; return; }
+    const raw = localStorage.getItem(state.loc.contacts);
     if (!raw) {
       state.contacts = {};
       mlog.info("STORAGE    no local data — fresh start");
       return;
     }
     try {
-      state.contacts = await deserialiseContacts(await decryptObject(state.cryptoKey, JSON.parse(raw)));
-    } catch(e) { quarantineUnreadable(STORAGE_KEY + "_" + state.publicId, raw); throw e; }
+      state.contacts = await deserialiseContacts(await decryptObject(state.storeKey, JSON.parse(raw), storeAad("contacts")));
+    } catch(e) { quarantineUnreadable(state.loc.contacts, raw); throw e; }
     const contactIds = Object.keys(state.contacts).filter(id => id !== state.publicId);
     mlog.info(`STORAGE    loaded ${Object.keys(state.contacts).length} contact(s)`);
     if (contactIds.length > 0) sessionFresh = false;
@@ -770,31 +966,10 @@ async function loadContacts() {
   }
 }
 
-function loadPeerBackups() {
-  try {
-    state.peerBackups = JSON.parse(localStorage.getItem(PEER_BACKUP_KEY + "_" + state.publicId) || "{}");
-    mlog.debug(`STORAGE    peer backups loaded: ${Object.keys(state.peerBackups).length}`);
-  } catch(e) { state.peerBackups = {}; }
-}
-
-function savePeerBackups() {
-  if (persistenceHalted) return;
-  try { localStorage.setItem(PEER_BACKUP_KEY + "_" + state.publicId, JSON.stringify(state.peerBackups)); }
-  catch(e) {}
-}
-
-function loadPeerTokens() {
-  try {
-    state.peerTokens = JSON.parse(localStorage.getItem(PEER_TOKEN_KEY + "_" + state.publicId) || "{}");
-    mlog.debug(`STORAGE    peer tokens loaded: ${Object.keys(state.peerTokens).length}`);
-  } catch(e) { state.peerTokens = {}; }
-}
-
-function savePeerTokens() {
-  if (persistenceHalted) return;
-  try { localStorage.setItem(PEER_TOKEN_KEY + "_" + state.publicId, JSON.stringify(state.peerTokens)); }
-  catch(e) {}
-}
+// Both live in the "held" entry (see LOCAL STORAGE): loadHeld() reads them,
+// these two just mark it dirty.
+function savePeerBackups() { scheduleHeldSave(); }
+function savePeerTokens()  { scheduleHeldSave(); }
 
 /* ══════════════════════════════════════════
    DEVICE REGISTRY — load / prune / save
@@ -833,9 +1008,11 @@ function pruneDeviceRegistry() {
 // than the underlying data could plausibly have changed.
 setInterval(pruneDeviceRegistry, DEVICE_PRUNE_INTERVAL_MS);
 
+// state.knownDevices itself is read by loadSettings(); this is the load-time
+// normalisation on top of it.
 function loadDeviceRegistry() {
   try {
-    state.knownDevices = JSON.parse(localStorage.getItem(DEVICE_REGISTRY_KEY + "_" + state.publicId) || "{}");
+    if (!isPlainObject(state.knownDevices)) state.knownDevices = {};
     // one-time SHAPE migration only — retention (cutoff/cap) is now
     // pruneDeviceRegistry()'s job, called below and periodically thereafter.
     for (const identityId of Object.keys(state.knownDevices)) {
@@ -857,11 +1034,7 @@ function loadDeviceRegistry() {
   } catch(e) { state.knownDevices = {}; }
 }
 
-function saveDeviceRegistry() {
-  if (persistenceHalted) return;
-  try { localStorage.setItem(DEVICE_REGISTRY_KEY + "_" + state.publicId, JSON.stringify(state.knownDevices)); }
-  catch(e) {}
-}
+function saveDeviceRegistry() { scheduleSettingsSave(); }
 
 // shared by app:message receipt and the existing self-sync fingerprint
 // tagging — local-only knowledge, never part of serialiseContacts()/backup.
@@ -919,18 +1092,10 @@ function recordKnownDevice(identityId, deviceId, n, endpointId) {
   maybeCompleteDeferredAck(identityId, deviceId).catch(e => mlog.warn(`X4DH       deferred ack failed: ${e.message}`));
 }
 
-function loadSendCounters() {
-  try {
-    state.sendCounters = JSON.parse(localStorage.getItem(SEND_COUNTER_KEY + "_" + state.publicId) || "{}");
-    mlog.debug(`STORAGE    send counters loaded: ${Object.keys(state.sendCounters).length}`);
-  } catch(e) { state.sendCounters = {}; }
-}
-
-function saveSendCounters() {
-  if (persistenceHalted) return;
-  try { localStorage.setItem(SEND_COUNTER_KEY + "_" + state.publicId, JSON.stringify(state.sendCounters)); }
-  catch(e) {}
-}
+// state.sendCounters is read by loadSettings(); saving is just marking it dirty.
+// (A counter lost to a crash inside the debounce window is bookkeeping only —
+// nothing consumes `n` as a chain position yet, see nextSendCounter.)
+function saveSendCounters() { scheduleSettingsSave(); }
 
 // Local-only, per (THIS device, contact) outbound sequence — never
 // included in serialiseContacts()/backups, same tier as the device seed
@@ -1166,12 +1331,12 @@ function schedulePendingX4DHExpiry(key) {
 ── */
 async function loadX4DHSessions() {
   try {
-    if (!state.cryptoKey) { state.x4dhSessions = {}; return; }
-    const raw = localStorage.getItem(X4DH_SESSION_KEY + "_" + state.publicId);
+    if (!state.storeKey) { state.x4dhSessions = {}; return; }
+    const raw = localStorage.getItem(state.loc.sessions);
     if (!raw) { state.x4dhSessions = {}; return; }
     try {
-      state.x4dhSessions = await decryptObject(state.cryptoKey, JSON.parse(raw));
-    } catch(e) { quarantineUnreadable(X4DH_SESSION_KEY + "_" + state.publicId, raw); throw e; }
+      state.x4dhSessions = await decryptObject(state.storeKey, JSON.parse(raw), storeAad("sessions"));
+    } catch(e) { quarantineUnreadable(state.loc.sessions, raw); throw e; }
     mlog.debug(`STORAGE    X4DH sessions loaded: ${Object.keys(state.x4dhSessions).length} contact(s)`);
   } catch(e) {
     mlog.warn(`STORAGE    X4DH session load failed: ${e.message}`);
@@ -1224,11 +1389,11 @@ const X4DH_SAVE_RETRY_MS = 5000;   // after a failed write, how long before a se
 
 function saveX4DHSessions() {
   const run = _saveX4DHChain.then(async () => {
-    if (!state.cryptoKey || persistenceHalted) { x4dhLastSaveOk = false; x4dhLastFailAt = Date.now(); return false; }
+    if (!state.storeKey || persistenceHalted) { x4dhLastSaveOk = false; x4dhLastFailAt = Date.now(); return false; }
     try {
-      const encrypted = await encryptObject(state.cryptoKey, state.x4dhSessions);
+      const encrypted = await encryptObject(state.storeKey, state.x4dhSessions, storeAad("sessions"));
       if (persistenceHalted) { x4dhLastSaveOk = false; x4dhLastFailAt = Date.now(); return false; }   // wiped while we were encrypting — see PERSISTENCE HALT
-      localStorage.setItem(X4DH_SESSION_KEY + "_" + state.publicId, JSON.stringify(encrypted));
+      localStorage.setItem(state.loc.sessions, JSON.stringify(encrypted));
       x4dhLastSaveOk = true;
       return true;
     } catch(e) {
@@ -5540,14 +5705,8 @@ async function getAudioUrl(msgId) {
    relay to drop our subscription rather than leaving it to go silently
    stale there.
 ══════════════════════════════════════════ */
-function loadPushPref() {
-  try { return localStorage.getItem(PUSH_PREF_KEY + "_" + state.publicId) === "1"; }
-  catch(e) { return false; }
-}
-function savePushPref(enabled) {
-  try { localStorage.setItem(PUSH_PREF_KEY + "_" + state.publicId, enabled ? "1" : "0"); }
-  catch(e) {}
-}
+function loadPushPref() { return state.settings.push === true; }
+function savePushPref(enabled) { setSetting("push", !!enabled); }
 
 function pushSupported() {
   return "serviceWorker" in navigator && "PushManager" in window;
@@ -6268,9 +6427,15 @@ function selfDestruct() {
   // recreate the very data this function exists to remove.
   persistenceHalted = true;
   forgetRemembered();
+  // the four current entries (and any quarantined copy of them) ...
+  Object.values(state.loc || {}).forEach(k => { localStorage.removeItem(k); localStorage.removeItem(k + UNREADABLE_SUFFIX); });
+  // ... the legacy keys, in case a migration never got to run on this device ...
   const suffix = "_" + state.publicId;
-  [STORAGE_KEY, PEER_BACKUP_KEY, PEER_TOKEN_KEY, DEVICE_REGISTRY_KEY, DEVICE_KEY_STORAGE, X4DH_SESSION_KEY]
+  [STORAGE_KEY, PEER_BACKUP_KEY, PEER_TOKEN_KEY, DEVICE_REGISTRY_KEY, DEVICE_KEY_STORAGE, X4DH_SESSION_KEY, SEND_COUNTER_KEY, PUSH_PREF_KEY]
     .forEach(key => { localStorage.removeItem(key + suffix); localStorage.removeItem(key + suffix + UNREADABLE_SUFFIX); });
+  // ... and the only plaintext there is: the theme (last shown + the legacy per-identity key).
+  localStorage.removeItem("meshchat-theme");
+  localStorage.removeItem(LEGACY_THEME_PREFIX + state.publicId);
  
   mlog.warn("BURN       self-destruct — all local identity data wiped, reloading");
   try { state.ws?.close(1000, "burned"); } catch(e) {}
