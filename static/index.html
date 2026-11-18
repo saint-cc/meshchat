@@ -28,10 +28,9 @@
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; font-src 'self'; connect-src 'self' ws: wss:; worker-src 'self'; manifest-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'">
 <title>MeshChat</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' fill='%23000'/%3E%3Cpath d='M3 8h10' stroke='%2300ffcc' stroke-width='2'/%3E%3Ccircle cx='8' cy='8' r='2' fill='%2300ffcc'/%3E%3C/svg%3E">
-<!-- vendored, pinned copies (was: cdnjs, unpkg and esm.sh at runtime) — vendor/README.md has
-     versions, hashes and how to rebuild. noble-ed25519.js is @noble/curves 1.4.0 bundled into one
-     classic script that sets window.ed25519 / window.x25519, so unlike the old deferred module it
-     is ready before any other script runs. -->
+<!-- vendored, pinned copies — vendor/README.md has versions, hashes and how to rebuild.
+     noble-ed25519.js is @noble/curves 1.4.0 bundled into one classic script that sets
+     window.ed25519 / window.x25519, so it is ready before any other script runs. -->
 <script src="./vendor/qrcode.min.js"></script>
 <script src="./vendor/html5-qrcode.min.js"></script>
 <script src="./vendor/noble-ed25519.js"></script>
@@ -161,9 +160,9 @@
         <input type="checkbox" id="showPwChk">
         Show password
       </label>
-      <!-- auto login = "remember me on this device": the checkbox state lives in localStorage
-           (meshchat_autologin), the secret (Argon2id master secret, wrapped under a non-extractable
-           key) in IndexedDB, the logic in meshchat-identity.js — see AUTO LOGIN there. -->
+      <!-- auto login = "remember me on this device": the checkbox intent and the secret (Argon2id
+           master secret, wrapped under a non-extractable key) both live in IndexedDB; the logic is
+           in meshchat-identity.js — see AUTO LOGIN there. -->
       <label class="loginOpt">
         <input type="checkbox" id="autoLoginChk">
         Auto login

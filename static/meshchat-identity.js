@@ -196,9 +196,9 @@ try {
 
    RECORD VERSION = KDF GENERATION. A record holds a master secret, and a
    master secret only means something under the KDF that produced it. A v:1
-   record is a PBKDF2 (pre-Argon2id) master secret: fed to hkdfExpand it would
-   still "work" and log straight in — to the OLD identity's keys under the new
-   labels, i.e. a different, empty identity, with no error. So rememberLoad
+   record of another generation is a master secret from a different KDF: fed to
+   hkdfExpand it would still "work" and log straight in — to a different, empty
+   identity, with no error. So rememberLoad
    accepts only v === REMEMBER_VERSION (the KDF generation) and DELETES a
    record of any other version; the user lands on the login screen and types
    the passphrase once. REMEMBER_AAD carries the generation as well, so an old
@@ -285,7 +285,7 @@ async function rememberStore(name, master) {
 }
 
 // -> { name, master: Uint8Array(32) } or null. Never throws: anything wrong with the record is "no record".
-// A record from another KDF generation (v:1 = PBKDF2) is not just ignored but deleted — see RECORD VERSION.
+// A record from another KDF generation is not just ignored but deleted — see RECORD VERSION.
 async function rememberLoad() {
   try {
     const rec = await idbDo("readonly", s => s.get(REMEMBER_KEY));

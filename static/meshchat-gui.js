@@ -744,7 +744,7 @@ function toggleShowBlocked() {
 function x4dhDotInfo(contactId, deviceId) {
   const session = state.x4dhSessions[contactId]?.[deviceId];
   if (!session) return { color: "var(--muted)", title: "X4DH: no session yet" };
-  if (session.stage === "rk1") return { color: "var(--online)", title: session.pq ? "X4DH: upgraded (RK1 · post-quantum hybrid)" : "X4DH: upgraded (RK1 · classical)" };
+  if (session.stage === "rk1") return { color: "var(--online)", title: "X4DH: upgraded (RK1 · post-quantum hybrid)" };
   const stuck = (Date.now() - (session.establishedAt || 0)) > X4DH_STUCK_RK0_THRESHOLD_MS;
   return stuck
     ? { color: "var(--danger)", title: "X4DH: stuck at RK0" }
@@ -785,7 +785,6 @@ function getDeviceRows(contactId) {
         sessionEpoch:     s.sessionEpoch,
         establishedAt:    s.establishedAt,
         upgradedAt:       s.upgradedAt,
-        pq:               !!s.pq,
         retryAttempts:    s.retryAttempts,
         retryExhaustedAt: s.retryExhaustedAt,
         lastRetryAt:      s.lastRetryAt,

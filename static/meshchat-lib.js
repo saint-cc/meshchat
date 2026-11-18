@@ -18,11 +18,11 @@
    memory bandwidth instead of a few kB of ALU — see KDF_ATTACK_RATE. A device
    that cannot allocate it cannot log in (deriveMasterSecret -> code "oom").
 
-   KDF_VERSION is the identity-derivation generation. v1 was PBKDF2-SHA256
-   (1,000,000 iterations), v2 is Argon2id. It rides in the Argon2 salt input
-   and in the x25519/backup/signing HKDF labels (KDF_LABEL_PREFIX), so a v2
-   name+passphrase can never land on a v1 identity. Backup files carry it too
-   (meshchat.js exportBackup/importBackup). The OTHER "meshchat-v1:" labels in
+   KDF_VERSION is the identity-derivation generation (2 = Argon2id). It rides
+   in the Argon2 salt input and in the x25519/backup/signing HKDF labels
+   (KDF_LABEL_PREFIX), so a name+passphrase derived under one generation can
+   never land on the identity of another. Backup files and the remembered-login
+   record carry it too (meshchat.js exportBackup/importBackup, meshchat-identity.js). The OTHER "meshchat-v1:" labels in
    this file (pairwise, device-endpoint, qr-intro, ephemeral-wrap, ...) name
    protocol domains, not the identity KDF, and deliberately stay as they are. */
 const KDF_VERSION      = 2;
@@ -35,7 +35,7 @@ const KDF_WORKER_URL   = "./kdf-worker.js";
 // hand-estimated number, not a measurement: Argon2id at 512 MiB / t=3 moves
 // ~3 GiB per guess, which is memory-bandwidth bound — a GPU with ~1 TB/s
 // manages a few hundred guesses/s, so ~1e6/s is a cluster of a few thousand
-// GPUs. (The old 1e11 was a PBKDF2-era figure.) It only labels the meter.
+// GPUs. It only labels the meter.
 const KDF_ATTACK_RATE  = 1e6;
 
 /* ── passphrase entropy model (login screen strength meter) ── */
@@ -635,7 +635,6 @@ async function hkdfBits(saltBytes, ikmBytes, infoStr, lengthBits = 256) {
 }
 
 const X4DH_INFO_ROOT    = "MeshChat-X4DH-v1/root";
-const X4DH_INFO_ROOT_V2 = "MeshChat-X4DH-v1/root-v2";
 const X4DH_INFO_ROOT_V3 = "MeshChat-X4DH-v1/root-v3"; // hybrid (ML-KEM-768), 0.7.1
 // New — wire-message key domain separation. Distinct label from both root
 // stages above, same "fixed, ASCII-only literal" rule X4DH.md §6.1 already
@@ -660,14 +659,8 @@ async function deriveX4DHRootStage1(dh1, dh2) {
 // rather than a special bootstrap-only formula (see §6.1's own comment
 // for why that distinction matters, and §7.1 for why this means BOTH
 // sides compute RK0 as a genuine intermediate, not just Alice).
-async function deriveX4DHRootStage2(rk0, dh3, dh4, kem /* optional { ss, pub, ct } */) {
-  if (!kem) {
-    // Classical stage 2 — byte-for-byte the pre-0.7.1 derivation (root-v2).
-    const ikm = new Uint8Array(dh3.length + dh4.length);
-    ikm.set(dh3, 0);
-    ikm.set(dh4, dh3.length);
-    return hkdfBits(rk0, ikm, X4DH_INFO_ROOT_V2);
-  }
+async function deriveX4DHRootStage2(rk0, dh3, dh4, kem /* { ss, pub, ct } — required */) {
+  if (!kem) throw new Error("X4DH stage 2 needs the ML-KEM secret — there is no classical derivation any more");
   // Hybrid stage 2 (0.7.1) — ML-KEM-768 shared secret joins the IKM, plus a
   // transcript hash binding the exact kemPub and kemCt used. The hash lives
   // in the IKM, not in `info`, because info strings stay fixed ASCII literals.
