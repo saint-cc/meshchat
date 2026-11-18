@@ -23,6 +23,10 @@ Message content is encrypted with AES-256-GCM under a per-device-pair session ke
 
 ---
 
+## Zero-state cryptography, decentralized by design.
+
+MeshChat separates identity, trust and transport. Devices establish their own cryptographic relationships through X4DH, while relays act solely as untrusted message carriers. The bipartite overlay represents these independent connections: devices form the trusted endpoints, relays provide temporary paths between them, and no relay owns or defines an identity. There is no global network state, central authority or requirement for relays to know who is communicating. Cryptographic identity lives at the edges; the network itself remains stateless.
+
 ## Features
 
 - End-to-end encrypted text, image and audio messages
