@@ -761,7 +761,7 @@ function x4dhDotInfo(contactId, deviceId) {
 // device simply has lastSeen 0.
 //
 // The `session` sub-object is an explicit WHITELIST. The stored session
-// also carries rootKey / rk0Root (real key material) — nothing here may
+// also carries key material (rootKey while at rk0, the chain state in gens) — nothing here may
 // ever spread or serialise the session object itself.
 function getDeviceRows(contactId) {
   const known    = state.knownDevices[contactId] || {};
@@ -779,6 +779,7 @@ function getDeviceRows(contactId) {
       lastN:        info?.lastN      || 0,
       missing:      Array.isArray(info?.missing) ? info.missing : [],
       x4dh:         x4dhDotInfo(contactId, deviceId),
+      chain:        x4dhChainInfo(contactId, deviceId),   // numbers and flags only — see meshchat.js
       session: s ? {
         stage:            s.stage,
         initiator:        s.initiator,
@@ -1268,6 +1269,7 @@ function formatPacketInfo(msgId) {
 
     const display = { ...envelope };
     delete display.blob;
+    if (envelope?.blob?.h) display.chain = envelope.blob.h;   // R1 header { g, i, t }: generation, position, tag — no key material
 
     const sigBytes = tryBytes(display.sig);   // base64url string (0.6.4+) or int array (<= 0.6.3)
     if (sigBytes) display.sig = bytesToHex(sigBytes);
@@ -1323,7 +1325,7 @@ function togglePacketInfo(msgId, wrap) {
    copying an id doesn't get wiped by the next tick.
 
    NEVER dump a session object here: state.x4dhSessions entries hold
-   rootKey / rk0Root. Every field shown is explicitly whitelisted (see
+   rootKey (at rk0) and the chain state (gens). Every field shown is explicitly whitelisted (see
    getDeviceRows). Same rule for the double ratchet when it lands —
    counters and indices only, never key material.
 
@@ -1412,6 +1414,9 @@ function ciDeviceBlock(d, contactId) {
     ciLine("endpoint", d.endpointId ? pid(d.endpointId) : "—") +
     ciLine("missing", missing) +
     ciLine("x4dh", x4.join(" · ")) +
+    // R1 chain position — counters only, never key material (see the note above CHAT_INFO_REFRESH_MS)
+    (d.chain ? ciLine("chain", "gen " + d.chain.gen + " · send #" + d.chain.sendN + " · recv #" + d.chain.recvN +
+      (d.chain.skipped ? " · " + d.chain.skipped + " skipped" : "") + (d.chain.keepsRk0 ? " · rk0 kept" : "")) : '') +
     '</div>';
 }
 
@@ -1508,9 +1513,7 @@ document.getElementById("chatInfoPanel")?.addEventListener("click", async (e) =>
   if (!btn) return;
   const contactId = btn.dataset.dropContact, theirDeviceId = btn.dataset.dropDevice;
   if (!state.x4dhSessions[contactId]) return;
-  delete state.x4dhSessions[contactId][theirDeviceId];
-  await saveX4DHSessions();
-  mlog.info(`X4DH       session dropped by hand  ${pid(contactId, { deviceId: theirDeviceId })}`);
+  await dropX4DHSession(contactId, theirDeviceId, "by hand");   // also clears retired generations, strikes and cached keys
   _chatInfoLastHtml = null;
   refreshChatInfo(contactId);
   renderContactList();

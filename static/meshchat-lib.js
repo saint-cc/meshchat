@@ -589,8 +589,8 @@ async function encryptMessage(recipientEncKey, payload, aad) {
 // work below, this is now the FALLBACK key for a device pair that hasn't
 // (yet, or ever) completed an X4DH session — it is no longer necessarily
 // the key actual traffic rides on once a session exists. See
-// deriveX4DHWireKey below and meshchat.js's sendFannedX4DH/
-// decryptIncomingMessage for what supersedes it per device pair.
+// the R1 chain ratchet below (deriveChainGen) and meshchat.js's
+// sendFannedX4DH/decryptIncomingMessage for what supersedes it per device pair.
 async function deriveSharedAesKey(myX25519Seed, theirX25519PublicKey) {
   const shared = x25519.getSharedSecret(myX25519Seed, theirX25519PublicKey);
   const hkdfKey = await crypto.subtle.importKey("raw", shared, { name: "HKDF" }, false, ["deriveBits"]);
@@ -700,37 +700,106 @@ function kemDecap(ct, sk) {
   return ss;
 }
 
-// X4DH wire-message key — derives the AES-256-GCM key that actually
-// encrypts app:message traffic for one specific (contact, device) pair,
-// once that pair has an X4DH session. HKDF over the session's CURRENT
-// root key bytes (RK0 or RK1 — the caller passes whichever the session
-// is actually at; this function doesn't need to know or care which
-// stage produced them) under its own domain-separation label, distinct
-// from both root-derivation stages above.
-//
-// Deliberately NOT a ratchet — the same derived key is reused for every
-// message under a given session, exactly like deriveSharedAesKey's old
-// identity-level key, until the underlying X4DH session itself is reset
-// or upgraded (X4DH.md's "session bootstrap and session reset are the
-// same mechanism" framing — see meshchat.js's retryX4DHPropose). Real
-// per-message key evolution is the separate, later Double Ratchet work
-// (Roadmap.md).
-//
-// This IS a real improvement over the old scheme even run statically,
-// though: forward secrecy is now scoped per DEVICE PAIR rather than
-// shared identity-wide, and a session that completes the live 4DH
-// upgrade (stage "rk1") carries DH4's protection against a future
-// identity-key compromise (X4DH.md §10) automatically, the next time
-// this function is called with that session's rootKey — no separate
-// code path needed here for "which stage is this."
-//
-// Caching/invalidation is meshchat.js's responsibility (see
-// x4dhWireKeyCache / getOrDeriveWireKey) — this function is pure and
-// re-derives every time it's called, same as every other function in
-// this file.
-async function deriveX4DHWireKey(rootKeyBytes) {
-  const bits = await hkdfBits(new Uint8Array(32), rootKeyBytes, X4DH_INFO_WIRE);
-  return importEncKey(bits);
+/* ══════════════════════════════════════════
+   R1 — SYMMETRIC CHAIN RATCHET (0.8.0), pure primitives (see X4DH.md)
+   A session root (RK0 or RK1 — one "generation") is expanded ONCE into:
+     aux            a static AES-256 key, the old per-session wire key. Used only
+                    by traffic that carries no chain header (self-backup pushes
+                    and their acks) — see known-limitations.md. NOT used for
+                    app:message content any more.
+     ck.i2r, ck.r2i the two chain keys, one per direction (initiator -> responder
+                    and back). Directions are separate chains because a shared
+                    chain would have both sides spending the same positions.
+     tk.i2r, tk.r2i a tag key per direction (below).
+   after which the caller DELETES the root: whoever later reads the stored session
+   must not be able to re-derive keys that were already used and deleted.
+
+   Each chain advances like the Signal symmetric ratchet:
+     MK_i     = HMAC-SHA256(CK_i, 0x01)   one message key, used once, then deleted
+     CK_i+1   = HMAC-SHA256(CK_i, 0x02)   the old chain key is overwritten
+   so a stored chain key can produce only messages that have NOT been sent yet.
+
+   Wire header { g, i, t } rides on the blob (v:3), outside the ciphertext:
+     g  generation (0 = RK0, 1 = RK1), i  chain position,
+     t  tag = first 6 bytes of HMAC(tk, i) — a per-message value only the two
+        ends of THIS chain can compute. It lets the receiver pick the session
+        among all it holds without trial decryption, and it means a forged packet
+        (no tk) cannot make us derive up to CHAIN_MAX_FORWARD chain steps. It tells
+        a relay nothing: it differs for every message, so it links nothing —
+        unlike a per-session id, which would reveal which device sent what.
+   (g, i) are bound into the AES-GCM AAD together with [type, from, to] (chainAad),
+   and the whole blob — header included — is covered by the envelope signature. */
+const R1_INFO_CHAIN = Object.freeze({ i2r: "MeshChat-R1-v1/chain/i2r", r2i: "MeshChat-R1-v1/chain/r2i" });
+const R1_INFO_TAG   = Object.freeze({ i2r: "MeshChat-R1-v1/tag/i2r",   r2i: "MeshChat-R1-v1/tag/r2i"   });
+const R1_AAD_LABEL  = "meshchat-chain-v1";
+const R1_TAG_BYTES  = 6;
+const R1_INDEX_MAX  = 0x7fffffff;
+
+// aux + both chains' keys, from one root. Plain byte arrays; the caller decides what to keep.
+async function deriveChainGen(rootBytes) {
+  const z = new Uint8Array(32);
+  const [aux, ci, cr, ti, tr] = await Promise.all([
+    hkdfBits(z, rootBytes, X4DH_INFO_WIRE),
+    hkdfBits(z, rootBytes, R1_INFO_CHAIN.i2r), hkdfBits(z, rootBytes, R1_INFO_CHAIN.r2i),
+    hkdfBits(z, rootBytes, R1_INFO_TAG.i2r),   hkdfBits(z, rootBytes, R1_INFO_TAG.r2i),
+  ]);
+  return { aux, ck: { i2r: ci, r2i: cr }, tk: { i2r: ti, r2i: tr } };
+}
+
+// One chain step: the message key for this position and the NEXT chain key.
+async function chainStep(ckBytes) {
+  const key = await importSignKey(ckBytes);
+  const [mk, next] = await Promise.all([
+    crypto.subtle.sign("HMAC", key, new Uint8Array([1])),
+    crypto.subtle.sign("HMAC", key, new Uint8Array([2])),
+  ]);
+  return { mk: new Uint8Array(mk), next: new Uint8Array(next) };
+}
+
+function chainIndexOk(i) { return Number.isInteger(i) && i >= 0 && i <= R1_INDEX_MAX; }
+
+async function chainTag(tkBytes, i) {
+  if (!chainIndexOk(i)) throw new Error("chainTag: bad index");
+  const key = await importSignKey(tkBytes);
+  const msg = new Uint8Array(4);
+  new DataView(msg.buffer).setUint32(0, i);
+  const mac = new Uint8Array(await crypto.subtle.sign("HMAC", key, msg));
+  return b64e(mac.slice(0, R1_TAG_BYTES));
+}
+
+// AAD of a chain blob: the envelope binding (type/from/to — see envelopeAad) plus
+// the header's generation and position, so none of them can be changed in transit.
+function chainAad(type, from, to, g, i) {
+  for (const [name, v] of [["type", type], ["from", from], ["to", to]]) {
+    if (typeof v !== "string" || !v) throw new Error(`chainAad: bad ${name}`);
+  }
+  if ((g !== 0 && g !== 1) || !chainIndexOk(i)) throw new Error("chainAad: bad header");
+  return new TextEncoder().encode(JSON.stringify([R1_AAD_LABEL, type, from, to, g, i]));
+}
+
+// The header as it must look on the wire, or null. Strict: nothing extra, exact shapes.
+function parseChainHeader(h) {
+  if (!h || typeof h !== "object" || Array.isArray(h)) return null;
+  const keys = Object.keys(h);
+  if (keys.length !== 3 || !("g" in h) || !("i" in h) || !("t" in h)) return null;
+  if ((h.g !== 0 && h.g !== 1) || !chainIndexOk(h.i)) return null;
+  if (typeof h.t !== "string" || h.t.length !== Math.ceil(R1_TAG_BYTES * 4 / 3) || !/^[A-Za-z0-9_-]+$/.test(h.t)) return null;
+  return { g: h.g, i: h.i, t: h.t };
+}
+
+// v:3 = chain message. A chain blob is always bound (it has no unbound form).
+async function encryptChainMessage(mkBytes, payload, hdr, aad) {
+  const key    = await importEncKey(mkBytes);
+  const iv     = crypto.getRandomValues(new Uint8Array(12));
+  const cipher = await crypto.subtle.encrypt({ name: "AES-GCM", iv, additionalData: aad }, key,
+    new TextEncoder().encode(JSON.stringify(payload)));
+  return { v: 3, h: { g: hdr.g, i: hdr.i, t: hdr.t }, iv: b64e(iv), data: b64e(new Uint8Array(cipher)) };
+}
+async function decryptChainMessage(mkBytes, blob, aad) {
+  if (!blob || blob.v !== 3) throw new Error("not a chain blob");
+  const key   = await importEncKey(mkBytes);
+  const plain = await crypto.subtle.decrypt({ name: "AES-GCM", iv: toBytes(blob.iv, 12), additionalData: aad }, key, toBytes(blob.data));
+  return JSON.parse(new TextDecoder().decode(plain));
 }
 // One-shot restore-push wrap key (meshchat.js's restore-token work, step
 // 4) — HKDF over a single ephemeral-to-ephemeral X25519 DH output, its own

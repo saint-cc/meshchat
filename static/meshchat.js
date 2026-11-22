@@ -13,7 +13,7 @@
 
    Load order: meshchat-lib.js → meshchat-gui.js → meshchat.js → statemachine.js
 ═══════════════════════════════════════════════════════════════ */
-const CLIENT_VERSION = "0.7.2";
+const CLIENT_VERSION = "0.8.0";
 
 const POLL_INTERVAL_MS        	= 30_000;			// base interval between presence polls
 const POLL_JITTER_MS          	= 10_000;			// ± random jitter added to poll interval
@@ -452,6 +452,15 @@ function verifyEnvelope(msg, contactSignPublicKey) {
 }
 async function sealEnvelope(type, from, to, key, payload) {
   const blob = await encryptMessage(key, payload, envelopeAad(type, from, to));
+  return { type, from, to, blob, sig: signEnvelope(type, from, to, blob) };
+}
+// The R1 form of the same thing (app:message content): the blob is a v:3 CHAIN message under
+// a one-time key, its header { g, i, t } sits beside iv/data, and the AAD binds [type, from, to]
+// AND the header's generation and position (lib: chainAad). The signature covers the whole
+// blob, header included. mk is zeroed here — a message key is used exactly once.
+async function sealChainEnvelope(type, from, to, mk, hdr, payload) {
+  const blob = await encryptChainMessage(mk, payload, hdr, chainAad(type, from, to, hdr.g, hdr.i));
+  mk.fill(0);
   return { type, from, to, blob, sig: signEnvelope(type, from, to, blob) };
 }
 
@@ -1242,10 +1251,10 @@ function resolveDeviceTargets(contactId) {
        now used to derive a real AES-256-GCM key per (contact, device)
        pair, which sendFannedX4DH/decryptIncomingMessage use in place of
        the old identity-level static key for any device that has one.
-       Deliberately NOT a ratchet — the derived key is static per session,
-       renegotiated only when the underlying session itself resets (the
-       existing reactive stuck-detection retry, nothing new added for
-       this pass — periodic/count-based rotation was explicitly deferred).
+       Was a static key per session. Since 0.8.0 (R1) the session root seeds
+       two symmetric CHAIN ratchets (one per direction) and every message
+       gets its own one-time key — see "session key material" below. The
+       DH and KEM ratchet steps (R2/R3) are later, separate work.
        As of 6.0.0 there is NO fallback: a device with no session yet
        receives nothing until one exists (hello -> bootstrap; sendContent
        holds the message meanwhile — see HELD OUTBOX). It used to degrade
@@ -1322,7 +1331,9 @@ function schedulePendingX4DHExpiry(key) {
    {
      "<contactId>": {
        "<theirDeviceId>": {
-         sessionEpoch, stage: "rk0"|"rk1", rootKey (base64),
+         sessionEpoch, stage: "rk0"|"rk1", sendStage,
+         rootKey (base64 — ONLY while stage is "rk0", see "session key material"),
+         gens: { 0|1: { aux, s, r } }   (R1 chain state — same section),
          initiator, establishedAt, upgradedAt,
          retryAttempts, retryExhaustedAt, lastRetryAt
        }
@@ -1347,6 +1358,11 @@ async function loadX4DHSessions() {
       for (const [did, s] of Object.entries(devs)) if (s && s.stage === "rk1" && s.pq !== true) { delete devs[did]; droppedClassical++; }
     }
     if (droppedClassical) mlog.warn(`STORAGE    ${droppedClassical} classical RK1 session(s) dropped — they are re-established as post-quantum hybrid`);
+    const mig = await migrateSessionsToChains();   // R1: raw roots -> chain generations, once
+    if (mig.converted || mig.dropped) {
+      mlog.warn(`STORAGE    R1: ${mig.converted} session(s) converted to chain ratchets (raw roots deleted)${mig.dropped ? `, ${mig.dropped} unusable one(s) dropped` : ""}`);
+      await saveX4DHSessions();
+    }
     mlog.debug(`STORAGE    X4DH sessions loaded: ${Object.keys(state.x4dhSessions).length} contact(s)`);
   } catch(e) {
     mlog.warn(`STORAGE    X4DH session load failed: ${e.message}`);
@@ -1385,13 +1401,24 @@ async function loadX4DHSessions() {
 //      never during trial decryption and never on an unverified packet.
 // A failed write used to be logged and forgotten, so every caller carried on as
 // if it had landed. Now the result is returned, callers that send act on it,
-// and a failed write leaves a mark (x4dhLastSaveOk) that getOrDeriveWireKey —
-// the one place every session-key encrypt goes through — checks via
+// and a failed write leaves a mark (x4dhLastSaveOk) that sendFannedX4DH and
+// getAuxSendKey — the two places a session key encrypts — check via
 // x4dhSessionsDurable(): while memory is ahead of storage we do not encrypt
 // under session keys (callers see "no session" and hold/fall back exactly as
 // they already do). Receiving is never gated. In memory the session state is
 // NOT rolled back on a failed write — receiving keeps working from it, and the
 // next successful write persists everything at once.
+// R1 (0.8.0) puts two more obligations under these rules. SEND: a chain position is
+// spent in memory when taken (takeSendKey) and the packet goes out only after the
+// write that records the spend has landed (sendFannedX4DH awaits it) — otherwise a
+// reload hands the same position to a different plaintext. RECEIVE: the envelope
+// signature is verified BEFORE decryption and a chain only advances for a verified
+// packet; the message is saved (saveContacts) BEFORE the session write that records
+// its consumed key, and the delivery ack goes out after both. A crash between the two
+// writes re-delivers rather than loses; in the other order it would lose the message
+// with its key already deleted. (The advance itself happens in memory at decrypt, so an
+// unrelated session write inside the processing time of one packet can persist it
+// early — a window of milliseconds, accepted.)
 let _saveX4DHChain = Promise.resolve();
 let x4dhLastSaveOk = true;    // did the most recent write land?
 let x4dhLastFailAt = 0;
@@ -1472,10 +1499,7 @@ async function storeX4DHSessionRK0(contactId, theirDeviceId, sessionEpoch, rk0By
   // A reset/retry replaces the whole session. Packets the OTHER side already
   // sent under the old generation(s) are still in flight — keep those roots
   // as decrypt-only for X4DH_RETIRED_GRACE_MS instead of discarding them.
-  if (existing) {
-    retireX4DHRoot(contactId, theirDeviceId, existing.rootKey);
-    retireX4DHRoot(contactId, theirDeviceId, existing.rk0Root);
-  }
+  if (existing) await retireX4DHSession(contactId, theirDeviceId, existing);
   state.x4dhSessions[contactId][theirDeviceId] = {
     // proposeTs — the ORIGINATING session:propose packet's own signed
     // `ts` field (the sender's clock), kept separate from establishedAt
@@ -1498,7 +1522,7 @@ async function storeX4DHSessionRK0(contactId, theirDeviceId, sessionEpoch, rk0By
     retryExhaustedAt: existing?.retryExhaustedAt || null,
     lastRetryAt:      existing?.lastRetryAt      || null,
   };
-  // (wire keys are cached per ROOT now — nothing to evict here, see x4dhWireKeyByRoot)
+  // (replaced generations live on in x4dhRetired for the grace window — nothing to evict here)
   const saved = await saveX4DHSessions();   // returned: callers that SEND on the strength of this session must not if it did not land
   mlog.info(`X4DH       RK0 established  ${pid(contactId, { deviceId: theirDeviceId })}  epoch=${pid(sessionEpoch)}${saved ? "" : "  (NOT SAVED)"}`);
   // Responder side is send-ready at once (see isSessionSendReady); the initiator's RK0 is not — it waits for the ack.
@@ -1522,9 +1546,20 @@ async function upgradeX4DHSessionToRK1(contactId, theirDeviceId, sessionEpoch, r
     mlog.warn(`X4DH       stale upgrade attempt — no matching rk0 session, dropped  ${pid(contactId, { deviceId: theirDeviceId })}  epoch=${pid(sessionEpoch)}`);
     return false;
   }
-  if (existing.stage === "rk0") existing.rk0Root = existing.rootKey;   // RK0 stays usable (decrypt always; send too while sendStage is "rk0")
+  // R1: RK0's chains are built NOW, while its root is still on the record — gen 0 stays
+  // usable (decrypt always; send too while sendStage is "rk0"). RK1's chains come from the
+  // new root, and then NO raw root is kept: a stored session must not be able to re-derive
+  // keys that were already used and deleted.
+  if (existing.stage === "rk0") await ensureGen(existing, 0);
+  const G1 = await buildGen(rk1Bytes, !!existing.initiator);
+  if (getX4DHSession(contactId, theirDeviceId) !== existing || existing.sessionEpoch !== sessionEpoch) {   // replaced while we awaited
+    mlog.warn(`X4DH       stale upgrade attempt — session replaced during the upgrade, dropped  ${pid(contactId, { deviceId: theirDeviceId })}  epoch=${pid(sessionEpoch)}`);
+    return false;
+  }
+  if (!existing.gens) existing.gens = {};
+  existing.gens[1]    = G1;
+  delete existing.rootKey;
   existing.stage      = "rk1";
-  existing.rootKey    = rawToBase64(rk1Bytes);
   existing.sendStage  = sendStage;
   existing.pq         = true;   // RK1 is always derived with the ML-KEM-768 secret (root-v3); loadX4DHSessions drops an rk1 record without this mark
   existing.upgradedAt = Date.now();
@@ -1548,10 +1583,30 @@ async function upgradeX4DHSessionToRK1(contactId, theirDeviceId, sessionEpoch, r
   return true;
 }
 
-/* ── wire-message keys: SEND vs DECRYPT, and key generations ──
-   Pass 1 derived ONE key per (contact, device) from the session's current
-   root and used it for everything. That lost packets whenever the two sides
-   disagreed, for a moment, about which root was current:
+/* ── session key material: generations, chains, aux keys (R1, 0.8.0) ──
+   A session has up to two GENERATIONS of key material: gen 0 from RK0 (the
+   offline-usable stage-1 root) and gen 1 from RK1 (the hybrid upgrade). Each
+   generation is built ONCE from its root (buildGen -> lib's deriveChainGen) and
+   the raw root is then deleted — a stored session never holds a root that could
+   re-derive keys already used and thrown away. The one exception is RK0 while the
+   session is still at stage "rk0": the stage-2 upgrade is salted with it, so
+   session.rootKey stays until upgradeX4DHSessionToRK1 has run.
+     session.gens[0|1] = {
+       aux,                              static AES key (base64) — self-backup traffic only, see getAuxSendKey
+       s: { k, n, tk },                  SEND chain: next chain key, next position, tag key
+       r: { k, n, tk, sk, seen },        RECEIVE chain: next chain key, next expected position, tag key,
+                                         sk   = skipped message keys [[i, mk, ts], ...] (newest CHAIN_SKIP_KEEP,
+                                                dropped after CHAIN_SKIP_TTL_MS = the relay buffer's lifetime),
+                                         seen = last CHAIN_SEEN_KEEP consumed positions [[i, iv], ...]
+     }
+     session.stage    — "rk0" | "rk1": which generation is CURRENT (newest)
+     session.sendStage— "rk0" | "rk1": which generation we SEND under
+   Direction: the initiator's send chain is the responder's receive chain and the
+   other way round (buildGen picks by session.initiator).
+
+   Pass 1 derived ONE key per (contact, device) from the session's current root.
+   That lost packets whenever the two sides disagreed, for a moment, about which
+   root was current:
      - the responder upgrades to RK1 BEFORE its ack is delivered, so the
        initiator's RK0-keyed messages (sent meanwhile) were undecryptable,
        and the responder's RK1-keyed ones were undecryptable to the
@@ -1560,119 +1615,365 @@ async function upgradeX4DHSessionToRK1(contactId, theirDeviceId, sessionEpoch, r
        left the pair permanently desynced until the stuck-retry;
      - a reset replaced the session wholesale, so anything the peer had
        already sent under the old keys was lost.
-   Rule now: SEND under the newest root the peer has demonstrably reached,
-   DECRYPT under every generation still alive.
-     session.rootKey  — newest root (RK1 once upgraded, else RK0)
-     session.rk0Root  — RK0, retained after the upgrade until the peer is
-                        confirmed to hold RK1 (persisted with the session,
-                        encrypted at rest like everything in it)
-     session.sendStage— "rk0" | "rk1": which of the two we encrypt under
-                        (absent on a pre-0.5.9 record = its current stage)
-   The initiator sends under RK1 as soon as the ack lands (the ack was built
-   from RK1). The responder keeps sending under RK0 until a VERIFIED message
-   from that device decrypts under RK1 — proof the initiator upgraded —
-   then switches (confirmX4DHPeerKey) and retires RK0. A lost ack therefore
-   no longer desyncs anything: both sides simply stay on RK0, which both
-   hold, until the retry.
-   Roots that are replaced (a reset) or retired (RK0 after confirmation) go
-   to x4dhRetired for X4DH_RETIRED_GRACE_MS: decrypt-only, memory-only —
-   never persisted, so a reload drops them (forward secrecy over
-   in-flight-across-a-reload packets). Wire keys are cached by ROOT CONTENT
-   (x4dhWireKeyByRoot), so a cache hit can never be stale; the entry is
-   evicted when its root's grace ends.
+   Rule: SEND under the newest generation the peer has demonstrably reached,
+   DECRYPT under every generation still alive. The initiator sends under gen 1 as
+   soon as the ack lands (the ack was built from RK1). The responder keeps sending
+   under gen 0 until a VERIFIED message from that device decrypts under gen 1 —
+   proof the initiator upgraded — then switches (confirmX4DHPeerKey) and retires
+   gen 0. A lost ack therefore no longer desyncs anything: both sides simply stay
+   on gen 0, which both hold, until the retry.
+   Generations that are replaced (a reset) or retired (gen 0 after confirmation) go
+   to x4dhRetired for X4DH_RETIRED_GRACE_MS: decrypt-only, memory-only — never
+   persisted, so a reload drops them (forward secrecy over in-flight-across-a-reload
+   packets). Their receive chains travel with them, skipped keys included.
+
+   WHAT TO CALL WHEN
+     takeSendKey          spend the next position of a send chain (memory), return its key + header.
+                          The caller persists BEFORE sending (rule 1 below).
+     decryptIncomingMessage / tryChainCandidate
+                          receive side; advances a receive chain only for a packet whose envelope
+                          signature verified (rule 2), and only after its AEAD tag passed.
+     getAuxSendKey / getAuxDecryptKeys
+                          the static per-session key for traffic that has no chain header.
+   All chain reads/writes of one session go through withChainLock — a position must
+   never be spent twice, and two concurrent receives must not both advance the chain.
+
+   RECOVERY. A session whose chains have drifted apart (a peer restored an old profile,
+   a position was lost to a crash) shows up as authenticated packets we cannot read:
+   the signature verifies and the tag matches this chain, but the AEAD fails, or the
+   position is one we already consumed with a DIFFERENT iv (a rewound sender re-using
+   a position — the same position with the SAME iv is just a replay and is dropped
+   quietly). CHAIN_STRIKE_LIMIT of those in a row drop the session (dropX4DHSession);
+   the ordinary re-establishment paths take over. Strikes are memory-only and reset by
+   any packet that decrypts.
 ── */
 const X4DH_RETIRED_GRACE_MS = 120_000;
-const x4dhWireKeyByRoot = new Map();   // root (base64) -> CryptoKey (AES-256-GCM) — memory only
-const x4dhRetired       = new Map();   // "contactId:deviceId" -> [{ rootB64, retiredAt }] — memory only
+const CHAIN_MAX_FORWARD  = 2000;              // how far past our receive position a header may point (KDF steps per packet, worst case); a real gap is relay eviction, never this big
+const CHAIN_SKIP_KEEP    = 100;               // skipped message keys kept per receive chain (the newest)
+const CHAIN_SKIP_TTL_MS  = 24 * 3600 * 1000;  // = the relay's message buffer lifetime: a key older than that can never be needed
+const CHAIN_SEEN_KEEP    = 32;                // consumed positions remembered with their iv (replay vs rewound sender)
+const CHAIN_STRIKE_LIMIT = 3;                 // consecutive authenticated-but-unreadable packets before the session is dropped
 
-async function wireKeyForRoot(rootB64) {
-  let k = x4dhWireKeyByRoot.get(rootB64);
-  if (!k) { k = await deriveX4DHWireKey(base64ToRaw(rootB64)); x4dhWireKeyByRoot.set(rootB64, k); }
+const auxKeyCache      = new Map();   // aux (base64) -> CryptoKey — memory only
+const x4dhRetired      = new Map();   // "contactId:deviceId" -> [{ g, G, retiredAt }] — memory only
+const x4dhChainStrikes = new Map();   // "contactId:deviceId" -> consecutive unreadable authenticated packets — memory only
+const _chainLocks      = new Map();   // "contactId:deviceId" -> tail of that session's operation queue
+
+function withChainLock(key, fn) {
+  const prev = _chainLocks.get(key) || Promise.resolve();
+  const run  = prev.then(fn);
+  const tail = run.then(() => {}, () => {});   // one failed step must not wedge the queue
+  _chainLocks.set(key, tail);
+  tail.then(() => { if (_chainLocks.get(key) === tail) _chainLocks.delete(key); });
+  return run;
+}
+
+// One generation's stored form, from its root. weAreInitiator picks which chain is ours to send on.
+async function buildGen(rootBytes, weAreInitiator) {
+  const d  = await deriveChainGen(rootBytes);
+  const sd = weAreInitiator ? "i2r" : "r2i", rd = weAreInitiator ? "r2i" : "i2r";
+  const G = {
+    aux: rawToBase64(d.aux),
+    s: { k: rawToBase64(d.ck[sd]), n: 0, tk: rawToBase64(d.tk[sd]) },
+    r: { k: rawToBase64(d.ck[rd]), n: 0, tk: rawToBase64(d.tk[rd]), sk: [], seen: [] },
+  };
+  d.aux.fill(0); d.ck.i2r.fill(0); d.ck.r2i.fill(0); d.tk.i2r.fill(0); d.tk.r2i.fill(0);
+  return G;
+}
+
+// A stored generation that is not the shape buildGen makes is unusable — see loadX4DHSessions.
+function genShapeOk(G) {
+  const chain = (c, recv) => isPlainObject(c) && typeof c.k === "string" && typeof c.tk === "string" &&
+    Number.isInteger(c.n) && c.n >= 0 && (!recv || (Array.isArray(c.sk) && Array.isArray(c.seen)));
+  return isPlainObject(G) && typeof G.aux === "string" && chain(G.s, false) && chain(G.r, true);
+}
+
+const x4dhCurGen  = (s) => s.stage === "rk1" ? 1 : 0;
+// the generation WE encrypt under
+function x4dhSendGen(s) {
+  return (s.stage === "rk1" && s.sendStage === "rk0" && s.gens?.[0]) ? 0 : x4dhCurGen(s);
+}
+
+// Generation g of this session, built now if it only exists as a root (gen 0 at stage rk0).
+async function ensureGen(s, g) {
+  if (s.gens?.[g]) return s.gens[g];
+  if (g === 0 && s.stage === "rk0" && typeof s.rootKey === "string") {
+    const G = await buildGen(base64ToRaw(s.rootKey), !!s.initiator);
+    if (!s.gens) s.gens = {};
+    return s.gens[0] || (s.gens[0] = G);   // another caller may have built it while we awaited
+  }
+  return null;
+}
+
+async function auxKeyFor(G) {
+  let k = auxKeyCache.get(G.aux);
+  if (!k) { k = await importEncKey(base64ToRaw(G.aux)); auxKeyCache.set(G.aux, k); }
   return k;
 }
 
-function retireX4DHRoot(contactId, theirDeviceId, rootB64) {
-  if (!rootB64) return;
-  const key = `${contactId}:${theirDeviceId}`;
+function retireGen(contactId, theirDeviceId, g, G) {
+  if (!G) return;
+  const key  = `${contactId}:${theirDeviceId}`;
   const list = x4dhRetired.get(key) || [];
-  if (!list.some(r => r.rootB64 === rootB64)) list.push({ rootB64, retiredAt: Date.now() });
+  if (!list.some(r => r.G === G)) list.push({ g, G, retiredAt: Date.now() });
   x4dhRetired.set(key, list);
 }
 
-function purgeRetiredX4DHRoots() {
+// Every generation of a session that is being replaced goes to the decrypt-only grace.
+async function retireX4DHSession(contactId, theirDeviceId, s) {
+  await ensureGen(s, 0);
+  for (const [g, G] of Object.entries(s.gens || {})) retireGen(contactId, theirDeviceId, Number(g), G);
+}
+
+function purgeRetiredX4DHGens() {
   const now = Date.now();
   for (const [key, list] of x4dhRetired) {
     const keep = list.filter(r => now - r.retiredAt <= X4DH_RETIRED_GRACE_MS);
-    for (const r of list) if (!keep.includes(r)) x4dhWireKeyByRoot.delete(r.rootB64);
+    for (const r of list) if (!keep.includes(r)) auxKeyCache.delete(r.G.aux);
     if (keep.length) x4dhRetired.set(key, keep); else x4dhRetired.delete(key);
   }
 }
-setInterval(purgeRetiredX4DHRoots, 30_000);   // so a retired key doesn't outlive its grace just because nothing decrypted lately
+setInterval(purgeRetiredX4DHGens, 30_000);   // so a retired key doesn't outlive its grace just because nothing decrypted lately
 
-// the root WE encrypt under for this session
-function x4dhSendRoot(s) {
-  return (s.stage === "rk1" && s.sendStage === "rk0" && s.rk0Root) ? s.rk0Root : s.rootKey;
+// Every generation a packet from this device could legitimately be under, most
+// likely first: the current one, the retained gen 0, then recently retired ones
+// (newest first). label tells the caller which one matched — "current" is what
+// confirmX4DHPeerKey keys off. onlyGen narrows to the generation a chain header names.
+async function x4dhGenCandidates(contactId, theirDeviceId, onlyGen) {
+  purgeRetiredX4DHGens();
+  const out = [];
+  const s = getX4DHSession(contactId, theirDeviceId);
+  if (s) {
+    if (x4dhCurGen(s) === 1) {
+      if (s.gens?.[1]) out.push({ G: s.gens[1], g: 1, label: "current" });
+      if (s.gens?.[0]) out.push({ G: s.gens[0], g: 0, label: "prev-rk0" });
+    } else {
+      const G0 = await ensureGen(s, 0);
+      if (G0) out.push({ G: G0, g: 0, label: "current" });
+    }
+  }
+  for (const r of [...(x4dhRetired.get(`${contactId}:${theirDeviceId}`) || [])].reverse()) out.push({ G: r.G, g: r.g, label: "retired" });
+  return onlyGen === undefined ? out : out.filter(c => c.g === onlyGen);
 }
 
-// getOrDeriveWireKey(contactId, theirDeviceId) — the key to ENCRYPT under
-// for that device pair (null if no session). Decrypting uses
-// getDecryptWireKeys below, never this.
-// Also null while session state is not durable (see the PERSISTENCE CONTRACT at
-// saveX4DHSessions): every encrypt-under-a-session path goes through here, so
-// this is the one gate rule 1 needs. Callers already handle null as "no usable
-// session" (held message / fallback), which is the right behaviour here too.
+/* ── aux keys: traffic with no chain header ──
+   Self-backup pushes (sync:backup_push) and their acks / the discovery ack are
+   not app:message — they carry no header, so there is no position to ratchet.
+   They keep a STATIC per-session key derived from the generation's root (what
+   every message used before R1). That is a known, deliberate gap: such a blob is
+   readable by whoever later obtains the session state, exactly as before — see
+   known-limitations.md. They are sent under the send generation and decrypted under
+   every live one.
+   Also null while session state is not durable (see the PERSISTENCE CONTRACT at
+   saveX4DHSessions); callers already treat null as "no usable session". */
 let x4dhNotDurableLoggedAt = 0;
-async function getOrDeriveWireKey(contactId, theirDeviceId) {
+function logSessionsNotDurable() {
+  if (Date.now() - x4dhNotDurableLoggedAt > 30_000) {
+    x4dhNotDurableLoggedAt = Date.now();
+    mlog.warn(`X4DH       session state could not be saved — not sending under session keys until storage works (held messages retry on the next tick)`);
+  }
+}
+async function getAuxSendKey(contactId, theirDeviceId) {
   const session = getX4DHSession(contactId, theirDeviceId);
   if (!session) return null;
-  if (!(await x4dhSessionsDurable())) {
-    if (Date.now() - x4dhNotDurableLoggedAt > 30_000) {
-      x4dhNotDurableLoggedAt = Date.now();
-      mlog.warn(`X4DH       session state could not be saved — not sending under session keys until storage works (held messages retry on the next tick)`);
-    }
-    return null;
-  }
-  return wireKeyForRoot(x4dhSendRoot(session));
+  if (!(await x4dhSessionsDurable())) { logSessionsNotDurable(); return null; }
+  const G = await ensureGen(session, x4dhSendGen(session));
+  return G ? auxKeyFor(G) : null;
 }
-
-// Every key a packet from this device could legitimately be under, most
-// likely first: the current root, the retained RK0, then recently retired
-// roots (newest first). label tells the caller which one matched —
-// "current" is what confirmX4DHPeerKey keys off.
-async function getDecryptWireKeys(contactId, theirDeviceId) {
-  purgeRetiredX4DHRoots();
+async function getAuxDecryptKeys(contactId, theirDeviceId) {
   const out = [], seen = new Set();
-  const add = async (rootB64, label) => {
-    if (!rootB64 || seen.has(rootB64)) return;
-    seen.add(rootB64);
-    out.push({ key: await wireKeyForRoot(rootB64), label });
-  };
-  const s = getX4DHSession(contactId, theirDeviceId);
-  if (s) { await add(s.rootKey, "current"); await add(s.rk0Root, "prev-rk0"); }
-  for (const r of [...(x4dhRetired.get(`${contactId}:${theirDeviceId}`) || [])].reverse()) await add(r.rootB64, "retired");
+  for (const { G, label } of await x4dhGenCandidates(contactId, theirDeviceId)) {
+    if (seen.has(G.aux)) continue;
+    seen.add(G.aux);
+    out.push({ key: await auxKeyFor(G), label });
+  }
   return out;
 }
 
-// A verified message from this device just decrypted under our CURRENT RK1:
-// it provably holds RK1. Switch to sending under RK1 (responder) and retire
-// the retained RK0 (both sides) into the decrypt-only grace.
+/* ── SEND: spend one chain position ──
+   Advances the send chain in memory and returns { mk, hdr } — the message key
+   (zero it after use) and the { g, i, t } header for the blob. The position is
+   spent from this moment; if the packet is then never sent, the receiver simply
+   sees a gap (it keeps the skipped key for CHAIN_SKIP_TTL_MS). What must NEVER
+   happen is the opposite — a packet going out while the advance exists only in
+   memory: a reload would hand the same position to a different plaintext under the
+   same key, and the peer, who already deleted that key, could not read it.
+   So sendFannedX4DH takes keys for ALL its targets, then awaits ONE
+   saveX4DHSessions, and only then puts anything on the wire (rule 1). */
+async function takeSendKey(contactId, theirDeviceId) {
+  const s = getX4DHSession(contactId, theirDeviceId);
+  if (!s) return null;
+  return withChainLock(`${contactId}:${theirDeviceId}`, async () => {
+    if (getX4DHSession(contactId, theirDeviceId) !== s) return null;   // replaced or dropped while we queued
+    const g = x4dhSendGen(s);
+    const G = await ensureGen(s, g);
+    if (!G) return null;
+    const i = G.s.n;
+    if (!chainIndexOk(i)) return null;
+    const { mk, next } = await chainStep(base64ToRaw(G.s.k));
+    const t = await chainTag(base64ToRaw(G.s.tk), i);
+    G.s.k = rawToBase64(next); G.s.n = i + 1;   // both fields together, nothing awaited in between
+    next.fill(0);
+    return { mk, hdr: { g, i, t } };
+  });
+}
+
+/* ── RECEIVE: one candidate chain ──
+   Result status:
+     "nomatch"  the header's tag is not this chain's: not our sender (cheap, no KDF)
+     "ok"       decrypted; `dirty` = the chain was advanced (commit was true)
+     "consumed" the position was already used and is not in the skipped store;
+                `replay` = same iv as the one we consumed (a re-delivery), else a
+                rewound sender
+     "toofar"   more than CHAIN_MAX_FORWARD ahead
+     "aead"     tag matched, position reachable, but the ciphertext does not open
+   commit=false (the envelope signature did not verify) decrypts from a COPY and
+   changes nothing — see rule 2 of the PERSISTENCE CONTRACT. */
+function pruneSkipped(r) {
+  const cutoff = Date.now() - CHAIN_SKIP_TTL_MS;
+  if (r.sk.some(e => !(e[2] >= cutoff))) r.sk = r.sk.filter(e => e[2] >= cutoff);
+}
+function noteSeen(r, i, iv) {
+  r.seen.push([i, iv]);
+  while (r.seen.length > CHAIN_SEEN_KEEP) r.seen.shift();
+}
+async function tryChainCandidate(G, h, blob, aad, commit) {
+  const r = G.r;
+  if ((await chainTag(base64ToRaw(r.tk), h.i)) !== h.t) return { status: "nomatch" };
+  pruneSkipped(r);
+
+  if (h.i < r.n) {                                   // already passed: skipped (key kept) or consumed (key gone)
+    const at = r.sk.findIndex(e => e[0] === h.i);
+    if (at < 0) {
+      const seen = r.seen.find(e => e[0] === h.i);
+      return { status: "consumed", replay: !!seen && seen[1] === blob.iv };
+    }
+    const mk = base64ToRaw(r.sk[at][1]);
+    let plain;
+    try { plain = await decryptChainMessage(mk, blob, aad); }
+    catch (e) { return { status: "aead" }; }
+    finally { mk.fill(0); }
+    if (commit) { r.sk.splice(at, 1); noteSeen(r, h.i, blob.iv); }
+    return { status: "ok", plain, dirty: !!commit };
+  }
+
+  if (h.i - r.n > CHAIN_MAX_FORWARD) return { status: "toofar" };
+  let ck = base64ToRaw(r.k), n = r.n;
+  const skipped = [];                                // only the newest CHAIN_SKIP_KEEP are worth keeping
+  while (n < h.i) {
+    const st = await chainStep(ck);
+    skipped.push([n, st.mk]);
+    if (skipped.length > CHAIN_SKIP_KEEP) skipped.shift()[1].fill(0);
+    ck = st.next; n++;
+  }
+  const st = await chainStep(ck);
+  let plain;
+  try { plain = await decryptChainMessage(st.mk, blob, aad); }
+  catch (e) { skipped.forEach(([, mk]) => mk.fill(0)); return { status: "aead" }; }
+  finally { st.mk.fill(0); }
+  if (commit) {
+    const now = Date.now();
+    r.k = rawToBase64(st.next); r.n = h.i + 1;
+    for (const [i, mk] of skipped) r.sk.push([i, rawToBase64(mk), now]);
+    while (r.sk.length > CHAIN_SKIP_KEEP) r.sk.shift();
+    noteSeen(r, h.i, blob.iv);
+  }
+  skipped.forEach(([, mk]) => mk.fill(0));
+  return { status: "ok", plain, dirty: !!commit };
+}
+
+// A verified message from this device just decrypted under our CURRENT generation
+// (gen 1): it provably holds RK1. Switch to sending under gen 1 (responder) and
+// retire the retained gen 0 (both sides) into the decrypt-only grace.
 // Callers must be past the authentication of the packet that proves it (AEAD
-// under the CURRENT root, plus the signature where the packet has one) — rule 2
+// under the CURRENT generation, plus the signature where the packet has one) — rule 2
 // of the PERSISTENCE CONTRACT. The switch is applied in memory at once (so the
-// very next send already uses RK1) and the write is AWAITED: until it lands,
-// getOrDeriveWireKey will not encrypt under session keys (rule 1), because a
-// reload would otherwise bring back "sending under RK0" while the peer has
-// already retired RK0.
+// very next send already uses gen 1) and the write is AWAITED: until it lands,
+// nothing is encrypted under session keys (rule 1), because a reload would
+// otherwise bring back "sending under gen 0" while the peer has already retired it.
 async function confirmX4DHPeerKey(contactId, theirDeviceId) {
   const s = getX4DHSession(contactId, theirDeviceId);
   if (!s || s.stage !== "rk1") return false;
   const switching = s.sendStage === "rk0";
-  if (!switching && !s.rk0Root) return false;
-  if (s.rk0Root) { retireX4DHRoot(contactId, theirDeviceId, s.rk0Root); delete s.rk0Root; }
+  if (!switching && !s.gens?.[0]) return false;
+  if (s.gens?.[0]) { retireGen(contactId, theirDeviceId, 0, s.gens[0]); delete s.gens[0]; }
   s.sendStage = "rk1";
   const saved = await saveX4DHSessions();
   mlog.info(`X4DH       peer confirmed RK1 — ${switching ? "now sending under RK1, " : ""}RK0 retired (decrypt-only grace ${X4DH_RETIRED_GRACE_MS / 1000}s)  ${pid(contactId, { deviceId: theirDeviceId })}${saved ? "" : "  (NOT SAVED)"}`);
   return saved;
+}
+
+// Forget one device's session for good: stored record, retired generations, strikes,
+// cached keys. What follows is the ordinary recovery — see recoverDroppedSession.
+async function dropX4DHSession(contactId, theirDeviceId, reason) {
+  const devs = state.x4dhSessions?.[contactId];
+  const s = devs?.[theirDeviceId];
+  if (!s) return false;
+  for (const G of Object.values(s.gens || {})) auxKeyCache.delete(G.aux);
+  for (const r of x4dhRetired.get(`${contactId}:${theirDeviceId}`) || []) auxKeyCache.delete(r.G.aux);
+  delete devs[theirDeviceId];
+  x4dhRetired.delete(`${contactId}:${theirDeviceId}`);
+  x4dhChainStrikes.delete(`${contactId}:${theirDeviceId}`);
+  const saved = await saveX4DHSessions();
+  mlog.warn(`X4DH       session dropped (${reason})  ${pid(contactId, { deviceId: theirDeviceId })}${saved ? "" : "  (NOT SAVED)"}`);
+  return saved;
+}
+
+// After a drop WE caused (not the × button, which leaves this to the next packet):
+// the fixed initiator proposes at once (the peer's endpoint is already known); a
+// responder sends a HELLO whose session list no longer names the device, which makes
+// the initiator re-propose (see "HELLO session list"). A self-pair responder has no
+// HELLO to send and waits for its sibling's own traffic.
+function recoverDroppedSession(contactId, theirDeviceId) {
+  if (isFixedInitiator(contactId, theirDeviceId)) maybeTriggerX4DHPropose(contactId, theirDeviceId);
+  else if (contactId !== state.publicId) sendHello(contactId, "chain desync", 0).catch(e => mlog.warn(`HELLO      after session drop failed: ${e.message}`));
+}
+
+async function registerChainStrike(contactId, theirDeviceId, why) {
+  const key = `${contactId}:${theirDeviceId}`;
+  const n = (x4dhChainStrikes.get(key) || 0) + 1;
+  if (n < CHAIN_STRIKE_LIMIT) {
+    x4dhChainStrikes.set(key, n);
+    mlog.warn(`X4DH       authenticated packet we cannot read (${why}) — strike ${n}/${CHAIN_STRIKE_LIMIT}  ${pid(contactId, { deviceId: theirDeviceId })}`);
+    return;
+  }
+  await dropX4DHSession(contactId, theirDeviceId, `chains out of step: ${n} authenticated packets in a row we cannot read (${why})`);
+  recoverDroppedSession(contactId, theirDeviceId);
+}
+
+// Counters and flags ONLY — the one thing the conversation info panel may show of a
+// chain. Never key material, never the session object.
+function x4dhChainInfo(contactId, theirDeviceId) {
+  const s = getX4DHSession(contactId, theirDeviceId);
+  if (!s?.gens) return null;
+  const cur = s.gens[x4dhCurGen(s)], snd = s.gens[x4dhSendGen(s)];
+  if (!cur || !snd) return null;
+  return { gen: x4dhSendGen(s), sendN: snd.s.n, recvN: cur.r.n, skipped: cur.r.sk.length, keepsRk0: x4dhCurGen(s) === 1 && !!s.gens[0] };
+}
+
+// Sessions from before R1 hold raw roots (rootKey, rk0Root) instead of generations. They
+// are converted in place at load — the derivation is deterministic and the same on both
+// sides, so no handshake is needed — and the raw roots are deleted. A session that is
+// not in a usable shape after this is dropped (it is re-established the ordinary way).
+async function migrateSessionsToChains() {
+  let converted = 0, dropped = 0;
+  for (const devs of Object.values(state.x4dhSessions)) {
+    if (!isPlainObject(devs)) continue;
+    for (const [did, s] of Object.entries(devs)) {
+      if (!isPlainObject(s)) { delete devs[did]; dropped++; continue; }
+      if (s.gens && !isPlainObject(s.gens)) delete s.gens;
+      for (const g of Object.keys(s.gens || {})) if (!genShapeOk(s.gens[g])) delete s.gens[g];
+      if (s.stage === "rk1" && (s.rootKey || s.rk0Root)) {
+        if (!s.gens) s.gens = {};
+        if (typeof s.rk0Root === "string" && !s.gens[0]) s.gens[0] = await buildGen(base64ToRaw(s.rk0Root), !!s.initiator);
+        if (typeof s.rootKey === "string" && !s.gens[1]) s.gens[1] = await buildGen(base64ToRaw(s.rootKey), !!s.initiator);
+        delete s.rootKey; delete s.rk0Root;
+        converted++;
+      }
+      if ((s.stage === "rk1" && !s.gens?.[1]) || (s.stage === "rk0" && typeof s.rootKey !== "string" && !s.gens?.[0])) { delete devs[did]; dropped++; }
+    }
+  }
+  return { converted, dropped };
 }
 
 /* ── packet signing ──
@@ -1911,7 +2212,7 @@ window.x4dhDebug = {
           retryAttempts: s.retryAttempts || 0,
           exhausted: !!s.retryExhaustedAt,
           deferredAck: !!s.pendingAck,
-          sendStage: s.sendStage || s.stage, rk0Kept: !!s.rk0Root,
+          sendStage: s.sendStage || s.stage, rk0Kept: !!s.gens?.[0], chain: JSON.stringify(x4dhChainInfo(contactId, deviceId)),
           epoch: pid(s.sessionEpoch),
         });
       }
@@ -2258,7 +2559,7 @@ async function handleX4DHAck(msg) {
   }
 
   const session = getX4DHSession(msg.from, theirDeviceId);
-  if (!session || session.sessionEpoch !== msg.sessionEpoch) {
+  if (!session || session.sessionEpoch !== msg.sessionEpoch || session.stage !== "rk0" || typeof session.rootKey !== "string") {   // an ack only ever upgrades an rk0 session — which is the one that still has its root
     mlog.warn(`← X4DH_ACK     from ${pid(msg.from, { deviceId: theirDeviceId })} — no matching rk0 session on file, dropped`);
     clearTimeout(pending.timeoutHandle);
     if (pending.kemSk) pending.kemSk.fill(0);
@@ -2417,21 +2718,38 @@ function contactNeedsHello(contactId) {
    So the check lives here, before anything is written to a socket. */
 const RELAY_FRAME_CAP_MESSAGE = 2 * 1024 * 1024;
 
+// R1 (0.8.0): each targeted copy is sealed under a ONE-TIME chain key (takeSendKey) and
+// carries its header { g, i, t } in the blob. All targets are taken first, then ONE awaited
+// saveX4DHSessions records the spent positions, and only then does anything go out
+// (rule 1 — see takeSendKey). A copy dropped for size has still spent its position: the
+// receiver sees a gap and keeps the skipped key, nothing worse.
 async function sendFannedX4DH(contactId, payload) {
   const resolved = resolveDeviceTargets(contactId);
   let sent = false, x4dhCount = 0, awaitingSession = 0, tooBig = 0;
   const envelopes = [];
 
+  const durable = resolved.targeted.length === 0 || await x4dhSessionsDurable();
+  if (!durable) logSessionsNotDurable();
+  const prepared = [];
   for (const { deviceId, endpointId } of resolved.targeted) {
-    const wireKey = isSessionSendReady(contactId, deviceId) ? await getOrDeriveWireKey(contactId, deviceId) : null;
-    if (!wireKey) { awaitingSession++; continue; }
-    const obj = await sealEnvelope("app:message", state.publicId, buildAddress(contactId, endpointId), wireKey, payload);
+    const taken = (durable && isSessionSendReady(contactId, deviceId)) ? await takeSendKey(contactId, deviceId) : null;
+    if (!taken) { awaitingSession++; continue; }
+    const obj = await sealChainEnvelope("app:message", state.publicId, buildAddress(contactId, endpointId), taken.mk, taken.hdr, payload);
     const frameLen = JSON.stringify(obj).length;   // ASCII only: base64url + ids, so chars == bytes
     if (frameLen > RELAY_FRAME_CAP_MESSAGE) {
       tooBig++;
-      mlog.warn(`\u2192 MSG too large  to ${pid(contactId, { deviceId })}  ${(frameLen / 1024).toFixed(0)} KiB on the wire, relay limit ${RELAY_FRAME_CAP_MESSAGE / 1024} KiB \u2014 not sent`);
+      mlog.warn(`→ MSG too large  to ${pid(contactId, { deviceId })}  ${(frameLen / 1024).toFixed(0)} KiB on the wire, relay limit ${RELAY_FRAME_CAP_MESSAGE / 1024} KiB — not sent`);
       continue;
     }
+    prepared.push(obj);
+  }
+  // rule 1: the spent positions are on disk before any packet that depends on them is on the wire
+  if (prepared.length && !(await saveX4DHSessions())) {
+    awaitingSession += prepared.length;
+    prepared.length = 0;
+    logSessionsNotDurable();
+  }
+  for (const obj of prepared) {
     const viaRelay = sendToRelay(contactId, obj, true);
     if (!viaRelay) sendSignal(obj);
     sent = sent || viaRelay || state.ws?.readyState === WebSocket.OPEN;
@@ -3094,7 +3412,7 @@ async function decryptSelfBackupBlob(blob, aad) {
   const candidates = Object.entries(sessions)
     .sort(([, a], [, b]) => (b.establishedAt || 0) - (a.establishedAt || 0));
   for (const [theirDeviceId] of candidates) {
-    for (const { key, label } of await getDecryptWireKeys(state.publicId, theirDeviceId)) {
+    for (const { key, label } of await getAuxDecryptKeys(state.publicId, theirDeviceId)) {
       try {
         const plain = await decryptObject(key, blob, aad);
         // self blobs carry no signature, but AES-GCM success under RK1 is the
@@ -3122,7 +3440,7 @@ async function handleSelfHello(plain) {
   mlog.info(`← BACKUP_HELLO from self  ${pid(state.publicId, { deviceId: plain.deviceId, endpointId: helloEndpoint })}`);
   recordKnownDevice(state.publicId, plain.deviceId, undefined, helloEndpoint);
 
-  const sessionKey = await getOrDeriveWireKey(state.publicId, plain.deviceId);
+  const sessionKey = await getAuxSendKey(state.publicId, plain.deviceId);
   const ackPayload = { deviceId: state.deviceId, endpointId: state.endpointId };
   if (sessionKey) ackPayload.fingerprint = await computeBackupFingerprint();
   const ackTo   = buildAddress(state.publicId, helloEndpoint);
@@ -3148,8 +3466,8 @@ async function pushBackupToContacts(blob) {
 		//
 		//   - A sibling we know (fresh, endpointId on file) AND hold an X4DH
 		//     self-session with gets a TARGETED full push encrypted under that
-		//     session's wire key (getOrDeriveWireKey) — the same per-device key
-		//     app:message already rides. Skipped when its fingerprint (learned
+		//     session's static aux key (getAuxSendKey; since R1 app:message rides one-time
+		//     chain keys, and this headerless traffic keeps the aux key). Skipped when its fingerprint (learned
 		//     from an ack) already matches ours.
 		//   - Anything we can't do that for — no sibling known yet, one whose
 		//     endpointId is unknown or stale, or one with no session yet — gets
@@ -3178,7 +3496,7 @@ async function pushBackupToContacts(blob) {
 				// comes back (its own traffic refreshes lastSeen, so the next cycle includes it again).
 				// Counted separately so it neither triggers a hello nor reads as "current".
 				if ((Date.now() - (siblingInfo[devId]?.lastSeen || 0)) > FANOUT_STALE_MS) { stale++; continue; }
-				const wireKey = await getOrDeriveWireKey(state.publicId, devId);
+				const wireKey = await getAuxSendKey(state.publicId, devId);
 				if (!wireKey) { noSession++; continue; }
 				// deviceId/endpointId/fingerprint ride INSIDE the encrypted blob, never
 				// as outer envelope fields (an unsigned outer field is silently
@@ -3545,7 +3863,7 @@ async function handleBackupPush(msg) {
 		  // Ack under the same class of key the push arrived under: a session
 		  // key when the sender used one, the backup key otherwise (an older
 		  // sender can only decrypt that).
-		  const ackKey  = wireDeviceId ? await getOrDeriveWireKey(state.publicId, wireDeviceId) : null;
+		  const ackKey  = wireDeviceId ? await getAuxSendKey(state.publicId, wireDeviceId) : null;
 		  const ackTo   = buildAddress(state.publicId, plain.endpointId);
 		  const ackBlob = await encryptObject(ackKey || state.cryptoKey, {
 			  deviceId: state.deviceId, endpointId: state.endpointId, fingerprint: ownFingerprint,
@@ -5797,55 +6115,72 @@ async function togglePushPref(enabled) {
    MESSAGING
 ══════════════════════════════════════════ */
 
-/* ── trial decryption across candidate keys (X4DH-aware) ──
-   deviceId — the piece of information that would tell us WHICH key to
-   use — lives INSIDE the encrypted payload by deliberate design (see
-   protocol.md's Device Identity section: moved there specifically so
-   the relay can never see or rewrite it). That means the recipient
-   can't know which key applies before decrypting, the same chicken-
-   and-egg any per-device-keyed scheme built this way runs into — there
-   is no relay-visible field we can safely reuse for this without
-   reopening exactly the exposure that move was meant to close.
+/* ── receiving app:message (R1, 0.8.0) ──
+   Two blob forms arrive here:
+     v:3  a CHAIN message. Its header { g, i, t } names a generation and a chain
+          position; the tag t belongs to exactly one receive chain, so we find the
+          session without trying them all (and without any KDF work for a packet
+          that is not ours). Decrypted under the one-time key of that position.
+     v:2  an envelope-bound blob under the legacy static-static key: the HELLO and
+          nothing else (receiveMessage drops anything else that arrives this way).
+          It is what lets a first contact with no session yet be heard at all.
+   deviceId — the piece of information that would tell us WHICH session — lives
+   INSIDE the encrypted payload by deliberate design (see protocol.md's Device
+   Identity section), so the header cannot name it; the tag does the narrowing.
 
-   Resolved by trying every candidate key held for this sender until one
-   succeeds. AES-GCM's auth tag makes a wrong-key attempt fail cleanly
-   and immediately (a rejected crypto.subtle.decrypt, not a corrupted
-   result), so this costs a handful of failed decrypt calls at worst —
-   bounded by how many devices a contact runs, typically 1-3 — never a
-   false positive. Order: every X4DH session held for this contact (any
-   stage — rk0 is eligible, see the design discussion this pass came out
-   of for why), most-recently-established first as a cheap "most likely
-   still active" heuristic, then the legacy identity-level key last,
-   since a device that's completed X4DH bootstrap no longer sends under
-   the old key at all.
+   `commit` is the result of verifyEnvelope, which receiveMessage now runs BEFORE
+   decrypting: a chain advances (consuming the key, storing skipped ones) only for a
+   packet whose envelope signature verified — rule 2 of the PERSISTENCE CONTRACT.
+   With commit false the packet is still decrypted, from a copy, and nothing changes.
+   Authenticated-but-unreadable packets count towards dropping the session
+   (registerChainStrike); an unsigned one never does.
 
-   Returns { plain, viaX4DH, theirDeviceId } — theirDeviceId is set only
-   when an X4DH candidate was the one that worked. Throws if every
-   candidate fails, same failure shape decryptMessage itself already
-   has — callers catch this exactly as before.
+   Returns { plain, viaX4DH, theirDeviceId, keyLabel, chainDirty } — theirDeviceId
+   and keyLabel are set only when a session matched; chainDirty means a chain was
+   advanced and the session store must be written (receiveMessage does it, after the
+   message is saved). Throws if nothing opens it, same failure shape as before —
+   callers catch this exactly as they did.
 ── */
-async function decryptIncomingMessage(fromId, blob, aad) {
-  const contact  = state.contacts[fromId];
-  const sessions = state.x4dhSessions[fromId] || {};
-  const candidates = Object.entries(sessions)
+async function decryptIncomingMessage(msg, commit) {
+  if (msg.blob && msg.blob.v === 3) return decryptChainIncoming(msg, commit);
+  const plain = await decryptMessage(msg.blob, state.contacts[msg.from].encKey, envelopeAad(msg.type, msg.from, msg.to));
+  return { plain, viaX4DH: false, theirDeviceId: null, keyLabel: null, chainDirty: false };
+}
+
+async function decryptChainIncoming(msg, commit) {
+  const fromId = msg.from, blob = msg.blob;
+  const h = parseChainHeader(blob.h);
+  if (!h) throw new Error("bad chain header");
+  const aad = chainAad(msg.type, msg.from, msg.to, h.g, h.i);
+  // most recently established first — a cheap "most likely still active" order; the tag makes it matter little
+  const devices = Object.entries(state.x4dhSessions[fromId] || {})
     .sort(([, a], [, b]) => (b.establishedAt || 0) - (a.establishedAt || 0));
 
-  for (const [theirDeviceId] of candidates) {
-    // every live generation for this device, not just the send key — see
-    // "wire-message keys" above. keyLabel says which one worked.
-    for (const { key, label } of await getDecryptWireKeys(fromId, theirDeviceId)) {
-      try {
-        const plain = await decryptMessage(blob, key, aad);
-        return { plain, viaX4DH: true, theirDeviceId, keyLabel: label };
-      } catch(e) { /* wrong key — try the next generation / device */ }
+  let strike = null;
+  search:
+  for (const [theirDeviceId] of devices) {
+    for (const cand of await x4dhGenCandidates(fromId, theirDeviceId, h.g)) {
+      const res = await withChainLock(`${fromId}:${theirDeviceId}`, () => tryChainCandidate(cand.G, h, blob, aad, commit));
+      if (res.status === "nomatch") continue;
+      if (res.status === "ok") {
+        x4dhChainStrikes.delete(`${fromId}:${theirDeviceId}`);
+        return { plain: res.plain, viaX4DH: true, theirDeviceId, keyLabel: cand.label, chainDirty: res.dirty };
+      }
+      if (res.status === "consumed" && res.replay) {
+        const e = new Error("replayed chain packet (position already consumed, same iv) — dropped");
+        e.quiet = true;
+        throw e;
+      }
+      // The tag matched, so this IS the sender's chain — no other candidate can be. A retired
+      // generation failing proves nothing about the live session (late packets, grace expiry).
+      if (cand.label !== "retired") {
+        strike = { theirDeviceId, why: res.status === "consumed" ? "position already used, different iv" : res.status === "toofar" ? "position too far ahead" : "does not decrypt" };
+      }
+      break search;
     }
   }
-
-  // legacy identity-level key — last resort. Since 6.0.0 only a HELLO is
-  // legitimately under it (receiveMessage drops anything else), so this is
-  // what lets a first contact with no session yet be heard at all.
-  const plain = await decryptMessage(blob, contact.encKey, aad);
-  return { plain, viaX4DH: false, theirDeviceId: null, keyLabel: null };
+  if (strike && commit) await registerChainStrike(fromId, strike.theirDeviceId, strike.why);
+  throw new Error(strike ? `chain packet unreadable (${strike.why})` : "no session matches this chain header");
 }
 
 /* ══════════════════════════════════════════
@@ -5952,7 +6287,17 @@ async function handleSelfSync(msg, plain, valid) {
   updateContactPreview();
 }
 
+// R1: a receive that advanced a chain must see the session store written even when it
+// returns early (hello, duplicate, id conflict, selfsync, ...) — ctx.chainDirty says so.
+// The ordinary path writes it itself, earlier and in the right order (after the message
+// is saved, before the ack): see receiveMessageInner.
 async function receiveMessage(msg) {
+  const ctx = { chainDirty: false };
+  try { await receiveMessageInner(msg, ctx); }
+  finally { if (ctx.chainDirty) await saveX4DHSessions(); }
+}
+
+async function receiveMessageInner(msg, ctx) {
   if (!msg.from || !msg.blob || !isAddressedToMe(msg.to)) return;
   const contact = state.contacts[msg.from];
   // A live-QR introduction is the one packet a non-contact may send us (see LIVE
@@ -5964,7 +6309,10 @@ async function receiveMessage(msg) {
     let plain, valid, viaX4DH, matchedDeviceId, keyLabel;
     // AAD is built from the envelope AS RECEIVED — a packet retyped, reflected or
     // redirected in transit no longer decrypts (see PACKET ENVELOPE above)
-    ({ plain, viaX4DH, theirDeviceId: matchedDeviceId, keyLabel } = await decryptIncomingMessage(msg.from, msg.blob, envelopeAad(msg.type, msg.from, msg.to)));
+    // R1: the envelope signature is checked FIRST. A chain only advances for a packet that
+    // verified (rule 2), so decryptIncomingMessage needs the verdict before it opens anything.
+    valid = verifyEnvelope(msg, contact.signPublicKey);
+    ({ plain, viaX4DH, theirDeviceId: matchedDeviceId, keyLabel, chainDirty: ctx.chainDirty } = await decryptIncomingMessage(msg, valid));
 
     // 6.0.0 — the legacy static-static key carries HELLO and nothing else. It is
     // deterministic from the two identity keys, so content under it would be
@@ -5976,8 +6324,6 @@ async function receiveMessage(msg) {
       mlog.warn(`← MSG          from ${pid(msg.from)} — ${plain.type || "message"} under the legacy key, dropped (hello only since 6.0.0)`);
       return;
     }
-    valid = verifyEnvelope(msg, contact.signPublicKey);
-
     // Belt-and-suspenders consistency check: a successful decrypt under
     // a specific device's X4DH session key means that ciphertext was
     // genuinely produced by whoever holds THAT session's key (AES-GCM's
@@ -6190,6 +6536,10 @@ async function receiveMessage(msg) {
     // ✔️✔️ delivered for a message the recipient never actually persisted.
     await saveContacts();
     saveContactsBackup();
+    // R1: the message is on disk — NOW record the consumed chain key (see the PERSISTENCE
+    // CONTRACT), and only then ack. A key deleted before its message was saved would turn a
+    // crash into a lost message; this order turns it into a re-delivery.
+    if (ctx.chainDirty) { await saveX4DHSessions(); ctx.chainDirty = false; }
 
     // Auto-ack — reuses the existing reaction channel (emoji:null) rather
     // than a new packet type. Only for a message that both decrypted AND
@@ -6207,6 +6557,7 @@ async function receiveMessage(msg) {
     if (state.currentChat === msg.from) renderMessages();
     updateContactPreview();
   } catch(e) {
+    if (e && e.quiet) { mlog.debug(`← MSG          from ${pid(msg.from)} — ${e.message}`); return; }   // a replay: nothing to report
     console.warn("message decrypt failed", e);
     mlog.err(`← MSG          from ${pid(msg.from)} — decrypt failed`);
   }
@@ -6423,7 +6774,7 @@ async function burnBlockContact(id) {
    credentials and we can't actually stop a re-login anyway, only
    pretend to). X4DH session state (rootKeys, retry bookkeeping) lives
    under X4DH_SESSION_KEY, wiped here same as everything else — the
-   in-memory x4dhWireKeyByRoot/x4dhRetired simply becomes garbage on reload, nothing
+   in-memory auxKeyCache/x4dhRetired/x4dhChainStrikes simply become garbage on reload, nothing
    extra needed for it.
 ══════════════════════════════════════════ */
 function selfDestruct() {
