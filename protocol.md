@@ -2,7 +2,7 @@
 
 A decentralised, encrypted messaging protocol built on WebSocket relay servers. No accounts, no central authority, no plaintext.
 
-Implementation version: `0.7.1`, reported informationally in the `version` field of `sig:relay_info` (not enforced). This document specifies the protocol as implemented, in enough detail to build an interoperable client. Packet shapes, key rules and signed field sets are exact; a peer that deviates will have its packets dropped. `X4DH.md` is the authoritative source for session establishment, session keys and send-readiness. `known-limitations.md` lists the permanent trade-offs.
+Implementation version: `0.8.0`, reported informationally in the `version` field of `sig:relay_info` (not enforced). This document specifies the protocol as implemented, in enough detail to build an interoperable client. Packet shapes, key rules and signed field sets are exact; a peer that deviates will have its packets dropped. `X4DH.md` is the authoritative source for session establishment, session keys and send-readiness. `known-limitations.md` lists the permanent trade-offs.
 
 ---
 
@@ -20,7 +20,7 @@ Implementation version: `0.7.1`, reported informationally in the `version` field
 
 **The relay is untrusted infrastructure.** Cryptographic proof — signatures and authenticated encryption — is the only trust boundary. Everything outside a packet's ciphertext (`type`, `from`, `to`) is relay-visible and relay-rewritable, which is why ciphertext is bound to it (see [Envelope Binding](#envelope-binding)).
 
-**Content is session-only.** All message content (text, audio, image, reaction, system notice, self-sync copy) is encrypted under a per-device-pair X4DH session key and under nothing else. The static pairwise key derived from the two identity keys carries exactly one kind of message — the content-free [HELLO](#hello) — plus a few signaling blobs listed under [Encryption](#encryption). A message cannot be sent to a device until a session with it is send-ready; until then it is held locally (see [Held Outbox](#held-outbox)). There is no fallback to the static key.
+**Content is session-only.** All message content (text, audio, image, reaction, system notice, self-sync copy) is encrypted under a one-time key drawn from a per-device-pair X4DH session chain and under nothing else (see [Session chain keys](#session-chain-keys-x4dh)). The static pairwise key derived from the two identity keys carries exactly one kind of message — the content-free [HELLO](#hello) — plus a few signaling blobs listed under [Encryption](#encryption). A message cannot be sent to a device until a session with it is send-ready; until then it is held locally (see [Held Outbox](#held-outbox)). There is no fallback to the static key.
 
 ---
 
@@ -299,9 +299,10 @@ On `sig:auth_fail` the client does not retry immediately — the socket `onclose
 
 ## Encryption
 
-Four independent key families:
+Five independent key families:
 
-- **Session wire keys** — per device pair, derived from an X4DH session root (see `X4DH.md`). Protect all `app:message` content and self-sync backup traffic.
+- **Session chain keys** — one-time, one per message and direction, drawn from a hash chain seeded by an X4DH session root (see `X4DH.md`). Protect all `app:message` content.
+- **Session aux keys** — one static key per device pair and key generation, derived from the same root. Protect only self-sync backup traffic, which has no chain header to ratchet (see [Session aux key](#session-aux-key)).
 - **Static pairwise key** — per identity pair, derived from the two identity keys. Protects only [HELLO](#hello), `app:migrate`, the SDP/ICE blobs of `call:*` and `data:*`, and the `restore_req` blob.
 - **Backup key** — passphrase-derived and deterministic. Protects backup blobs, the restore token, local storage, and the discovery hello/ack of self-sync.
 - **Ephemeral wrap keys** — one-shot keys from an ephemeral-to-ephemeral X25519 exchange. Protect specific handshake pushes and the manual-sync batch.
@@ -314,8 +315,9 @@ AES-256-GCM, random 12-byte IV, 128-bit tag. A blob is `{ v, iv, data }`, with `
 |---|---|---|---|
 | **message blob** | UTF-8 JSON | `v:1` | `v:2` |
 | **object blob** | gzip(UTF-8 JSON) | `v:2` | `v:3` |
+| **chain blob** | UTF-8 JSON | — | `v:3`, plus a header `h` |
 
-A decrypt that is given an AAD requires exactly the bound version and never falls back to an unbound blob; a decrypt without one refuses a bound blob.
+A decrypt that is given an AAD requires exactly the bound version and never falls back to an unbound blob; a decrypt without one refuses a bound blob. The **chain blob** is the content of an `app:message` under a session (see [Session chain keys](#session-chain-keys-x4dh)); it has its own AAD. `v:3` therefore means a chain blob in `app:message` and an object blob everywhere else, and the packet type fixes which.
 
 ### Static pairwise key
 
@@ -326,15 +328,37 @@ aesKey       = HKDF-SHA256(ikm = sharedSecret, salt = 32 zero bytes, info = "mes
 
 Static-static ECDH is symmetric, so both sides derive the same key. Self-targeted traffic uses the same derivation against the identity's own public key. This key is **not** forward-secret: a later compromise of either identity's X25519 scalar exposes everything recorded under it. This is why it carries only content-free or short-lived material.
 
-### X4DH wire key
+### Session chain keys (X4DH)
 
-For a device pair with an X4DH session, all `app:message` content encrypts under:
+Each X4DH root (`RK0`, `RK1`) is expanded once into two one-way chains, one per direction, and the raw root is then deleted (`RK0` stays until the live upgrade). Every `app:message` content packet is encrypted under its own message key:
 
 ```
-wireKey = HKDF-SHA256(ikm = rootKeyBytes, salt = 32 zero bytes, info = "MeshChat-X4DH-v1/wire-message", 256 bits)
+CK_0     = HKDF-SHA256(ikm = root, salt = 32 zero bytes, info = "MeshChat-R1-v1/chain/i2r" or ".../r2i")   // chain seed, one per direction
+MK_i     = HMAC-SHA256(CK_i, 0x01)     // AES-256-GCM key for position i; used once, then deleted
+CK_(i+1) = HMAC-SHA256(CK_i, 0x02)     // replaces CK_i
 ```
 
-where `rootKeyBytes` is `RK0` or `RK1` of that session. The send/decrypt generation rules, trial decryption and send-readiness are specified in `X4DH.md` §6–§8. Summary: **send** under the newest root the peer has demonstrably reached; **decrypt** under every generation still alive; a sibling device within one fanout may be on a different root than another.
+`i2r` runs from the fixed initiator of the pair to the responder (`X4DH.md` §3.1), `r2i` the other way. A message blob under a chain is
+
+```json
+{ "v": 3, "h": { "g": 1, "i": 17, "t": "<base64url: 6 bytes>" }, "iv": "<base64url: 12 bytes>", "data": "<base64url>" }
+```
+
+- `g` is the generation (`0` = `RK0`, `1` = `RK1`) and `i` the chain position (integer, `0 … 2^31 − 1`). The header has exactly these three fields; anything else is malformed.
+- `t` is the first 6 bytes of `HMAC-SHA256(TK, u32be(i))`, where `TK` is a per-direction tag key derived from the same root (`MeshChat-R1-v1/tag/i2r`, `.../r2i`). Only the two ends can compute it; it differs for every message, so it identifies no session to a relay, and it lets the receiver find the right chain without trial decryption and without deriving anything for a forged packet.
+- The AAD is `UTF-8( JSON.stringify( ["meshchat-chain-v1", type, from, to, g, i] ) )`, built from the envelope as received, so retyping, redirecting, or changing the generation or position fails the GCM tag. The envelope signature covers the whole blob, header included.
+
+**Receiver.** The chain is found by tag, advanced at most `CHAIN_MAX_FORWARD` (2000) positions on a copy, and the keys of the skipped positions are kept (the newest 100, for 24 h) so that late or reordered packets still open. The chain **commits** — advances, stores skipped keys, records the position and `iv` — only when the tag matched, the AEAD tag passed and the envelope signature verified. A consumed position seen again with the same `iv` is a quiet duplicate; with a different `iv` it is a sender that re-used a position. Three authenticated but unreadable packets in a row on one session drop it and the ordinary re-establishment takes over (`X4DH.md` §9.1).
+
+**Sender.** The next position is taken under a per-session lock, the packet is sealed, and the spent positions are saved before the packet leaves (see [Per-device fanout](#per-device-fanout)). The send generation is the newest one the peer has demonstrably reached; the receiver tries every generation still alive. Generations, send-readiness and the exact rules are in `X4DH.md` §5.3–§5.5, §7 and §8.
+
+### Session aux key
+
+```
+auxKey = HKDF-SHA256(ikm = root, salt = 32 zero bytes, info = "MeshChat-X4DH-v1/wire-message", 256 bits)
+```
+
+Derived from the same root, once per generation, and kept for as long as the generation lives. It protects only packets that carry no chain header — the self-sync backup push and its acknowledgement — and is therefore **not one-time and not ratcheted**: a later copy of the session state reads recorded traffic under it. This gap is listed in `known-limitations.md`.
 
 ### Envelope Binding
 
@@ -344,7 +368,7 @@ A packet's `{ type, from, to }` sit outside its ciphertext, where a relay can re
    ```
    aad = UTF-8( JSON.stringify( ["meshchat-env-v1", type, from, to] ) )
    ```
-   built by the receiver from the packet *as received* — `to` bare or compound exactly as sent — never from anything inside the payload. Rewriting any of the three in transit fails the GCM tag and the packet is dropped at decrypt.
+   built by the receiver from the packet *as received* — `to` bare or compound exactly as sent — never from anything inside the payload. Rewriting any of the three in transit fails the GCM tag and the packet is dropped at decrypt. A chain blob additionally binds its generation and position (see [Session chain keys](#session-chain-keys-x4dh)).
 2. **Signature scope.** The Ed25519 signature covers `type`, `from` and `to` as well as the content (see [Signed bodies](#signed-bodies)), so a signature for one type can never verify as another.
 
 ### Message signing
@@ -353,7 +377,7 @@ A packet's `{ type, from, to }` sit outside its ciphertext, where a relay can re
 sig = Ed25519.sign( UTF-8(JSON.stringify({ type, from, to, blob })), senderSigningSeed )
 ```
 
-For `app:message`, an invalid or missing signature on a packet whose ciphertext nevertheless decrypts is flagged, not dropped: a content message is displayed with an "unverified" warning. A HELLO or selfsync with an invalid signature is ignored/dropped, and every packet type that drives state rather than display drops on an invalid signature.
+For `app:message`, an invalid or missing signature on a packet whose ciphertext nevertheless decrypts is flagged, not dropped: a content message is displayed with an "unverified" warning, and its chain does not advance, so such a packet cannot use up a position. A HELLO or selfsync with an invalid signature is ignored/dropped, and every packet type that drives state rather than display drops on an invalid signature.
 
 ### Per-message signatures
 
@@ -374,7 +398,7 @@ The signature is checked where it matters — in a sync batch (see [Manual Sync]
 
 | Packet | Content protection | Signature | Buffered offline |
 |---|---|---|---|
-| `app:message` — content | session wire key, message blob `v:2` bound | mandatory to *trust*; invalid ⇒ shown flagged. Plus an inner per-message signature | yes (+ push) |
+| `app:message` — content | session chain key (one-time per message), chain blob `v:3` bound | mandatory to *trust*; invalid ⇒ shown flagged, chain not advanced. Plus an inner per-message signature | yes (+ push) |
 | `app:message` — `hello` | static pairwise key, message blob `v:2` bound | invalid ⇒ ignored | yes (+ push) |
 | `app:message` — QR intro | token-derived key, `v:2` bound, plus `intro`/`ek` | mandatory | yes |
 | `app:migrate` | static pairwise key, `v:2` bound | mandatory | yes — always, overwrite per sender, 7 d |
@@ -388,7 +412,7 @@ The signature is checked where it matters — in a sync batch (see [Manual Sync]
 | `sync:restore_ack/push` | backup-key object blob (+ ephemeral wrap) | conditional (self `restore_ack`: mandatory) | no |
 | `sync:token_req` | none | none | no |
 | `sync:token_resp` | token sealed under backup key | mandatory (client-checked) | no |
-| self-sync `sync:backup_push/accept` | session wire key or backup key, object blob `v:3` bound | none (tamper-evident only) | no |
+| self-sync `sync:backup_push/accept` | session aux key or backup key, object blob `v:3` bound | none (tamper-evident only) | no |
 
 **Conditional signature.** If we hold a signing key for the claimed sender — a contact on file or, for `restore_push`, one recovered from an opened restore token — the packet **must** verify, and a missing or invalid signature is dropped. If we hold no key for the sender (a fresh or not-yet-mutual device bootstrapping) the packet is processed unverified, as this handshake has always had to allow. A *missing* signature from a known sender is treated as tampering, not as "unverifiable": otherwise a relay could strip `sig` (and `ek`, which the signature covers) from a known contact's packet and have it processed on the unverified path — overwriting the backup we hold for them, or making us send a backup unwrapped.
 
@@ -396,7 +420,7 @@ The signature is checked where it matters — in a sync batch (see [Manual Sync]
 
 ## Session Establishment (X4DH)
 
-Device pairs establish an X4DH session — an asynchronous root-key agreement that upgrades opportunistically when both sides are online — and use it for the wire key above. `X4DH.md` specifies the derivations, state machine, guards and retry logic. This section covers the wire packets and relay behaviour.
+Device pairs establish an X4DH session — an asynchronous root-key agreement that upgrades opportunistically when both sides are online — and derive their message keys from it (see [Session chain keys](#session-chain-keys-x4dh)). `X4DH.md` specifies the derivations, state machine, guards and retry logic. This section covers the wire packets and relay behaviour.
 
 ```json
 {
@@ -412,14 +436,14 @@ Device pairs establish an X4DH session — an asynchronous root-key agreement th
 }
 ```
 
-`session:ack` is structurally identical, sent in reply: `ekPub` is the responder's ephemeral and `kemCt` (base64url, 1088 bytes, the ML-KEM-768 ciphertext) takes the place of `kemPub`. Both KEM fields are optional on the wire and covered by the signature only when present, so they cannot be stripped in transit; a propose without `kemPub` yields a classical `RK1` (`X4DH.md` §4.2, §11.3). With them, both packets are about 2 KB, inside `FRAME_CAP_TINY`, so the relay needs no change. A 0.7.0 client cannot verify a propose that carries `kemPub` and drops it, so 0.7.0 and 0.7.1 clients do not establish sessions with each other when the 0.7.1 side is the initiator. Both types:
+`session:ack` is structurally identical, sent in reply: `ekPub` is the responder's ephemeral and `kemCt` (base64url, 1088 bytes, the ML-KEM-768 ciphertext) takes the place of `kemPub`. Every session is hybrid: a propose without a valid `kemPub`, or an ack without a valid `kemCt`, is dropped (`X4DH.md` §4.2, §4.4); there is no classical session. The field is appended to the signed body only when the packet carries it, so it cannot be stripped in transit without breaking the signature. Both packets are about 2 KB, inside `FRAME_CAP_TINY`, so the relay needs no change. Both types:
 
 - are **mandatory-signed** (see [Signed bodies](#signed-bodies)) and dropped on a missing or invalid signature. `deviceId` is an identity-authenticated claim, not proven with a separate device key;
 - **require a compound `to`** — a session is always device-to-device; the relay drops a bare `to`;
 - are **always durably buffered** in addition to live delivery (a stale-but-not-yet-closed session of the same identity could otherwise swallow a packet meant for a device still catching up). `session:propose` additionally overwrites per sender in its own bucket and uses the ordinary 24 h TTL; `session:ack` is not overwritten;
 - **never trigger a push**.
 
-Session state is local-only and stored encrypted at rest under the backup key; root keys are never part of any backup or export.
+Session state is local-only and stored encrypted at rest under the backup key; chain keys, skipped keys and (until the upgrade) the `RK0` root are never part of any backup or export. A send saves its spent chain positions before the packet leaves; a receive saves the message and then the consumed positions before it acknowledges (`X4DH.md` §6).
 
 ---
 
@@ -469,10 +493,12 @@ Image payloads are JPEG, downscaled to at most 800 px on the long edge. Media is
 A content-free `app:message`:
 
 ```json
-{ "id": "<uuid>", "type": "hello", "ts": 1234567890123, "deviceId": "<deviceId>", "endpointId": "<endpointId>", "relay": { "wss": "..." } }
+{ "id": "<uuid>", "type": "hello", "ts": 1234567890123, "deviceId": "<deviceId>", "endpointId": "<endpointId>", "relay": { "wss": "..." }, "sessions": ["<deviceId>", "..."] }
 ```
 
 Envelope: `app:message`, `to` = the contact's **bare** publicId (every device of the contact), blob = message blob `v:2` under the **static pairwise key**, signed like any `app:message`. It is the only thing that key still carries as a message. It holds nothing worth protecting beyond what the relay already sees; its purpose is to tell the other side "this device, at this endpoint, exists", which is the input X4DH bootstrap needs (the fixed initiator can only propose once it knows the responder's `endpointId`; the responder can only ack once it knows the initiator's).
+
+`sessions` is optional: the device ids of the **recipient's** identity with which the sender currently holds a session (at most 64; the field is left out beyond that, and a malformed list is ignored). It is how a session lost on one side is noticed. A fixed initiator that receives a signed HELLO from a device that holds an `RK1` session with it for at least 120 s, but whose list does not name the initiator's device, proposes again — at most once per 2 minutes and 10 times per pair (memory only, reset when the peer lists us again), and only if the HELLO's `ts` is within the propose skew window, so a buffered old HELLO cannot reset a session that has since been rebuilt. A responder never proposes. A responder that dropped a chain-desynced session sends exactly this HELLO to make the initiator do so (`X4DH.md` §9.1).
 
 **Send rules**
 
@@ -550,12 +576,12 @@ The ack never fires for self-targeted traffic, for a message that failed verific
   "type": "app:message",
   "from": "<publicId>",
   "to":   "<publicId>" | "<publicId>::<endpointId>",
-  "blob": { "v": 2, "iv": "<base64url>", "data": "<base64url>" },
+  "blob": { "v": 3, "h": { "g": 1, "i": 17, "t": "<base64url>" }, "iv": "<base64url>", "data": "<base64url>" },
   "sig":  "<base64url>"
 }
 ```
 
-The envelope carries no `deviceId`; the sender's device is inside the encrypted payload. Content messages always use a compound `to` (the recipient's `endpointId`, learned earlier); `blob` and `sig` differ per destination because each device has its own key and the AAD and signature cover that destination's `to`. Only HELLO and the QR introduction use a bare `to`.
+The envelope carries no `deviceId`; the sender's device is inside the encrypted payload. Content messages always use a compound `to` (the recipient's `endpointId`, learned earlier); `blob` and `sig` differ per destination because each device has its own chain and the AAD and signature cover that destination's `to`. Only HELLO and the QR introduction use a bare `to`; their blob is a message blob `v:2`, not a chain blob.
 
 ### Receiving an `app:message`
 
@@ -564,11 +590,11 @@ Normative order:
 1. Require `from`, `blob`, and `isAddressedToMe(to)`.
 2. Look up `contact = contacts[from]`. No contact: if `blob.intro === 1` hand to the QR-intro handler, else drop. A blocked contact: drop.
 3. Mark the sender online.
-4. Decrypt by trial: every X4DH session held for that sender, most recently established first; within a session every live key generation (current root, retained `RK0`, recently retired roots); then the static pairwise key last. The AAD is built from the envelope as received. A wrong key fails cleanly on the GCM tag. Record which key worked (session + generation, or static).
-5. **If the static key worked and `plain.type !== "hello"`, drop the packet** before it touches the device registry, dedup cache, unread counters or ack.
-6. Verify the signature (`valid`).
-7. If decrypted under a session key and valid, `plain.deviceId` must equal the session's device; a mismatch sets `valid = false`.
-8. If valid and decrypted under the session's **current** `RK1`, confirm the peer holds `RK1` (see `X4DH.md` §7).
+4. **Verify the envelope signature** (`valid`) before anything is opened: a chain advances only for a packet that verified.
+5. **Decrypt.** A `v:3` chain blob: parse the header strictly, build the AAD from the envelope *as received*, find the sender's chain by tag among every session held for that sender (most recently established first) and every live key generation, and open the packet under that position's one-time key (see [Session chain keys](#session-chain-keys-x4dh), `X4DH.md` §8.2). A `v:2` blob: the static pairwise key. A tag that matches no chain, or a failed GCM tag, fails cleanly. The chain commits only if the packet opened **and** `valid`; a signed packet that matches a live chain but cannot be read counts as a strike against that session (three in a row drop it, `X4DH.md` §9.1). Record which key worked (session + generation, or static).
+6. **If the static key worked and `plain.type !== "hello"`, drop the packet** before it touches the device registry, dedup cache, unread counters or ack.
+7. If decrypted under a session chain and valid, `plain.deviceId` must equal the session's device; a mismatch sets `valid = false`.
+8. If valid and decrypted under the session's **current** generation `1` (`RK1`), confirm the peer holds `RK1` (see `X4DH.md` §7).
 9. **Shape check, content messages only** (not `hello`, not `selfsync`): `id` well-formed, `text` a string for text/system payloads, and for a reaction `id` equal to the derived reaction id of `(from, targetId)`. Otherwise drop. This runs before the duplicate guard so a rejected packet cannot stamp the window.
 10. Drop if `(from, plain.id, plain.ts)` was seen within the last 3 s (a targeted copy and another path can both arrive). The sender is part of the key so one contact's packet cannot suppress another's.
 11. If valid and `plain.deviceId`: record the device (`deviceId`, `n`, `endpointId`). If valid and `plain.relay.wss`: adopt it as a relay hint (clamped, timestamp-guarded).
@@ -576,7 +602,7 @@ Normative order:
 13. Build the stored message: `ts` clamped (see below), `n`, `deviceId` and ack pointer copied from the payload, media as a stub. Keep the payload's per-message `sig` only if it verifies (`to` = us) and `ts` was not clamped.
 14. **Id check** (see below): drop if this id may not be used here. An exact redelivery is dropped quietly but still gets the RECEIVED ack (if valid, not from ourselves, not a reaction); a refused collision gets nothing.
 15. Only now write the media caches and the packet-inspector cache (both are keyed by id), merge, reconcile delivery status and missing numbers, bump unread if the chat is not open.
-16. **Persist**, then trigger a backup round.
+16. **Persist** the contact store, then the session state (the consumed chain positions), then trigger a backup round. Any other path that advanced a chain (a HELLO, a self-sync copy, an early return) saves the session state before the handler returns.
 17. Only now send the RECEIVED auto-ack (if not a reaction, `valid`, and `from` is not ourselves).
 
 ### Message ids and timestamps
@@ -606,7 +632,7 @@ If the contact's relay is unreachable the fallback lands on the sender's own sig
 A send to a contact addresses that contact's known devices from the [device registry](#device-registry):
 
 - **Targeted** — a device with an `endpointId` on file that was seen within `FANOUT_STALE_MS` (7 d) **or** has an X4DH session with us. A device with a session stays targeted however long it has been quiet (its copy is encrypted under its own key and buffered in its own endpoint bucket). A device that is stale with no session is not targeted, and neither is one with no `endpointId`. In a self fanout the sending device itself is excluded.
-- Each targeted device with a **send-ready** session gets **its own ciphertext**, compound `to`, signed, encrypted under that device's wire key. A targeted device without a send-ready session is skipped for this message.
+- Each targeted device with a **send-ready** session gets **its own ciphertext**, compound `to`, signed, encrypted under the next one-time key of that device's send chain. A targeted device without a send-ready session is skipped for this message. All chain positions one fanout uses are saved in a single write **before** any packet leaves; if that write fails nothing is sent, and the positions stay spent (`X4DH.md` §8.1).
 - There is no identity-level broadcast copy and no static-key copy of any content.
 - When some fresh device of the contact has no session (`contactNeedsHello`), a [HELLO](#hello) goes out as well. Self fanout never says hello (siblings bootstrap via the self-backup handshake and ordinary self traffic).
 
@@ -1095,10 +1121,10 @@ The recipient trusts or displays the endpoint suffix only once a signature has v
 
 There is no offer/accept; a push goes directly. Self-sync never rides the deterministic backup key alone for contact data, because a full push carries the contact store with recent messages. Every self-sync blob is an object blob `v:3`, envelope-bound (AAD over `type`, `from`, `to`), so a relay cannot retype or redirect one.
 
-**Full push.** For each known sibling that is targetable (`endpointId` on file, seen within `FANOUT_STALE_MS`), has an X4DH self-session, and whose fingerprint doesn't already match ours, the device sends a `sync:backup_push` with a compound `to` and a `blob` under that pair's wire key:
+**Full push.** For each known sibling that is targetable (`endpointId` on file, seen within `FANOUT_STALE_MS`), has an X4DH self-session, and whose fingerprint doesn't already match ours, the device sends a `sync:backup_push` with a compound `to` and a `blob` under that pair's session aux key (static, not a chain key: this packet has no header to ratchet — see [Session aux key](#session-aux-key)):
 
 ```
-blob = objectBlob_v3( wireKey(self-session with that sibling), aad,
+blob = objectBlob_v3( auxKey(self-session with that sibling), aad,
                       { deviceId, endpointId, fingerprint, contacts: serialiseContacts() } )
 ```
 
@@ -1106,12 +1132,12 @@ The `contacts` are the full store (messages included, `waiting` status stripped)
 
 **Discovery hello.** When a sibling is unknown, unresolved, or has no session yet, the device instead (at most once per 60 s) broadcasts to its own identity (bare `to`) a content-free hello under the **backup key**: `{ deviceId, endpointId, hello: true }`. Its only job is to let siblings learn the device, which can start an X4DH self-session that later pushes ride. The hello exposes the `deviceId`↔`endpointId` link to anyone holding recorded traffic plus a later passphrase compromise — metadata only.
 
-**Receiving.** The blob carries no key hint, so the receiver tries every X4DH self-session wire key (every live generation, newest session first) and then the backup key last; when a session key decrypts it the payload's `deviceId` must match the session's device, and a decrypt under the current `RK1` confirms the sibling holds it. Then:
+**Receiving.** The blob carries no key hint, so the receiver tries every X4DH self-session aux key (every live generation, newest session first) and then the backup key last; when a session aux key decrypts it the payload's `deviceId` must match the session's device, and a decrypt under the current `RK1` confirms the sibling holds it. Then:
 - a **hello** (`hello === true`, a valid-id `deviceId`, no `contacts`) teaches the sibling (which can trigger X4DH bootstrap), deduped for 3 s, and is answered with a small ack;
 - a **full push** from our own echo is ignored; otherwise it is merged (contact metadata, then message merge, then delivery-status and missing-message reconciliation), saved, and — if it changed our own relay — followed by a signal reconnect. The sender's fingerprint is recorded and we ack with our own post-merge fingerprint;
-- a full push decrypted under the static backup key (rather than a session key) is accepted and logged as a static-key sender.
+- a full push decrypted under the static backup key (rather than a session aux key) is accepted and logged as a static-key sender.
 
-**Ack.** `sync:backup_accept` with a `blob` encrypting `{ deviceId, endpointId, fingerprint? }` — under the session key (with fingerprint) when a session exists, otherwise content-free under the backup key — compound-addressed to the sender's endpoint when known. The presence of `blob` is what distinguishes it from a contact-offer accept, which never sets one. The receiver records the sibling and, when present, the fingerprint.
+**Ack.** `sync:backup_accept` with a `blob` encrypting `{ deviceId, endpointId, fingerprint? }` — under the session aux key (with fingerprint) when a session exists, otherwise content-free under the backup key — compound-addressed to the sender's endpoint when known. The presence of `blob` is what distinguishes it from a contact-offer accept, which never sets one. The receiver records the sibling and, when present, the fingerprint.
 
 **Fingerprint.** `fingerprint = base64url( SHA-256( JSON(serialiseContacts()) )[0:12] )`. Each device keeps an in-memory table `{ deviceId → fingerprint }` of what it has heard this session; if every targetable sibling already has the current fingerprint the push is skipped. The table resets on reload — worst case one extra push on cold start.
 
@@ -1163,7 +1189,7 @@ Restore flooding is limited by three independent 5-minute cooldowns, deliberatel
 
 ### Ephemeral Wrap
 
-`sync:restore_push` and contact-path `sync:backup_push` can carry an additional layer: a one-shot X25519 ephemeral-to-ephemeral wrap around the existing blob, generated per exchange and never written to disk. (Self-sync backup pushes use X4DH session keys instead; a self `restore_push` does use the wrap.)
+`sync:restore_push` and contact-path `sync:backup_push` can carry an additional layer: a one-shot X25519 ephemeral-to-ephemeral wrap around the existing blob, generated per exchange and never written to disk. (Self-sync backup pushes use the X4DH session aux key instead; a self `restore_push` does use the wrap.)
 
 ```
 ek        = fresh X25519 ephemeral public key, attached to the ack/accept that precedes the push
@@ -1313,7 +1339,7 @@ Not yet observed on real devices: storing a `CryptoKey` in IndexedDB on iOS Safa
 
 ### Logout
 
-A full page reload, the same way self-destruct and a displacement end a session: the client keeps far too much module-level state (pending X4DH ephemerals, retired roots, the wire-key cache, media caches, timers) to reset in place. Unlike BURN it wipes nothing: contacts, device seed, X4DH sessions and held messages stay in storage, encrypted as before, and logging back in picks up where this left off (held messages go out then). That is why it asks for no confirmation.
+A full page reload, the same way self-destruct and a displacement end a session: the client keeps far too much module-level state (pending X4DH ephemerals, retired key generations, the aux-key cache, media caches, timers) to reset in place. Unlike BURN it wipes nothing: contacts, device seed, X4DH sessions and held messages stay in storage, encrypted as before, and logging back in picks up where this left off (held messages go out then). That is why it asks for no confirmation.
 
 Order:
 
@@ -1338,7 +1364,7 @@ Everything about *you* or *this device* sits in one panel (the gear in the sideb
 | `meshchat_peer_tokens_v1_<publicId>`   | per identity | Restore tokens held for contacts |
 | `meshchat_known_devices_v1_<publicId>` | per identity | Device registry |
 | `meshchat_send_counters_v1_<publicId>` | per identity | Per-contact outbound `n` counters for this device |
-| `meshchat_x4dh_sessions_v1_<publicId>` | per identity | X4DH session state including root keys, encrypted at rest under the backup key |
+| `meshchat_x4dh_sessions_v1_<publicId>` | per identity | X4DH session state — chain keys and positions per generation, skipped keys, and an `RK0` root until the upgrade — encrypted at rest under the backup key |
 | `meshchat_device_seed_v1_<publicId>`   | per device   | Raw 32-byte device seed (base64url). Never shared, never backed up |
 | `meshchat_push_pref_v1_<publicId>`     | per device   | Push opt-in (`"1"`/`"0"`). The `PushSubscription` lives in the browser |
 | `<key>_unreadable`                     | per store    | Quarantined copy of a contact-store or X4DH-session blob that failed to decrypt or parse (see below) |
@@ -1355,7 +1381,7 @@ The contact store written locally keeps `status: "waiting"` on held messages; ev
 
 **Write ordering.** Contact-store saves and X4DH-session saves are each serialised through a promise chain, and the snapshot is taken inside the queued step, so the last write in the queue always carries the freshest state. Every save also checks the persistence-halt flag set by [self-destruct](#self-destruct) at the last synchronous moment before `localStorage.setItem`, after its own awaits, so a save that started before a wipe cannot finish after it and write the identity back.
 
-Held in memory only, never persisted: pending X4DH proposal ephemerals, retired X4DH roots (decrypt-only grace), pending wrap ephemerals, pending manual-sync ephemerals, the wire-key cache, the armed live-QR token, the hello rate-limit table, and the media caches.
+Held in memory only, never persisted: pending X4DH proposal ephemerals, retired X4DH generations with their chains (decrypt-only grace), the chain strike counters, pending wrap ephemerals, pending manual-sync ephemerals, the aux-key cache, the armed live-QR token, the hello rate-limit table, and the media caches.
 
 ---
 
@@ -1367,7 +1393,7 @@ Held in memory only, never persisted: pending X4DH proposal ephemerals, retired 
 | `WS_PORT`             | `8888`        | WebSocket signal server port |
 | `RELAY_WSS_URL`       | —             | Public WSS URL of this relay. **Required for auth**: its host is what clients' auth proofs are bound to; with no valid value the relay refuses every `sig:auth_init` (`relay_not_configured`) |
 | `RELAY_AUTH_HOSTS`    | —             | Extra hostnames (bare, or full URLs; comma-separated) this relay also accepts an auth proof for. Only meaningful on top of a valid `RELAY_WSS_URL` |
-| `PROTOCOL_VERSION`    | `0.7.1`       | Reported on `sig:relay_info`; informational |
+| `PROTOCOL_VERSION`    | `0.8.0`       | Reported on `sig:relay_info`; informational |
 | `WS_MAX_SIZE`         | `2097152`     | Outer bound on any frame, in bytes. The per-type caps below it are clamped to this |
 | `FRAME_CAP_PREAUTH`   | `1024`        | Largest frame accepted before auth |
 | `FRAME_CAP_TINY`      | `4096`        | `session:*`, `app:burn`, `sig:announce`, `sig:ping`, `sig:relay_req` |
@@ -1469,6 +1495,7 @@ Held in memory only, never persisted: pending X4DH proposal ephemerals, retired 
 | Device registry cutoff / cap / sweep | 30 d / 20 per identity / 10 min | Registry retention |
 | HELLO interval | 20 s per contact | Event-driven hellos |
 | HELLO nudge | 15 min per contact | Held outbox, believed-online contacts only |
+| HELLO session list / repair | 64 ids / 2 min, 10 attempts per pair | `sessions` field; initiator re-proposes when a peer lost its side |
 | Held message max age / tick | 24 h / 5 s | Held outbox |
 | X4DH constants | see `X4DH.md` §12 | Sessions |
 | Live-QR token | 16 bytes, 120 s, single use | Live QR |
@@ -1481,5 +1508,5 @@ Held in memory only, never persisted: pending X4DH proposal ephemerals, retired 
 
 ---
 
-*MeshChat Protocol v1 — implementation 0.7.1 — experimental, subject to change*
+*MeshChat Protocol v1 — implementation 0.8.0 — experimental, subject to change*
 *Last updated: October 2026*

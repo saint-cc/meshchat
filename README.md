@@ -45,8 +45,8 @@ MeshChat separates identity, trust and transport. Devices establish their own cr
 - Encrypted backup export / import
 - Optional auto login on a device you trust, and a logout that keeps your data on the device
 - Settings panel for per-device options (push, theme, backup, relay override, migrate, burn)
-- Progressive Web App (PWA)
-- Installable and offline-capable for reading conversations
+- Progressive Web App (PWA): web app manifest and a service worker for push notifications
+- Installable on devices whose browser supports it. There is no offline mode yet: the app needs a connection to load, and stored conversations can only be read once it has loaded
 - Opt-in push notifications (per device, content-free — a push only ever means "open the app and check")
 
 ---
@@ -229,8 +229,7 @@ while remaining reachable.
 ### Important limitations
 
 * Passphrase security is everything.
-* Forward secrecy is **partial**: message content only ever travels under per-device-pair X4DH session keys, and a session that has completed its live upgrade also protects against a later compromise of your identity keys (see `X4DH.md`). There is no per-message ratchet yet: one key is used for every message under a session. A device pair without a session cannot exchange content at all; messages are held until one is established. See `known-limitations.md` for the complete picture.
-* Relay operators can observe IP addresses.
+* Forward secrecy is **partial**: message content only ever travels under per-device-pair X4DH sessions, with a one-time key per message from a symmetric chain, and a session that has completed its live upgrade also protects against a later compromise of your identity keys (see `X4DH.md`). There is no post-compromise recovery yet (no DH or post-quantum ratchet). A device pair without a session cannot exchange content at all; messages are held until one is established. See `known-limitations.md` for the complete picture.* Relay operators can observe IP addresses.
 * **Auto login is a convenience with a cost.** When ticked, the browser keeps your identity's master secret (not your passphrase) encrypted under a key stored beside it. Anyone with access to that browser profile can open your identity. Leave it off on shared or untrusted devices. Logout and BURN remove it.
 * MeshChat is **not** an anonymity network and is not a replacement for Tor.
 

@@ -380,7 +380,7 @@ There is no time-based or message-count-based rotation of the *root*: a healthy 
 Two chains can drift apart: a peer restored an old profile (it re-uses positions the other side already consumed), a position was lost to a crash, or a peer is further ahead than `CHAIN_MAX_FORWARD`. It shows up as **authenticated packets we cannot read**: the signature verifies and the tag matches a live chain, but the AEAD fails, or the position was consumed with a different `iv` (§8.2), or it is too far ahead. Each such packet is a *strike* against that session (memory only); a packet that decrypts resets the count. At `CHAIN_STRIKE_LIMIT` (3) in a row the session is dropped — the same operation as the manual × in the conversation panel — and the ordinary re-establishment paths take over:
 
 - the **fixed initiator** proposes again at once (the peer's endpoint is already known);
-- a **responder** sends a HELLO whose session list no longer names the device, which makes the initiator re-propose;
+- a **responder** sends a HELLO whose `sessions` list no longer names the device (the HELLO field described in `protocol.md`), which makes the initiator re-propose;
 - a **self-pair** responder has no HELLO to send and waits for its sibling's own traffic.
 
 Only strikes that are attributable count: an unsigned packet, a packet whose tag matches no chain (so a forged or foreign one), a replay, and a failure against a *retired* generation never do — otherwise whoever relays packets could force session resets. A position older than the newest-100 skipped window looks identical to a rewound sender and counts too; three of those in a row with nothing readable between them is what "desynced" has to mean.
