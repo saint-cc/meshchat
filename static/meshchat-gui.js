@@ -1487,7 +1487,7 @@ function setChatInfoOpen(open) {
   const btn   = document.getElementById("chatInfoToggle");
   const panel = document.getElementById("chatInfoPanel");
   if (btn) {
-    btn.textContent = open ? "^" : "v";
+    btn.textContent = open ? "🢕" : "🢗";
     btn.title       = open ? "hide conversation details" : "show conversation details";
     btn.setAttribute("aria-expanded", open ? "true" : "false");
   }
