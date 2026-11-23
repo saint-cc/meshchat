@@ -256,12 +256,31 @@
   </div>
 </div>
 
-<!-- IN-PAGE LOG -->
+<!-- IN-PAGE LOG — docked at the bottom, a flex child of <body> (style.css "in-page log: docked panel").
+     Open: 50% of the page, #appContainer resizes to the rest. Controls are wired in mlog (meshchat-gui.js);
+     #meshLogClear / #meshLogHide keep their ids because meshchat-boot.js wires those two. -->
 <div id="meshLog">
   <div id="meshLogHeader">
-    <span>MESHCHAT LOG</span>
-    <button id="meshLogClear">CLR</button>
-    <button id="meshLogHide">✕</button>
+    <span id="meshLogTitle">MESHCHAT LOG</span>
+    <span id="meshLogCount" title="lines shown / lines buffered"></span>
+    <span class="mlog-spacer"></span>
+    <button type="button" class="mlog-btn on" id="meshLogFollow" title="keep scrolled to the newest line (pauses while you scroll up)">FOLLOW</button>
+    <button type="button" class="mlog-btn" id="meshLogCopy" title="copy the lines currently shown, as plain text">COPY</button>
+    <button type="button" class="mlog-btn" id="meshLogClear">CLR</button>
+    <button type="button" class="mlog-btn" id="meshLogHide" title="close">✕</button>
+  </div>
+  <div id="meshLogFilters">
+    <span class="mlog-lbl">LEVEL</span>
+    <span class="mlog-seg" id="meshLogLevels">
+      <button type="button" class="mlog-btn on" data-level="1">ALL</button>
+      <button type="button" class="mlog-btn"    data-level="2">WARN+</button>
+      <button type="button" class="mlog-btn"    data-level="3">ERR</button>
+    </span>
+    <button type="button" class="mlog-btn" id="meshLogDebug" title="also show debug lines (browser-console-only until now) — only under level ALL">DEBUG</button>
+    <span class="mlog-sep"></span>
+    <span class="mlog-lbl">TAGS</span>
+    <button type="button" class="mlog-btn on" id="meshLogTagsAll" title="show every tag again">ALL</button>
+    <span id="meshLogTags"></span>
   </div>
   <div id="meshLogBody"></div>
 </div>

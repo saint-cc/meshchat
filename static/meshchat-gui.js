@@ -14,14 +14,18 @@
 /* ══════════════════════════════════════════
    LOGGING
    mlog.info()  → console + in-page
-   mlog.debug() → console only
+   mlog.debug() → console + in-page (shown only while the DEBUG chip is on)
    mlog.warn()  → console.warn + in-page
    mlog.err()   → console.error + in-page
-   In-page: circular buffer, max LOG_MAX_LINES.
+   In-page: docked panel at the bottom of the page (index.html #meshLog). Two ring buffers —
+   LOG_MAX_LINES for info/warn/err, LOG_MAX_DEBUG for debug — so debug volume can never push
+   real events out. Level and tag filters, copy, follow-scroll; see mlog below.
    Console: hard-cleared every LOG_CLEAR_INTERVAL ms.
 ═══════════════════════════════════════════════════════════════ */
 
-const LOG_MAX_LINES      = 20;
+const LOG_MAX_LINES      = 300;    // info / warn / err
+const LOG_MAX_DEBUG      = 300;    // debug — separate ring
+const LOG_MAX_TEXT       = 4000;   // per line; text can be contact-controlled
 const LOG_CLEAR_INTERVAL = 5 * 60 * 1000;
 const MODAL_CLOSE_DELAY_MS    	= 1_200;			// brief pause before closing export/import modal
 
@@ -97,47 +101,294 @@ function applyTheme(theme, { remember = true, pin = true } = {}) {
 applyTheme(loadTheme(), { remember: false, pin: false });   // boot: apply only, no identity yet
 
 const mlog = (() => {
-  const ts    = () => new Date().toLocaleTimeString([], { hour:"2-digit", minute:"2-digit", second:"2-digit", hour12:false });
-  const lines = [];
-  let visible = false;
+  const RANK      = { debug: 0, info: 1, warn: 2, err: 3 };
+  const LEVEL_TAG = { debug: "DEBUG", info: "INFO", warn: "WARN", err: "ERR" };
+  const DIRS      = { "→": "out", "←": "in", "●": "on", "○": "off" };
 
-  // DOM nodes + textContent, never innerHTML. Log lines are built from
-  // strings a contact or a relay controls (a system-message kind/text, a
-  // reaction emoji, a migrate's new relay address, a relay's version/reason
-  // field, …), and this renders even while the panel is hidden — so
-  // interpolating them into markup meant any contact could run script in
-  // the page that holds state.keys and the remembered-login secret.
-  // textContent makes "is this string escaped?" a question that can no longer
-  // be answered wrongly by a future log call. `level` is only ever one of
-  // the three literals below, but goes in via className all the same.
-  function render() {
-    const body = document.getElementById("meshLogBody");
-    if (!body) return;
-    body.textContent = "";
-    for (const l of lines) {
-      const row = document.createElement("div");
-      row.className   = "mlog-line " + l.level;
-      row.textContent = l.text;
-      body.appendChild(row);
+  // Tag → colour family (a CSS class, .f-<family> in style.css). Unlisted tags render in the
+  // neutral "other" family, so a new tag needs no change here — add it only to give it a colour.
+  const TAG_FAMILY = {};
+  for (const [family, tags] of Object.entries({
+    crypto : "X4DH KDF AUTH LOGIN KEY CRYPTO",
+    net    : "WS RELAY SIGNAL NET ICE RTC MIGRATE",
+    msg    : "MSG CALL DATA REACT SYNC HELLO HELD ACK",
+    backup : "BACKUP RESTORE EXPORT IMPORT",
+    sys    : "STORAGE DEVICE SETTINGS CONTACT BLOCK PUSH SW BOOT",
+  })) for (const t of tags.split(" ")) TAG_FAMILY[t] = family;
+  const familyOf = (tag) => Object.hasOwn(TAG_FAMILY, tag) ? TAG_FAMILY[tag] : "other";
+
+  const main = [];                 // info / warn / err — capped at LOG_MAX_LINES
+  const dbg  = [];                 // debug — own ring, so a burst of debug lines can't push real events out
+  const tagsSeen  = new Set();     // first-seen order = chip order
+  const mutedTags = new Set();
+  let seq = 0;
+  let open = false;
+  let minRank   = RANK.info;       // level filter: 1 = ALL, 2 = WARN+, 3 = ERR
+  let showDebug = false;
+  let follow    = true;            // auto-scroll; off while the user has scrolled up to read
+  let flushPending = false;        // a rAF flush (scroll + counter) is queued
+
+  const $ = (id) => document.getElementById(id);
+  const pad2 = (n) => String(n).padStart(2, "0");
+  const fmtTime = (d) => `${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`;
+  const clip = (s) => s.length > LOG_MAX_TEXT ? s.slice(0, LOG_MAX_TEXT) + "…" : s;
+
+  // First argument of a log call, as text. Nearly always a string already.
+  function str(x) {
+    if (typeof x === "string") return x;
+    if (x instanceof Error) return x.message;
+    try { const j = JSON.stringify(x); return j === undefined ? String(x) : j; }
+    catch (e) { try { return String(x); } catch (e2) { return "[unprintable]"; } }
+  }
+  // Debug lines only: primitives after the message, so `mlog.debug("skip", id)` keeps its id in the panel
+  // (it used to exist only in the browser console). Objects are not dumped — "{…}" marks that one was passed.
+  function extras(a) {
+    if (!a.length) return "";
+    return " " + a.map(x => x instanceof Error ? x.message
+      : (x !== null && (typeof x === "object" || typeof x === "function")) ? "{…}" : String(x)).join(" ");
+  }
+
+  /* ── line parsing ──
+     The ~100 call sites stay plain strings. At push time each is split into
+       [direction glyph] [UPPERCASE TAG] body
+     e.g. "SETTINGS   own relay cleared", "→ MSG sent id=ab12", "X4DH → propose". Anything that does not
+     fit (no tag, no glyph) is just a body. */
+  const LINE_RE = /^\s*([→←●○])?\s*(?:([A-Z][A-Z0-9_]{1,14})(?=[\s:→←●○]|$)[:\s]*)?([\s\S]*)$/;
+  function parse(raw) {
+    const m = LINE_RE.exec(raw);
+    let dir = m[1] || "", tag = m[2] || "", body = m[3];
+    if (!dir) {
+      const d = /^([→←●○])\s*/.exec(body);
+      if (d) { dir = d[1]; body = body.slice(d[0].length); }
     }
-    body.scrollTop = body.scrollHeight;
+    return { dir, tag, body };
   }
 
-  function push(level, text) {
-    lines.push({ level, text: `${ts()} ${text}` });
-    if (lines.length > LOG_MAX_LINES) lines.shift();
-    render();
+  /* ── rendering ──
+     DOM nodes + textContent, never innerHTML. Log lines are built from strings a contact or a relay
+     controls (a system-message kind/text, a reaction emoji, a migrate's new relay address, a relay's
+     version/reason field, …), and this code runs even while the panel is hidden — so interpolating
+     them into markup meant any contact could run script in the page that holds state.keys and the
+     remembered-login secret. textContent makes "is this string escaped?" a question that can no
+     longer be answered wrongly by a future log call. Every className below is a fixed literal or a
+     lookup into a fixed table (level, family, direction) — never log text. */
+  const mk = (tagName, cls, text) => {
+    const n = document.createElement(tagName);
+    n.className = cls;
+    if (text) n.textContent = text;
+    return n;
+  };
+
+  // ✓ ✗ tinted green / red, key=value split into dim key + bright value; everything else plain text.
+  const TOKEN_RE = /([✓✔]️?)|([✗✘]️?)|\b([A-Za-z_][\w.]*)=(\S*)/g;
+  function fillBody(el, text) {
+    let last = 0, m;
+    TOKEN_RE.lastIndex = 0;
+    while ((m = TOKEN_RE.exec(text))) {
+      if (m.index > last) el.appendChild(document.createTextNode(text.slice(last, m.index)));
+      if (m[1])      el.appendChild(mk("span", "mlog-ok",  m[1]));
+      else if (m[2]) el.appendChild(mk("span", "mlog-bad", m[2]));
+      else {
+        el.appendChild(mk("span", "mlog-k", m[3] + "="));
+        if (m[4]) el.appendChild(mk("span", "mlog-v", m[4]));
+      }
+      last = TOKEN_RE.lastIndex;
+    }
+    if (last < text.length) el.appendChild(document.createTextNode(text.slice(last)));
   }
+
+  // time | level dot | tag chip | direction | text
+  function buildRow(e) {
+    const row = mk("div", "mlog-row " + e.level);
+    const t = mk("span", "mlog-t", e.time);
+    t.title = `${e.time}.${String(e.ms).padStart(3, "0")}`;
+    row.appendChild(t);
+    row.appendChild(mk("span", "mlog-dot"));
+    row.appendChild(e.tag ? mk("span", "mlog-tag f-" + familyOf(e.tag), e.tag) : mk("span", "mlog-notag"));
+    row.appendChild(mk("span", "mlog-dir" + (e.dir ? " d-" + DIRS[e.dir] : ""), e.dir));
+    const txt = mk("span", "mlog-txt");
+    fillBody(txt, e.body);
+    row.appendChild(txt);
+    return row;
+  }
+
+  function matches(e) {
+    if (e.tag && mutedTags.has(e.tag)) return false;
+    if (e.level === "debug") return showDebug && minRank <= RANK.info;   // debug ranks below ALL, so only ALL can include it
+    return RANK[e.level] >= minRank;
+  }
+  const visibleEntries = () => main.concat(dbg).filter(matches).sort((a, b) => a.seq - b.seq);
+
+  const nearBottom = (body) => body.scrollHeight - body.scrollTop - body.clientHeight < 6;
+
+  function updateFollowBtn() {
+    const b = $("meshLogFollow");
+    if (b) b.classList.toggle("on", follow);
+  }
+  function updateCount() {
+    const c = $("meshLogCount"), body = $("meshLogBody");
+    if (!c || !body) return;
+    c.textContent = `${body.childElementCount} / ${main.length + dbg.length}`;
+  }
+
+  // One rAF per burst of pushes: scroll once, update the counter once. scrollPending-style guard: while a
+  // flush is queued, scroll events (our own appends/trims shifting the content) must not flip `follow` off.
+  function scheduleFlush() {
+    if (flushPending) return;
+    flushPending = true;
+    requestAnimationFrame(() => {
+      flushPending = false;
+      const body = $("meshLogBody");
+      if (!open || !body) return;
+      if (follow) body.scrollTop = body.scrollHeight;
+      updateCount();
+    });
+  }
+
+  function render() {
+    const body = $("meshLogBody");
+    if (!open || !body) return;
+    for (const e of main) e.el = null;
+    for (const e of dbg)  e.el = null;
+    const frag = document.createDocumentFragment();
+    for (const e of visibleEntries()) { e.el = buildRow(e); frag.appendChild(e.el); }
+    body.textContent = "";
+    body.appendChild(frag);
+    updateCount();
+    if (follow) body.scrollTop = body.scrollHeight;
+  }
+
+  /* ── tag chips (filter bar) ── */
+  function makeTagChip(tag) {
+    const b = mk("button", "mlog-tag mlog-tagchip f-" + familyOf(tag) + (mutedTags.has(tag) ? " off" : ""), tag);
+    b.type = "button";
+    b.title = "hide / show " + tag + " lines";
+    b.addEventListener("click", () => {
+      if (mutedTags.has(tag)) mutedTags.delete(tag); else mutedTags.add(tag);
+      b.classList.toggle("off", mutedTags.has(tag));
+      updateTagsAllBtn();
+      render();
+    });
+    return b;
+  }
+  function renderTags() {
+    const box = $("meshLogTags");
+    if (!box) return;
+    box.textContent = "";
+    for (const tag of tagsSeen) box.appendChild(makeTagChip(tag));
+    updateTagsAllBtn();
+  }
+  function updateTagsAllBtn() {
+    const b = $("meshLogTagsAll");
+    if (b) b.classList.toggle("on", mutedTags.size === 0);
+  }
+
+  /* ── buffer ── */
+  function push(level, raw) {
+    raw = clip(raw);
+    const d = new Date();
+    const { dir, tag, body } = parse(raw);
+    const e = { seq: seq++, time: fmtTime(d), ms: d.getMilliseconds(), level, raw, dir, tag, body, el: null };
+    const ring = level === "debug" ? dbg : main;
+    const cap  = level === "debug" ? LOG_MAX_DEBUG : LOG_MAX_LINES;
+    ring.push(e);
+    if (ring.length > cap) {
+      const old = ring.shift();
+      if (old.el) { old.el.remove(); old.el = null; }
+    }
+    if (tag && !tagsSeen.has(tag)) {
+      tagsSeen.add(tag);
+      if (open) { const box = $("meshLogTags"); if (box) box.appendChild(makeTagChip(tag)); }
+    }
+    if (!open) return;
+    const bodyEl = $("meshLogBody");
+    if (bodyEl && matches(e)) { e.el = buildRow(e); bodyEl.appendChild(e.el); }
+    scheduleFlush();
+  }
+
+  /* ── controls — wired here (not in meshchat-boot.js) so the panel is self-contained;
+        the ids that boot.js already wires (#meshLogClear, #meshLogHide) are unchanged ── */
+  const on = (id, ev, fn) => { const el = $(id); if (el) el.addEventListener(ev, fn); };
+
+  function copyAll() {
+    const text = visibleEntries().map(e => `${e.time} ${LEVEL_TAG[e.level].padEnd(5)} ${e.raw}`).join("\n");
+    const btn = $("meshLogCopy");
+    const flash = (msg) => {
+      if (!btn) return;
+      btn.textContent = msg;
+      setTimeout(() => { btn.textContent = "COPY"; }, 1200);
+    };
+    const fallback = () => {          // no async clipboard (insecure context, old browser)
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.style.cssText = "position:fixed;top:0;left:0;opacity:0";
+      document.body.appendChild(ta);
+      ta.select();
+      let ok = false;
+      try { ok = document.execCommand("copy"); } catch (e) {}
+      ta.remove();
+      flash(ok ? "COPIED" : "FAILED");
+    };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(() => flash("COPIED"), fallback);
+    } else fallback();
+  }
+
+  const levels = $("meshLogLevels");
+  if (levels) for (const b of levels.children) b.addEventListener("click", () => {
+    minRank = Number(b.dataset.level);
+    for (const o of levels.children) o.classList.toggle("on", o === b);
+    const dbtn = $("meshLogDebug");
+    if (dbtn) dbtn.classList.toggle("blocked", minRank > RANK.info);   // debug can only show under ALL
+    render();
+  });
+  on("meshLogDebug", "click", (ev) => {
+    showDebug = !showDebug;
+    ev.currentTarget.classList.toggle("on", showDebug);
+    render();
+  });
+  on("meshLogTagsAll", "click", () => {
+    mutedTags.clear();
+    renderTags();
+    render();
+  });
+  on("meshLogFollow", "click", () => {
+    follow = true;
+    updateFollowBtn();
+    const body = $("meshLogBody");
+    if (body) body.scrollTop = body.scrollHeight;
+  });
+  on("meshLogCopy", "click", copyAll);
+  on("meshLogBody", "scroll", (ev) => {
+    if (flushPending) return;         // our own append / trim moved the content, not the user
+    follow = nearBottom(ev.currentTarget);
+    updateFollowBtn();
+  });
 
   return {
-    debug : (...a) => console.debug("[MC]", ...a),
-    info  : (text, ...a) => { console.log  ("[MC]", text, ...a); push("info",  text); },
-    warn  : (text, ...a) => { console.warn ("[MC]", text, ...a); push("warn",  text); },
-    err   : (text, ...a) => { console.error("[MC]", text, ...a); push("err",   text); },
-    clear : ()           => { lines.length = 0; render(); },
-    show  : ()           => { visible = true;  document.getElementById("meshLog").classList.add("open"); },
-    hide  : ()           => { visible = false; document.getElementById("meshLog").classList.remove("open"); },
-    toggle: ()           => visible ? mlog.hide() : mlog.show(),
+    debug : (text, ...a) => { console.debug("[MC]", text, ...a); push("debug", str(text) + extras(a)); },
+    info  : (text, ...a) => { console.log  ("[MC]", text, ...a); push("info",  str(text)); },
+    warn  : (text, ...a) => { console.warn ("[MC]", text, ...a); push("warn",  str(text)); },
+    err   : (text, ...a) => { console.error("[MC]", text, ...a); push("err",   str(text)); },
+    clear : ()           => { main.length = 0; dbg.length = 0; tagsSeen.clear(); renderTags(); render(); },
+    show  : ()           => {
+      open = true; follow = true;
+      const el = $("meshLog");
+      if (el) el.classList.add("open");
+      updateFollowBtn();
+      renderTags();
+      render();
+    },
+    hide  : ()           => {
+      open = false;
+      const el = $("meshLog");
+      if (el) el.classList.remove("open");
+      const body = $("meshLogBody");
+      if (body) body.textContent = "";         // rows are rebuilt on show; nothing is kept in the DOM while closed
+      for (const e of main) e.el = null;
+      for (const e of dbg)  e.el = null;
+    },
+    toggle: ()           => open ? mlog.hide() : mlog.show(),
   };
 })();
 
@@ -2215,7 +2466,7 @@ async function saveOwnRelay() {
   });
 
   $("settingsBackupBtn").onclick  = () => { closeSettings(); openExportModal(); };
-  $("settingsLogBtn").onclick     = () => mlog.toggle();     // the log sits above the panel (z-index), so it stays open
+  $("settingsLogBtn").onclick     = () => { closeSettings(); mlog.toggle(); };   // the log is docked in the page now — the settings overlay would cover it, so close that first (like BACKUP / MIGRATE)
   $("settingsRelaySave").onclick  = saveOwnRelay;
   $("settingsRelay").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); saveOwnRelay(); } });
   $("settingsMigrateBtn").onclick = () => { closeSettings(); contactAction("migrate"); };
