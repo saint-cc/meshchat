@@ -1221,6 +1221,43 @@ function buildMissingBanner(contactId) {
   return wrap;
 }
 
+/* ══════════════════════════════════════════
+   CHAT SCROLL — stay at the bottom while images arrive late
+   Images are decrypted and decoded AFTER renderMessages() has already scrolled to the bottom, so each
+   one grows the list afterwards and pushes the newest message out of view. The old fix asked, inside
+   each image's onload, "is the distance to the bottom no more than THIS image's height (+40)?". With
+   two or more images finishing in the same moment each one sees the combined growth of all of them,
+   answers no, and nobody scrolls — the page "jumps up".
+   Now it is an explicit intent instead of a distance guess: chatStick = "the reader is at the bottom".
+   renderMessages() / scrollChatToBottom() set it; a scroll the READER makes clears it (scrolled up to
+   read → stop following) or sets it again (back at the bottom). A scroll event where scrollTop has not
+   moved since we last looked is not the reader: it is our own jump arriving a frame late, or the
+   browser re-laying-out after an image grew — evaluated at that moment the list is taller than the
+   view and would wrongly read as "scrolled away from the bottom", so those are skipped.
+══════════════════════════════════════════ */
+const CHAT_STICK_PX = 32;     // within this many px of the bottom still counts as "at the bottom"
+let chatStick   = true;
+let chatLastTop = 0;          // scrollTop as last seen by us — our own jumps and the reader's scrolls
+
+function scrollChatToBottom() {
+  const c = document.getElementById("chatMessages");
+  if (!c) return;
+  c.scrollTop = c.scrollHeight;
+  chatLastTop = c.scrollTop;
+  chatStick   = true;
+}
+
+(function wireChatScroll() {
+  const c = document.getElementById("chatMessages");
+  if (!c) return;
+  c.addEventListener("scroll", () => {
+    const top = c.scrollTop;
+    if (Math.abs(top - chatLastTop) < 0.5) return;   // nothing moved — not the reader
+    chatLastTop = top;
+    chatStick   = c.scrollHeight - top - c.clientHeight < CHAT_STICK_PX;
+  }, { passive: true });
+})();
+
 function renderMessages() {
   const container = document.getElementById("chatMessages");
   container.innerHTML = "";
@@ -1300,7 +1337,7 @@ function renderMessages() {
         const img = document.createElement("img");
         img.style.cssText = "max-width:200px;display:block;border-radius:2px";
         img.alt = "image";
-		img.onload = () => { if (container.scrollHeight - container.scrollTop - container.clientHeight <= img.offsetHeight + 40) container.scrollTop = container.scrollHeight; };  // dont jump up
+		img.onload = () => { if (img.isConnected && chatStick) scrollChatToBottom(); };   // late-loading image: keep the bottom in view — see CHAT SCROLL above renderMessages
         (async () => {
           try {
             const plain = await decryptObject(state.encKey, imageCache[m.id].encBlob);
@@ -1360,7 +1397,7 @@ function renderMessages() {
     wrap.appendChild(infoPre);
     container.appendChild(wrap);
   });
-  container.scrollTop = container.scrollHeight;
+  scrollChatToBottom();
 }
 
 // Packet inspector (ⓘ) — two views, one renderer.
