@@ -350,6 +350,82 @@ select {
 }
 @keyframes mlog-blink { 50% { border-right-color: transparent; } }
 
+/* ── error / warning / MSG = the signal goes bad ──
+   TRIGGER: error and warning rows, plus [data-tag="MSG"] rows — the MSG one is a TEST HOOK (errors are
+   hard to force on demand; sending a message is not). To drop it later, delete `, [data-tag="MSG"]`
+   everywhere below (it is the same :is(...) in every selector of this block).
+   An error line arriving (and only that: the newest 25 rows animate, as above) gets:
+     · analog static: a strip of green noise across its row that shimmers and fades out
+     · horizontal dealignment: its time, tag and text columns each slip sideways on their own, with an
+       RGB split on the text, like a tracking error
+   and, where the browser has :has() (Chrome 105+, Safari 15.4+, Firefox 121+; older ones just skip
+   this part), while the NEWEST row is an error the whole screen loses horizontal sync for a moment:
+   the last 40 rows tear sideways in three out-of-phase groups, the picture flashes, and the refresh
+   roll whips down the panel once. The next non-error line ends it. prefers-reduced-motion turns all
+   of it off (blanket rule at the end of this section). */
+:root[data-theme="matrix"] #meshLog {
+  /* SVG turbulence → green speckle with its own alpha. A data: image, which the page's CSP allows (img-src data:) */
+  --ml-noise: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='120' height='40'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.85 .5' numOctaves='2' stitchTiles='stitch'/%3E%3CfeColorMatrix values='0 0 0 0 0  0 0 0 0 1  0 0 0 0 .6  0 0 0 1.6 -.4'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+}
+
+/* the row: a positioned anchor for the static (out-of-flow, so the grid columns are untouched) */
+:root[data-theme="matrix"] .mlog-row:is(.err, .warn, [data-tag="MSG"]) { position: relative; }
+:root[data-theme="matrix"] .mlog-row:is(.err, .warn, [data-tag="MSG"]):nth-last-child(-n+25)::after {
+  content: "";
+  position: absolute; inset: 0; pointer-events: none;
+  background: var(--ml-noise);
+  background-size: 120px 40px;
+  animation: mlog-static .9s steps(8) both;
+}
+@keyframes mlog-static {
+  0%   { opacity: .95; background-position:   0px   0px; }
+  25%  {               background-position: -37px  11px; }
+  50%  { opacity: .7;  background-position:  23px -17px; }
+  75%  {               background-position: -11px  29px; }
+  100% { opacity: 0;   background-position:  41px   3px; }
+}
+
+/* the row's own columns slip out of line, each on its own schedule */
+:root[data-theme="matrix"] .mlog-row:is(.err, .warn, [data-tag="MSG"]):nth-last-child(-n+25) .mlog-t   { animation: mlog-tear-a .9s steps(1) .1s backwards; }
+:root[data-theme="matrix"] .mlog-row:is(.err, .warn, [data-tag="MSG"]):nth-last-child(-n+25) .mlog-tag { animation: mlog-tear-b .9s steps(1) .1s backwards; }
+:root[data-theme="matrix"] .mlog-row:is(.err, .warn, [data-tag="MSG"]):nth-last-child(-n+25) .mlog-txt {
+  animation: mlog-type .5s steps(32, end) backwards, mlog-tear-c .9s steps(1) .1s backwards;   /* keeps the typing */
+}
+@keyframes mlog-tear-a { 10% { transform: translateX(14px); }  20% { transform: translateX(-9px); }  30% { transform: translateX(5px); }  45% { transform: translateX(-18px); } 60% { transform: translateX(3px); }  80% { transform: translateX(-2px); } 100% { transform: none; } }
+@keyframes mlog-tear-b { 10% { transform: translateX(-12px); } 25% { transform: translateX(8px); }  40% { transform: translateX(-4px); } 55% { transform: translateX(16px); }  70% { transform: translateX(-6px); } 85% { transform: translateX(1px); }  100% { transform: none; } }
+@keyframes mlog-tear-c {
+  10%  { transform: translateX(-8px) skewX(-6deg); text-shadow: -2px 0 #ff2a6d, 2px 0 #05d9e8; }
+  22%  { transform: translateX(11px);               text-shadow:  2px 0 #ff2a6d, -2px 0 #05d9e8; }
+  34%  { transform: translateX(-3px) skewX(4deg);   text-shadow: -1px 0 #ff2a6d, 1px 0 #05d9e8; }
+  48%  { transform: translateX(7px);                text-shadow: -3px 0 #ff2a6d, 3px 0 #05d9e8; }
+  64%  { transform: translateX(-2px); }
+  80%  { transform: translateX(1px); }
+  100% { transform: none; text-shadow: none; }
+}
+
+/* the whole screen, while the newest row is an error (needs :has) */
+:root[data-theme="matrix"] #meshLog:has(#meshLogBody > .mlog-row:is(.err, .warn, [data-tag="MSG"]):last-child) #meshLogBody {
+  animation: mlog-flicker 4.7s steps(1) infinite, mlog-body-flash .8s steps(1) 1;
+}
+:root[data-theme="matrix"] #meshLog:has(#meshLogBody > .mlog-row:is(.err, .warn, [data-tag="MSG"]):last-child)::before {
+  animation: mlog-roll-whip .8s linear 1;
+}
+:root[data-theme="matrix"] #meshLog:has(#meshLogBody > .mlog-row:is(.err, .warn, [data-tag="MSG"]):last-child) .mlog-row:nth-last-child(-n+40):not(:last-child):nth-child(3n)   { animation: mlog-slice-a .8s steps(1) 1; }
+:root[data-theme="matrix"] #meshLog:has(#meshLogBody > .mlog-row:is(.err, .warn, [data-tag="MSG"]):last-child) .mlog-row:nth-last-child(-n+40):not(:last-child):nth-child(3n+1) { animation: mlog-slice-b .8s steps(1) 1; }
+:root[data-theme="matrix"] #meshLog:has(#meshLogBody > .mlog-row:is(.err, .warn, [data-tag="MSG"]):last-child) .mlog-row:nth-last-child(-n+40):not(:last-child):nth-child(3n+2) { animation: mlog-slice-c .8s steps(1) 1; }
+@keyframes mlog-slice-a { 12% { transform: translateX(-10px); } 28% { transform: translateX(6px); }  44% { transform: translateX(-3px); } 60% { transform: translateX(8px); }  76% { transform: translateX(-1px); } 90% { transform: none; } }
+@keyframes mlog-slice-b { 12% { transform: translateX(6px); }   28% { transform: translateX(-12px); } 44% { transform: translateX(9px); }  60% { transform: translateX(-4px); } 76% { transform: translateX(2px); }  90% { transform: none; } }
+@keyframes mlog-slice-c { 12% { transform: translateX(13px); }  28% { transform: translateX(-5px); }  44% { transform: translateX(-9px); } 60% { transform: translateX(4px); }  76% { transform: translateX(-2px); } 90% { transform: none; } }
+@keyframes mlog-body-flash {
+  0%   { filter: none; }
+  8%   { filter: contrast(1.6) brightness(1.5); }
+  16%  { filter: hue-rotate(35deg) brightness(1.2); }
+  24%  { filter: none; }
+  36%  { filter: contrast(1.3) brightness(1.25); }
+  48%, 100% { filter: none; }
+}
+@keyframes mlog-roll-whip { from { transform: translateY(-100%); } to { transform: translateY(300%); } }
+
 @media (prefers-reduced-motion: reduce) {
   :root[data-theme="matrix"] #meshLog,
   :root[data-theme="matrix"] #meshLog *,

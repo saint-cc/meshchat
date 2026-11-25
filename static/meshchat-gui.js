@@ -200,6 +200,7 @@ const mlog = (() => {
   // time | level dot | tag chip | direction | text
   function buildRow(e) {
     const row = mk("div", "mlog-row " + e.level);
+    if (e.tag) row.dataset.tag = e.tag;          // hook for themes: [data-tag="MSG"] (tag is [A-Z0-9_] only, from the parser)
     const t = mk("span", "mlog-t", e.time);
     t.title = `${e.time}.${String(e.ms).padStart(3, "0")}`;
     row.appendChild(t);
