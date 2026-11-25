@@ -150,3 +150,211 @@ select {
 @keyframes matrix-crt-roll {
   to { background-position: 0 48px; }
 }
+
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   Matrix theme — the in-page log (#meshLog, see "in-page log: docked panel" in style.css)
+   Pure CSS, no markup or JS changes: everything below hangs off the elements the log already has.
+   No falling characters. Instead: a terminal that is slightly too proud of itself.
+
+     · CRT switch-on when the panel opens (a bright line that unfolds)
+     · scanlines + vignette over the whole panel, and a slow "refresh roll" band drifting down it
+     · a light that sweeps along the top edge of the header, a title that glitches every few seconds
+     · [bracketed] buttons and tags; selected = inverse video, like selected text in a terminal
+     · a dot-matrix background that scrolls with the lines
+     · new lines flash in and "type" themselves (only the newest 25 rows animate, so a 300-line
+       re-render stays cheap); errors pulse
+     · a prompt with a blinking block cursor after the last line
+   All of it is switched off by prefers-reduced-motion (the static look stays).
+   Specificity note: each rule is prefixed with :root[data-theme="matrix"], which outranks the
+   plain rules in style.css, so the family colours and per-level dots have to be restated here.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+:root[data-theme="matrix"] #meshLog {
+  --ml-bg:   #020a06;
+  --ml-bg2:  #04140c;
+  --ml-bd:   #0d3a24;
+  --ml-bd2:  #082a1a;
+  --ml-fg:   #a8ffd0;
+  --ml-dim:  #4fae83;
+  --ml-mute: #2f7a56;
+  --ml-acc:  #00ff99;
+  --ml-warn: #ffd84a;
+  --ml-err:  #ff4d6a;
+  position: relative;                       /* anchor for the overlays below */
+  overflow: hidden;                         /* the sweep / roll stay inside the panel */
+  font-family: "JetBrains Mono", "Fira Code", ui-monospace, monospace;
+  text-shadow: 0 0 5px rgba(0, 255, 153, .28);        /* phosphor glow */
+  border-top-color: #00ff99;
+  box-shadow: 0 -1px 0 rgba(0, 255, 153, .55), 0 -10px 28px rgba(0, 255, 153, .16);
+}
+:root[data-theme="matrix"] #meshLog ::selection { background: #00ff99; color: #001a0d; text-shadow: none; }
+
+/* CRT switch-on: a hot line that unfolds into the panel */
+:root[data-theme="matrix"] #meshLog.open { animation: mlog-crt-on .38s cubic-bezier(.2, .8, .2, 1); }
+@keyframes mlog-crt-on {
+  0%   { transform: scaleY(.015); filter: brightness(6); }
+  45%  { transform: scaleY(1.04); filter: brightness(2.2); }
+  100% { transform: none;         filter: none; }
+}
+
+/* scanlines + vignette over everything (clicks and selection pass straight through) */
+:root[data-theme="matrix"] #meshLog::after {
+  content: "";
+  position: absolute; inset: 0; z-index: 5; pointer-events: none;
+  background:
+    repeating-linear-gradient(0deg, transparent 0 2px, rgba(0, 0, 0, .18) 2px 3px),
+    radial-gradient(ellipse at 50% 40%, transparent 55%, rgba(0, 0, 0, .5) 100%);
+}
+/* the slow refresh roll: a soft band drifts down the screen, then rests */
+:root[data-theme="matrix"] #meshLog::before {
+  content: "";
+  position: absolute; left: 0; right: 0; top: 0; height: 38%; z-index: 4; pointer-events: none;
+  background: linear-gradient(180deg, transparent, rgba(0, 255, 153, .07) 55%, rgba(0, 255, 153, .13) 92%, transparent);
+  transform: translateY(-100%);
+  animation: mlog-roll 8s linear infinite;
+}
+@keyframes mlog-roll {
+  0%        { transform: translateY(-100%); }
+  70%, 100% { transform: translateY(300%); }
+}
+
+/* header: gradient wash, a light sweeping along its top edge, a glitching title */
+:root[data-theme="matrix"] #meshLogHeader {
+  position: relative; overflow: hidden;
+  background: linear-gradient(90deg, rgba(0, 255, 153, .12), transparent 70%), var(--ml-bg2);
+}
+:root[data-theme="matrix"] #meshLogHeader::before {
+  content: "";
+  position: absolute; top: 0; left: 0; width: 30%; height: 1px;
+  background: linear-gradient(90deg, transparent, #00ff99, transparent);
+  box-shadow: 0 0 8px #00ff99;
+  transform: translateX(-100%);
+  animation: mlog-sweep 3.4s linear infinite;
+}
+@keyframes mlog-sweep { to { transform: translateX(340%); } }
+
+:root[data-theme="matrix"] #meshLogTitle {
+  display: inline-block;
+  color: #00ff99;
+  letter-spacing: 2px;
+  animation: mlog-glitch 6s steps(1) infinite;
+}
+:root[data-theme="matrix"] #meshLogTitle::before { content: ">_ "; opacity: .7; }
+@keyframes mlog-glitch {
+  0%, 92%, 100% { transform: none;                         text-shadow: 0 0 6px rgba(0, 255, 153, .6); }
+  93%           { transform: translateX(-1px) skewX(-8deg); text-shadow: -2px 0 #ff2a6d, 2px 0 #05d9e8; }
+  95%           { transform: translateX(2px);               text-shadow: 2px 0 #ff2a6d, -2px 0 #05d9e8; }
+  97%           { transform: translateX(-1px) skewX(6deg);  text-shadow: 0 0 9px #00ff99; }
+}
+:root[data-theme="matrix"] #meshLogCount::before { content: "["; }
+:root[data-theme="matrix"] #meshLogCount::after  { content: "]"; }
+:root[data-theme="matrix"] .mlog-lbl             { text-transform: lowercase; letter-spacing: .04em; }
+:root[data-theme="matrix"] .mlog-lbl::before     { content: "--"; opacity: .6; }
+:root[data-theme="matrix"] .mlog-sep             { background: var(--ml-bd); }
+
+/* buttons: [ bracketed ]; hover and "on" are inverse video, the way a terminal shows a selection */
+:root[data-theme="matrix"] .mlog-btn {
+  background: none; border-color: transparent; border-radius: 0;
+  padding: 0 4px; margin-left: 0;
+  color: var(--ml-dim);
+}
+:root[data-theme="matrix"] .mlog-btn::before { content: "["; opacity: .55; }
+:root[data-theme="matrix"] .mlog-btn::after  { content: "]"; opacity: .55; }
+:root[data-theme="matrix"] .mlog-btn:hover,
+:root[data-theme="matrix"] .mlog-btn.on {
+  background: #00ff99; color: #02140c; text-shadow: none;
+  box-shadow: 0 0 10px rgba(0, 255, 153, .6);
+}
+:root[data-theme="matrix"] .mlog-btn:hover::before, :root[data-theme="matrix"] .mlog-btn:hover::after,
+:root[data-theme="matrix"] .mlog-btn.on::before,    :root[data-theme="matrix"] .mlog-btn.on::after { opacity: 1; }
+:root[data-theme="matrix"] .mlog-seg .mlog-btn { margin-left: 0; border-radius: 0; }
+
+/* tags: [TAG] in neon, one hue per family (restated: they must outrank style.css's .f-* rules) */
+:root[data-theme="matrix"] .mlog-tag {
+  --c: #3f9a72;
+  background: none; border-color: transparent; padding: 0 1px;
+  text-shadow: 0 0 6px color-mix(in srgb, var(--c) 65%, transparent);
+}
+:root[data-theme="matrix"] .mlog-tag::before { content: "["; opacity: .5; }
+:root[data-theme="matrix"] .mlog-tag::after  { content: "]"; opacity: .5; }
+:root[data-theme="matrix"] .mlog-tag.f-crypto { --c: #d58bff; }
+:root[data-theme="matrix"] .mlog-tag.f-net    { --c: #3dd8ff; }
+:root[data-theme="matrix"] .mlog-tag.f-msg    { --c: #00ff99; }
+:root[data-theme="matrix"] .mlog-tag.f-backup { --c: #ffb86b; }
+:root[data-theme="matrix"] .mlog-tag.f-sys    { --c: #7fd6ad; }
+:root[data-theme="matrix"] button.mlog-tagchip.off { border-style: solid; }
+
+/* the screen: a dot-matrix grid that scrolls with the text, and a barely-there flicker */
+:root[data-theme="matrix"] #meshLogBody {
+  background-image: radial-gradient(rgba(0, 255, 153, .09) 1px, transparent 1.3px);
+  background-size: 12px 12px;
+  background-attachment: local;
+  animation: mlog-flicker 4.7s steps(1) infinite;
+}
+@keyframes mlog-flicker {
+  0%, 8%, 100% { opacity: 1; }
+  4%           { opacity: .93; }
+  50%          { opacity: .97; }
+  51%          { opacity: 1; }
+}
+:root[data-theme="matrix"] #meshLogBody::-webkit-scrollbar { width: 5px; }
+:root[data-theme="matrix"] #meshLogBody::-webkit-scrollbar-thumb { background: #00ff99; box-shadow: 0 0 8px #00ff99; }
+:root[data-theme="matrix"] #meshLogBody:empty::before { content: "-- no output --"; }
+
+/* rows */
+:root[data-theme="matrix"] .mlog-row:hover {
+  background: linear-gradient(90deg, rgba(0, 255, 153, .16), transparent 65%);
+  box-shadow: inset 2px 0 0 #00ff99;
+}
+:root[data-theme="matrix"] .mlog-row.warn { border-left-color: var(--ml-warn); background: rgba(255, 216, 74, .07); }
+:root[data-theme="matrix"] .mlog-row.err  { border-left-color: var(--ml-err);  background: rgba(255, 77, 106, .10); }
+:root[data-theme="matrix"] .mlog-t        { color: var(--ml-mute); }
+:root[data-theme="matrix"] .mlog-txt      { color: var(--ml-fg); }
+:root[data-theme="matrix"] .mlog-row.warn  .mlog-txt { color: #ffe98a; }
+:root[data-theme="matrix"] .mlog-row.err   .mlog-txt { color: #ff9aab; }
+:root[data-theme="matrix"] .mlog-row.debug .mlog-txt,
+:root[data-theme="matrix"] .mlog-row.debug .mlog-k   { color: var(--ml-mute); text-shadow: none; }
+:root[data-theme="matrix"] .mlog-k   { color: var(--ml-dim); }
+:root[data-theme="matrix"] .mlog-v   { color: #d4ffe6; }
+:root[data-theme="matrix"] .mlog-ok  { color: #00ff99; text-shadow: 0 0 8px #00ff99; }
+:root[data-theme="matrix"] .mlog-bad { color: #ff4d6a; text-shadow: 0 0 8px #ff4d6a; }
+
+/* level dots light up; an error's dot pulses */
+:root[data-theme="matrix"] .mlog-dot            { background: #00ff99; box-shadow: 0 0 6px #00ff99; }
+:root[data-theme="matrix"] .mlog-row.warn  .mlog-dot { background: #ffd84a; box-shadow: 0 0 6px #ffd84a; }
+:root[data-theme="matrix"] .mlog-row.err   .mlog-dot { background: #ff4d6a; box-shadow: 0 0 8px #ff4d6a; animation: mlog-pulse 1.2s ease-in-out infinite; }
+:root[data-theme="matrix"] .mlog-row.debug .mlog-dot { background: var(--ml-mute); box-shadow: none; }
+@keyframes mlog-pulse { 50% { transform: scale(1.7); opacity: .45; } }
+
+:root[data-theme="matrix"] .mlog-dir.d-out { color: #3dd8ff; }
+:root[data-theme="matrix"] .mlog-dir.d-in  { color: #00ff99; }
+:root[data-theme="matrix"] .mlog-dir.d-on  { color: #00ff99; text-shadow: 0 0 8px #00ff99; }
+:root[data-theme="matrix"] .mlog-dir.d-off { color: var(--ml-mute); }
+
+/* newest 25 rows: flash in from the left and type themselves out (older rows: no animation at all,
+   so opening the panel on a full 300-line buffer does not start 300 animations) */
+:root[data-theme="matrix"] .mlog-row:nth-last-child(-n+25) { animation: mlog-in .45s ease-out backwards; }
+:root[data-theme="matrix"] .mlog-row:nth-last-child(-n+25) .mlog-txt { animation: mlog-type .5s steps(32, end) backwards; }
+@keyframes mlog-in   { from { opacity: 0; transform: translateX(-10px); background-color: rgba(0, 255, 153, .35); } }
+@keyframes mlog-type { from { clip-path: inset(0 100% 0 0); } to { clip-path: inset(0 0 0 0); } }
+
+/* the prompt after the last line, with a blinking block cursor (a border, so it blinks on its own) */
+:root[data-theme="matrix"] #meshLogBody::after {
+  content: "root@meshchat:~#";
+  display: block; width: fit-content;
+  padding: 3px 6px 5px 10px;
+  color: var(--ml-dim);
+  border-right: .6em solid #00ff99;
+  animation: mlog-blink 1.05s steps(1) infinite;
+}
+@keyframes mlog-blink { 50% { border-right-color: transparent; } }
+
+@media (prefers-reduced-motion: reduce) {
+  :root[data-theme="matrix"] #meshLog,
+  :root[data-theme="matrix"] #meshLog *,
+  :root[data-theme="matrix"] #meshLog *::before,
+  :root[data-theme="matrix"] #meshLog *::after,
+  :root[data-theme="matrix"] #meshLog::before,
+  :root[data-theme="matrix"] #meshLog::after { animation: none !important; }
+}

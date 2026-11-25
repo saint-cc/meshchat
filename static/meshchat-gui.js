@@ -1335,7 +1335,8 @@ function renderMessages() {
         bubble.innerHTML = `<span style="color:var(--muted);font-size:12px">🖼 image (not available)</span>`;
       } else {
         const img = document.createElement("img");
-        img.style.cssText = "max-width:200px;display:block;border-radius:2px";
+        img.className = "msgImg";                 // size rules live in style.css (a fixed inline 200px stuck out of narrow bubbles)
+        bubble.classList.add("hasImage");
         img.alt = "image";
 		img.onload = () => { if (img.isConnected && chatStick) scrollChatToBottom(); };   // late-loading image: keep the bottom in view — see CHAT SCROLL above renderMessages
         (async () => {

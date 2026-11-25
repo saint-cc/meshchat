@@ -351,7 +351,7 @@
   color: var(--ml-fg);
   border-top: 1px solid var(--ml-bd);
   box-shadow: 0 -6px 14px rgba(0,0,0,.55);
-  font: 11px/1.5 monospace;
+  font: 9px/1.5 monospace;      /* the log's own size — chat text is 13px; chips, buttons and the grid columns below are sized to match */
 }
 #meshLog.open { display: flex; }
 @media (max-width: 600px) { #meshLog { flex-basis: 40%; } }
@@ -365,13 +365,13 @@
 #meshLogTitle   { color: var(--ml-acc); font-weight: bold; letter-spacing: 1px; }
 #meshLogCount   { color: var(--ml-mute); }
 .mlog-spacer    { flex: 1; }
-.mlog-lbl       { color: var(--ml-mute); font-size: 9px; letter-spacing: 0.1em; }
+.mlog-lbl       { color: var(--ml-mute); font-size: 8px; letter-spacing: 0.1em; }
 .mlog-sep       { width: 1px; align-self: stretch; background: var(--ml-bd2); margin: 0 4px; }
 #meshLogTags    { display: contents; }
 
 .mlog-btn {
   background: none; border: 1px solid var(--ml-bd); color: var(--ml-dim);
-  font: inherit; font-size: 10px; letter-spacing: 0.08em; line-height: 1.6;
+  font: inherit; letter-spacing: 0.08em; line-height: 1.6;
   padding: 0 8px; border-radius: 3px; cursor: pointer;
   transition: color 0.15s, border-color 0.15s;
 }
@@ -392,7 +392,7 @@
   background: color-mix(in srgb, var(--c) 13%, transparent);
   border: 1px solid color-mix(in srgb, var(--c) 32%, transparent);
   border-radius: 3px;
-  font: inherit; font-size: 9px; letter-spacing: 0.06em; line-height: 15px;
+  font: inherit; font-size: 8px; letter-spacing: 0.06em; line-height: 11px;
   padding: 0 4px; text-align: center;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
@@ -415,7 +415,7 @@ button.mlog-tagchip.off { opacity: 0.35; border-style: dashed; text-decoration: 
 /* row: time | level dot | tag chip | direction | text */
 .mlog-row {
   display: grid;
-  grid-template-columns: 58px 8px 68px 12px minmax(0, 1fr);
+  grid-template-columns: 48px 8px 60px 10px minmax(0, 1fr);
   column-gap: 8px; align-items: start;
   padding: 1px 10px 1px 8px;
   border-left: 2px solid transparent;
@@ -424,7 +424,7 @@ button.mlog-tagchip.off { opacity: 0.35; border-style: dashed; text-decoration: 
 .mlog-row.warn  { border-left-color: var(--ml-warn); background: rgba(255,179,71,.06); }
 .mlog-row.err   { border-left-color: var(--ml-err);  background: rgba(255,107,107,.08); }
 .mlog-t   { color: var(--ml-mute); white-space: nowrap; }
-.mlog-dot { width: 6px; height: 6px; border-radius: 50%; margin-top: 6px; background: #5fb6c9; }
+.mlog-dot { width: 6px; height: 6px; border-radius: 50%; margin-top: 4px; background: #5fb6c9; }
 .mlog-row.warn  .mlog-dot { background: var(--ml-warn); }
 .mlog-row.err   .mlog-dot { background: var(--ml-err); }
 .mlog-row.debug .mlog-dot { background: var(--ml-mute); }
@@ -497,11 +497,29 @@ button.mlog-tagchip.off { opacity: 0.35; border-style: dashed; text-decoration: 
   0%, 100% { opacity: 1; }
   50%       { opacity: 0.4; }
 }
-.message.mine img,
-.message.theirs img {
-  max-width: 200px;
+/* image bubbles: the picture is up to 200px wide, but never wider than the bubble's content box.
+   It used to be a fixed 200px, which stuck out of the 65%-wide bubble on a narrow chat pane — a small
+   phone, or a desktop window just above the 600px single-pane breakpoint — and the bubble itself now
+   gets extra room (85%) because a picture needs it more than a line of text does.
+   Why vw and not max-width:100%: a percentage max-width makes the bubble size itself from the image's
+   NATURAL width (hundreds of px) instead of the 200px it is shown at, so bubbles would be far too wide
+   on a wide window. Viewport units are not cyclic and work on old phones (unlike container queries).
+   The numbers mirror the layout: bubble = 85% of the message list's content box (pane - 2x20px padding),
+   minus the bubble's own 2x14px padding, minus ~6px for the scrollbar.
+     pane = 100vw on a phone (single view) → 85vw - 68px
+     pane = 100vw - 260px (sidebar) above 600px → 85vw - 289px
+   If the sidebar width, the list padding or the bubble padding change, change these with them.
+   Classes are set in renderMessages (.hasImage on the bubble, .msgImg on the <img>). */
+.message.hasImage { max-width: 85%; }
+.message .msgImg {
   display: block;
+  max-width: 200px;                                /* fallback for browsers without min() */
+  max-width: min(200px, calc(85vw - 289px));
+  height: auto;
   border-radius: 2px;
+}
+@media (max-width: 600px) {
+  .message .msgImg { max-width: min(200px, calc(85vw - 68px)); }
 }
 .reaction-trigger {
   display: block;
